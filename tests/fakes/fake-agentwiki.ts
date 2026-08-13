@@ -30,5 +30,6 @@ export class FakeAgentWiki implements PushRemotePort {
     session.info = { ...session.info, status: "published", result }; return result;
   }
   async getSession(sessionId: string): Promise<PushSessionInfo> { return this.sessions.get(sessionId)!.info; }
-  async snapshot(_spaceId: string): Promise<SyncPage[]> { return [...this.pages.values()].map((page) => ({ ...page })); }
+  async snapshot(): Promise<SyncPage[]> { return [...this.pages.values()].map((page) => ({ ...page })); }
+  async seed(pages: SyncPage[]): Promise<void> { this.pages.clear(); for (const page of pages) this.pages.set(page.pageId, { ...page }); this.revision = pages.length > 0 ? 1 : 0; }
 }

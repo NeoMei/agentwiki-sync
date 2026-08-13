@@ -1,4 +1,5 @@
 export interface VaultPort {
+  listMarkdown(rootPath: string): Promise<Array<{ relativePath: string; bytes: Uint8Array }>>;
   read(path: string): Promise<Uint8Array | null>;
   write(path: string, bytes: Uint8Array): Promise<void>;
   remove(path: string): Promise<void>;

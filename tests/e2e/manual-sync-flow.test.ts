@@ -12,7 +12,7 @@ describe("manual multi-device sync", () => {
     const body = "top\nmiddle\nbottom";
     const first = await desktop.publish({ spaceId: "space", baseRevision: "0", capabilities: remote.capabilities, changes: [{ operation: "upsert", pageId: "p1", path: "Guide.md", title: "Guide", body, contentHash: await contentHash(body) }] });
     expect(first.revision).toBe("1");
-    const mobileSnapshot = await remote.snapshot("space");
+    const mobileSnapshot = await remote.snapshot();
     expect(mobileSnapshot[0]?.body).toContain("middle");
     const merged = await mergeBody(mobileSnapshot[0]!.body, "TOP\nmiddle\nbottom", "top\nmiddle\nBOTTOM", "p1");
     expect(merged.conflicts).toHaveLength(0);

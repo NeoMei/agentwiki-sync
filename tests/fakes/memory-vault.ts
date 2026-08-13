@@ -9,6 +9,10 @@ export class MemoryVault implements VaultPort {
   constructor(initial: Record<string, string>) {
     for (const [path, body] of Object.entries(initial)) this.files.set(path, new TextEncoder().encode(body));
   }
+  async listMarkdown(rootPath: string): Promise<Array<{ relativePath: string; bytes: Uint8Array }>> {
+    const prefix = rootPath.length > 0 ? `${rootPath}/` : "";
+    return [...this.files.entries()].filter(([path]) => path.startsWith(prefix) && path.toLowerCase().endsWith(".md") && !path.startsWith(".agentwiki/")).map(([path, bytes]) => ({ relativePath: path.slice(prefix.length), bytes: bytes.slice() }));
+  }
   private fail(): void { this.operations += 1; if (this.failAfterOperations !== null && this.operations >= this.failAfterOperations) throw new Error("injected vault failure"); }
   exists(path: string): boolean { return this.files.has(path); }
   text(path: string): string | null { const value = this.files.get(path); return value ? new TextDecoder().decode(value) : null; }

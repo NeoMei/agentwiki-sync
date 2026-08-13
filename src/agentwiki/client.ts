@@ -1,4 +1,4 @@
-import { RevisionHeadResponseSchema, type RevisionHeadResponse } from "./protocol";
+import { DeltaPageSchema, RevisionHeadResponseSchema, SnapshotPageSchema, type DeltaItem, type RevisionHeadResponse, type SnapshotPage, type SyncPage } from "./protocol";
 import type { HttpPort, HttpResponse } from "../ports/http";
 
 export function normalizeServerUrl(input: string, development = false): string {
@@ -28,5 +28,31 @@ export class AgentWikiClient {
 
   async head(spaceId: string): Promise<RevisionHeadResponse> {
     return RevisionHeadResponseSchema.parse((await this.raw("GET", `/api/sync/v1/spaces/${encodeURIComponent(spaceId)}/head`)).json);
+  }
+
+  async snapshot(spaceId: string, revision = "current"): Promise<{ metadata: Omit<SnapshotPage, "items" | "nextCursor">; items: SyncPage[] }> {
+    let cursor: string | null = null;
+    let fixed: Omit<SnapshotPage, "items" | "nextCursor"> | null = null;
+    const items: SyncPage[] = [];
+    do {
+      const query = new URLSearchParams({ revision }); if (cursor) query.set("cursor", cursor);
+      const page = SnapshotPageSchema.parse((await this.raw("GET", `/api/sync/v1/spaces/${encodeURIComponent(spaceId)}/snapshot?${query}`)).json);
+      const metadata = { protocolVersion: page.protocolVersion, spaceId: page.spaceId, revision: page.revision, sequence: page.sequence, revisionContentHash: page.revisionContentHash, pageCount: page.pageCount, revisionManifestByteLength: page.revisionManifestByteLength, revisionBodyBytes: page.revisionBodyBytes };
+      if (fixed && JSON.stringify(fixed) !== JSON.stringify(metadata)) throw new Error("Snapshot pagination metadata changed");
+      fixed ??= metadata; items.push(...page.items); cursor = page.nextCursor;
+    } while (cursor);
+    if (!fixed) throw new Error("Snapshot returned no metadata");
+    return { metadata: fixed, items };
+  }
+
+  async delta(spaceId: string, from: string): Promise<{ toRevision: string; items: DeltaItem[] }> {
+    let cursor: string | null = null; let fixed: string | null = null; const items: DeltaItem[] = [];
+    do {
+      const query = new URLSearchParams({ from }); if (cursor) query.set("cursor", cursor);
+      const page = DeltaPageSchema.parse((await this.raw("GET", `/api/sync/v1/spaces/${encodeURIComponent(spaceId)}/delta?${query}`)).json);
+      const signature = JSON.stringify([page.fromRevision, page.toRevision, page.toSequence, page.toRevisionContentHash, page.toPageCount, page.toRevisionManifestByteLength, page.toRevisionBodyBytes]);
+      if (fixed && fixed !== signature) throw new Error("Delta pagination metadata changed"); fixed ??= signature; items.push(...page.items); cursor = page.nextCursor;
+    } while (cursor);
+    return { toRevision: fixed ? JSON.parse(fixed)[1] as string : from, items };
   }
 }
