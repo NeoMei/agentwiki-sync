@@ -1,5 +1,5 @@
 import type { PushBatch, SyncCapabilities } from "../../src/agentwiki/protocol";
-import type { FinalizeResult, PushRemotePort, PushSessionInfo } from "../../src/ports/push-remote";
+import type { FinalizeResult, PushRemotePort, PushSessionInfo, PushSessionStatusInfo } from "../../src/ports/push-remote";
 
 export class FakePushRemote implements PushRemotePort {
   readonly batches: PushBatch[] = [];
@@ -18,5 +18,5 @@ export class FakePushRemote implements PushRemotePort {
     if (this.loseFinalizeResponseOnce) { this.loseFinalizeResponseOnce = false; throw new Error("finalize response lost"); }
     return this.result;
   }
-  async getSession(): Promise<PushSessionInfo> { if (!this.session) throw new Error("missing session"); return this.session; }
+  async getSession(): Promise<PushSessionStatusInfo> { if (!this.session) throw new Error("missing session"); return { sessionId: this.session.sessionId, status: this.session.status, expiresAt: this.session.expiresAt, receivedBatchIndexes: this.batches.map((batch) => batch.batchIndex), result: this.session.result }; }
 }

@@ -18,6 +18,8 @@ describe("PushService", () => {
     const result = await service.publish({ spaceId: "s", baseRevision: "r1", changes, capabilities });
     expect(remote.batches).toHaveLength(2);
     expect(result.status).toBe("published");
+    expect((await store.read(".agentwiki/push/t1/journal.json"))).toContain('"localCommitPhase":"not_started"');
+    await service.markVerified();
     expect((await store.read(".agentwiki/push/t1/journal.json"))).toContain('"localCommitPhase":"verified"');
   });
 

@@ -58,7 +58,7 @@ export function computeStatus(manifest: Record<string, ManifestPage>, files: Res
   const seen = new Set(files.flatMap((file) => file.pageId ? [file.pageId] : []));
   const added = files.filter((file) => file.identityStatus === "new");
   const ambiguous = files.filter((file) => file.identityStatus === "ambiguous");
-  const modified = files.filter((file) => file.pageId !== null && manifest[file.pageId]?.contentHash !== file.contentHash);
+  const modified = files.filter((file) => file.pageId !== null && (manifest[file.pageId]?.contentHash !== file.contentHash || manifest[file.pageId]?.title !== file.title));
   const renamed = files.filter((file) => file.pageId !== null && portablePathKey(manifest[file.pageId]?.relativePath ?? "") !== portablePathKey(file.relativePath));
   const deleted = Object.values(manifest).filter((page) => !seen.has(page.pageId));
   return { added, modified, renamed, deleted, ambiguous };

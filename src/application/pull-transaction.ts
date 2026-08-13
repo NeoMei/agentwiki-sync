@@ -14,8 +14,8 @@ interface PullJournal {
   scanEpoch: number;
   actions: PullAction[];
   snapshots: SnapshotEntry[];
-  temporaryPaths: Array<{ original: string; temporary: string }>;
-  materialized: Array<{ path: string; resultHash: string }>;
+  temporaryPaths: Array<{ original: string; temporary: string; expectedHash: string | null }>;
+  materialized: Array<{ path: string; resultHash: string; expectedHash: string | null }>;
 }
 
 const encoder = new TextEncoder();
@@ -59,21 +59,24 @@ export class PullTransaction {
       for (let index = 0; index < journal.actions.length; index += 1) {
         const action = journal.actions[index]!;
         if (action.kind === "rename") {
-          const temporary = `.agentwiki-tmp-${index}`;
+          const temporary = `${action.fromPath}.agentwiki-tmp-${index}`;
+          const expectedHash = journal.snapshots.find((item) => item.path === action.fromPath)?.hash ?? null;
+          journal.temporaryPaths.push({ original: action.fromPath, temporary, expectedHash }); await this.save(journal);
           await this.vault.rename(action.fromPath, temporary);
-          journal.temporaryPaths.push({ original: action.fromPath, temporary }); await this.save(journal);
         }
       }
       for (let index = 0; index < journal.actions.length; index += 1) {
         const action = journal.actions[index]!;
         if (action.kind === "trash") {
+          const expected = journal.snapshots.find((item) => item.path === action.path); const current = await this.vault.read(action.path); const currentHash = current ? await sha256Hex(current) : null;
+          if (currentHash !== (expected?.hash ?? null)) throw new Error("Vault changed before trash");
           await this.vault.trashFile(action.path);
         } else {
-          const existing = await this.vault.read(action.path);
-          if (existing) await this.vault.remove(action.path);
           const body = encoder.encode(action.body);
-          await this.vault.write(action.path, body);
-          journal.materialized.push({ path: action.path, resultHash: await sha256Hex(body) }); await this.save(journal);
+          const snapshot = journal.snapshots.find((item) => item.path === action.path); const expected = action.kind === "rename" || snapshot?.bytes === null || !snapshot ? null : new Uint8Array(snapshot.bytes); const resultHash = await sha256Hex(body);
+          journal.materialized.push({ path: action.path, resultHash, expectedHash: action.kind === "rename" ? null : snapshot?.hash ?? null }); await this.save(journal);
+          await this.vault.ensureParentDirectories(action.path);
+          if (!await this.vault.compareAndSwap(action.path, expected, body)) throw new Error("Vault changed before conditional write");
         }
       }
       for (const temporary of journal.temporaryPaths) if (await this.vault.read(temporary.temporary)) await this.vault.remove(temporary.temporary);
@@ -95,7 +98,9 @@ export class PullTransaction {
     try {
       for (const materialized of [...journal.materialized].reverse()) {
         const current = await this.vault.read(materialized.path);
-        if (current && await sha256Hex(current) !== materialized.resultHash) throw new Error("User edited an applied result");
+        const currentHash = current ? await sha256Hex(current) : null;
+        if (currentHash === materialized.expectedHash) continue;
+        if (currentHash !== materialized.resultHash) throw new Error("User edited an applied result");
         if (current) await this.vault.remove(materialized.path);
       }
       for (const temporary of [...journal.temporaryPaths].reverse()) {
@@ -104,7 +109,7 @@ export class PullTransaction {
           const current = await this.vault.read(temporary.original);
           if (current) await this.vault.remove(temporary.original);
           await this.vault.rename(temporary.temporary, temporary.original);
-        }
+        } else { const original = await this.vault.read(temporary.original); const hash = original ? await sha256Hex(original) : null; if (hash !== temporary.expectedHash) throw new Error("Rename recovery is ambiguous"); }
       }
       for (const snapshot of journal.snapshots) {
         const current = await this.vault.read(snapshot.path);

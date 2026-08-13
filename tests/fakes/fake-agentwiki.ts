@@ -9,6 +9,7 @@ export class FakeAgentWiki implements PushRemotePort {
   private readonly pages = new Map<string, SyncPage>();
   private readonly sessions = new Map<string, Session>();
   async getHead(): Promise<{ revision: string }> { return { revision: String(this.revision) }; }
+  async getCapabilities(): Promise<SyncCapabilities> { return this.capabilities; }
   async createSession(input: { baseRevision: string }): Promise<PushSessionInfo> {
     if (input.baseRevision !== String(this.revision)) throw new Error("BASE_STALE");
     const sessionId = `session-${this.sessions.size + 1}`;
@@ -29,7 +30,7 @@ export class FakeAgentWiki implements PushRemotePort {
     const result: FinalizeResult = { status: "published", revision: String(this.revision), sequence: this.revision, publishedAt: "2026-08-14T00:00:00.000Z", revisionContentHash: await revisionContentHash(manifest), pageCount: String(this.pages.size), revisionManifestByteLength: String(canonicalBytes(manifest).byteLength), revisionBodyBytes: String([...this.pages.values()].reduce((sum, page) => sum + new TextEncoder().encode(page.body).byteLength, 0)), changeSetId: `c-${this.revision}` };
     session.info = { ...session.info, status: "published", result }; return result;
   }
-  async getSession(sessionId: string): Promise<PushSessionInfo> { return this.sessions.get(sessionId)!.info; }
+  async getSession(sessionId: string) { const info = this.sessions.get(sessionId)!.info; return { sessionId: info.sessionId, status: info.status, expiresAt: info.expiresAt, receivedBatchIndexes: [...this.sessions.get(sessionId)!.batches.keys()], result: info.result }; }
   async snapshot(): Promise<SyncPage[]> { return [...this.pages.values()].map((page) => ({ ...page })); }
   async seed(pages: SyncPage[]): Promise<void> { this.pages.clear(); for (const page of pages) this.pages.set(page.pageId, { ...page }); this.revision = pages.length > 0 ? 1 : 0; }
   async replace(pages: SyncPage[]): Promise<void> { this.pages.clear(); for (const page of pages) this.pages.set(page.pageId, { ...page }); this.revision += 1; }

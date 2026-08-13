@@ -1,4 +1,4 @@
-import { normalizePath, requestUrl, type App, type DataAdapter, type FileManager, type TFile, type Vault } from "obsidian";
+import { normalizePath, requestUrl, TFile, TFolder, type App, type DataAdapter, type FileManager, type Vault } from "obsidian";
 import type { ControlStorePort } from "../ports/control-store";
 import type { HttpPort, HttpResponse } from "../ports/http";
 import type { SecretPort } from "../ports/secrets";
@@ -42,8 +42,11 @@ export class RequestUrlHttp implements HttpPort {
 }
 
 export class ObsidianVaultPort implements VaultPort {
-  constructor(private readonly vault: Vault, private readonly fileManager: FileManager) {}
-  private file(path: string): TFile | null { const value = this.vault.getFileByPath(normalizePath(path)); return value; }
+  private readonly root: string;
+  constructor(private readonly vault: Vault, private readonly fileManager: FileManager, rootPath: string) { this.root = normalizePath(rootPath); }
+  private safe(path: string): string { const normalized = normalizePath(path); if (normalized !== this.root && !normalized.startsWith(`${this.root}/`)) throw new TypeError("Vault target escapes the mapping root"); return normalized; }
+  private file(path: string): TFile | null { return this.vault.getFileByPath(this.safe(path)); }
+  async rootStatus(rootPath: string): Promise<"folder" | "missing" | "file"> { const value = this.vault.getAbstractFileByPath(normalizePath(rootPath)); return value instanceof TFolder ? "folder" : value instanceof TFile ? "file" : "missing"; }
   async listMarkdown(rootPath: string): Promise<Array<{ relativePath: string; bytes: Uint8Array }>> {
     const root = normalizePath(rootPath); const prefix = root.length > 0 ? `${root}/` : "";
     const files = this.vault.getMarkdownFiles().filter((file) => file.path.startsWith(prefix) && !file.path.startsWith(".agentwiki/"));
@@ -52,8 +55,10 @@ export class ObsidianVaultPort implements VaultPort {
     return result;
   }
   async read(path: string): Promise<Uint8Array | null> { const file = this.file(path); return file ? new Uint8Array(await this.vault.readBinary(file)) : null; }
-  async write(path: string, bytes: Uint8Array): Promise<void> { const file = this.file(path); const data = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer; if (file) await this.vault.modifyBinary(file, data); else await this.vault.createBinary(normalizePath(path), data); }
+  async ensureParentDirectories(path: string): Promise<void> { const safe = this.safe(path); const parts = safe.split("/"); parts.pop(); let current = ""; for (const part of parts) { current = current ? `${current}/${part}` : part; const entry = this.vault.getAbstractFileByPath(current); if (entry instanceof TFile) throw new Error("Parent path is a file"); if (!entry) await this.vault.createFolder(current); } }
+  async write(path: string, bytes: Uint8Array): Promise<void> { const file = this.file(path); const data = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer; if (file) await this.vault.modifyBinary(file, data); else { await this.ensureParentDirectories(path); await this.vault.createBinary(this.safe(path), data); } }
+  async compareAndSwap(path: string, expected: Uint8Array | null, replacement: Uint8Array): Promise<boolean> { const safe = this.safe(path); const file = this.vault.getFileByPath(safe); if (!file) { if (expected !== null) return false; await this.write(safe, replacement); return true; } if (expected === null) return false; let matched = false; const data = replacement.buffer.slice(replacement.byteOffset, replacement.byteOffset + replacement.byteLength) as ArrayBuffer; await this.vault.process(file, (current) => { const actual = new TextEncoder().encode(current); matched = actual.length === expected.length && actual.every((value, index) => value === expected[index]); return matched ? new TextDecoder().decode(replacement) : current; }); if (matched && replacement.byteLength === 0) await this.vault.modifyBinary(file, data); return matched; }
   async remove(path: string): Promise<void> { const file = this.file(path); if (file) await this.vault.delete(file); }
-  async rename(from: string, to: string): Promise<void> { const file = this.file(from); if (!file) throw new Error("Missing rename source"); await this.vault.rename(file, normalizePath(to)); }
+  async rename(from: string, to: string): Promise<void> { const file = this.file(from); if (!file) throw new Error("Missing rename source"); await this.ensureParentDirectories(to); await this.vault.rename(file, this.safe(to)); }
   async trashFile(path: string): Promise<void> { const file = this.file(path); if (!file) throw new Error("Missing trash source"); await this.fileManager.trashFile(file); }
 }

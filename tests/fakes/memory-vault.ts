@@ -9,6 +9,7 @@ export class MemoryVault implements VaultPort {
   constructor(initial: Record<string, string>) {
     for (const [path, body] of Object.entries(initial)) this.files.set(path, new TextEncoder().encode(body));
   }
+  async rootStatus(rootPath: string): Promise<"folder" | "missing" | "file"> { if (this.files.has(rootPath)) return "file"; const prefix = rootPath ? `${rootPath}/` : ""; return rootPath === "" || [...this.files.keys()].some((path) => path.startsWith(prefix)) ? "folder" : "missing"; }
   async listMarkdown(rootPath: string): Promise<Array<{ relativePath: string; bytes: Uint8Array }>> {
     const prefix = rootPath.length > 0 ? `${rootPath}/` : "";
     return [...this.files.entries()].filter(([path]) => path.startsWith(prefix) && path.toLowerCase().endsWith(".md") && !path.startsWith(".agentwiki/")).map(([path, bytes]) => ({ relativePath: path.slice(prefix.length), bytes: bytes.slice() }));
@@ -21,4 +22,6 @@ export class MemoryVault implements VaultPort {
   async remove(path: string): Promise<void> { this.fail(); this.files.delete(path); }
   async rename(from: string, to: string): Promise<void> { this.fail(); const value = this.files.get(from); if (!value || this.files.has(to)) throw new Error("rename conflict"); this.files.delete(from); this.files.set(to, value); }
   async trashFile(path: string): Promise<void> { this.fail(); const value = this.files.get(path); if (!value) throw new Error("missing trash source"); this.trash.set(path, value); this.files.delete(path); }
+  async ensureParentDirectories(path: string): Promise<void> { void path; }
+  async compareAndSwap(path: string, expected: Uint8Array | null, replacement: Uint8Array): Promise<boolean> { const actual = this.files.get(path) ?? null; const equal = actual === null ? expected === null : expected !== null && actual.length === expected.length && actual.every((value, index) => value === expected[index]); if (!equal) return false; this.fail(); this.files.set(path, replacement.slice()); return true; }
 }

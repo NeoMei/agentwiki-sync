@@ -73,4 +73,16 @@ describe("SyncRuntime", () => {
     const remote = new FakeAgentWiki(); const runtime = new SyncRuntime(new MemoryVault({}), new MemoryControlStore(), remote, { spaceId: "space", rootPath: "Wiki", status: "pending" });
     await runtime.establishEmptyBase(); const preview = await runtime.previewPush(); expect(preview.changes).toHaveLength(0); await runtime.applyPush(preview); expect(remote.sessionCount()).toBe(0);
   });
+
+  it("moves the existing page when the remote renames the same pageId", async () => {
+    const remote=new FakeAgentWiki();const body="body";await remote.seed([{pageId:"p1",path:"Old.md",title:"Old",body,contentHash:await contentHash(body),updatedAt:"2026-08-14T00:00:00.000Z"}]);const vault=new MemoryVault({});const runtime=new SyncRuntime(vault,new MemoryControlStore(),remote,{spaceId:"space",rootPath:"Wiki",status:"pending"});await runtime.applyPull(await runtime.previewPull());await remote.replace([{pageId:"p1",path:"New.md",title:"New",body,contentHash:await contentHash(body),updatedAt:"2026-08-14T00:01:00.000Z"}]);const preview=await runtime.previewPull();expect(preview.actions).toContainEqual({kind:"rename",fromPath:"Wiki/Old.md",path:"Wiki/New.md",body});await runtime.applyPull(preview);expect(vault.exists("Wiki/Old.md")).toBe(false);expect(vault.text("Wiki/New.md")).toBe(body);
+  });
+
+  it("does not overwrite a same-path local document during initial binding", async () => {
+    const remote=new FakeAgentWiki();await remote.seed([{pageId:"p1",path:"A.md",title:"A",body:"remote",contentHash:await contentHash("remote"),updatedAt:"2026-08-14T00:00:00.000Z"}]);const runtime=new SyncRuntime(new MemoryVault({"Wiki/A.md":"local"}),new MemoryControlStore(),remote,{spaceId:"space",rootPath:"Wiki",status:"pending"});const preview=await runtime.previewPull();expect(preview.conflicts).toHaveLength(1);expect(preview.actions).toHaveLength(0);
+  });
+
+  it("keeps separate device namespaces for the same space", async () => {
+    const remote=new FakeAgentWiki();const control=new MemoryControlStore();const a=new SyncRuntime(new MemoryVault({}),control,remote,{spaceId:"space",rootPath:"Wiki",status:"pending"},undefined,"device-a");const b=new SyncRuntime(new MemoryVault({}),control,remote,{spaceId:"space",rootPath:"Wiki",status:"pending"},undefined,"device-b");await a.establishEmptyBase();await b.establishEmptyBase();expect(await control.read(".agentwiki/devices/d-device-a/spaces/s-space/current.json")).not.toBeNull();expect(await control.read(".agentwiki/devices/d-device-b/spaces/s-space/current.json")).not.toBeNull();
+  });
 });

@@ -26,7 +26,7 @@ export class PushService {
     await this.persistPayload(input.changes);
     await this.save(journal);
     const totalBodyBytes = input.changes.reduce((total, change) => total + (change.operation === "upsert" ? new TextEncoder().encode(change.body).byteLength : 0), 0);
-    const session = await this.remote.createSession({ spaceId: input.spaceId, baseRevision: input.baseRevision, idempotencyKey: journal.idempotencyKey, capabilitiesHash: journal.capabilitiesHash, confirmationHash: manifestHash, confirmationByteLength: canonicalBytes(manifest).byteLength, changeCount: input.changes.length, totalBodyBytes });
+    const session = await this.remote.createSession({ baseRevision: input.baseRevision, idempotencyKey: journal.idempotencyKey, capabilitiesHash: journal.capabilitiesHash, confirmationHash: manifestHash, confirmationByteLength: canonicalBytes(manifest).byteLength, changeCount: input.changes.length, totalBodyBytes });
     journal.sessionId = session.sessionId; journal.remoteState = "uploading"; await this.save(journal);
     const batches = await partitionPushChanges(input.changes, session.capabilities);
     for (const batch of batches) { const receipt = await this.remote.uploadBatch(session.sessionId, batch); await this.store.write(`${this.root}/receipts/${batch.batchIndex}.json`, JSON.stringify({ batchIndex: batch.batchIndex, batchHash: batch.batchHash, receipt: receipt.receipt })); }
@@ -45,7 +45,7 @@ export class PushService {
 
   private async commitResult(journal: PushJournal, result: FinalizeResult): Promise<FinalizeResult> {
     journal.remoteState = "published"; journal.result = result; await this.save(journal);
-    journal.localCommitPhase = "verified"; await this.save(journal);
     return result;
   }
+  async markVerified(): Promise<void> { const journal=await this.load(); if(journal.remoteState!=="published"||!journal.result)throw new Error("Push result is not published"); journal.localCommitPhase="verified"; await this.save(journal); }
 }

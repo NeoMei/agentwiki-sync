@@ -12,10 +12,11 @@ export interface FinalizeResult {
   changeSetId: string | null;
 }
 export interface PushSessionInfo { sessionId: string; status: "uploading" | "ready_to_finalize" | "published" | "aborted" | "expired"; expiresAt: string; capabilities: SyncCapabilities; result: FinalizeResult | null }
+export interface PushSessionStatusInfo { sessionId: string; status: PushSessionInfo["status"]; expiresAt: string; receivedBatchIndexes: number[]; result: FinalizeResult | null }
 export interface PushRemotePort {
   getHead(spaceId: string): Promise<{ revision: string }>;
-  createSession(input: { spaceId: string; baseRevision: string; idempotencyKey: string; capabilitiesHash: string; confirmationHash: string; confirmationByteLength: number; changeCount: number; totalBodyBytes: number }): Promise<PushSessionInfo>;
+  createSession(input: { baseRevision: string; idempotencyKey: string; capabilitiesHash: string; confirmationHash: string; confirmationByteLength: number; changeCount: number; totalBodyBytes: number }): Promise<PushSessionInfo>;
   uploadBatch(sessionId: string, batch: PushBatch): Promise<{ receipt: string }>;
   finalize(sessionId: string, confirmationHash: string): Promise<FinalizeResult>;
-  getSession(sessionId: string): Promise<PushSessionInfo>;
+  getSession(sessionId: string): Promise<PushSessionStatusInfo>;
 }

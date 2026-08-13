@@ -29,7 +29,7 @@ export class GenerationRepository {
       if (body === undefined) throw new Error(`Missing base body for ${pageId}`);
       page.contentHash = await contentHash(body);
       bodyBytes += new TextEncoder().encode(body).byteLength;
-      await this.store.write(this.path(input.generationId, `base/${pageId}.md`), body);
+      await this.store.write(this.path(input.generationId, `base/${encodeURIComponent(pageId)}.md`), body);
     }
     const protocolManifest = { pages: Object.values(pages).map((page) => ({ pageId: page.pageId, path: page.relativePath, title: page.title, contentHash: page.contentHash })) };
     const manifest: SpaceManifest = {
@@ -50,7 +50,7 @@ export class GenerationRepository {
     if (manifest.schemaVersion !== 1 || manifest.generationId !== generationId) throw new Error("baseline corrupt: invalid identity");
     let bodyBytes = 0;
     for (const page of Object.values(manifest.pages)) {
-      const body = await this.store.read(this.path(generationId, `base/${page.pageId}.md`));
+      const body = await this.store.read(this.path(generationId, `base/${encodeURIComponent(page.pageId)}.md`));
       if (body === null || await contentHash(body) !== page.contentHash) throw new Error("baseline corrupt: base hash mismatch");
       bodyBytes += new TextEncoder().encode(body).byteLength;
     }
@@ -58,5 +58,11 @@ export class GenerationRepository {
     const manifestBytes = Object.keys(manifest.pages).length > 0 ? canonicalBytes(protocolManifest).byteLength : 0;
     if (manifest.basePageCount !== Object.keys(manifest.pages).length || manifest.baseRevisionBodyBytes !== bodyBytes || manifest.baseRevisionManifestByteLength !== manifestBytes || manifest.baseRevisionContentHash !== await revisionContentHash(protocolManifest)) throw new Error("baseline corrupt: revision metrics mismatch");
     return manifest;
+  }
+
+  async read(generationId: string): Promise<{ manifest: SpaceManifest; bodies: Record<string, string> }> {
+    const manifest = await this.verify(generationId); const bodies: Record<string, string> = {};
+    for (const page of Object.values(manifest.pages)) { const body = await this.store.read(this.path(generationId, `base/${encodeURIComponent(page.pageId)}.md`)); if (body === null) throw new Error("baseline corrupt: missing body"); bodies[page.pageId] = body; }
+    return { manifest, bodies };
   }
 }

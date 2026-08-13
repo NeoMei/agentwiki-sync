@@ -1,70 +1,53 @@
-import { contentHash, type PushChange, type SyncCapabilities, type SyncPage } from "../agentwiki/protocol";
+import { contentHash, parseCapabilities, type PushChange, type SyncCapabilities, type SyncPage } from "../agentwiki/protocol";
+import { mergeBody, mergeField, type StructuredConflict } from "../core/merge";
+import type { LocalStatus, ScanResult } from "../core/model";
+import { portablePathKey, validatePortablePath } from "../core/portable-path";
 import { computeStatus, resolvePageIdentities, scanMapping } from "../core/status";
-import type { LocalStatus, ManifestPage, ScanResult } from "../core/model";
-import { mergeBody, type StructuredConflict } from "../core/merge";
 import type { ControlStorePort } from "../ports/control-store";
 import type { PushRemotePort } from "../ports/push-remote";
 import type { VaultPort } from "../ports/vault";
+import { BaselineRepository, type BaselineState } from "../storage/baseline";
+import { MutableControlRepository } from "../storage/envelope";
 import { PullTransaction, type PullAction } from "./pull-transaction";
 import { PushService } from "./push-service";
 import type { SpaceMapping } from "./sync-coordinator";
 
-interface BaseState { schemaVersion: 1; revision: string; pages: Record<string, ManifestPage & { body: string }> }
 export interface PullPreview { scanEpoch: number; revision: string; actions: PullAction[]; remotePages: SyncPage[]; conflicts: StructuredConflict[] }
 export interface PushPreview { revision: string; changes: PushChange[]; capabilities: SyncCapabilities }
-interface RuntimeRemote extends PushRemotePort { snapshot(spaceId?: string): Promise<SyncPage[]> }
-
-const DEFAULT_CAPABILITIES: SyncCapabilities = { maxPageBytes: 1048576, maxBatchBytes: 4194304, maxBatchItems: 100, maxChangeCount: 5000, maxConfirmationBytes: 4194304, maxClientSpacePages: 5000, maxClientManifestBytes: 4194304, maxClientTotalBodyBytes: 104857600, maxResponseBytes: 4194304, maxPageItems: 200, pushSessionTtlSeconds: 900 };
+interface RuntimeRemote extends PushRemotePort { snapshot(revision?: string): Promise<SyncPage[]>; getCapabilities?(): Promise<SyncCapabilities> }
+interface PendingIdentities { schemaVersion: 1; entries: Record<string, { pageId: string; path: string; contentHash: string }> }
+const isPendingIdentities=(value:unknown):value is PendingIdentities=>!!value&&typeof value==="object"&&(value as Partial<PendingIdentities>).schemaVersion===1&&typeof (value as Partial<PendingIdentities>).entries==="object";
+const DEFAULT_CAPABILITIES: SyncCapabilities = { maxPageBytes:1048576,maxBatchBytes:4194304,maxBatchItems:100,maxChangeCount:5000,maxConfirmationBytes:4194304,maxClientSpacePages:5000,maxClientManifestBytes:4194304,maxClientTotalBodyBytes:104857600,maxResponseBytes:4194304,maxPageItems:200,pushSessionTtlSeconds:900 };
+const safeKey=(value:string)=>value.replace(/[^A-Za-z0-9_-]/gu,"_");
+const joinRoot=(root:string,relative:string)=>`${root}/${validatePortablePath(relative).path}`;
 
 export class SyncRuntime {
-  private scanEpoch = 0;
-  constructor(private readonly vault: VaultPort, private readonly control: ControlStorePort, private readonly remote: RuntimeRemote, private readonly mapping: SpaceMapping, private readonly capabilities = DEFAULT_CAPABILITIES) {}
-  private get root(): string { return `.agentwiki/runtime/${this.mapping.spaceId}`; }
-  private get basePath(): string { return `${this.root}/base.json`; }
-  private get identitiesPath(): string { return `${this.root}/pending-identities.json`; }
-  invalidate(): void { this.scanEpoch += 1; }
-
-  private async readBase(): Promise<BaseState> { const raw = await this.control.read(this.basePath); return raw ? JSON.parse(raw) as BaseState : { schemaVersion: 1, revision: "0", pages: {} }; }
-  private async writeBase(revision: string, pages: SyncPage[]): Promise<void> {
-    const state: BaseState = { schemaVersion: 1, revision, pages: Object.fromEntries(pages.map((page) => [page.pageId, { pageId: page.pageId, relativePath: page.path, title: page.title, contentHash: page.contentHash, body: page.body }])) };
-    await this.control.write(this.basePath, JSON.stringify(state));
-  }
-  private async scan(): Promise<ScanResult> { return scanMapping(await this.vault.listMarkdown(this.mapping.rootPath), { complete: true, scanEpoch: this.scanEpoch, capabilities: { pages: this.capabilities.maxClientSpacePages, bodyBytes: this.capabilities.maxClientTotalBodyBytes, manifestBytes: this.capabilities.maxClientManifestBytes } }); }
-  async establishEmptyBase(): Promise<void> { const head = await this.remote.getHead(this.mapping.spaceId); await this.writeBase(head.revision, []); }
-  async status(): Promise<{ baseRevision: string; remoteRevision: string; local: LocalStatus }> {
-    const base = await this.readBase(); const scan = await this.scan(); const resolved = resolvePageIdentities(base.pages, scan.files, []); const head = await this.remote.getHead(this.mapping.spaceId);
-    return { baseRevision: base.revision, remoteRevision: head.revision, local: computeStatus(base.pages, resolved, scan) };
-  }
-  async previewPull(): Promise<PullPreview> {
-    const base = await this.readBase(); const remote = await this.remote.snapshot(this.mapping.spaceId); const scan = await this.scan(); const localByPath = new Map(scan.files.map((file) => [file.relativePath, file]));
-    const actions: PullAction[] = []; const conflicts: StructuredConflict[] = [];
-    for (const page of remote) {
-      const local = localByPath.get(page.path); const path = `${this.mapping.rootPath}/${page.path}`; const basePage = base.pages[page.pageId];
-      if (!local) actions.push({ kind: "create", path, body: page.body });
-      else if (!basePage) { if (local.contentHash !== page.contentHash) actions.push({ kind: "write", path, body: page.body }); }
-      else {
-        const merged = await mergeBody(basePage.body, local.normalizedBody, page.body, page.pageId); conflicts.push(...merged.conflicts);
-        if (merged.body !== local.normalizedBody) actions.push({ kind: "write", path, body: merged.body });
-      }
+  private scanEpoch=0;
+  private readonly root:string;
+  private readonly baseline:BaselineRepository;
+  private readonly identities:MutableControlRepository<PendingIdentities>;
+  constructor(private readonly vault:VaultPort,private readonly control:ControlStorePort,private readonly remote:RuntimeRemote,private readonly mapping:SpaceMapping,private readonly fallbackCapabilities=DEFAULT_CAPABILITIES,deviceKey="local",spaceKey=safeKey(mapping.spaceId)){ this.root=`.agentwiki/devices/d-${safeKey(deviceKey)}/spaces/s-${safeKey(spaceKey)}`; this.baseline=new BaselineRepository(control,this.root,mapping.spaceId,mapping.rootPath); this.identities=new MutableControlRepository(control,`${this.root}/pending-identities.json`,isPendingIdentities); }
+  invalidate():void{this.scanEpoch+=1;}
+  get spaceId():string{return this.mapping.spaceId;}
+  private async readBase():Promise<BaselineState>{return this.baseline.read();}
+  private async stageAndCommit(revision:string,pages:SyncPage[],kind:"pull"|"push"|"initialize"):Promise<void>{await this.baseline.prepare(revision,pages,kind);await this.baseline.commit();}
+  private async capabilities():Promise<SyncCapabilities>{return parseCapabilities(this.remote.getCapabilities?await this.remote.getCapabilities():this.fallbackCapabilities);}
+  private async scan():Promise<ScanResult>{const status=await this.vault.rootStatus(this.mapping.rootPath);if(status==="file")throw new Error("Mapping root is a file");if(status==="missing"&&this.mapping.status==="active")throw new Error("local scan incomplete: mapping root is missing");const capabilities=await this.capabilities();try{return await scanMapping(status==="missing"?[]:await this.vault.listMarkdown(this.mapping.rootPath),{complete:true,scanEpoch:this.scanEpoch,capabilities:{pages:capabilities.maxClientSpacePages,bodyBytes:capabilities.maxClientTotalBodyBytes,manifestBytes:capabilities.maxClientManifestBytes}});}catch(error){throw new Error(`local scan incomplete: ${error instanceof Error?error.message:"read failure"}`);}}
+  async establishEmptyBase():Promise<void>{const head=await this.remote.getHead(this.mapping.spaceId);await this.stageAndCommit(head.revision,[],"initialize");}
+  async recover():Promise<void>{const pullRaw=await this.control.read(`${this.root}/pull/journal.json`);const pullCommitted=!!pullRaw&&(()=>{try{return (JSON.parse(pullRaw) as {state?:string}).state==="committed";}catch{return false;}})();await this.baseline.recover(pullCommitted);const pushRaw=await this.control.read(`${this.root}/push/journal.json`);if(pushRaw){const journal=JSON.parse(pushRaw) as {remoteState?:string;localCommitPhase?:string;result?:{revision:string}};if(journal.localCommitPhase!=="verified"){const service=new PushService(this.remote,this.control,`${this.root}/push`);const result=journal.remoteState==="published"&&journal.result?journal.result:await service.resume();if(result){await this.baseline.recover(true);const base=await this.readBase();if(base.revision!==result.revision)await this.stageAndCommit(result.revision,await this.remote.snapshot(result.revision),"push");await service.markVerified();}}}}
+  async status():Promise<{baseRevision:string;remoteRevision:string;local:LocalStatus}>{const base=await this.readBase();const scan=await this.scan();const resolved=resolvePageIdentities(base.pages,scan.files,[]);const head=await this.remote.getHead(this.mapping.spaceId);return{baseRevision:base.revision,remoteRevision:head.revision,local:computeStatus(base.pages,resolved,scan)};}
+  async previewPull():Promise<PullPreview>{
+    const base=await this.readBase();const head=await this.remote.getHead(this.mapping.spaceId);const remote=await this.remote.snapshot(head.revision);const scan=await this.scan();const localByPath=new Map(scan.files.map(file=>[portablePathKey(file.relativePath),file]));const actions:PullAction[]=[];const conflicts:StructuredConflict[]=[];const finalKeys=new Set<string>();
+    for(const page of remote){const remotePath=validatePortablePath(page.path).path;if(finalKeys.has(portablePathKey(remotePath)))throw new Error("PATH_COLLISION");finalKeys.add(portablePathKey(remotePath));const basePage=base.pages[page.pageId];const local=localByPath.get(portablePathKey(basePage?.relativePath??remotePath))??localByPath.get(portablePathKey(remotePath));
+      if(!basePage){if(!local)actions.push({kind:"create",path:joinRoot(this.mapping.rootPath,remotePath),body:page.body});else if(local.contentHash!==page.contentHash)conflicts.push({conflictId:`initial:${page.pageId}`,base:"",local:local.normalizedBody,remote:page.body,wholeDocument:true});continue;}
+      if(!local){const remoteChanged=basePage.contentHash!==page.contentHash||portablePathKey(basePage.relativePath)!==portablePathKey(remotePath)||basePage.title!==page.title;if(remoteChanged)conflicts.push({conflictId:`delete:${page.pageId}`,base:basePage.body,local:"",remote:page.body,wholeDocument:true});continue;}
+      const pathMerge=mergeField(basePage.relativePath,local.relativePath,remotePath);const titleMerge=mergeField(basePage.title,local.title,page.title);const bodyMerge=await mergeBody(basePage.body,local.normalizedBody,page.body,page.pageId);conflicts.push(...bodyMerge.conflicts);if(pathMerge.conflict)conflicts.push({conflictId:`path:${page.pageId}`,base:basePage.relativePath,local:local.relativePath,remote:remotePath,wholeDocument:true});if(titleMerge.conflict)conflicts.push({conflictId:`title:${page.pageId}`,base:basePage.title,local:local.title,remote:page.title,wholeDocument:true});
+      if(!pathMerge.conflict&&portablePathKey(pathMerge.value)!==portablePathKey(local.relativePath))actions.push({kind:"rename",fromPath:joinRoot(this.mapping.rootPath,local.relativePath),path:joinRoot(this.mapping.rootPath,pathMerge.value),body:bodyMerge.body});else if(bodyMerge.body!==local.normalizedBody)actions.push({kind:"write",path:joinRoot(this.mapping.rootPath,local.relativePath),body:bodyMerge.body});
     }
-    const remoteIds = new Set(remote.map((page) => page.pageId));
-    for (const page of Object.values(base.pages)) if (!remoteIds.has(page.pageId)) {
-      const local = localByPath.get(page.relativePath);
-      if (local && local.contentHash !== page.contentHash) conflicts.push((await mergeBody(page.body, local.normalizedBody, "", page.pageId)).conflicts[0] ?? { conflictId: page.pageId, base: page.body, local: local.normalizedBody, remote: "", wholeDocument: true });
-      else if (local) actions.push({ kind: "trash", path: `${this.mapping.rootPath}/${page.relativePath}` });
-    }
-    return { scanEpoch: scan.scanEpoch, revision: (await this.remote.getHead(this.mapping.spaceId)).revision, actions, remotePages: remote, conflicts };
+    const remoteIds=new Set(remote.map(page=>page.pageId));for(const page of Object.values(base.pages))if(!remoteIds.has(page.pageId)){const local=localByPath.get(portablePathKey(page.relativePath));if(local&&local.contentHash!==page.contentHash)conflicts.push({conflictId:`archive:${page.pageId}`,base:page.body,local:local.normalizedBody,remote:"",wholeDocument:true});else if(local)actions.push({kind:"trash",path:joinRoot(this.mapping.rootPath,page.relativePath)});}
+    return{scanEpoch:scan.scanEpoch,revision:head.revision,actions,remotePages:remote,conflicts};
   }
-  async applyPull(preview: PullPreview): Promise<void> { if (preview.conflicts.length > 0) throw new Error("Pull has unresolved structured conflicts"); const tx = new PullTransaction(this.vault, this.control, `${this.root}/pull`); await tx.prepare(preview.actions, preview.scanEpoch); await tx.apply(this.scanEpoch); await this.writeBase(preview.revision, preview.remotePages); this.mapping.status = "active"; }
-  async previewPush(): Promise<PushPreview> {
-    const base = await this.readBase(); const head = await this.remote.getHead(this.mapping.spaceId); if (head.revision !== base.revision) throw new Error("BASE_STALE");
-    const scan = await this.scan(); const resolved = resolvePageIdentities(base.pages, scan.files, []); const local = computeStatus(base.pages, resolved, scan); if (local.ambiguous.length > 0) throw new Error("IDENTITY_REQUIRED");
-    const rawIdentities = await this.control.read(this.identitiesPath); const identities = rawIdentities ? JSON.parse(rawIdentities) as Record<string, { pageId: string; contentHash: string }> : {};
-    const changes: PushChange[] = [];
-    for (const file of [...local.added, ...local.modified, ...local.renamed]) { const identity = identities[file.relativePath]; const pageId = file.pageId ?? (identity?.contentHash === file.contentHash ? identity.pageId : crypto.randomUUID()); if (!file.pageId) identities[file.relativePath] = { pageId, contentHash: file.contentHash }; changes.push({ operation: "upsert", pageId, path: file.relativePath, title: file.title, body: file.normalizedBody, contentHash: await contentHash(file.normalizedBody) }); }
-    await this.control.write(this.identitiesPath, JSON.stringify(identities));
-    for (const page of local.deleted) changes.push({ operation: "archive", pageId: page.pageId, previousPath: page.relativePath });
-    return { revision: base.revision, changes, capabilities: this.capabilities };
-  }
-  async applyPush(preview: PushPreview): Promise<void> { if (preview.changes.length === 0) return; const result = await new PushService(this.remote, this.control, `${this.root}/push`).publish({ spaceId: this.mapping.spaceId, baseRevision: preview.revision, changes: preview.changes, capabilities: preview.capabilities }); await this.writeBase(result.revision, await this.remote.snapshot(this.mapping.spaceId)); await this.control.remove(this.identitiesPath); this.mapping.status = "active"; }
+  async applyPull(preview:PullPreview):Promise<void>{if(preview.conflicts.length)throw new Error("Pull has unresolved structured conflicts");await this.baseline.prepare(preview.revision,preview.remotePages,"pull");await this.baseline.setPhase("applying");const tx=new PullTransaction(this.vault,this.control,`${this.root}/pull`);await tx.prepare(preview.actions,preview.scanEpoch);await tx.apply(this.scanEpoch);await this.baseline.commit();this.mapping.status="active";}
+  async previewPush():Promise<PushPreview>{const capabilities=await this.capabilities();const base=await this.readBase();const head=await this.remote.getHead(this.mapping.spaceId);if(head.revision!==base.revision)throw new Error("BASE_STALE");const scan=await this.scan();const resolved=resolvePageIdentities(base.pages,scan.files,[]);const local=computeStatus(base.pages,resolved,scan);if(local.ambiguous.length)throw new Error("IDENTITY_REQUIRED");const envelope=await this.identities.read();const identities:PendingIdentities=envelope?.payload??{schemaVersion:1,entries:{}};const changes:PushChange[]=[];const changed=new Map<string,(typeof local.added)[number]>();for(const file of [...local.added,...local.modified,...local.renamed])changed.set(file.pageId??`path:${portablePathKey(file.relativePath)}`,file);for(const file of changed.values()){let identity=Object.values(identities.entries).find(item=>item.path===file.relativePath)||Object.values(identities.entries).find(item=>item.contentHash===file.contentHash);const pageId=file.pageId??identity?.pageId??crypto.randomUUID();if(!file.pageId){identity={pageId,path:file.relativePath,contentHash:file.contentHash};identities.entries[pageId]=identity;}changes.push({operation:"upsert",pageId,path:file.relativePath,title:file.title,body:file.normalizedBody,contentHash:await contentHash(file.normalizedBody)});}await this.identities.write(identities);for(const page of local.deleted)changes.push({operation:"archive",pageId:page.pageId,previousPath:page.relativePath});return{revision:base.revision,changes,capabilities};}
+  async applyPush(preview:PushPreview):Promise<void>{if(!preview.changes.length)return;const service=new PushService(this.remote,this.control,`${this.root}/push`);const result=await service.publish({spaceId:this.mapping.spaceId,baseRevision:preview.revision,changes:preview.changes,capabilities:preview.capabilities});const pages=await this.remote.snapshot(result.revision);await this.stageAndCommit(result.revision,pages,"push");await service.markVerified();this.mapping.status="active";}
 }

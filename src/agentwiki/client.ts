@@ -32,14 +32,15 @@ export class AgentWikiClient {
 
   async snapshot(spaceId: string, revision = "current"): Promise<{ metadata: Omit<SnapshotPage, "items" | "nextCursor">; items: SyncPage[] }> {
     let cursor: string | null = null;
+    let requestRevision = revision;
     let fixed: Omit<SnapshotPage, "items" | "nextCursor"> | null = null;
     const items: SyncPage[] = [];
     do {
-      const query = new URLSearchParams({ revision }); if (cursor) query.set("cursor", cursor);
+      const query = new URLSearchParams({ revision: requestRevision }); if (cursor) query.set("cursor", cursor);
       const page = SnapshotPageSchema.parse((await this.raw("GET", `/api/sync/v1/spaces/${encodeURIComponent(spaceId)}/snapshot?${query}`)).json);
       const metadata = { protocolVersion: page.protocolVersion, spaceId: page.spaceId, revision: page.revision, sequence: page.sequence, revisionContentHash: page.revisionContentHash, pageCount: page.pageCount, revisionManifestByteLength: page.revisionManifestByteLength, revisionBodyBytes: page.revisionBodyBytes };
       if (fixed && JSON.stringify(fixed) !== JSON.stringify(metadata)) throw new Error("Snapshot pagination metadata changed");
-      fixed ??= metadata; items.push(...page.items); cursor = page.nextCursor;
+      fixed ??= metadata; requestRevision = page.revision; items.push(...page.items); cursor = page.nextCursor;
     } while (cursor);
     if (!fixed) throw new Error("Snapshot returned no metadata");
     return { metadata: fixed, items };
