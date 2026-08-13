@@ -366,8 +366,9 @@ export default class AgentWikiSyncPlugin extends Plugin {
               new Notice("Pull complete.");
             },
             () => {
-              void runtime.discardPullPreview(preview);
-              modalRelease?.();
+              void runtime
+                .discardPullPreview(preview)
+                .finally(() => modalRelease?.());
             },
             preview.initialBindings,
             preview,
@@ -390,8 +391,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
             new Notice("Push complete.");
           },
           () => {
-            void runtime.discardPushPreview();
-            modalRelease?.();
+            void runtime.discardPushPreview().finally(() => modalRelease?.());
           },
         ).open();
         release = null;

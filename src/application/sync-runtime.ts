@@ -10,7 +10,11 @@ import {
 } from "../agentwiki/protocol";
 import { mergeBody, mergeField, type StructuredConflict } from "../core/merge";
 import type { LocalStatus, MoveHint, ScanResult } from "../core/model";
-import { portablePathKey, validatePortablePath } from "../core/portable-path";
+import {
+  portablePathKey,
+  titleFromPath,
+  validatePortablePath,
+} from "../core/portable-path";
 import {
   computeStatus,
   resolvePageIdentities,
@@ -74,6 +78,7 @@ interface RuntimeRemote extends PushRemotePort {
 interface SnapshotDownload {
   metadata: Omit<SnapshotResult, "items">;
   pages: SyncPage[];
+  previewId?: string;
 }
 interface PendingIdentities {
   schemaVersion: 1;
@@ -373,7 +378,10 @@ export class SyncRuntime {
     )
       throw new Error("Snapshot integrity mismatch");
   }
-  private async downloadSnapshot(revision: string): Promise<SnapshotDownload> {
+  private async downloadSnapshot(
+    revision: string,
+    previewId = crypto.randomUUID(),
+  ): Promise<SnapshotDownload> {
     if (!this.remote.snapshotPages) {
       const value = await this.remote.snapshot(revision);
       await this.validateSnapshotResult(value, revision);
@@ -417,9 +425,9 @@ export class SyncRuntime {
         ids.add(item.pageId);
         keys.add(path.key);
         bodyBytes += new TextEncoder().encode(item.body).byteLength;
-        const sidecar = `${this.root}/downloads/${safeKey(revision)}/${await opaqueFileKey(item.pageId)}.md`;
+        const sidecar = `${this.root}/downloads/${safeKey(previewId)}/${await opaqueFileKey(item.pageId)}.md`;
         await this.control.write(sidecar, item.body);
-        pages.push({ ...item, body: "" });
+        pages.push({ ...item, body: "", bodyPath: sidecar } as SyncPage);
       }
     }
     if (!metadata) throw new Error("Snapshot returned no metadata");
@@ -440,13 +448,18 @@ export class SyncRuntime {
       metadata.revisionContentHash !== (await revisionContentHash(manifest))
     )
       throw new Error("Snapshot integrity mismatch");
-    return { metadata, pages };
+    return { metadata, pages, previewId };
   }
-  private async remoteBody(revision: string, page: SyncPage): Promise<string> {
+  private async remoteBody(
+    revision: string,
+    page: SyncPage,
+    previewId?: string,
+  ): Promise<string> {
     if (page.body) return page.body;
-    const body = await this.control.read(
-      `${this.root}/downloads/${safeKey(revision)}/${await opaqueFileKey(page.pageId)}.md`,
-    );
+    const bodyPath =
+      (page as SyncPage & { bodyPath?: string }).bodyPath ??
+      `${this.root}/downloads/${safeKey(previewId ?? revision)}/${await opaqueFileKey(page.pageId)}.md`;
+    const body = await this.control.read(bodyPath);
     if (body === null || (await contentHash(body)) !== page.contentHash)
       throw new Error("Downloaded snapshot body is corrupt");
     return body;
@@ -811,7 +824,7 @@ export class SyncRuntime {
       conflictValuePaths,
       localCandidates,
       artifactRoots: [
-        `${this.root}/downloads/${safeKey(head.revision)}`,
+        `${this.root}/downloads/${safeKey(downloaded.previewId ?? head.revision)}`,
         `${this.root}/pull-preview-results`,
         `${this.root}/pull-conflicts`,
       ],
@@ -1126,12 +1139,19 @@ export class SyncRuntime {
         );
       const pageId = file.pageId ?? identity?.pageId ?? crypto.randomUUID();
       if (!file.pageId) {
-        identity = {
-          intent: "create",
-          pageId,
-          path: file.relativePath,
-          contentHash: file.contentHash,
-        };
+        identity =
+          identity?.intent === "restore"
+            ? {
+                ...identity,
+                path: file.relativePath,
+                contentHash: file.contentHash,
+              }
+            : {
+                intent: "create",
+                pageId,
+                path: file.relativePath,
+                contentHash: file.contentHash,
+              };
         identities.entries[pageId] = identity;
       }
       const body = await this.localBody(file);
@@ -1141,7 +1161,11 @@ export class SyncRuntime {
         operation: "upsert",
         pageId,
         path: file.relativePath,
-        title: file.title,
+        title:
+          identity?.intent === "restore" &&
+          titleFromPath(identity.archivedBasePath) === file.title
+            ? identity.archivedBaseTitle
+            : file.title,
         contentHash: file.contentHash,
         payloadPath,
         bodyBytes: new TextEncoder().encode(body).byteLength,
