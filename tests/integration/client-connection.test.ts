@@ -88,4 +88,6 @@ describe("AgentWiki connection", () => {
     http.responses.push({ status: 200, json: { protocolVersion: "1", spaceId: "space", revision: "r1", sequence: 1, revisionContentHash: "h", pageCount: "1", revisionManifestByteLength: "1", revisionBodyBytes: "1", items: [{ pageId: "p", path: "../../Private.md", title: "Private", body: "x", contentHash: "h", updatedAt: "2026-08-14T00:00:00.000Z" }], nextCursor: null } });
     await expect(new AgentWikiClient("https://wiki.example.com", http, () => "secret").snapshot("space")).rejects.toThrow(/relative segment|portable/i);
   });
+
+  it("rejects a pending connection journal from another Vault",async()=>{const control=new MemoryControlStore();await control.write("connection-journal.json",JSON.stringify({schemaVersion:1,phase:"exchange_prepared",serverUrl:"https://wiki.example.com",exchangeId:"x",codeSecretId:"code",credentialSecretId:"credential",deviceId:"33333333-3333-4333-8333-333333333333",deviceName:"Phone",vaultId:"44444444-4444-4444-8444-444444444444",pluginVersion:"0.1.0"}));await expect(new ConnectionService(new FakeHttp(),new MemorySecrets(),control).connect({serverUrl:"https://wiki.example.com",code:"code",deviceId:"33333333-3333-4333-8333-333333333333",deviceName:"Phone",vaultId:"99999999-9999-4999-8999-999999999999",pluginVersion:"0.1.0"})).rejects.toThrow(/identity mismatch/);});
 });

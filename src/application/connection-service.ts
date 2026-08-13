@@ -17,7 +17,7 @@ export class ConnectionService {
   async connect(input: ConnectInput): Promise<{ credentialSecretId: string; credentialId: string; serverInstanceId: string }> {
     const serverUrl = normalizeServerUrl(input.serverUrl);
     const existingRaw = await this.state.read("connection-journal.json");
-    if (existingRaw) return this.resume(JSON.parse(existingRaw) as ConnectionJournal, input.code);
+    if (existingRaw) {const journal=this.parseJournal(existingRaw);if(journal.serverUrl!==serverUrl||journal.deviceId!==input.deviceId||journal.vaultId!==input.vaultId||journal.pluginVersion!==input.pluginVersion)throw new Error("Pending connection identity mismatch");return this.resume(journal, input.code);}
     const codeSecretId = `agentwiki-sync-secret-${randomHex(16)}`;
     const credentialSecretId = `agentwiki-sync-secret-${randomHex(16)}`;
     let credential = base64url(crypto.getRandomValues(new Uint8Array(32)));
@@ -53,6 +53,7 @@ export class ConnectionService {
   private assertSession(session: { serverInstanceId: string; credentialId: string; deviceId: string; vaultId: string }, journal: ConnectionJournal, exchanged: { credentialId: string; serverInstanceId: string }): void {
     if (session.serverInstanceId !== exchanged.serverInstanceId || session.credentialId !== exchanged.credentialId || session.deviceId !== journal.deviceId || session.vaultId !== journal.vaultId) throw new Error("Device session identity mismatch");
   }
+  private parseJournal(raw:string):ConnectionJournal{let value:unknown;try{value=JSON.parse(raw);}catch{throw new Error("Connection journal is corrupt");}if(!value||typeof value!=="object")throw new Error("Connection journal is corrupt");const item=value as Partial<ConnectionJournal>;if(item.schemaVersion!==1||!["exchange_prepared","credential_stored","activating","activated"].includes(item.phase??"")||typeof item.serverUrl!=="string"||typeof item.exchangeId!=="string"||typeof item.codeSecretId!=="string"||typeof item.credentialSecretId!=="string"||typeof item.deviceId!=="string"||typeof item.deviceName!=="string"||typeof item.vaultId!=="string"||typeof item.pluginVersion!=="string")throw new Error("Connection journal is corrupt");return item as ConnectionJournal;}
 
   private async resume(journal: ConnectionJournal, code: string): Promise<{ credentialSecretId: string; credentialId: string; serverInstanceId: string }> {
     void code;
