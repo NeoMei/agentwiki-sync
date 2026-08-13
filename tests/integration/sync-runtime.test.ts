@@ -33,6 +33,8 @@ describe("SyncRuntime", () => {
     expect((await remote.snapshot()).items[0]?.body).toBe("new");
   });
 
+  it("first-publishes local content from a relation-only nonzero remote head without prebuilding a base",async()=>{const remote=new FakeAgentWiki();await remote.advanceEmptyRevision();const vault=new MemoryVault({"Wiki/New.md":"new"});const runtime=new SyncRuntime(vault,new MemoryControlStore(),remote,{spaceId:"space",rootPath:"Wiki",status:"pending"});const preview=await runtime.previewPush();expect(preview.revision).toBe("1");expect(preview.changes).toHaveLength(1);await runtime.applyPush(preview);expect((await remote.snapshot()).items[0]?.body).toBe("new");});
+
   it("three-way merges non-overlapping local and remote edits and keeps local-only changes dirty", async () => {
     const remote = new FakeAgentWiki();
     const original = "top\nmiddle\nbottom";

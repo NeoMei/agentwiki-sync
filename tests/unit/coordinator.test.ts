@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { OperationLock, removeMapping, selectMappingForPath, validateMappings } from "../../src/application/sync-coordinator";
+import { parseSettings } from "../../src/application/settings";
 
 describe("sync coordinator", () => {
   it("serializes each space without blocking another space", async () => {
@@ -12,6 +13,7 @@ describe("sync coordinator", () => {
   });
 
   it("removes pending mappings but requires clean proof for active mappings",()=>{const pending=[{spaceId:"s",rootPath:"Wiki",status:"pending" as const}];expect(removeMapping(pending,"s",{activeTransaction:false,localClean:false,remoteAtBase:false})).toEqual([]);const active=[{spaceId:"s",rootPath:"Wiki",status:"active" as const}];expect(()=>removeMapping(active,"s",{activeTransaction:true,localClean:true,remoteAtBase:true})).toThrow(/transaction/);expect(()=>removeMapping(active,"s",{activeTransaction:false,localClean:false,remoteAtBase:true})).toThrow(/clean/);expect(removeMapping(active,"s",{activeTransaction:false,localClean:true,remoteAtBase:true})).toEqual([]);});
+  it("freezes unknown future settings instead of silently resetting them",()=>{expect(()=>parseSettings({schemaVersion:2,serverUrl:"",serverInstanceId:null,mappings:[]})).toThrow(/newer settings version/);});
 
   it("selects the active mapping for an open file and rejects overlaps", () => {
     const mappings = [{ spaceId: "s1", rootPath: "Wiki", status: "active" as const }, { spaceId: "s2", rootPath: "Other", status: "pending" as const }];
