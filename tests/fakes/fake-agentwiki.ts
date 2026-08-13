@@ -5,6 +5,7 @@ interface Session { info: PushSessionInfo; baseRevision: string; batches: Map<nu
 export class FakeAgentWiki implements PushRemotePort {
   readonly capabilities: SyncCapabilities = { maxPageBytes: 1048576, maxBatchBytes: 4194304, maxBatchItems: 100, maxChangeCount: 5000, maxConfirmationBytes: 4194304, maxClientSpacePages: 5000, maxClientManifestBytes: 4194304, maxClientTotalBodyBytes: 104857600, maxResponseBytes: 4194304, maxPageItems: 200, pushSessionTtlSeconds: 900 };
   canPublish = true;
+  truncateNextSnapshot=false;
   private revision = 0;
   private readonly pages = new Map<string, SyncPage>();
   private readonly sessions = new Map<string, Session>();
@@ -31,7 +32,7 @@ export class FakeAgentWiki implements PushRemotePort {
     session.info = { ...session.info, status: "published", result }; return result;
   }
   async getSession(sessionId: string) { const info = this.sessions.get(sessionId)!.info; return { sessionId: info.sessionId, status: info.status, expiresAt: info.expiresAt, receivedBatchIndexes: [...this.sessions.get(sessionId)!.batches.keys()], result: info.result }; }
-  async snapshot(): Promise<SyncPage[]> { return [...this.pages.values()].map((page) => ({ ...page })); }
+  async snapshot() { const all=[...this.pages.values()].map((page)=>({...page}));const manifest={pages:all.map(page=>({pageId:page.pageId,path:page.path,title:page.title,contentHash:page.contentHash}))};const items=this.truncateNextSnapshot?all.slice(0,-1):all;this.truncateNextSnapshot=false;return{revision:String(this.revision),revisionContentHash:await revisionContentHash(manifest),pageCount:String(all.length),revisionManifestByteLength:String(all.length===0?0:canonicalBytes(manifest).byteLength),revisionBodyBytes:String(all.reduce((sum,page)=>sum+new TextEncoder().encode(page.body).byteLength,0)),items};}
   async seed(pages: SyncPage[]): Promise<void> { this.pages.clear(); for (const page of pages) this.pages.set(page.pageId, { ...page }); this.revision = pages.length > 0 ? 1 : 0; }
   async replace(pages: SyncPage[]): Promise<void> { this.pages.clear(); for (const page of pages) this.pages.set(page.pageId, { ...page }); this.revision += 1; }
   sessionCount(): number { return this.sessions.size; }

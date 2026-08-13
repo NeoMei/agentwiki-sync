@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { PullTransaction } from "../../src/application/pull-transaction";
 import { MemoryControlStore } from "../fakes/memory-control-store";
 import { MemoryVault } from "../fakes/memory-vault";
+import { sha256Hex } from "../../src/agentwiki/protocol";
 
 describe("PullTransaction", () => {
   it("applies writes, creates, rename cycles and trash as one recoverable plan", async () => {
@@ -38,4 +39,6 @@ describe("PullTransaction", () => {
     await transaction.prepare([{ kind: "create", path: "A.md", body: "a" }], 1);
     await expect(transaction.apply(2)).rejects.toThrow(/scan epoch/);
   });
+
+  it("recognizes a fully materialized rename after temporary cleanup as committed",async()=>{const vault=new MemoryVault({"A.md":"old"});const control=new MemoryControlStore();const transaction=new PullTransaction(vault,control,".agentwiki/tx/final-window");await transaction.prepare([{kind:"rename",fromPath:"A.md",path:"B.md",body:"new"}],1,"tx-final");const raw=JSON.parse((await control.read(".agentwiki/tx/final-window/journal.json"))!) as Record<string,unknown>;const original=new TextEncoder().encode("old");const result=new TextEncoder().encode("new");raw.state="applying";raw.temporaryPaths=[{original:"A.md",temporary:"A.md.agentwiki-tmp-0",expectedHash:await sha256Hex(original)}];raw.materialized=[{path:"B.md",resultHash:await sha256Hex(result),expectedHash:null}];await control.write(".agentwiki/tx/final-window/journal.json",JSON.stringify(raw));await vault.rename("A.md","A.md.agentwiki-tmp-0");await vault.write("B.md",result);await vault.remove("A.md.agentwiki-tmp-0");await transaction.recover();expect(vault.text("B.md")).toBe("new");expect(JSON.parse((await control.read(".agentwiki/tx/final-window/journal.json"))!).state).toBe("committed");});
 });

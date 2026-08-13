@@ -3,6 +3,8 @@ import { sha256Hex } from "../agentwiki/protocol";
 
 export interface StructuredConflict {
   conflictId: string;
+  pageId: string;
+  field: "path" | "title" | "body" | "archive" | "delete";
   base: string;
   local: string;
   remote: string;
@@ -24,7 +26,7 @@ function lineCount(text: string): number {
 
 async function conflict(pageId: string, base: string, local: string, remote: string, wholeDocument: boolean): Promise<StructuredConflict> {
   const conflictId = await sha256Hex(new TextEncoder().encode(`${pageId}\0${base}\0${local}\0${remote}`));
-  return { conflictId, base, local, remote, wholeDocument };
+  return { conflictId, pageId, field: "body", base, local, remote, wholeDocument };
 }
 
 export async function mergeBody(base: string, local: string, remote: string, pageId: string): Promise<{ body: string; conflicts: StructuredConflict[] }> {

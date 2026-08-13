@@ -1,6 +1,6 @@
 import type { AgentWikiClient } from "./client";
-import { CreatePushSessionResponseSchema, FinalizeResultSchema, parseCapabilities, PushReceiptSchema, PushSessionStatusResponseSchema, type PushBatch, type SyncPage } from "./protocol";
-import type { FinalizeResult, PushRemotePort, PushSessionInfo, PushSessionStatusInfo } from "../ports/push-remote";
+import { CreatePushSessionResponseSchema, FinalizeResultSchema, parseCapabilities, PushReceiptSchema, PushSessionStatusResponseSchema, type PushBatch } from "./protocol";
+import type { FinalizeResult, PushRemotePort, PushSessionInfo, PushSessionStatusInfo, SnapshotResult } from "../ports/push-remote";
 
 export class AgentWikiPushRemote implements PushRemotePort {
   constructor(private readonly client: AgentWikiClient, private readonly spaceId: string) {}
@@ -10,5 +10,5 @@ export class AgentWikiPushRemote implements PushRemotePort {
   async uploadBatch(sessionId: string, batch: PushBatch): Promise<{ receipt: string }> { return PushReceiptSchema.parse((await this.client.raw("PUT", `/api/sync/v1/spaces/${encodeURIComponent(this.spaceId)}/push-sessions/${encodeURIComponent(sessionId)}/batches/${batch.batchIndex}`, batch)).json); }
   async finalize(sessionId: string, confirmationHash: string): Promise<FinalizeResult> { return FinalizeResultSchema.parse((await this.client.raw("POST", `/api/sync/v1/spaces/${encodeURIComponent(this.spaceId)}/push-sessions/${encodeURIComponent(sessionId)}/finalize`, { confirmationHash, userConfirmed: true })).json); }
   async getSession(sessionId: string): Promise<PushSessionStatusInfo> { return PushSessionStatusResponseSchema.parse((await this.client.raw("GET", `/api/sync/v1/spaces/${encodeURIComponent(this.spaceId)}/push-sessions/${encodeURIComponent(sessionId)}`)).json); }
-  async snapshot(revision = "current"): Promise<SyncPage[]> { return (await this.client.snapshot(this.spaceId, revision)).items; }
+  async snapshot(revision = "current"): Promise<SnapshotResult> { const value=await this.client.snapshot(this.spaceId, revision);return {...value.metadata,items:value.items}; }
 }

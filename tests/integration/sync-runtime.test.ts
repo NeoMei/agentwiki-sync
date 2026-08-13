@@ -28,9 +28,9 @@ describe("SyncRuntime", () => {
     expect(preview.changes).toHaveLength(1);
     const repeated = await runtime.previewPush();
     expect(repeated.changes[0]?.pageId).toBe(preview.changes[0]?.pageId);
-    expect(await remote.snapshot()).toHaveLength(0);
+    expect((await remote.snapshot()).items).toHaveLength(0);
     await runtime.applyPush(preview);
-    expect((await remote.snapshot())[0]?.body).toBe("new");
+    expect((await remote.snapshot()).items[0]?.body).toBe("new");
   });
 
   it("three-way merges non-overlapping local and remote edits and keeps local-only changes dirty", async () => {
@@ -59,6 +59,7 @@ describe("SyncRuntime", () => {
     await remote.replace([{ pageId: "p1", path: "A.md", title: "A", body: "remote", contentHash: await contentHash("remote"), updatedAt: "2026-08-14T00:01:00.000Z" }]);
     const preview = await runtime.previewPull(); expect(preview.conflicts).toHaveLength(1);
     await expect(runtime.applyPull(preview)).rejects.toThrow(/conflict/);
+    preview.conflictResolutions[preview.conflicts[0]!.conflictId]={choice:"remote"};await runtime.applyPull(preview);expect(vault.text("Wiki/A.md")).toBe("remote");
   });
 
   it("treats remote archive versus local edit as a conflict", async () => {
@@ -72,6 +73,10 @@ describe("SyncRuntime", () => {
   it("returns clean without creating an empty push session", async () => {
     const remote = new FakeAgentWiki(); const runtime = new SyncRuntime(new MemoryVault({}), new MemoryControlStore(), remote, { spaceId: "space", rootPath: "Wiki", status: "pending" });
     await runtime.establishEmptyBase(); const preview = await runtime.previewPush(); expect(preview.changes).toHaveLength(0); await runtime.applyPush(preview); expect(remote.sessionCount()).toBe(0);
+  });
+
+  it("rejects a truncated remote snapshot before planning destructive Pull actions", async () => {
+    const remote=new FakeAgentWiki();const body="base";await remote.seed([{pageId:"p1",path:"A.md",title:"A",body,contentHash:await contentHash(body),updatedAt:"2026-08-14T00:00:00.000Z"}]);const vault=new MemoryVault({});const runtime=new SyncRuntime(vault,new MemoryControlStore(),remote,{spaceId:"space",rootPath:"Wiki",status:"pending"});await runtime.applyPull(await runtime.previewPull());remote.truncateNextSnapshot=true;await expect(runtime.previewPull()).rejects.toThrow(/snapshot integrity/i);expect(vault.text("Wiki/A.md")).toBe("base");
   });
 
   it("moves the existing page when the remote renames the same pageId", async () => {

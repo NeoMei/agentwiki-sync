@@ -92,8 +92,11 @@ export class PullTransaction {
   async recover(): Promise<void> {
     const journal = await this.load();
     if (journal.state === "committed") return;
+    if(await this.isFullyMaterialized(journal)){journal.state="committed";await this.save(journal);return;}
     await this.rollback(journal);
   }
+
+  private async isFullyMaterialized(journal:PullJournal):Promise<boolean>{if(journal.materialized.length!==journal.actions.filter(action=>action.kind!=="trash").length)return false;for(const item of journal.materialized){const current=await this.vault.read(item.path);if(!current||await sha256Hex(current)!==item.resultHash)return false;}for(const action of journal.actions){if(action.kind==="trash"&&await this.vault.read(action.path)!==null)return false;if(action.kind==="rename"&&await this.vault.read(action.fromPath)!==null)return false;}for(const temporary of journal.temporaryPaths)if(await this.vault.read(temporary.temporary)!==null)return false;return true;}
 
   private async rollback(journal: PullJournal): Promise<void> {
     try {
