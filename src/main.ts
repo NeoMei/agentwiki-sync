@@ -104,7 +104,14 @@ export default class AgentWikiSyncPlugin extends Plugin {
       this.app.vault.on("rename", (file, oldPath) => {
         invalidate();
         for (const runtime of this.liveRuntimes.values())
-          void runtime.recordRename(oldPath, file.path).catch(() => undefined);
+          void runtime
+            .recordRename(oldPath, file.path)
+            .catch(
+              (error) =>
+                new Notice(
+                  `AgentWiki rename tracking failed: ${error instanceof Error ? error.message : "unknown error"}`,
+                ),
+            );
       }),
     );
   }
@@ -214,7 +221,8 @@ export default class AgentWikiSyncPlugin extends Plugin {
       spaceId,
       gate,
     );
-    this.liveRuntimes.delete(spaceId);
+    for (const [key, runtime] of this.liveRuntimes)
+      if (runtime.spaceId === spaceId) this.liveRuntimes.delete(key);
     await this.saveSettings();
   }
   async disconnect(): Promise<void> {
@@ -357,7 +365,10 @@ export default class AgentWikiSyncPlugin extends Plugin {
               await this.saveSettings();
               new Notice("Pull complete.");
             },
-            () => modalRelease?.(),
+            () => {
+              void runtime.discardPullPreview(preview);
+              modalRelease?.();
+            },
             preview.initialBindings,
             preview,
           ).open();
@@ -378,7 +389,10 @@ export default class AgentWikiSyncPlugin extends Plugin {
             await this.saveSettings();
             new Notice("Push complete.");
           },
-          () => modalRelease?.(),
+          () => {
+            void runtime.discardPushPreview();
+            modalRelease?.();
+          },
         ).open();
         release = null;
       } catch (error) {

@@ -440,4 +440,38 @@ describe("SyncRuntime", () => {
       ),
     ).not.toBeNull();
   });
+
+  it("does not replay an applied Pull control after-state over later identity work", async () => {
+    const remote = new FakeAgentWiki();
+    await remote.seed([
+      {
+        pageId: "p1",
+        path: "A.md",
+        title: "A",
+        body: "a",
+        contentHash: await contentHash("a"),
+        updatedAt: "2026-08-14T00:00:00.000Z",
+      },
+    ]);
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = new SyncRuntime(vault, control, remote, {
+      spaceId: "space",
+      rootPath: "Wiki",
+      status: "pending",
+    });
+    await runtime.applyPull(await runtime.previewPull());
+    await vault.write("Wiki/New.md", new TextEncoder().encode("new"));
+    const first = await runtime.previewPush();
+    const firstId = first.changes.find(
+      (item) => item.operation === "upsert" && item.path === "New.md",
+    )?.pageId;
+    await runtime.recover();
+    const second = await runtime.previewPush();
+    expect(
+      second.changes.find(
+        (item) => item.operation === "upsert" && item.path === "New.md",
+      )?.pageId,
+    ).toBe(firstId);
+  });
 });

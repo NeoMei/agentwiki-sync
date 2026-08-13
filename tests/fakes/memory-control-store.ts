@@ -17,4 +17,8 @@ export class MemoryControlStore implements ControlStorePort {
     this.files.set(to, value);
     this.files.delete(from);
   }
+  async removeTree(path: string): Promise<void> {
+    for (const key of [...this.files.keys()])
+      if (key === path || key.startsWith(`${path}/`)) this.files.delete(key);
+  }
 }

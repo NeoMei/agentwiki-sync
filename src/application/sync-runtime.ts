@@ -60,6 +60,7 @@ export interface PullPreview {
     { base: string; local: string; remote: string }
   >;
   localCandidates: Array<{ path: string; vaultByteHash: string }>;
+  artifactRoots: string[];
 }
 export interface PushPreview {
   revision: string;
@@ -78,18 +79,77 @@ interface PendingIdentities {
   schemaVersion: 1;
   entries: Record<
     string,
-    { pageId: string; path: string; contentHash: string }
+    | { intent: "create"; pageId: string; path: string; contentHash: string }
+    | {
+        intent: "restore";
+        pageId: string;
+        path: string;
+        contentHash: string;
+        archivedBasePath: string;
+        archivedBaseTitle: string;
+        archivedBaseContentHash: string;
+      }
   >;
 }
-const isPendingIdentities = (value: unknown): value is PendingIdentities =>
-  !!value &&
-  typeof value === "object" &&
-  (value as Partial<PendingIdentities>).schemaVersion === 1 &&
-  typeof (value as Partial<PendingIdentities>).entries === "object";
+const isPendingIdentities = (value: unknown): value is PendingIdentities => {
+  if (!value || typeof value !== "object") return false;
+  const state = value as Partial<PendingIdentities>;
+  if (
+    state.schemaVersion !== 1 ||
+    !state.entries ||
+    typeof state.entries !== "object"
+  )
+    return false;
+  const paths = new Set<string>();
+  for (const [key, entry] of Object.entries(state.entries)) {
+    if (
+      !entry ||
+      key !== entry.pageId ||
+      !entry.pageId ||
+      !entry.contentHash ||
+      !["create", "restore"].includes(entry.intent)
+    )
+      return false;
+    try {
+      const path = validatePortablePath(entry.path);
+      if (paths.has(path.key)) return false;
+      paths.add(path.key);
+      if (
+        entry.intent === "restore" &&
+        (!entry.archivedBasePath ||
+          !entry.archivedBaseTitle ||
+          !entry.archivedBaseContentHash)
+      )
+        return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+};
 interface MoveHintsState {
   schemaVersion: 1;
   hints: MoveHint[];
 }
+interface PullControlAfterState {
+  schemaVersion: 1;
+  transactionId: string;
+  phase: "pending" | "applied";
+  identities: PendingIdentities;
+  moveHints: MoveHintsState;
+}
+const isPullControlAfterState = (
+  value: unknown,
+): value is PullControlAfterState =>
+  !!value &&
+  typeof value === "object" &&
+  (value as Partial<PullControlAfterState>).schemaVersion === 1 &&
+  typeof (value as Partial<PullControlAfterState>).transactionId === "string" &&
+  ["pending", "applied"].includes(
+    (value as Partial<PullControlAfterState>).phase ?? "",
+  ) &&
+  isPendingIdentities((value as Partial<PullControlAfterState>).identities) &&
+  isMoveHints((value as Partial<PullControlAfterState>).moveHints);
 const isMoveHints = (value: unknown): value is MoveHintsState =>
   !!value &&
   typeof value === "object" &&
@@ -118,6 +178,8 @@ export class SyncRuntime {
   private readonly baseline: BaselineRepository;
   private readonly identities: MutableControlRepository<PendingIdentities>;
   private readonly moveHints: MutableControlRepository<MoveHintsState>;
+  private readonly pullControlAfter: MutableControlRepository<PullControlAfterState>;
+  private renameQueue: Promise<void> = Promise.resolve();
   constructor(
     private readonly vault: VaultPort,
     private readonly control: ControlStorePort,
@@ -144,6 +206,11 @@ export class SyncRuntime {
       `${this.root}/move-hints.json`,
       isMoveHints,
     );
+    this.pullControlAfter = new MutableControlRepository(
+      control,
+      `${this.root}/pull-control-after.json`,
+      isPullControlAfterState,
+    );
   }
   invalidate(): void {
     this.scanEpoch += 1;
@@ -152,6 +219,16 @@ export class SyncRuntime {
     return this.mapping.spaceId;
   }
   async recordRename(fromPath: string, toPath: string): Promise<void> {
+    const operation = this.renameQueue.then(() =>
+      this.recordRenameNow(fromPath, toPath),
+    );
+    this.renameQueue = operation.catch(() => undefined);
+    return operation;
+  }
+  private async recordRenameNow(
+    fromPath: string,
+    toPath: string,
+  ): Promise<void> {
     const prefix = `${this.mapping.rootPath}/`;
     if (!fromPath.startsWith(prefix) || !toPath.startsWith(prefix)) return;
     const base = await this.readBase();
@@ -173,6 +250,18 @@ export class SyncRuntime {
       observedVaultByteHash: await sha256Hex(bytes),
     });
     await this.moveHints.write({ schemaVersion: 1, hints });
+  }
+  private async applyPullControlAfter(transactionId: string): Promise<void> {
+    const after = await this.pullControlAfter.read();
+    if (
+      !after ||
+      after.payload.transactionId !== transactionId ||
+      after.payload.phase === "applied"
+    )
+      return;
+    await this.identities.write(after.payload.identities);
+    await this.moveHints.write(after.payload.moveHints);
+    await this.pullControlAfter.write({ ...after.payload, phase: "applied" });
   }
   private async readBase(): Promise<BaselineState> {
     const base = await this.baseline.read();
@@ -501,8 +590,15 @@ export class SyncRuntime {
     const pull = await pullTx.inspect();
     let committedTransactionId: string | null =
       pull?.state === "committed" ? pull.transactionId : null;
-    if (pull && !committedTransactionId) await pullTx.recover();
+    if (pull && !committedTransactionId) {
+      await pullTx.recover();
+      const recovered = await pullTx.inspect();
+      committedTransactionId =
+        recovered?.state === "committed" ? recovered.transactionId : null;
+    }
     await this.baseline.recover(committedTransactionId);
+    if (committedTransactionId)
+      await this.applyPullControlAfter(committedTransactionId);
     const pushService = new PushService(
       this.remote,
       this.control,
@@ -525,6 +621,8 @@ export class SyncRuntime {
           "push",
         );
       }
+      await this.identities.clear();
+      await this.moveHints.clear();
       await pushService.markVerified();
     }
   }
@@ -712,6 +810,11 @@ export class SyncRuntime {
       expectedVaultHashes,
       conflictValuePaths,
       localCandidates,
+      artifactRoots: [
+        `${this.root}/downloads/${safeKey(head.revision)}`,
+        `${this.root}/pull-preview-results`,
+        `${this.root}/pull-conflicts`,
+      ],
     };
   }
   async bindInitialLocal(
@@ -744,6 +847,13 @@ export class SyncRuntime {
     binding.localBody = await this.localBody(local);
     binding.localVaultByteHash = local.vaultByteHash;
     binding.resolution = null;
+  }
+  async discardPullPreview(preview: PullPreview): Promise<void> {
+    for (const root of preview.artifactRoots)
+      await this.control.removeTree?.(root);
+  }
+  async discardPushPreview(): Promise<void> {
+    await this.control.removeTree?.(`${this.root}/push-preview`);
   }
   async applyPull(preview: PullPreview): Promise<void> {
     if (
@@ -835,9 +945,13 @@ export class SyncRuntime {
           });
         else if (local) {
           restoreEntries[pageId] = {
+            intent: "restore",
             pageId,
             path: local.relativePath,
             contentHash: local.contentHash,
+            archivedBasePath: basePage?.relativePath ?? local.relativePath,
+            archivedBaseTitle: basePage?.title ?? local.title,
+            archivedBaseContentHash: basePage?.contentHash ?? local.contentHash,
           };
           hints.push({
             pageId,
@@ -929,6 +1043,13 @@ export class SyncRuntime {
       "pull",
       (page) => this.remoteBody(preview.revision, page),
     );
+    await this.pullControlAfter.write({
+      schemaVersion: 1,
+      transactionId: baselineTx.transactionId,
+      phase: "pending",
+      identities: { schemaVersion: 1, entries: restoreEntries },
+      moveHints: { schemaVersion: 1, hints },
+    });
     await this.baseline.setPhase("applying");
     const tx = new PullTransaction(
       this.vault,
@@ -955,14 +1076,9 @@ export class SyncRuntime {
       expectedHashes,
     );
     await tx.apply(this.scanEpoch);
-    if (hints.length) await this.moveHints.write({ schemaVersion: 1, hints });
     await this.baseline.commit();
-    await this.identities.clear();
-    if (Object.keys(restoreEntries).length)
-      await this.identities.write({
-        schemaVersion: 1,
-        entries: restoreEntries,
-      });
+    await this.applyPullControlAfter(baselineTx.transactionId);
+    await this.discardPullPreview(preview);
     this.mapping.status = "active";
   }
   async previewPush(): Promise<PushPreview> {
@@ -1011,6 +1127,7 @@ export class SyncRuntime {
       const pageId = file.pageId ?? identity?.pageId ?? crypto.randomUUID();
       if (!file.pageId) {
         identity = {
+          intent: "create",
           pageId,
           path: file.relativePath,
           contentHash: file.contentHash,
@@ -1056,9 +1173,10 @@ export class SyncRuntime {
     const pages = downloaded.pages;
     this.verifyPublishedSnapshot(result, downloaded.metadata);
     await this.stageDownloadedAndCommit(result.revision, pages, "push");
-    await service.markVerified();
     await this.identities.clear();
     await this.moveHints.clear();
+    await service.markVerified();
+    await this.discardPushPreview();
     this.mapping.status = "active";
   }
 }
