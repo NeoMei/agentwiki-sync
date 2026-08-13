@@ -18,7 +18,11 @@ import {
 } from "../core/status";
 import { decodeVaultMarkdown } from "../core/markdown";
 import type { ControlStorePort } from "../ports/control-store";
-import type { PushRemotePort, SnapshotResult } from "../ports/push-remote";
+import type {
+  FinalizeResult,
+  PushRemotePort,
+  SnapshotResult,
+} from "../ports/push-remote";
 import type { VaultPort } from "../ports/vault";
 import { BaselineRepository, type BaselineState } from "../storage/baseline";
 import { MutableControlRepository } from "../storage/envelope";
@@ -35,7 +39,6 @@ export interface InitialBindingChoice {
   localPath: string | null;
   localBody: string | null;
   localVaultByteHash: string | null;
-  localCandidates: Array<{ path: string; vaultByteHash: string }>;
   resolution: "local" | "remote" | "manual" | null;
   manualBody?: string;
 }
@@ -56,6 +59,7 @@ export interface PullPreview {
     string,
     { base: string; local: string; remote: string }
   >;
+  localCandidates: Array<{ path: string; vaultByteHash: string }>;
 }
 export interface PushPreview {
   revision: string;
@@ -108,6 +112,7 @@ const safeKey = (value: string) => value.replace(/[^A-Za-z0-9_-]/gu, "_");
 const joinRoot = (root: string, relative: string) =>
   `${root}/${validatePortablePath(relative).path}`;
 export class SyncRuntime {
+  private pinnedBase: BaselineState | null = null;
   private scanEpoch = 0;
   private readonly root: string;
   private readonly baseline: BaselineRepository;
@@ -170,13 +175,23 @@ export class SyncRuntime {
     await this.moveHints.write({ schemaVersion: 1, hints });
   }
   private async readBase(): Promise<BaselineState> {
-    return this.baseline.read();
+    const base = await this.baseline.read();
+    this.pinnedBase = base;
+    return base;
   }
   private async baseBody(page: {
     pageId: string;
     body?: string;
+    contentHash: string;
   }): Promise<string> {
-    return page.body ?? this.baseline.readBody(page.pageId);
+    return (
+      page.body ??
+      this.baseline.readBody(
+        page.pageId,
+        this.pinnedBase?.generationId,
+        page.contentHash,
+      )
+    );
   }
   private async stageAndCommit(
     revision: string,
@@ -195,6 +210,20 @@ export class SyncRuntime {
       this.remoteBody(revision, page),
     );
     await this.baseline.commit();
+  }
+  private verifyPublishedSnapshot(
+    result: FinalizeResult,
+    metadata: SnapshotDownload["metadata"],
+  ): void {
+    if (
+      result.revision !== metadata.revision ||
+      result.pageCount !== metadata.pageCount ||
+      result.revisionBodyBytes !== metadata.revisionBodyBytes ||
+      result.revisionManifestByteLength !==
+        metadata.revisionManifestByteLength ||
+      result.revisionContentHash !== metadata.revisionContentHash
+    )
+      throw new Error("Published snapshot does not match finalize result");
   }
   private async capabilities(): Promise<SyncCapabilities> {
     return parseCapabilities(
@@ -358,11 +387,8 @@ export class SyncRuntime {
   }
   private async stageConflictValues(
     conflicts: StructuredConflict[],
-  ): Promise<Record<string, { base: string; local: string; remote: string }>> {
-    const refs: Record<
-      string,
-      { base: string; local: string; remote: string }
-    > = {};
+    refs: Record<string, { base: string; local: string; remote: string }>,
+  ): Promise<void> {
     for (const conflict of conflicts) {
       const root = `${this.root}/pull-conflicts/${safeKey(conflict.conflictId)}`;
       refs[conflict.conflictId] = {
@@ -383,7 +409,6 @@ export class SyncRuntime {
       conflict.local = "";
       conflict.remote = "";
     }
-    return refs;
   }
   private async conflictValue(
     preview: PullPreview,
@@ -403,6 +428,23 @@ export class SyncRuntime {
         preview.conflictValuePaths[conflict.conflictId]![resolution.choice],
       )) ?? ""
     );
+  }
+  async conflictSummary(
+    preview: PullPreview,
+    conflict: StructuredConflict,
+  ): Promise<{ base: string; local: string; remote: string }> {
+    const refs = preview.conflictValuePaths[conflict.conflictId];
+    if (!refs)
+      return {
+        base: conflict.base,
+        local: conflict.local,
+        remote: conflict.remote,
+      };
+    return {
+      base: (await this.control.read(refs.base))?.slice(0, 120) ?? "",
+      local: (await this.control.read(refs.local))?.slice(0, 120) ?? "",
+      remote: (await this.control.read(refs.remote))?.slice(0, 120) ?? "",
+    };
   }
   private async scan(): Promise<ScanResult> {
     const epoch = this.scanEpoch;
@@ -476,6 +518,7 @@ export class SyncRuntime {
       const base = await this.readBase();
       if (base.revision !== result.revision) {
         const downloaded = await this.downloadSnapshot(result.revision);
+        this.verifyPublishedSnapshot(result, downloaded.metadata);
         await this.stageDownloadedAndCommit(
           result.revision,
           downloaded.pages,
@@ -529,6 +572,14 @@ export class SyncRuntime {
     );
     const actions: PullAction[] = [];
     const conflicts: StructuredConflict[] = [];
+    const conflictValuePaths: Record<
+      string,
+      { base: string; local: string; remote: string }
+    > = {};
+    const addConflicts = async (items: StructuredConflict[]) => {
+      await this.stageConflictValues(items, conflictValuePaths);
+      conflicts.push(...items);
+    };
     const initialBindings: InitialBindingChoice[] = [];
     const finalKeys = new Set<string>();
     for (const page of remote) {
@@ -550,10 +601,6 @@ export class SyncRuntime {
           localPath: local?.relativePath ?? null,
           localBody: null,
           localVaultByteHash: local?.vaultByteHash ?? null,
-          localCandidates: scan.files.map((file) => ({
-            path: file.relativePath,
-            vaultByteHash: file.vaultByteHash,
-          })),
           resolution: local ? null : "remote",
         });
         continue;
@@ -565,15 +612,17 @@ export class SyncRuntime {
             portablePathKey(remotePath) ||
           basePage.title !== page.title;
         if (remoteChanged)
-          conflicts.push({
-            conflictId: `delete:${page.pageId}`,
-            pageId: page.pageId,
-            field: "delete",
-            base: await this.baseBody(basePage),
-            local: "",
-            remote: await this.remoteBody(head.revision, page),
-            wholeDocument: true,
-          });
+          await addConflicts([
+            {
+              conflictId: `delete:${page.pageId}`,
+              pageId: page.pageId,
+              field: "delete",
+              base: await this.baseBody(basePage),
+              local: "",
+              remote: await this.remoteBody(head.revision, page),
+              wholeDocument: true,
+            },
+          ]);
         continue;
       }
       const pathMerge = mergeField(
@@ -598,7 +647,7 @@ export class SyncRuntime {
           remote: remotePath,
           wholeDocument: true,
         });
-      conflicts.push(...pageConflicts);
+      await addConflicts(pageConflicts);
       if (pageConflicts.length === 0) {
         if (
           pathMerge.value.normalize("NFC") !==
@@ -627,15 +676,17 @@ export class SyncRuntime {
       if (!remoteIds.has(page.pageId)) {
         const local = localByPageId.get(page.pageId);
         if (local && local.contentHash !== page.contentHash)
-          conflicts.push({
-            conflictId: `archive:${page.pageId}`,
-            pageId: page.pageId,
-            field: "archive",
-            base: await this.baseBody(page),
-            local: await this.localBody(local),
-            remote: "",
-            wholeDocument: true,
-          });
+          await addConflicts([
+            {
+              conflictId: `archive:${page.pageId}`,
+              pageId: page.pageId,
+              field: "archive",
+              base: await this.baseBody(page),
+              local: await this.localBody(local),
+              remote: "",
+              wholeDocument: true,
+            },
+          ]);
         else if (local)
           actions.push({
             kind: "trash",
@@ -646,7 +697,10 @@ export class SyncRuntime {
     for (const file of scan.files)
       expectedVaultHashes[joinRoot(this.mapping.rootPath, file.relativePath)] =
         file.vaultByteHash;
-    const conflictValuePaths = await this.stageConflictValues(conflicts);
+    const localCandidates = scan.files.map((file) => ({
+      path: file.relativePath,
+      vaultByteHash: file.vaultByteHash,
+    }));
     return {
       scanEpoch: scan.scanEpoch,
       revision: head.revision,
@@ -657,6 +711,7 @@ export class SyncRuntime {
       initialBindings,
       expectedVaultHashes,
       conflictValuePaths,
+      localCandidates,
     };
   }
   async bindInitialLocal(
@@ -999,14 +1054,7 @@ export class SyncRuntime {
     });
     const downloaded = await this.downloadSnapshot(result.revision);
     const pages = downloaded.pages;
-    if (
-      result.pageCount !== downloaded.metadata.pageCount ||
-      result.revisionBodyBytes !== downloaded.metadata.revisionBodyBytes ||
-      result.revisionManifestByteLength !==
-        downloaded.metadata.revisionManifestByteLength ||
-      result.revisionContentHash !== downloaded.metadata.revisionContentHash
-    )
-      throw new Error("Published snapshot does not match finalize result");
+    this.verifyPublishedSnapshot(result, downloaded.metadata);
     await this.stageDownloadedAndCommit(result.revision, pages, "push");
     await service.markVerified();
     await this.identities.clear();

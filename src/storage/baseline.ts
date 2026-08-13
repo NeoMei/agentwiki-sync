@@ -10,6 +10,7 @@ import { isCurrentPointerPayload, type CurrentPointerPayload } from "./pointer";
 
 export interface BaselineState {
   revision: string;
+  generationId?: string;
   pages: Record<
     string,
     {
@@ -94,9 +95,19 @@ export class BaselineRepository {
     const pages: BaselineState["pages"] = {};
     for (const page of Object.values(manifest.pages))
       pages[page.pageId] = { ...page };
-    return { revision: manifest.baseRevision, pages };
+    return {
+      revision: manifest.baseRevision,
+      generationId: current.payload.generationId,
+      pages,
+    };
   }
-  async readBody(pageId: string): Promise<string> {
+  async readBody(
+    pageId: string,
+    generationId?: string,
+    expectedHash?: string,
+  ): Promise<string> {
+    if (generationId && expectedHash)
+      return this.generations.readBody(generationId, pageId, expectedHash);
     const current = await this.pointer.read();
     if (!current?.payload.active) throw new Error("Missing baseline");
     const manifest = await this.generations.readManifest(

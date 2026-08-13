@@ -39,12 +39,42 @@ export class PreviewModal extends Modal {
         .setDesc(
           "Choose an optional local page, then choose Local, Remote, or manual content. The remote revision remains the exact base.",
         );
+      setting.addText((text) =>
+        text
+          .setPlaceholder("Exact local path (search all candidates)")
+          .onChange((value) => {
+            const candidate = this.pullPreview?.localCandidates.find(
+              (item) => item.path === value,
+            );
+            if (candidate) {
+              binding.localPath = candidate.path;
+              binding.localBody = null;
+              binding.localVaultByteHash = candidate.vaultByteHash;
+              binding.resolution = null;
+            }
+            const matches = (this.pullPreview?.localCandidates ?? [])
+              .filter((item) =>
+                item.path
+                  .toLocaleLowerCase()
+                  .includes(value.toLocaleLowerCase()),
+              )
+              .slice(0, 20);
+            setting.setDesc(
+              matches.length
+                ? `Matches: ${matches.map((item) => item.path).join(" · ")}`
+                : "No matching local path. Leave empty to create/use remote path.",
+            );
+          }),
+      );
       setting.addDropdown((dropdown) => {
         dropdown.addOption("", "Create/use remote path");
-        for (const candidate of binding.localCandidates)
+        for (const candidate of (this.pullPreview?.localCandidates ?? []).slice(
+          0,
+          100,
+        ))
           dropdown.addOption(candidate.path, candidate.path);
         dropdown.setValue(binding.localPath ?? "").onChange((value) => {
-          const candidate = binding.localCandidates.find(
+          const candidate = this.pullPreview?.localCandidates.find(
             (item) => item.path === value,
           );
           binding.localPath = candidate?.path ?? null;
@@ -78,7 +108,26 @@ export class PreviewModal extends Modal {
     for (const conflict of this.pullPreview?.conflicts ?? []) {
       const setting = new Setting(this.contentEl)
         .setName(`${conflict.field}: ${conflict.pageId}`)
-        .setDesc(
+        .setDesc("Loading Base / Local / Remote preview…");
+      const refs = this.pullPreview?.conflictValuePaths[conflict.conflictId];
+      if (refs)
+        void Promise.all(
+          [refs.base, refs.local, refs.remote].map((path) =>
+            this.app.vault.adapter.read(path),
+          ),
+        )
+          .then(([base, local, remote]) =>
+            setting.setDesc(
+              `Base: ${(base ?? "").slice(0, 120)} · Local: ${(local ?? "").slice(0, 120)} · Remote: ${(remote ?? "").slice(0, 120)}`,
+            ),
+          )
+          .catch(() =>
+            setting.setDesc(
+              "Conflict preview unavailable; choose a side or enter the final value manually.",
+            ),
+          );
+      else
+        setting.setDesc(
           `Base: ${conflict.base.slice(0, 120)} · Local: ${conflict.local.slice(0, 120)} · Remote: ${conflict.remote.slice(0, 120)}`,
         );
       setting.addDropdown((dropdown) =>

@@ -64,6 +64,26 @@ export default class AgentWikiSyncPlugin extends Plugin {
       await this.settingsRepo().write(this.settings);
       await this.saveData(DEFAULT_SETTINGS);
     }
+    const localStore = new ObsidianLocalControlStore(this.app);
+    const connection = await new MutableControlRepository(
+      localStore,
+      "connection-state.json",
+      isConnectionState,
+    ).read();
+    if (connection) {
+      if (
+        this.settings.serverUrl &&
+        this.settings.serverUrl !== connection.payload.serverUrl
+      )
+        throw new Error("Connection and device settings server mismatch");
+      this.settings.serverUrl = connection.payload.serverUrl;
+      this.settings.serverInstanceId = connection.payload.serverInstanceId;
+      await new VaultIdentityService(
+        new ObsidianControlStore(this.app.vault.adapter),
+        localStore,
+      ).bind(connection.payload.vaultId);
+      await this.saveSettings();
+    }
     this.addSettingTab(new AgentWikiSyncSettingTab(this.app, this));
     this.addRibbonIcon("refresh-cw", "AgentWiki Sync", () =>
       this.openSync("status"),
@@ -194,6 +214,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       spaceId,
       gate,
     );
+    this.liveRuntimes.delete(spaceId);
     await this.saveSettings();
   }
   async disconnect(): Promise<void> {
@@ -216,6 +237,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       isConnectionState,
     ).clear();
     this.settings.serverInstanceId = null;
+    this.liveRuntimes.clear();
     await this.saveSettings();
     new Notice(
       "Device disconnected locally. Revoke it in AgentWiki Web if the server could not be reached.",
@@ -232,7 +254,8 @@ export default class AgentWikiSyncPlugin extends Plugin {
   private async runtime(
     mapping: NonNullable<ReturnType<AgentWikiSyncPlugin["selectedMapping"]>>,
   ): Promise<SyncRuntime | null> {
-    const existing = this.liveRuntimes.get(mapping.spaceId);
+    const runtimeKey = `${this.settings.serverInstanceId ?? "pending"}\0${mapping.spaceId}\0${mapping.rootPath}`;
+    const existing = this.liveRuntimes.get(runtimeKey);
     if (existing) return existing;
     const local = new ObsidianLocalControlStore(this.app);
     await new VaultIdentityService(
@@ -287,7 +310,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       await idFileKey(deviceId),
       await idFileKey(mapping.spaceId),
     );
-    this.liveRuntimes.set(mapping.spaceId, runtime);
+    this.liveRuntimes.set(runtimeKey, runtime);
     return runtime;
   }
   private openSync(action: SyncAction): void {
