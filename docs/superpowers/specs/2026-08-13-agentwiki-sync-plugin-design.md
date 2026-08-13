@@ -5,7 +5,7 @@
 - 产品名称：`AgentWiki Sync`
 - Obsidian 插件 ID：`agentwiki-sync`
 - 设计确认日期：2026-08-13
-- 状态：已完成对话确认与实现完整性复审，等待修订版书面 spec 复核
+- 状态：已完成实现完整性复审与修订，等待用户最终确认
 - 依赖契约：[`docs/contracts/agentwiki-obsidian-sync-api-v1.md`](../../contracts/agentwiki-obsidian-sync-api-v1.md)
 
 ## 1. 背景与目标
@@ -103,8 +103,10 @@ AgentWiki 必须为每个 Page 保存正式的 `syncPath` 与大小写无关的 
 - 正文不做 Unicode 归一化。
 - 路径分隔符统一为 `/`，路径段进行 Unicode NFC 归一化。
 - 为保证跨平台恢复，Status 必须拒绝 Unicode 归一化后重复或仅大小写不同的路径碰撞。
-- 禁止绝对路径、空路径段、`.`、`..`、NUL 和逃逸映射根目录的路径。
-- 路径最长 1,024 个字符，标题最长 500 个字符，规范化正文最长 1 MiB。
+- 禁止绝对路径、空路径段、`.`、`..`、U+0000–U+001F、`< > : " / \\ | ? *` 和逃逸映射根目录的路径。
+- 任一路径段不得以空格或句点结尾；路径段从开头到第一个 `.` 前的 Windows device basename 按 ASCII 大小写不敏感不得等于 `CON`、`PRN`、`AUX`、`NUL`、`COM1`–`COM9` 或 `LPT1`–`LPT9`。
+- 每个 NFC 路径段的 UTF-8 编码最长 255 字节，完整相对路径的 UTF-8 编码最长 1,024 字节；标题最长 500 个 Unicode code point，规范化正文最长 1 MiB。
+- 上述可移植路径规则同时由协议包、插件 Status/Pull 和服务端写入器执行。服务端不得接受一个只能在部分支持平台落盘的 syncPath。
 - 目标文件路径不能已被文件夹占用，任何父路径也不能是普通文件；这些情况属于阻塞性 `invalid`。
 - Pull 可以创建缺失父目录。回滚只删除本事务创建且仍为空的目录；普通空目录不参与同步，也不会因 Pull/Push 自动删除。
 
@@ -200,11 +202,16 @@ flowchart TB
 .agentwiki/
 ├── config.json
 ├── spaces/
-│   └── <space-id>/
-│       ├── manifest.json
+│   └── s-<space-key>/
+│       ├── current.json
+│       ├── current.json.prev
+│       ├── current.json.next
 │       ├── pending-identities.json
-│       └── base/
-│           └── <page-id>.md
+│       └── generations/
+│           └── <generation-id>/
+│               ├── manifest.json
+│               └── base/
+│                   └── p-<page-key>.md
 ├── transactions/
 │   └── <transaction-id>/
 │       ├── journal.json
@@ -212,10 +219,12 @@ flowchart TB
 │       ├── results/
 │       └── payload/
 └── detached/
-    └── <timestamp>-<space-id>/
+    └── <timestamp>-s-<space-key>/
 ```
 
 `.agentwiki/` 永不进入 AgentWiki 同步 payload。所有内容只在本地 Vault 中使用。
+
+远端 ID 不得直接成为本地文件或目录名。`space-key` 和 `page-key` 分别是规范化 UTF-8 `spaceId`、`pageId` 的 SHA-256 小写十六进制值；完整 64 位不得截断。读取时必须再以 manifest 内的原 ID 校验 key，任何 hash/key 不一致或两个 ID 映射到同一 key 都按控制目录损坏处理。这样即使合法远端 ID 是 Windows 保留名、含句点或仅大小写不同，也不会造成控制目录碰撞。
 
 ### 5.2 `config.json`
 
@@ -230,6 +239,7 @@ interface AgentWikiConfigV1 {
     spaceId: string;
     displayName: string;
     rootPath: string;
+    state: "pending" | "active";
   }>;
 }
 ```
@@ -241,6 +251,7 @@ interface AgentWikiConfigV1 {
 - Secret ID 固定格式为 `agentwiki-sync-<server-instance-id>-<device-id>` 的小写字母、数字和连字符；UUID 中的连字符保留。
 - 真正的设备凭据只存 Secret Storage。
 - `deviceId` 使用 Obsidian vault-local local storage 保存，不进入 `.agentwiki/`，确保每台设备独立连接。
+- 新映射先以 `pending` 保存，只供首次绑定与事务恢复使用，不进入普通 Status/Pull/Push Space 列表。第一个 generation 指针校验成功后才在同一本地提交流程中改为 `active`；取消且没有可恢复 journal 时删除 pending 项。
 
 ### 5.3 `manifest.json`
 
@@ -248,9 +259,11 @@ interface AgentWikiConfigV1 {
 interface SpaceManifestV1 {
   schemaVersion: 1;
   protocolVersion: "1";
+  generationId: string;
   spaceId: string;
   rootPath: string;
   baseRevision: string;
+  baseRevisionContentHash: string;
   lastSuccessfulSyncAt: string;
   pages: Record<string, {
     pageId: string;
@@ -261,15 +274,17 @@ interface SpaceManifestV1 {
 }
 ```
 
-manifest 只在成功建立基线或成功完成 Pull/Push 后整体替换。临时或部分执行结果不得写入有效 manifest。
+`generationId` 是本地随机 UUID v4。`manifestHash` 是完整 `SpaceManifestV1` canonical UTF-8 bytes SHA-256；manifest 不含该 hash，因此不存在自引用。`current.json` 只包含 `{ schemaVersion: 1, generationId, manifestHash }`。manifest 与 base 组成不可变 generation；成功建立基线或完成 Pull/Push 时先完整写入并重新校验新 generation，再切换指针。切换顺序固定为：写入并校验 `current.json.next`；若旧 current 存在则移除已确认无 journal 引用的旧 prev、把 current rename 为 prev；最后把 next rename 为 current。加载时 current 缺失但 prev 有效且 journal 处于 `committing`，必须按 journal 完成或恢复；无 journal 时自动恢复 prev 为 current 并记录诊断。临时或部分 generation 不得成为有效状态。
 
 `pages` 以 `pageId` 为 key。服务端 `updatedAt` 不属于同步正确性条件，不保存到 manifest；并发控制只使用 Space `baseRevision` 和本地内容 hash。
 
-加载 manifest 时必须执行运行时 Schema 校验，并验证 space ID、rootPath、page ID 唯一性、relativePath/pathKey 唯一性，以及每个 `base/<page-id>.md` 的规范化 hash 等于 manifest contentHash。任一失败都把 Space 标记为 `baseline_corrupt` 并禁止 Push；不能跳过坏条目继续运行。
+加载 manifest 时必须执行运行时 Schema 校验，并验证 generation ID、space ID、rootPath、page ID 唯一性、relativePath/pathKey 唯一性、ID 文件 key，以及每个 `base/p-<page-key>.md` 的规范化 hash 等于 manifest contentHash。任一失败都把 Space 标记为 `baseline_corrupt` 并禁止 Push；不能跳过坏条目继续运行。
 
 ### 5.4 `base/`
 
-`base/<page-id>.md` 保存对应 manifest 的共同基线正文，用于真正的 diff3。路径和标题在 manifest 中保存，因此页面移动不需要移动 base 文件。
+当前 generation 的 `base/p-<page-key>.md` 保存对应 `baseRevision` 在服务端的**精确远端正文**，用于真正的 diff3；它不是 Pull 后写入 Vault 的合并结果。manifest 的 path、title 和 contentHash 同样必须等于该远端 revision。Pull 把 Base=`A`、Local=`A+L`、Remote=`A+R` 合并为 Vault=`A+L+R` 时，新 base 必须是 `A+R`，因此 `L` 在下一次 Status 中仍是本地修改。路径和标题在 manifest 中保存，因此页面移动不需要移动 base 文件。
+
+generation 一经校验并被指针引用便不可修改。未完成事务同时记录 `oldGenerationId` 和 `newGenerationId`：`prepared/applying` 回滚 Vault 并保持旧指针；`committing` 根据新 generation 是否完整有效和 Vault 结果是否匹配，确定完成指针切换或恢复旧指针。对已建立基线的 Space，整个切换期间至少保留一个已校验指针；首次绑定的 `oldGenerationId` 为 null，切换前保持“未绑定”状态，依靠 journal/snapshot 回滚 Vault，只有新 generation 完整校验后才创建第一个 current 指针。旧 generation 只能在事务 committed、没有 journal 引用且至少保留最近两个成功 generation 后清理；尚不足两个时全部保留。
 
 ### 5.5 重命名识别
 
@@ -292,12 +307,16 @@ manifest 只在成功建立基线或成功完成 Pull/Push 后整体替换。临
 - `rolling_back`
 - `failed`
 
-快照记录受影响路径在事务前是否存在及其完整字节内容。插件启动和每个写操作前检查未清理事务：
+快照记录受影响路径在事务前是否存在及其完整字节内容；journal 同时记录旧/新 generation、指针 hash 和应用阶段。插件启动和每个写操作前检查未清理事务：
 
-- `prepared`、`applying`、`committing`：执行回滚。
+- `prepared`：删除未引用的新 generation 和 staging，不修改 Vault。
+- `applying`：按已持久化阶段回滚 Vault 并保持旧 generation 指针。
+- `committing`：若新 generation、指针和全部 Vault 结果均已校验则完成提交；否则回滚 Vault。`oldGenerationId` 非 null 时恢复 `current.json.prev` 指向的旧 generation；为 null 时删除部分 current/next 指针并恢复 pending 未绑定状态。
 - `committed`：完成安全清理。
 - `rolling_back`：继续回滚。
 - `failed`：冻结对应 Space，等待用户查看诊断并人工恢复。
+
+Pull journal 在 `committed` 后同样要完成 cleanup 才能删除：移除 staging、snapshot、result 和未引用 generation，保留最近两个成功 generation。cleanup 操作幂等；清理失败不撤销已提交结果，而是保留 committed journal 在下次启动继续。
 
 Push journal 状态为：
 
@@ -308,9 +327,9 @@ Push journal 状态为：
 - `aborted`
 - `expired`
 
-Push journal 保存 base revision、不可变确认 manifest、idempotency key、远端 session ID、已确认批次 receipt，以及 `payload/<page-id>.md` 中用户确认时的规范化正文快照；不保存设备凭据。插件启动时不自动联网恢复 Push；用户下次打开同步中心时，插件查询 session 状态并显示“继续上传”“重新确认并 finalize”或“丢弃”。`finalizing` 状态必须先查询服务端结果，不能假定请求失败，也不能创建不同 payload 的新 session。
+Push journal 保存 base revision、不可变确认 manifest、idempotency key、远端 session ID、创建 session 时的 credential ID、已确认批次 receipt，以及 `payload/p-<page-key>.md` 中用户确认时的规范化正文快照；不保存设备凭据。插件启动时不自动联网恢复 Push；用户下次打开同步中心时，插件查询 session 状态并显示“继续上传”“重新确认并 finalize”或“丢弃”。如果 session 创建响应丢失或 session ID 尚未落盘，先用同一 idempotency key 重试 create 取回同一 session。`finalizing` 状态必须先查询服务端结果，不能假定请求失败，也不能创建不同 payload 的新 session。
 
-成功或明确 abort 后删除 payload；未知结果、离线或查询失败时必须保留。服务端已发布时，以 journal 中的确认快照而不是当前 Vault 内容推进 base；用户在确认后的新编辑因此仍会被 Status 判定为 `modified`。
+成功且本地 `verified`，或明确 abort 后才删除 payload；未知结果、离线、查询失败或本地 generation 未验证时必须保留。服务端已发布时，以 journal 中的确认快照而不是当前 Vault 内容推进 base；用户在确认后的新编辑因此仍会被 Status 判定为 `modified`。
 
 ### 5.7 Pull journal Schema 与条件写入
 
@@ -320,11 +339,21 @@ interface PullJournalV1 {
   kind: "pull_apply";
   transactionId: string;
   spaceId: string;
+  rootPath: string;
   fromRevision: string;
   toRevision: string;
+  toRevisionContentHash: string;
+  oldGenerationId: string | null;
+  newGenerationId: string;
   previewHash: string;
   state: "prepared" | "applying" | "committing" | "committed" | "rolling_back" | "failed";
+  applyPhase: "validated" | "sources_staged" | "deletions_trashed" | "results_materialized" | "generation_written" | "pointer_switched";
   nextActionIndex: number;
+  expectedPaths: Record<string, { exists: false } | { exists: true; contentHash: string }>;
+  stagedPaths: Array<{ sourcePath: string; temporaryPath: string; contentHash: string }>;
+  trashedPaths: Array<{ path: string; contentHash: string }>;
+  createdDirectories: string[];
+  materializedPaths: Array<{ path: string; contentHash: string }>;
   actions: PullActionV1[];
   failure?: { code: string; actionIndex: number; path?: string };
 }
@@ -333,47 +362,44 @@ type PullActionV1 =
   | {
       kind: "create";
       path: string;
-      expected: { exists: false };
       resultContentHash: string;
     }
   | {
       kind: "write";
       path: string;
-      expected: { exists: true; contentHash: string };
       resultContentHash: string;
     }
   | {
       kind: "rename";
       fromPath: string;
       toPath: string;
-      expected: { fromExists: true; fromContentHash: string; toExists: false };
       resultContentHash: string;
     }
   | {
       kind: "trash";
       path: string;
-      expected: { exists: true; contentHash: string };
     };
 ```
 
-`rename` 是复合动作：以 expected 验证源和目标后，把 `results/` 中的最终正文写入目标路径并移除源路径；因此它同时覆盖“移动且正文被合并”的情形，不是假设正文保持不变。创建/写入/rename 的结果正文都必须能由 `results/` 按 action index 找到。
+`rename` 是逻辑动作：最终正文来自 `results/`，因此同时覆盖“移动且正文被合并”，不假设正文保持不变。创建、写入和 rename 的结果正文都必须能由 `results/` 按 action index 找到。
 
-`previewHash` 是 `{ schemaVersion: 1, spaceId, fromRevision, toRevision, actions }` 的 canonical UTF-8 bytes SHA-256；action 按最终目标路径、kind、源路径排序，且包含 expected 与 result hash。UI 的确认对象同时保存该 hash；确认 hash 与 journal 不一致时禁止应用。
+`previewHash` 是 `{ schemaVersion: 1, spaceId, rootPath, fromRevision, toRevision, toRevisionContentHash, expectedPaths, actions }` 的 canonical UTF-8 bytes SHA-256；expectedPaths 按 path 排序，action 按最终目标路径、kind、源路径排序。UI 的确认对象同时保存该 hash；确认 hash 与 journal 不一致时禁止应用。
 
 每个 action 的结果正文保存在事务目录的 `results/`，操作前原始正文保存在 `snapshots/`。journal、snapshot 和 result 全部写完并重新读取校验后，状态才能从 `prepared` 进入 `applying`。
 
-条件写入规则：
+条件写入和路径置换规则：
 
-1. 预览确认时记录每个受影响路径的 `expected`。
-2. 进入事务前重新扫描全部 expected；任一不匹配则不创建 `applying` 状态，废弃预览。
-3. 每个 action 执行前再次验证自己的 expected。修改已有文件优先使用 Obsidian `Vault.process()` 在同一读改写操作中比较当前 hash；其他动作由 Vault Adapter 执行最接近的条件操作。
-4. 每次插件写入后记录 `resultContentHash`，并在 action 完成后重新读取验证。
-5. 所有 Vault action 成功后，再以临时文件 + rename 方式替换 base 与 manifest，并进入 `committing`。
-6. 最后重新扫描全部预期结果；全部一致才进入 `committed`。
+1. 预览确认时把每个受影响源路径和目标路径在事务前的状态记录到全局 `expectedPaths`；同一路径只能有一个 expectation。
+2. 写完 journal、snapshot、result 后重新扫描全部 expected；任一不匹配则废弃预览，不能进入 `applying`。
+3. 对所有 rename 源文件，先用 `Vault.rename()` 移到同一父目录下的唯一临时路径 `awtmp-<transaction-key>-<ordinal>.tmp`；`transaction-key` 是 transaction UUID 的 SHA-256 前 16 位，ordinal 是十进制序号。普通 write 不改路径并在后续使用 `Vault.process()`。写入阶段不直接做 `A → B`，因此 `A.md ↔ B.md`、任意移动环和大小写改名都转换成空目标上的物化操作。临时名必须先验证不存在、符合段长，且没有 `.md` 扩展名，所以不会进入同步扫描；journal 保存完整 UUID 与临时路径的对应，临时 key 不作为安全 identity。
+4. 远端归档使用 `FileManager.trashFile()`；失败则按 snapshot 回滚。普通移动不进入回收站。
+5. 从 `results/` 物化所有最终目标：按深度升序使用 `Vault.createFolder()` 创建缺失父目录，每个成功后立即追加到 `createdDirectories`；rename/create 使用 `Vault.create()`，write 使用 `Vault.process()` 并在同步回调中核对事务开始前 hash。每次操作后重新读取并验证 `resultContentHash`。此后只按当前阶段的结果 hash 检查，不再用事务开始前的 expected 检查已被前一步改变的路径。
+6. 把**精确远端 `toRevision`** 写成完整的新 generation，验证 manifest hash、`baseRevisionContentHash` 和全部 base 正文后进入 `committing`。
+7. 写入并重读 `current.json.next`，保存 `current.json.prev`，再切换 `current.json`；随后重新扫描全部最终 Vault 结果。全部一致才进入 `committed`。
 
-如果预览后用户继续编辑，步骤 2 或 3 必须中止并要求重新 Pull，不能覆盖新编辑。如果用户在插件写入后又修改同一文件，回滚只在当前内容仍等于插件记录的 `resultContentHash` 时自动恢复；否则 journal 进入 `failed` 并冻结 Space，避免回滚再次覆盖用户的新内容。
+如果预览后用户继续编辑，步骤 2 必须中止并要求重新 Pull，不能覆盖新编辑。事务开始后若用户或其他程序修改了未完成结果，回滚只在当前内容仍等于 journal 记录的 staged/result hash 时自动恢复；否则 journal 进入 `failed` 并冻结 Space，避免回滚再次覆盖用户的新内容。
 
-回滚按已完成 action 的逆序执行：create 删除插件创建的文件；write 从 snapshot 恢复；rename 移回原路径；trash 使用 snapshot 在原路径重建。已经进入 Obsidian 或系统回收站的副本可能保留，但活动 Vault 必须恢复到事务前内容。控制文件替换保留 `.prev`，恢复时根据 journal 选择旧 manifest/base；不依赖底层 rename 具备操作系统级原子性。
+每次 rename、trash 或物化成功后都先重读 hash，再把条目追加到对应数组并持久化 journal。若进程恰好在文件操作成功、journal 追加前退出，恢复器通过“源/目标/唯一临时路径是否存在 + snapshot/result hash”确定唯一状态；若不能唯一判定则进入 `failed`，不得猜测。回滚先移除仍匹配 result hash 的物化目标，再把临时路径中的原文件恢复到原路径；trash 使用 snapshot 在原路径重建。按深度降序删除 `createdDirectories` 中仍为空的目录；未来得及记录或已有其他内容的目录宁可保留。已经进入 Obsidian 或系统回收站的副本可能保留，但活动 Vault 必须恢复到事务前内容。`oldGenerationId` 非 null 时恢复旧指针；为 null 时恢复为 pending 且无 current 指针。然后删除未引用的新 generation；不依赖底层 rename 具备操作系统级原子性。
 
 ### 5.8 Push journal Schema
 
@@ -383,20 +409,28 @@ interface PushJournalV1 {
   kind: "push_upload";
   transactionId: string;
   spaceId: string;
+  rootPath: string;
   baseRevision: string;
+  oldGenerationId: string | null;
+  newGenerationId: string;
   previewHash: string;
   confirmationManifest: PushConfirmationManifestV1;
   confirmationHash: string;
   idempotencyKey: string;
+  credentialIdAtCreation: string;
   state: "uploading" | "ready_to_finalize" | "finalizing" | "published" | "aborted" | "expired";
   sessionId: string | null;
   sessionExpiresAt: string | null;
   uploadedBatches: Array<{ batchIndex: number; batchHash: string; receipt: string }>;
   publishedRevision: string | null;
+  publishedRevisionContentHash: string | null;
+  localCommitPhase: "not_started" | "generation_written" | "pointer_switched" | "verified";
 }
 ```
 
-Push 预览确认后先持久化 journal 与 payload，再创建远端 session。每个 upsert 的正文必须能由 `payload/<page-id>.md` 和 confirmation manifest 完整重建。只有成功查询到 `published` 或成功收到 finalize 响应后，才可用这些快照更新 base 与 manifest。
+Push 预览确认后先持久化 journal 与 payload，再创建远端 session。每个 upsert 的正文必须能由 `payload/p-<page-key>.md` 和 confirmation manifest 完整重建。只有成功查询到 `published` 或成功收到 finalize 响应后，才可用这些快照更新 base 与 manifest。
+
+`published` 表示服务端结果已经确定，不表示本地基线已经提交。收到或恢复最终结果后，先持久化 published revision/hash，再用固定 `newGenerationId` 从旧 generation 与 payload 幂等构造新 generation，按 `generation_written → pointer_switched → verified` 推进；首次“本地有内容、远端页面为空”时 `oldGenerationId = null`，构造输入固定为首次绑定时远端 head revision `R` 的空页面集；Relation/Memory-only 变更可能使 `R` 不是 `0`。任一阶段重启都重读校验后继续；只有 `verified` 才删除 payload 和 journal。`noop` 不创建新 generation，只验证当前 generation revision/hash 与响应相同后清理；不相同则要求 Pull。首次本地发布不会生成 noop，因为至少包含一个 upsert。
 
 ## 6. 身份、连接与权限
 
@@ -429,10 +463,13 @@ Push 预览确认后先持久化 journal 与 payload，再创建远端 session�
 ## 7. Status
 
 1. 活动文件位于某个映射目录时，默认选择该 Space；否则显示 Space 选择器。
-2. 扫描该映射目录的可见 Markdown。
-3. 与 manifest 和 base 比较，产生本地状态。
-4. 请求远端 revision head，不下载正文。
-5. 显示本地变化、远端是否领先、附件链接警告和阻塞错误。
+2. 先验证已绑定 `rootPath` 存在且是 `TFolder`，当前 generation 完整，且没有未恢复事务。
+3. 通过 Vault API 枚举该目录下全部可见 Markdown，并逐一读取；枚举、读取或 stat 任一失败都把本次扫描标记为不完整。
+4. 只有完整扫描才能与 manifest 和 base 比较并产生本地状态。
+5. 请求远端 revision head，不下载正文。
+6. 显示本地变化、远端是否领先、附件链接警告和阻塞错误。
+
+已绑定 rootPath 缺失、被普通文件占用、Vault 尚未完成加载、扫描/读取不完整或扫描期间收到相关文件事件时，状态为 `local_scan_incomplete`。此状态不得把缺失页面分类为 deleted，不得生成 Push/Pull 写入预览，尤其禁止产生全量 archive。用户必须恢复目录或在设置中走“移除映射/重新绑定”，插件不能自动创建一个已绑定但消失的目录。
 
 附件链接警告通过 Obsidian MetadataCache 中已解析的 embeds/links 加原始 Markdown 链接扫描生成：目标不是同一映射目录内 `.md` 的链接标记为“不随 AgentWiki 同步”。警告不阻止同步，也不读取或上传附件内容；代码块中的文本不作为链接扫描 fallback 的命中。
 
@@ -445,6 +482,8 @@ Push 预览确认后先持久化 journal 与 payload，再创建远端 session�
 - `renamed`
 - `identity_required`
 - `invalid`
+- `local_scan_incomplete`
+- `baseline_corrupt`
 
 离线或请求失败时仍显示本地分类，远端状态显示 `unknown`。Status 永不修改 Vault、manifest、base 或服务端。
 
@@ -455,14 +494,14 @@ Push 预览确认后先持久化 journal 与 payload，再创建远端 session�
 1. 获取 Space 操作锁。
 2. 恢复或冻结未完成事务。
 3. 从 `baseRevision` 分页获取 Delta；服务端无法提供该历史 revision 时获取固定 revision 的分页 Snapshot。
-4. 构造 base、local、remote 三个分支。
+4. 构造 base、local、remote 三个分支。Delta 模式从旧 generation 逐页复用未变化 base，并用 upsert/archive 覆盖得到精确 remote；Snapshot 模式逐页落盘为 remote。两种模式都以服务端 `toRevisionContentHash` 校验完整 remote manifest 后才能生成预览。
 5. 按 page ID 合并路径、标题和正文。
 6. 非重叠正文改动自动合并；冲突转换为结构化冲突块。
 7. 展示新增、修改、移动、回收站删除和冲突解决后的最终预览。
 8. 用户确认后记录每个受影响路径的 expected hash，并生成 journal、结果文件和原始文件快照。
 9. 事务开始前重新验证全部 expected；不匹配则废弃预览，不写入 Vault。
 10. 使用条件写入应用全部 Vault 变化。
-11. 写入新的 base 和 manifest，并验证最终文件 hash。
+11. 将固定远端 `toRevision` 的精确 Snapshot 状态写入新 generation；不得把合并后的 Vault 结果写入 base。
 12. 标记 committed 并清理事务。
 
 这是应用层原子性，不宣称操作系统级原子写入。
@@ -504,7 +543,7 @@ Push 预览确认后先持久化 journal 与 payload，再创建远端 session�
 5. 展示新增、修改、移动、归档和附件链接警告。
 6. 以确认时的不可变内容快照计算 `confirmationHash` 和幂等键。
 7. 建立 push session，并按服务端能力限制分批上传变更。
-8. 所有批次完成后，携带 `baseRevision` 和 `confirmationHash` 执行原子 finalize。
+8. 所有批次完成后，对已绑定 `baseRevision` 的 session 携带 `confirmationHash` 和 `userConfirmed: true` 执行原子 finalize；finalize 请求不重复传 base。
 9. 服务端重新检查用户、角色、base revision、批次 hash 和完整 payload hash。
 10. 成功后用已确认快照更新 base 和 manifest revision。
 
@@ -512,9 +551,11 @@ Push 预览确认后先持久化 journal 与 payload，再创建远端 session�
 
 用户可能在网络请求期间继续编辑。远端发布的是用户确认时的快照；发布成功后 base 也更新为该快照，之后的新编辑仍留在 Vault，并在下一次 Status 中显示为 `modified`。
 
+Push 成功后的新 generation 由“旧精确远端 base + confirmation manifest”确定构造：upsert 使用持久化 payload 正文和确认 path/title，archive 移除条目，未涉及页面逐项复用旧 generation。不得从此时的 Vault 重扫构造 base。校验时必须把本地 manifest 转成协议 `RevisionContentManifestV1`（仅含按 pageId 排序的 pageId/path/title/contentHash 数组）再计算 `revisionContentHash`；它不是本地 `manifestHash`。与服务端 hash 一致后才能切换 current 指针。
+
 服务端 finalize 返回 `BASE_STALE` 时不推进本地基线。网络重试复用幂等键；相同幂等键和相同 payload 返回原结果，相同幂等键和不同 payload 返回错误。
 
-Push 上传和 finalize 状态写入 `kind: "push_upload"` 的本地 journal。finalize 响应丢失时，下次用户主动打开同步中心后查询同一 session；服务端已发布则按 journal 中的原确认快照推进 base，未发布则允许以同一 idempotency key 安全重试。成功响应的 `revisionContentHash` 必须与随后由本地确认快照重建的 manifest hash 一致，否则不推进本地基线并要求重新 Pull。
+Push 上传、finalize 和本地 generation 提交状态写入 `kind: "push_upload"` 的 journal。finalize 响应丢失时，下次用户主动打开同步中心后查询同一 session；服务端已发布则按 journal 中的原确认快照推进 base，未发布则允许以同一 idempotency key 安全重试。成功响应的 `revisionContentHash` 必须与由本地确认快照重建的 `RevisionContentManifestV1` hash 一致，否则不推进本地基线并要求重新 Pull。
 
 ## 10. 首次绑定
 
@@ -522,10 +563,19 @@ Push 上传和 finalize 状态写入 `kind: "push_upload"` 的本地 journal。f
 
 - 本地空、远端有内容：显示 Clone 预览，确认后按 Pull 事务写入。
 - 本地有内容、远端空：显示发布预览，确认后为每页生成 page ID 并按 Push session 发布。
-- 两边都有内容：按规范化相对路径形成首次合并候选；同路径不同正文必须解决，确认后才创建共同 base。
+- 两边都有内容：按规范化相对路径形成首次合并候选；同路径不同正文必须解决，确认后以固定远端 revision 建立 base，并把最终选择应用到 Vault。选择中的本地差异继续显示为 dirty，必须在后续独立 Push 中再次预览确认。
 - 两边都空：直接记录当前远端 revision 为空基线。
 
 首次绑定失败或取消不得写入有效 manifest。换设备没有控制目录时，重新获取远端 Snapshot 并进入同一首次绑定流程。
+
+首次绑定始终固定一次远端 Snapshot revision `R`，并复用 Pull journal 的 generation 与 Vault 事务：
+
+1. 本地空、远端有内容：base=`R`，Vault=remote `R`，一次 Clone 事务完成后 clean。
+2. 本地有内容、远端页面为空：先保持无有效 manifest，使用固定远端 head revision `R` 完成独立 Push；不能仅因页面集为空就把 base 写成 `0`，因为 Relation/Memory-only revision 也会推进 head。服务端成功后以返回 revision 和确认快照创建首个 generation。Push 失败或 `BASE_STALE` 时不修改 Vault、不建立基线，重新取得 Snapshot 后回到首次绑定。
+3. 双方都有内容：先生成 `Base=remote R`、`Local=用户确认的最终 Vault` 的本地事务；事务完成后 manifest/base 精确表示 `R`。任何 Local 与 R 不同的页面保持 added/modified/renamed/deleted，不能在本次绑定中隐式上传。用户随后执行普通 Push；遇到远端领先时先普通 Pull。
+4. 双方页面都空：以固定远端 head revision `R` 和零页面 hash 创建空 generation；只有全新 Space 的 `R` 才是 `0`。
+
+因此首次绑定不存在“同时修改 Vault 和远端”的跨系统事务，也不会把未发布的合并结果称为共同 base。
 
 首次绑定逐路径使用以下真值表：
 
@@ -540,7 +590,7 @@ Push 上传和 finalize 状态写入 `kind: "push_upload"` 的本地 journal。f
 
 首次绑定没有共同 Base，因此不得自动把两份不同正文做 diff3。远端相同 page ID 但不同 path 以远端 path 为准；两个不同 page ID 占用同一路径时，用户必须选定一个保留的 page ID。远端 page ID 优先；本地临时 ID 只有在最终选择发布本地为新页面时保留。
 
-新增 page ID 在第一次展示 Push/首次绑定预览前生成，并写入 `.agentwiki/spaces/<space-id>/pending-identities.json`：
+新增 page ID 在第一次展示 Push/首次绑定预览前生成，并写入 `.agentwiki/spaces/s-<space-key>/pending-identities.json`：
 
 ```ts
 interface PendingIdentityV1 {
@@ -553,8 +603,8 @@ interface PendingIdentityV1 {
 
 ### 10.1 映射和连接配置迁移
 
-- 添加映射：目标目录与其他映射互斥后进入首次绑定，不得直接创建有效 manifest。目标目录不存在时在确认首次绑定后创建；失败时可留下空目录，但不得留下有效 manifest。
-- 移除映射：要求没有活动事务；只移除 active mapping，不删除 Markdown。manifest/base 移到 `.agentwiki/detached/<timestamp>-<space-id>/`，用户可手动清理。
+- 添加映射：目标目录与其他映射互斥后以 `pending` 进入首次绑定，不得直接创建有效 manifest 或暴露为普通同步 Space。目标目录不存在时只有“本地为空”的首次绑定分支可以在用户确认后创建；失败时可留下空目录，但不得留下有效 manifest。
+- 移除映射：要求没有活动事务；只移除 active mapping，不删除 Markdown。整个 Space 控制目录移到 `.agentwiki/detached/<timestamp>-s-<space-key>/`，用户可手动清理。
 - 更改已绑定目录：首版不支持原地改 rootPath。用户必须先在 clean 且远端 head 等于 base 时移除映射，再添加新目录并重新首次绑定。
 - 断开设备：撤销成功后用 `SecretStorage.setSecret(secretId, "")` 覆写本地值，再清除 config 中的引用；Obsidian 1.11.5 API 没有插件级 deleteSecret。保留 Markdown 和控制状态，所有 Space 显示 disconnected。
 - 离线断开：只能用空字符串覆写并在本地忘记凭据，必须明确警告远端凭据仍需稍后在 AgentWiki Web 撤销。
@@ -566,7 +616,7 @@ interface PendingIdentityV1 {
 ### 11.1 同步入口
 
 - 功能区图标打开轻量同步中心模态框。
-- 命令面板注册 `AgentWiki: Status`、`AgentWiki: Pull`、`AgentWiki: Push`。
+- 命令 ID 固定为 `status`、`pull`、`push`，显示名称为 `Status`、`Pull`、`Push`；不在显示名称中重复插件名，因为 Obsidian 会自动显示插件来源。
 - 活动文件可确定 Space 时直接使用该 Space，否则显示选择器。
 - 同步中心始终允许明确选择一个 Space。
 - 首版不提供 `Push All` 或 `Pull All`。
@@ -617,6 +667,7 @@ interface PendingIdentityV1 {
 - 远端分页 cursor 失效：放弃当前预览并从固定 revision 重新请求，不混用两次分页结果。
 - Push session 过期：重新检查 head、重新生成预览并取得确认；不得仅重建上传 session 后静默 finalize。
 - finalize 响应丢失：保留 `finalizing` journal；下次用户主动操作时查询 session 状态，禁止猜测发布结果。
+- finalize 后原 credential 被撤销或轮换：用户以同一 AgentWiki 人类账号为同一 `deviceId + vaultId` 重新连接后，使用服务端恢复授权查询旧 session；若换成不同用户、deviceId、vaultId 或结果已超过保留期，则禁止猜测，保留 journal 并要求 Pull 当前 head。Pull 后若远端已经包含确认 payload，则按普通三方状态收敛；否则原 payload 仍作为本地变化重新预览，绝不盲目重放 finalize。
 
 ## 14. 诊断与隐私
 
@@ -664,6 +715,7 @@ interface PendingIdentityV1 {
 ### 17.1 单元测试
 
 - 路径规范化、非法路径、Unicode/大小写碰撞和目录重叠。
+- Windows 保留名、非法字符、尾随点/空格、UTF-8 段长度，以及 Space/Page ID 到 64 位 hash 文件 key 的映射与碰撞校验。
 - 状态分类和 rename hint/hash fallback/身份歧义。
 - LF 规范化、hash、canonical serialization 和 confirmation hash。
 - diff3 非重叠合并、重叠冲突、删除/修改和双向移动。
@@ -678,9 +730,16 @@ interface PendingIdentityV1 {
 - 使用内存 Vault 和 fake HTTP 实现测试端口契约。
 - 在每个 Pull journal 阶段注入异常，验证回滚或冻结结果。
 - 预览后、事务开始前、每个 action 前和插件写入后注入用户编辑，验证条件写入不会覆盖新内容。
-- 验证 manifest 临时替换损坏、`.prev` 恢复、回滚逆序和回收站残留语义。
+- 验证不可变 generation 写入、`current.json.next/current.json.prev` 指针切换、每个 commit 点崩溃恢复、旧 generation 保留和损坏冻结。
+- 验证 `A ↔ B`、三路径移动环、大小写改名、移动并合并正文，以及 staging 中断后的逆向恢复。
+- 验证 rootPath 缺失、被文件占用、扫描/读取失败和扫描中收到文件事件时禁止产生 deleted/archive。
 - 验证回收站失败、控制目录损坏、分页 cursor 失效和 push session 过期。
 - 验证 Push journal 保存确认正文、finalize 响应丢失后以确认快照推进 base。
+- 在服务端已发布后的 `generation_written/pointer_switched/verified` 每个本地阶段注入退出，验证重启只重建同一 generation、不会重复发布或丢失用户后续编辑。
+- 验证 Pull 后 base 精确等于远端 revision，而自动合并的本地独有修改继续是 dirty。
+- 验证首次双方有内容只建立远端 base 并应用 Vault，未发布差异留给后续普通 Push；Push 失败不破坏首次绑定基线。
+- 验证 pending 映射不进入普通同步列表，首次绑定从 `oldGenerationId = null` 在每个崩溃点都只能恢复为未绑定或完整 active，不会留下无基线 active 映射。
+- 验证凭据轮换后只恢复查询同 credential family 的 Push 结果，不盲目重放 finalize。
 - 验证 Secret 从不进入普通设置、控制目录和日志。
 - 验证插件加载、文件事件和闲置状态不产生网络请求。
 - 验证添加/移除映射、断开、离线忘记凭据和 serverInstanceId 变化。
@@ -709,6 +768,9 @@ interface PendingIdentityV1 {
 8. 5,000 篇、100 MiB 的 Space 完成分页 Pull、Status 和分批 Push；界面持续显示进度且保持可交互。
 9. Pull 预览期间继续编辑受影响文件，确认时安全失效且不覆盖新编辑。
 10. finalize 成功但响应丢失，重启后查询 session 并以确认快照恢复正确 base，同时保留之后的新编辑。
+11. Pull 合并本地独有修改后，另一台设备看不到该修改，直到当前设备完成后续 Push；当前设备 Status 始终保持 modified。
+12. Windows、macOS、iOS 和 Android fixture 对可移植路径得到相同判定；合法远端 ID 不直接用于控制文件名。
+13. 映射目录临时改名或读取失败时 Push 被阻塞，恢复目录后原页面不会被误判为全量归档。
 
 ### 17.5 持续集成门禁
 
