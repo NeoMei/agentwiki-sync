@@ -37,7 +37,7 @@
 - 与每个跨 HTTP 边界类型同名并以 `Schema` 结尾的运行时 Schema。
 - `normalizeMarkdown(text)`、`normalizeSyncPath(path)`、`pathKey(path)`。
 - `canonicalBytes(value)`、`sha256Hex(bytes)`、`contentHash(body)`、`confirmationHash(manifest)`、`batchHash(batchWithoutHash)` 和 `revisionContentHash(manifest)`。
-- `idFileKey(id)`，返回规范化 UTF-8 ID 的 SHA-256 小写十六进制值，供客户端安全映射本地控制文件名。
+- `idFileKey(id)`，返回已通过第 3.3 节校验的 ID 原字符串 UTF-8 bytes 的 SHA-256 小写十六进制值，不做大小写或 Unicode 改写，供客户端安全映射本地控制文件名。
 - `partitionPushChanges(changes, capabilities)`，实现第 3.4 节确定性批次划分。
 
 包内不得导出 AgentWiki Prisma、NestJS、Obsidian 或 Node `Buffer` 类型；hash API 接受/返回 `Uint8Array` 和字符串，并使用 Web Crypto 兼容实现。
@@ -58,6 +58,7 @@
 | 撤销未交换安装码 | 204 | 401, 403, 404, 409 |
 | 交换设备凭据 | 201 | 400, 401, 409, 429 |
 | 查询当前设备会话 | 200 | 401, 403 |
+| 激活当前设备凭据 | 200 | 400, 401, 403, 409 |
 | 撤销当前设备 | 204 | 401, 403 |
 | Web 列出/撤销自己的设备 | 200/204 | 401, 403, 404 |
 | 列出 Space | 200 | 401, 403 |
@@ -68,6 +69,8 @@
 | 查询 Push session | 200 | 401, 403, 404 |
 | 终止 Push session | 204 | 401, 403, 404, 409, 410 |
 
+对无权访问的 Space 或 Push session，服务端可统一返回 404 以避免资源枚举；上表中的 403 只用于资源归属已知但当前操作权限不足（例如 viewer finalize）。插件不依赖 403/404 来推断资源是否存在。
+
 ## 3. 规范化与 hash
 
 ### 3.1 Markdown 正文
@@ -76,6 +79,7 @@
 - `CRLF` 和单独 `CR` 规范化为 `LF`。
 - 保留末尾换行的有无。
 - 不做 Unicode 正文归一化。
+- 正文不得以 U+FEFF 开头；插件把对应的 UTF-8 BOM bytes 视为阻塞性非法输入，避免文本 API 吞掉 BOM 后破坏原始字节条件写入。
 - 单页规范化正文最大 1 MiB。
 
 ### 3.2 路径与标题
@@ -83,9 +87,9 @@
 - 相对路径使用 `/` 分隔。
 - 路径段使用 Unicode NFC。
 - 禁止绝对路径、空段、`.`、`..`、U+0000–U+001F、`< > : " / \\ | ? *` 和根目录逃逸。
-- 任一路径段不得以空格或句点结尾；路径段从开头到第一个 `.` 前的 Windows device basename 按 ASCII 大小写不敏感不得等于 `CON`、`PRN`、`AUX`、`NUL`、`COM1`–`COM9` 或 `LPT1`–`LPT9`。
+- 任一路径段不得以空格或句点结尾；路径段从开头到第一个 `.` 前的 Windows device basename 按 ASCII 大小写不敏感不得等于 `CON`、`PRN`、`AUX`、`NUL`、`COM1`–`COM9`、`LPT1`–`LPT9`、`COM¹`–`COM³` 或 `LPT¹`–`LPT³`。
 - 每个 NFC 路径段的 UTF-8 编码最长 255 字节，完整相对路径的 UTF-8 编码最长 1,024 字节。
-- 标题最长 500 个 Unicode code point。
+- 标题长度为 1–500 个 Unicode code point，禁止 U+0000–U+001F；不自动 trim 或做 Unicode 归一化。
 - 同一 Space 中禁止 NFC 后重复和仅大小写不同的路径。
 - path 扩展名按 ASCII 大小写不敏感必须等于 `.md`；服务端保留客户端提交的实际大小写。扩展名判断在 NFC 规范化后的最后一个路径段执行，最后一个 `.` 之后的 ASCII fold 必须精确为 `md`。
 
@@ -100,7 +104,7 @@
 协议包必须提供唯一的 canonical serialization 规则：
 
 - 对象 key 按 Unicode code point 升序排列。
-- 数组保持协议定义顺序；Push changes 按 `pageId`、`operation`、`path` 稳定排序后序列化。
+- 数组保持协议定义顺序；Push changes 在进入 canonical serializer 前按 `(pageId, operation, path-or-previousPath)` 的 Unicode code point tuple 稳定排序。
 - 字符串必须是有效 Unicode scalar sequence，拒绝未配对 surrogate。JSON 字符串转义 `"`、`\`、`\b`、`\t`、`\n`、`\f`、`\r`；其余 U+0000–U+001F 使用小写四位 `\u00xx`。不转义 `/`、非 ASCII、U+2028 或 U+2029。
 - 不允许 `undefined`、NaN、Infinity 或循环引用。
 
@@ -188,7 +192,7 @@ interface SyncPageRecord {
 
 - `pageId` 对应 `Page.knowledgeKey`，是公开、稳定且不透明的 Knowledge ID；`Page.id` 仍是数据库内部 ID，永不进入 sync v1。
 - 现有 `knowledgeKey` 原值保持不变；不要求把既有 CUID 改为 UUID。
-- Obsidian 新页面使用 UUID v4 作为 `knowledgeKey`。服务端仅在同一 Space 中该 knowledgeKey 不存在时创建；已存在时必须属于同一页面，否则返回 `PAGE_ID_CONFLICT`。
+- Obsidian 新页面使用 UUID v4 作为 `knowledgeKey`。sync v1 的公开 pageId 在整个 AgentWiki 实例内全局唯一，服务端仅在该 knowledgeKey 全局不存在时创建；已存在时必须是同一内部 Page，否则返回 `PAGE_ID_CONFLICT`。数据库必须为 `Page.knowledgeKey` 建立全局唯一约束，或建立以 knowledgeKey 为主键并唯一引用内部 Page/Space 的 `SyncPageIdentityRegistry`；仅有 `(spaceId, knowledgeKey)` 唯一键不够阻止两个 Space 的并发 finalize 创建同一 pageId。
 - `path` 对应新增的非空 `Page.syncPath`，是 Space 内的规范化 Markdown 相对路径。
 - `pathKey` 对应新增的非空 `Page.syncPathKey`。协议包 `pathKey(path)` 先做 NFC，再使用内嵌 Unicode 15.1 `CaseFolding.txt` 的默认 full case folding；不得依赖客户端操作系统 locale 或运行时自带 Unicode 版本。数据库必须建立 `@@unique([spaceId, syncPathKey])`，并在迁移 SQL 中显式命名该唯一约束，防止跨平台碰撞。
 - `title` 对应 `Page.title`，`body` 对应 `Page.content`，格式固定为 Markdown。
@@ -204,6 +208,7 @@ interface SyncPageRecord {
 6. 若历史异常数据仍发生 pathKey 碰撞，迁移失败并列出 Page ID，不允许静默加随机后缀。
 7. 一个 Space 的正文转换、syncPath backfill、初始规范化 revision 和约束启用必须在可恢复迁移阶段中完成；失败时该 Space 不对 sync v1 可见，现有 Web 与旧 local-sync 数据不得处于半迁移状态。
 8. 全部 Space backfill 完成后把 `syncPath`、`syncPathKey` 设为非空并建立唯一约束。
+9. 启用 sync v1 前扫描全部现有 Page 的 knowledgeKey；发现跨 Space 重复时迁移失败并列出内部 Page ID/Space ID，由运维显式解决，不能静默改写公开 identity。校验通过后再建立全局 pageId identity 约束。
 
 `slug` 继续服务 AgentWiki Web URL，`parentId` 继续服务 Web 层级，`sourcePath` 继续表示来源 provenance；三者都不能代替 `syncPath`。Web 移动/重命名页面必须显式更新 `syncPath`，并通过统一 revision 写入器校验路径。
 
@@ -284,7 +289,7 @@ interface RevisionContentManifestV1 {
 
 `pages` 按 pageId Unicode code point 升序。零页面 revision 使用零字节 SHA-256，即上面的 `e3b0...b855`，不对空 JSON 对象求 hash。统一写入器在所有入口把 Page content 的换行规范化为 LF，并保证 `format = "markdown"`；迁移遇到非 Markdown Page 必须先显式转换，不能从 sync revision 中静默排除。
 
-Obsidian finalize 必须创建一个来源为 `obsidian_sync`、状态直接为 `published` 的 ChangeSet 和 published ChangeItem，记录 `createdByUserId`、HumanDeviceCredential ID、confirmation hash、base revision 和新 revision。它不创建待审核 Approval，也不授予调用者一般 `review:decide` 权限。这是唯一允许的审计实现，不使用“等价记录”分支。
+Obsidian finalize 必须创建一个来源为 `obsidian_sync`、状态直接为 `published` 的 ChangeSet 和 published ChangeItem，记录 `createdByUserId`、HumanDeviceCredential ID、confirmation hash、base revision 和新 revision。它不创建待审核 Approval，也不授予调用者一般 `review:decide` 权限。这是唯一允许的审计实现，不使用“等价记录”分支。具有实际变更的 finalize 必须给 Push session 增加非空 `publishedChangeSetId` 或等价外键，并对该 session 一对一唯一，使服务端可以用数据库约束阻止重复审计发布。
 
 为承载该审计，`ChangeSet` 增加 `origin: "review" | "obsidian_sync"`、`humanDeviceCredentialId`、`confirmationHash` 和 `baseRevisionId` 可空字段；普通 ChangeSet 使用默认 `review`。Obsidian ChangeItem 使用既有 `create_page/update_page/archive_page` 类型、状态直接为 `published`，`publishedResourceId` 保存内部 `Page.id`，payload 同时保存公开 pageId/path/title/contentHash 以及变更前字段。`reviewedAt` 与 `publishedAt` 设为同一事务时间，不创建 Approval。
 
@@ -330,20 +335,20 @@ interface SyncRevisionDeltaRow {
 - 内容 blob 只有在没有 Page、revision entry 或未过期 staging 引用后才能垃圾回收。
 - `SpaceKnowledgeRevision` 必须删除现有 `@@unique([spaceId, contentHash])`；Space 内容允许经历 `A → B → A`，第三次仍创建新 sequence/revision。可保留普通 `(spaceId, contentHash)` 索引用于查询，但 content hash 不是 revision identity。
 - `SpaceKnowledgeRevision` 新增非空 `revisionContentHash`。现有 `contentHash` 保留为 legacy bundle hash，供旧路由使用；两者语义不得混用。所有旧 revision 按 sequence 升序固定批次回填规范化 page entry并重算 `revisionContentHash`，不覆盖旧 `contentHash`。每个 revision 的 page rows 必须由其历史 snapshot/delta 得到，不能用当前 Page 表倒灌历史。回填 hash 或 page 内容不一致时停止该 Space 迁移并报告 revision ID。
-- Prisma 迁移顺序固定为 expand/backfill/contract：先添加可空新列和新表并部署兼容读写代码；再按 Space 回填并校验；最后添加非空/唯一约束、删除 contentHash 唯一约束并允许 legacy JSON 为空。任何阶段回滚应用都不得读到旧二进制无法解析的新必填状态。
+- Prisma 迁移顺序固定为 expand/backfill/contract：Release A 先添加可空新列和新表、部署可同时读写新旧存储的代码，再按 Space 回填并校验；Release B 最后添加非空/唯一约束、删除 contentHash 唯一约束并允许 legacy JSON 为空。Release A 可回滚到旧二进制；Release B 之后只允许回滚到 Release A 兼容二进制，不得声称旧二进制能解析 nullable legacy JSON。
 
 ### 5.2 既有 local-sync 兼容适配器
 
-兼容策略唯一固定为“规范化 Page rows + legacy 非 Page sidecar 合成旧 DTO”，不允许新写入器继续双写包含全部页面正文的巨大 `snapshot/delta` JSON：
+兼容策略唯一固定为“规范化 Page rows + legacy 非 Page sidecar 合成旧 DTO”。为保留安全回滚窗口，迁移分为两次应用发布：Release A 完成 expand/backfill，并在新写入器中临时双写规范化 rows 与旧 `snapshot/delta` JSON，因此可回滚到旧应用；完成数据校验、旧 local-sync 回归和一个明确观察窗口后，Release B 才执行 contract、停止 legacy JSON 双写并允许其为 null。Release B 不承诺回滚到不理解 nullable legacy JSON 的旧二进制；必须保留 Release A 兼容二进制作为回滚目标。Release B 之后不允许新写入器继续双写包含全部页面正文的巨大 `snapshot/delta` JSON：
 
 1. 迁移旧 revision 时，从原 `snapshot/delta` 提取 memories、relations、provenance、deletions、schemaVersion、recipeVersion 等非 Page 字段到按 revision 保存的 `LegacyRevisionSidecar`；sidecar 中每个数组保持原始 ordinal。每个原 `pages[]` 元素的完整 legacy 投影由 `(revisionId, pageId)` 对应的 `LegacyRevisionPageExtra` 与其引用的正文 blob 共同表示：extra 保存原始 ordinal、字段存在性、字段顺序、`legacyBodyHash`、原 contentHash/path/updatedAt 以及 `order`、`metadata`、`artifactIds` 等全部非正文字段；不得假设规范化 row 的共有字段足以重建原 DTO。存储实现不得在每个 revision 重复内联整篇正文：未规范化正文按原始 UTF-8 bytes 放入内容寻址的 `LegacyPageBodyRow`；若原 bytes 已等于规范化正文，可与 `SyncPageContentRow` 共享同一 blob 或等价去重存储。Pages 的 sync v1 字段和规范化正文另行回填到规范化 rows。旧 JSON 在验证完成前保留，之后可按独立迁移清理。
 2. 每个新统一 `SpaceKnowledgeRevision` 都继承父 revision 的规范化 Page rows 和 sidecar。Page 变化更新 page rows 和 page delta；Memory/Relation-only 变化只更新 sidecar 和 legacy delta，但仍可按现有 local-sync 语义推进同一 sequence/head。`/api/sync/v1` 遇到没有 Page 净变化的 revision 时仍返回新的 revision ID、相同 `revisionContentHash` 和空 Page Delta，使插件安全推进 base；不维护第二套相互漂移的 revision 序列。
-3. 既有 local-sync Snapshot 路由优先按 legacy page ordinal 流式输出 `LegacyRevisionPageExtra` 保存的完整旧 Page 投影，再按 sidecar ordinal 合并其他数组；规范化 Page rows 只作为 sync v1 权威内容，不覆盖历史 legacy 字段。新 revision 在统一写入事务中同时生成完整、确定的 legacy Page 投影与 ordinal。迁移前后的字段存在性、数组顺序、默认值和状态码必须保持不变。
+3. 既有 local-sync Snapshot 路由优先按 legacy page ordinal 流式输出 `LegacyRevisionPageExtra` 与其正文 blob 合成的完整旧 Page 投影，再按 sidecar ordinal 合并其他数组；规范化 Page rows 只作为 sync v1 权威内容，不覆盖历史 legacy 字段。新 revision 在统一写入事务中同时生成完整、确定的 legacy Page 投影与 ordinal。迁移前后的字段存在性、数组顺序、默认值和状态码必须保持不变。
 4. 既有 local-sync Delta 路由的每个 `revisions[i].delta` 必须继续是**目标 revision 的完整 KnowledgeBundle 起点**，不能只包含净变化。当前发布版客户端把第一条 delta 直接作为 accumulated bundle，只有后续条目才在其上合并；返回净增量会使未出现页面从本地工作区消失。适配器必须为每个目标 revision 读取其完整规范化 Page rows/page extras 和完整 Memory/Relation sidecar，同时保留从父 revision 到该 revision 的 legacy `deletions/provenance` 转换信息，使连续多条 revision 合并与当前实现完全一致。若未来要改成真正净 Delta，必须先发布能把第一条增量应用到本地 base 的新版 local-sync 协议，不得在本兼容层静默改变语义。
 5. 现有 legacy revision controller 的外层响应保持 `revisionId/sequence/contentHash/schemaVersion/recipeVersion/bundle` 和 `fromRevision/toRevision/revisions[]` 不变；其中每个 `bundle/delta` 继续是现有 KnowledgeBundle 结构。不得误用 packages/local-sync 中另一个 `SnapshotSchema/DeltaSchema` 作为这些路由的替代 DTO。
 6. 旧路由的单响应 JSON 和原有数量限制属于 legacy 兼容边界，不承诺 sync v1 的 100 MiB 有界响应；但服务端内部不得先解析已经清理的完整 legacy snapshot JSON。新插件只调用 `/api/sync/v1`。
 7. 新 revision 以固定 legacy serializer 流式计算现有 `contentHash`，不构造完整 bundle 字符串；serializer 必须与迁移前 `JSON.stringify(snapshot)` 的字段插入顺序、数组顺序和省略规则兼容。历史 revision 保留已存储的 legacy `contentHash`，不得用规范化正文重算并覆盖；迁移验证以原 DTO 深度等价且返回原 contentHash 为通过条件。旧 `snapshot`/`delta` 字段在 schema 中改为 nullable，新写入器写 null，兼容路由不能依赖它们。
-8. 上线迁移必须在把旧 JSON 置 null 前，以当前生产 `@neomei/agentwiki-local-sync` 公网版本运行 Snapshot、Delta、Pull 和 Push 回归，逐字段比较迁移前后 DTO并比较 legacy contentHash；不一致则禁止清理旧字段或发布。
+8. Release A 上线后、Release B 把旧 JSON 置 null 前，必须以当前生产 `@neomei/agentwiki-local-sync` 公网版本运行 Snapshot、Delta、Pull 和 Push 回归，逐字段比较迁移前后 DTO并比较 legacy contentHash；不一致则禁止 Release B。旧 JSON 实体清理是 Release B 之后的独立运维批次，只能在规范化 rows/sidecar/blob 验证通过且兼容路由不再读取旧 JSON 后执行。
 
 统一写入器的 Page 修改方法必须返回 `{ page, revision, sequence, revisionContentHash }`，使 Web/API 调用者能观测该次写入对应的 revision。
 
@@ -360,6 +365,9 @@ interface HumanDeviceCredentialRecord {
   vaultId: string;
   deviceName: string;
   credentialHash: string;
+  status: "provisional" | "active" | "revoked" | "expired";
+  provisionalExpiresAt: string | null;
+  activatedAt: string | null;
   createdAt: string;
   lastUsedAt: string | null;
   revokedAt: string | null;
@@ -370,9 +378,11 @@ interface HumanDeviceCredentialRecord {
 
 - 明文凭据只在 exchange 成功响应中返回一次。
 - 设备凭据是 32 个密码学安全随机字节的 base64url 字符串。数据库保存 `HMAC-SHA-256(serverPepper, credential)`，serverPepper 只来自服务端秘密配置；日志不记录明文或摘要。
-- 凭据长期有效，直到用户或当前设备撤销。
-- 同一 `userId + deviceId + vaultId` 重新连接时可以撤销旧凭据并签发新凭据。
+- exchange 创建的凭据初始为 `provisional`，最长 10 分钟，仅允许调用 `GET session`、`POST credentials/current/activate` 和 `DELETE credentials/current`；不能列 Space、读 Snapshot/Delta 或创建 Push session。成功 activate 后变为长期 `active`；过期 provisional 在认证时原子标记 `expired` 并返回 `DEVICE_CREDENTIAL_EXPIRED`，定时清理只用于回收从未再次访问的过期记录。
+- 只有 `active` 凭据长期有效，直到用户或当前设备撤销。
+- 同一 `userId + deviceId + vaultId` 重新连接时允许保留原 active 凭据并新建一个 provisional 凭据。exchange 必须锁定 credential family、撤销该 family 先前未过期的 provisional，再创建新的 provisional；数据库分别建立“每个 family 最多一个 provisional credential”和“每个 family 最多一个 active credential”的部分唯一约束。这样旧连接在新连接完成前仍可使用，但较早的 provisional 不能在稍后反向覆盖较新的连接尝试。
 - `credentialFamilyId` 是首次为 `userId + deviceId + vaultId` 连接时生成的 UUID；同一组合重新连接沿用该 family，不同用户、deviceId 或 vaultId 永不共享 family。Push session 同时记录创建 credential ID 和 family ID。
+- credential family 使用独立持久化记录或等价唯一键，对 `(userId, deviceId, vaultId)` 唯一；并发 exchange 通过 upsert/唯一冲突重读并锁定同一 family，不能产生两个 family 或两个可激活的 provisional credential。
 - 凭据认证得到人类 principal：包含 `userId` 和 `credentialId`，不包含 `agentId`。
 - 认证时重新加载未删除、有效用户；不得相信签发时缓存的用户状态。
 - 授权时重新加载 Space membership、角色和 platform role。
@@ -442,6 +452,8 @@ interface HumanDeviceCredentialRecord {
   "serverInstanceId": "uuid",
   "credential": "secret-returned-once",
   "credentialId": "uuid",
+  "credentialStatus": "provisional",
+  "provisionalExpiresAt": "2026-08-13T11:10:00.000Z",
   "user": {
     "id": "uuid",
     "displayName": "NeoMei"
@@ -461,8 +473,10 @@ interface HumanDeviceCredentialRecord {
 
 - 交换端点按 IP、installation ID 和失败次数限流。
 - code 的检查和消费必须原子执行。
+- 对存储在 PostgreSQL 的 installation，exchange 在单个事务中以条件更新把 `pending` 改为 `exchanged`、取得并锁定 credential family、撤销该 family 的旧 provisional、创建唯一新 provisional credential 并写安全审计；任一步失败整体回滚，不消费 code。Redis 可用于限流，不作为 installation 消费和 credential 创建之间的唯一事务边界。
 - 没有共同协议版本时返回 `PROTOCOL_UNSUPPORTED`，不得消费 code。
 - 成功后创建绑定 code 所属 user 的 HumanDeviceCredential。
+- 成功响应返回 provisional HumanDeviceCredential；此时不撤销该 user/device/vault 的现有 active credential，避免新设备连接流程中断时破坏旧连接。旧 active credential 只在 activate 新凭据的事务中被撤销。
 - 响应与日志必须设置禁止缓存和禁止记录 credential 的安全策略。
 - `serverInstanceId` 是数据库持久化的部署实例 UUID；重启和域名变化时保持不变，数据库克隆到独立服务时必须显式轮换。
 
@@ -484,6 +498,8 @@ interface HumanDeviceSessionResponse {
   vaultId: string;
   createdAt: string;
   lastUsedAt: string;
+  credentialStatus: "provisional" | "active";
+  provisionalExpiresAt: string | null;
   user: { id: string; displayName: string };
   capabilities: SyncCapabilities;
 }
@@ -498,13 +514,23 @@ interface SyncCapabilities {
 }
 ```
 
-### 8.2 撤销当前设备
+### 8.2 激活当前设备凭据
+
+`POST /api/integrations/obsidian/credentials/current/activate`
+
+- 认证：当前 provisional 或已 active HumanDeviceCredential。
+- 请求：`{ "credentialId": "uuid" }`，必须与 Authorization 对应的 credential ID 一致。
+- provisional 且未过期时，在一个事务中锁定 credential family，确认当前凭据仍是该 family 唯一 provisional，撤销其他 active credential，把当前凭据改为 active、清空 provisionalExpiresAt、写 activatedAt 和审计事件。被后续 exchange 替换的 provisional 必须返回 `DEVICE_CREDENTIAL_REVOKED`，不能重新激活。
+- 当前凭据已 active 时幂等返回 `200 + HumanDeviceSessionResponse`；已过期或已撤销返回 401。
+- 并发 exchange/activate 通过 family 行锁以及 provisional/active 两个部分唯一约束收敛；不得留下两个 active credential，也不得让较早的 provisional 在较新 exchange 完成后重新激活。
+
+### 8.3 撤销当前设备
 
 `DELETE /api/integrations/obsidian/credentials/current`
 
 只撤销当前 HumanDeviceCredential。成功返回 `204`。撤销成功后当前请求之外的后续请求必须失败；重复撤销以 `DEVICE_CREDENTIAL_REVOKED` 返回 `401`。
 
-### 8.3 用户端设备管理
+### 8.4 用户端设备管理
 
 AgentWiki Web 必须允许当前用户查看和撤销自己的 Obsidian 设备：
 
@@ -517,6 +543,8 @@ interface HumanDeviceCredentialSummary {
   deviceId: string;
   vaultId: string;
   deviceName: string;
+  status: "provisional" | "active" | "revoked" | "expired";
+  provisionalExpiresAt: string | null;
   createdAt: string;
   lastUsedAt: string | null;
   revokedAt: string | null;
@@ -589,7 +617,7 @@ interface RevisionHeadResponse {
 - cursor 不透明，客户端不得解析。
 - cursor 是 base64url 编码、服务端 HMAC 签名的 payload，绑定 route kind、Space、固定 revision、最后 pageId/ordinal 和 24 小时到期时间；签名错误、跨路由/Space 使用或过期返回 `CURSOR_INVALID`。
 - 后续有新发布时，本次分页结果仍保持固定 revision。
-- revision 不存在或已清理时返回 `REVISION_GONE`。
+- revision 存在但其规范化 Page rows 已超过保留期时返回 `REVISION_GONE`。根本不存在、属于另一 Space 或调用者不可读的 revision 统一返回 `REVISION_GONE / 410`，不通过 404/403 泄漏跨 Space revision 存在性。
 - `limit` 必须在 `1..capabilities.maxPageItems`；默认取二者较小的 100。
 - 服务端在加入下一项会使完整 JSON 响应超过 `maxResponseBytes` 时提前结束本页并返回 cursor。单个合法页面必须始终可以单独返回，因此 `maxResponseBytes` 必须大于 `maxPageBytes` 加协议开销。
 - 每一页都重复相同 revision、sequence 和 revisionContentHash；客户端发现变化必须废弃全部分页结果。
@@ -640,9 +668,9 @@ type DeltaItem =
   | { operation: "archive"; pageId: string; previousPath: string };
 ```
 
-移动和重命名使用同一 page ID 的 `upsert` 表达。若 `from` 已不可用，返回 `REVISION_GONE`，客户端改取 Snapshot 并使用本地 base 做三方合并。
+移动和重命名使用同一 page ID 的 `upsert` 表达。若 `from` 已不可用，返回 `REVISION_GONE`，客户端改取 Snapshot 并使用本地 base 做三方合并。若 `fromRevision` 等于第一次请求时的 head，响应固定 `toRevision = fromRevision`、`items = []`、`nextCursor = null`，并返回该 revision 的 sequence/hash。
 
-Delta 使用与 Snapshot 相同的条数、字节、cursor 和固定 revision 规则。archive 项目按 page ID 排序位置参与分页；同一 `toRevision` 中一个 page ID 只出现一次最终操作。
+Delta 使用与 Snapshot 相同的条数、字节、cursor 和固定 revision 规则。合并后的最终项统一按 page ID Unicode code point 升序分页，archive 与 upsert 使用同一排序空间；同一 `toRevision` 中一个 page ID 只出现一次最终操作。cursor 必须绑定 `fromRevision + toRevision + lastPageId`，不能仅绑定某个中间 revision ordinal。
 
 当 `fromRevision` 不是 head 时，服务端把 `(fromSequence, toSequence]` 中所有 revision delta 合并为每个 page ID 的最终净变化：
 
@@ -652,6 +680,8 @@ Delta 使用与 Snapshot 相同的条数、字节、cursor 和固定 revision �
 - 两边都不存在或最终完全相同：不返回项目。
 
 实现使用 revision rows 的有序 SQL/流式归并，不把完整 from/to Snapshot 加载到 Node 内存。`toRevision` 在第一次请求时锁定为当时 head，后续 cursor 不随新发布变化。
+
+当 `(fromSequence, toSequence]` 只有 Relation/Memory-only revision 时，`items` 为空，但 `toRevision/toSequence` 仍前进且 `toRevisionContentHash` 与 from 相同。这与“from 已是 head”不同，客户端必须仍能推进本地 base revision。
 
 ## 13. Push session
 
@@ -675,7 +705,7 @@ interface CreatePushSessionRequest {
 }
 ```
 
-服务端处理 create 时先认证 HumanDeviceCredential 并重载当前用户，再以 `(credentialFamilyId, idempotencyKey)` 查询既有 session：存在则校验它属于同一 user/device/vault/Space、全部绑定字段相同且该用户仍可读该 Space，然后直接返回当前状态/result；恢复路径不再要求原 base 等于当前 head，也不要求当前仍有发布权。不存在时才检查 Space 读取/发布能力，并要求 base revision 等于当前 head，不接受仍存在但已经落后的 revision。finalize 时必须在发布事务内再次检查。创建与 finalize 之间 head 改变时返回 `BASE_STALE`。
+服务端处理 create 时先认证 HumanDeviceCredential 并重载当前用户，再以 `(credentialFamilyId, idempotencyKey)` 查询既有 session：存在则校验它属于同一 user/device/vault/Space、全部绑定字段相同且该用户仍可读该 Space，然后直接返回当前状态/result；恢复路径不再要求原 base 等于当前 head，也不要求当前仍有发布权。不存在时才检查 Space 读取/发布能力，并要求 base revision 等于当前 head，不接受仍存在但已经落后的 revision。“查询既有或创建”必须依赖 `(credentialFamilyId, idempotencyKey)` 唯一约束并在唯一冲突后重读既有记录，两个并发 create 不能创建两个 session。finalize 时必须在发布事务内再次检查。创建与 finalize 之间 head 改变时返回 `BASE_STALE`。
 
 ```ts
 interface CreatePushSessionResponse {
@@ -687,12 +717,12 @@ interface CreatePushSessionResponse {
   result: FinalizePushResponse | null;
 }
 
-type PushSessionStatus = "uploading" | "ready_to_finalize" | "finalizing" | "published" | "aborted" | "expired";
+type PushSessionStatus = "uploading" | "ready_to_finalize" | "published" | "aborted" | "expired";
 ```
 
 TypeScript 中 `FinalizePushResponse` 与 `PushSessionStatus` 可以按声明提升互相引用；运行时 Schema 必须使用惰性引用或先定义 finalize result Schema，不能产生模块初始化循环。
 
-相同 idempotency key 的创建重试只有在 user、credential family、Space、base revision、confirmation hash、changeCount 和 totalBodyBytes 全部相同时才返回同一 session 的当前状态和已持久化 result，状态码仍为 `201`；任一项不同返回 `IDEMPOTENCY_MISMATCH`。因此 finalize 已成功但本地 session ID 未持久化时，同一 credential 或同 family 的轮换 credential 重试 create 也能恢复同一结果。轮换凭据只能恢复既有 session，不能上传、finalize 或终止它。
+相同 idempotency key 的创建重试只有在 user、credential family、Space、base revision、confirmation hash、changeCount 和 totalBodyBytes 全部相同时才返回同一 session 的当前状态和已持久化 result，状态码仍为 `201`；任一项不同返回 `IDEMPOTENCY_MISMATCH`。因此 finalize 已成功但本地 session ID 未持久化时，同一 credential 或同 family 的轮换 credential 重试 create 也能恢复同一结果。轮换凭据只能恢复既有 session，不能上传、finalize 或终止它；旧 session 未发布时客户端必须以新确认和新 idempotency key 开始另一 session，旧 staging 按 TTL 清理。
 
 `changeCount` 是 `0..100000` 的安全整数，`totalBodyBytes` 是非负安全整数且受租户配额限制。`changeCount = 0` 时 `totalBodyBytes` 必须为 0，session 创建后立即为 `ready_to_finalize`，不上传批次；非零时初始为 `uploading`。
 
@@ -744,7 +774,9 @@ interface PushBatchReceipt {
 - 批次顺序可以乱序到达；finalize 负责检查索引完整性。
 - 批次不能为空；batch index 必须从 0 开始连续。`changeCount > 0` 时 finalize 要求 `0..maxReceivedIndex` 每个 index 恰好存在一次，且全部 changes 数量等于 changeCount；`changeCount = 0` 时批次集合必须为空，完整性条件为空真。
 - 同一 page ID 不得跨批次重复；finalize 发现重复返回 `PAYLOAD_INVALID`。
-- 任一批次使 session 累计 change 数或 totalBodyBytes 超过创建声明时立即返回 `PAYLOAD_INVALID`，不保存该批次。
+- upsert 的 page ID 如已存在于同一 Space 的未归档 Page，表示更新；如已存在于同一 Space 的归档 Page，表示恢复同一 Page，必须清除 `deletedAt`、校验路径唯一并写恢复前 PageVersion；如不存在，表示创建。若该 page ID 存在于另一 Space，返回 `PAGE_ID_CONFLICT`，不转移原页。
+- 数据库必须对 `(sessionId, pageId)` 建立唯一约束。每次 PUT batch 都必须与 DELETE/finalize 使用同一 Push session `SELECT ... FOR UPDATE` 行锁；锁内重新检查 credential、状态、expiry 和既有 batch receipt，再在一个事务内写入该批全部 staging rows、receipt、`receivedBatchCount`、累计 change 数/正文 bytes 以及 `ready_to_finalize` 转换。不同 batch 不得发生累计值 lost update，session 进入 aborted/published/expired 后不得再提交 staging。
+- 任一批次使 session 累计 change 数或 totalBodyBytes 超过创建声明时立即返回 `PAYLOAD_INVALID`，整批不保存。上传结束只有“累计值等于声明值”才能把 session 置为 `ready_to_finalize`；小于声明值保持 `uploading`。
 - receipt 是 `base64url(HMAC-SHA-256(serverPepper, sessionId + "\n" + batchIndex + "\n" + batchHash))`；客户端只需原样持久化，不用于授权。
 
 ### 13.3 原子 finalize
@@ -771,6 +803,8 @@ finalize 必须：
 7. 校验 page ID、路径、标题、正文、hash 和路径唯一性。
 8. 记录人类用户、设备 credential、来源 `obsidian_sync` 和确认 hash。
 9. 发布所有页面更新和归档，并推进一个新 revision。
+
+finalize 对同一 session 使用第 13.2 节 PUT 和第 13.6 节 DELETE 共享的数据库行锁，并在同一发布事务内完成所有动作。第一个请求持锁验证 `ready_to_finalize`，写 Page/ChangeSet/revision、`publishedChangeSetId` 和完整 result，然后直接把 session 提交为 `published`。并发 finalize 必须等待该行锁：锁释放后如已 `published` 则返回已持久化的同一 result，不启动第二次发布。事务回滚时 session 仍是 `ready_to_finalize`。服务端不持久 `finalizing` 中间状态；该词只用于客户端本地 journal 表示“finalize 请求已发出但结果未知”。
 
 如果 changeCount 为 0，客户端不应创建 session；服务端仍必须接受协议调用并在 finalize 返回 `noop` 和当前 revision，不创建 ChangeSet 或新 revision。如果所有 upsert 与当前 page 完全相同且没有 archive，finalize 同样返回 `noop`，不创建 ChangeSet 或新 revision。
 
@@ -809,7 +843,7 @@ interface PushSessionStatusResponse {
 }
 ```
 
-finalize 已提交但客户端未收到响应时，该端点必须返回持久化的最终结果。查询不得延长 session 到期时间，不得泄漏正文或其他 credential family 的 session。`published`、`aborted`、`expired` session 的不含正文状态至少保留 30 天；staging 正文可在发布、终止或到期后立即删除。在保留期内查询过期 session 固定返回 `200 + status: "expired"`；超过保留期才返回 `PUSH_SESSION_NOT_FOUND / 404`。`PUSH_SESSION_EXPIRED / 410` 只用于对已过期 session 执行上传、finalize 或 DELETE 等变更请求。
+finalize 已提交但客户端未收到响应时，该端点必须返回持久化的最终结果。查询不得延长 session 到期时间，不得泄漏正文或其他 credential family 的 session。`published`、`aborted`、`expired` session 的不含正文状态至少保留 30 天；staging 正文可在发布、终止或到期后立即删除，但删除事务必须遵守第 13.6 节的统一 session 行锁。在保留期内查询过期 session 固定返回 `200 + status: "expired"`；超过保留期才返回 `PUSH_SESSION_NOT_FOUND / 404`。`PUSH_SESSION_EXPIRED / 410` 只用于对已过期 session 执行上传、finalize 或 DELETE 等变更请求。
 
 ### 13.5 审计而非二次审核
 
@@ -819,7 +853,7 @@ finalize 已提交但客户端未收到响应时，该端点必须返回持久�
 
 `DELETE /api/sync/v1/spaces/:spaceId/push-sessions/:sessionId`
 
-允许创建该 session 的当前 credential 在未过期且 finalize 前删除 staging，成功返回 `204`。credential family 中的轮换凭据没有终止权限。`finalizing` 或 `published` 状态返回 `PUSH_SESSION_STATE_INVALID`；已过期返回 `PUSH_SESSION_EXPIRED / 410`。到期 session 由服务端安全清理，且清理不得影响已发布 revision。
+允许创建该 session 的当前 credential 在未过期且 finalize 提交前删除 staging，并在事务中把 session 置为 `aborted`，成功返回 `204`。DELETE、PUT、finalize，以及所有“标记 expired/删除 staging”的请求路径和后台 cleanup worker 必须先取得同一 session `SELECT ... FOR UPDATE` 行锁，并在锁内按数据库当前时间重查状态与 expiry。这样不会在发布中途删 staging，也不会在 session 已进入确定状态后反向改状态；`published/aborted` 只允许清理 staging 正文，不能改变已持久化状态或 result。credential family 中的轮换凭据没有终止权限。`published` 状态返回 `PUSH_SESSION_STATE_INVALID`；已过期返回 `PUSH_SESSION_EXPIRED / 410`。到期 session 由服务端按上述锁规则清理，且清理不得影响已发布 revision。
 
 ## 14. 容量和分页要求
 
@@ -848,6 +882,7 @@ interface SyncApiErrorResponse {
 
 - `AUTHENTICATION_REQUIRED`
 - `DEVICE_CREDENTIAL_REVOKED`
+- `DEVICE_CREDENTIAL_EXPIRED`
 - `USER_INACTIVE`
 - `SPACE_FORBIDDEN`
 - `SPACE_READ_ONLY`
@@ -883,7 +918,7 @@ interface SyncApiErrorResponse {
 
 | Error code | HTTP | retryable |
 |---|---:|---|
-| `AUTHENTICATION_REQUIRED`, `DEVICE_CREDENTIAL_REVOKED` | 401 | false |
+| `AUTHENTICATION_REQUIRED`, `DEVICE_CREDENTIAL_REVOKED`, `DEVICE_CREDENTIAL_EXPIRED` | 401 | false |
 | `USER_INACTIVE`, `SPACE_FORBIDDEN`, `SPACE_READ_ONLY` | 403 | false |
 | `INSTALLATION_NOT_FOUND`, `PUSH_SESSION_NOT_FOUND` | 404 | false |
 | `INSTALLATION_REVOKED`, `PUSH_SESSION_EXPIRED`, `REVISION_GONE` | 410 | false |
@@ -902,6 +937,7 @@ interface SyncApiErrorResponse {
 - 生产服务地址必须是 HTTPS。
 - 仅 development 模式允许 loopback HTTP。
 - URL 禁止嵌入用户名或密码。
+- `/api/integrations/obsidian/*`、`/api/sync/v1/*` 和设备 session 路由不得返回 3xx；服务端必须在原请求 URL 直接返回终态成功或结构化错误。这是移动端 Obsidian `requestUrl` 无手动 redirect 控制时的强制服务端边界。
 - credential 使用 `Authorization: Bearer <secret>`。
 - 敏感响应设置 `Cache-Control: no-store`。
 - 服务端日志中对 code、credential、Authorization 和正文做默认删除或脱敏。
@@ -943,7 +979,18 @@ interface SyncApiErrorResponse {
 27. finalize 成功但响应丢失、创建凭据随后撤销时，同一 user/device/vault 的轮换凭据只能查询原结果，不能继续写旧 session；不同 identity 无法查询。
 28. Relation/Memory-only revision 保持同一权威 sequence、相同 Page hash 和空 sync v1 Delta；随后 Page revision 的 parent/sequence 连续。
 29. create session 响应丢失且该推送已使 head 前进后，以同一幂等键仍能恢复同一 session 及完全相同 result，不因原 base 已落后返回 `BASE_STALE`；任一绑定字段变化均返回 `IDEMPOTENCY_MISMATCH`，不同 credential family 不互相碰撞。
-30. expand/backfill/contract 每阶段均可中断和重试；历史 rows 只由对应历史 revision 重建，旧应用回滚不会读取半迁移必填状态。
+30. expand/backfill/contract 每阶段均可中断和重试；历史 rows 只由对应历史 revision 重建。Release A 双写期间可回滚到旧应用；Release B 停止 legacy JSON 双写后只回滚到 Release A 兼容二进制，不尝试回滚到不理解 nullable 字段的旧代码。
+31. 并发 exchange 对同一 user/device/vault 复用并锁定同一 credential family，最终最多留下一个可激活 provisional；较早 provisional 被替换后不能再 activate，并发 activate 最终只留下一个 active credential。installation 状态、旧 provisional 撤销、新 provisional 创建和审计事务中任一故障都不会产生已消费但无凭据或有凭据但 installation 仍 pending 的状态。
+32. 并发相同 create session 仅创建一条 session；同批并发上传的 staging rows、receipt 与累计值原子一致，跨批 page ID 重复被数据库唯一约束拒绝。
+33. 两个并发 finalize 最多发布一个 ChangeSet 和一个 revision；第二个请求等待行锁后返回同一 result。发布事务回滚后 session 仍为 `ready_to_finalize` 且可重试，服务端不会留下无 result 的 `finalizing`。
+34. Delta 的 from=head 返回空项与原 revision；Relation/Memory-only revision 则返回空项但前进 to revision。两种情况在分页 cursor 和插件 base 推进中都能区分。
+35. `idFileKey` 对大小写不同的合法 ID 生成不同 key；COM¹–COM³/LPT¹–LPT³、空标题和控制字符标题在协议包与服务端得到相同拒绝结果。
+36. 所有 Obsidian integration、session 和 sync v1 路由对正确 URL 直接返回终态响应，集成测试断言不出现 3xx。
+37. 对同一 Space 已归档 page ID 的 upsert 恢复原 Page 并写 PageVersion；跨 Space 重用 page ID 返回 `PAGE_ID_CONFLICT`，不会静默移动页面。
+38. exchange 后进程在 Secret Storage、本地 journal、session 验证和 activate 的每个间隙退出时，未激活凭据最长 10 分钟失效并返回专用 expired 错误；activate 响应丢失后重试/GET session 能确定 active 结果，且任何时候同一 user/device/vault 最多一个 active credential。
+39. credential 轮换后，同 family 新凭据只能恢复查询旧 Push session 的已发布结果；未发布 session 不能继续写或 finalize，客户端以新确认和新 idempotency key 重建。不同 family 无法查询旧 session 时通过 head/Pull 判断并收敛，不盲目重复未知发布。
+40. 两个不同 batch 的并发 PUT 与 DELETE/finalize/expiry cleanup 竞争时全部通过同一 session 行锁线性化；累计数量/字节不丢更新，aborted/published/expired 后无 staging 晚提交，cleanup 不能删除正在 finalize 所需的 staging 或改变确定结果。
+41. 两个 Space 并发创建同一 pageId 时，全局数据库约束只允许一个内部 Page/identity 成功，另一事务返回 `PAGE_ID_CONFLICT`；历史跨 Space 重复会阻塞迁移而非静默重写。
 
 ## 18. 跨仓实施规则
 
