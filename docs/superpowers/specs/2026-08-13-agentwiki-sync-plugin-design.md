@@ -5,7 +5,7 @@
 - 产品名称：`AgentWiki Sync`
 - Obsidian 插件 ID：`agentwiki-sync`
 - 设计确认日期：2026-08-13
-- 状态：已完成第五轮可实现性复审与修订，等待用户最终确认
+- 状态：已完成第六轮可实现性复审与修订，等待用户最终确认
 - 依赖契约：[`docs/contracts/agentwiki-obsidian-sync-api-v1.md`](../../contracts/agentwiki-obsidian-sync-api-v1.md)
 
 ## 1. 背景与目标
@@ -37,6 +37,7 @@ AgentWiki Sync 是独立发布、独立版本化的 Obsidian 社区插件。首�
 - 使用人类设备同步凭据，按当前用户和实时 Space 角色授权。
 - 支持分页 Snapshot/Delta、分批上传和原子 finalize。
 - 在单 Space 5,000 篇 Markdown、正文总计 100 MiB、单篇不超过 1 MiB 的基线下验收。
+- 插件 v1 只绑定服务端 pageCount 与本地 Markdown 均不超过 5,000 的 Space；AgentWiki 本身可容纳更大 Space，但插件显示不兼容诊断且不下载正文或同步。
 
 ### 2.2 不包含
 
@@ -184,8 +185,8 @@ flowchart TB
 
 ### 4.6 适配器
 
-- `Vault Adapter`：仅通过 Obsidian Vault、FileManager、MetadataCache 和 Adapter API访问 Vault；不得使用 Node `fs`。
-- `Control Store`：读写 `.agentwiki/` 下的 config、manifest、base 和 transaction。
+- `Vault Adapter`：只负责映射目录中 Obsidian 可见的 Markdown，使用 Vault、FileManager 和 MetadataCache；不得用 DataAdapter 绕过 Obsidian 的文件事件与缓存，也不得使用 Node `fs`。
+- `Control Store`：`.agentwiki/` 是隐藏目录，只通过跨平台 `app.vault.adapter` 的 `exists/stat/list/read/readBinary/write/writeBinary/mkdir/rename/remove/rmdir` 操作经 `normalizePath()` 处理的 Vault 相对路径。禁止向下转型 `FileSystemAdapter`、读取绝对 base path 或使用 Node `fs`。next/prev/journal 恢复始终按第 5 节可重放协议实现，不假设 DataAdapter rename 具有 OS 级原子性。
 - `AgentWiki Client`：通过 Obsidian 跨平台请求 API 调用公开 HTTPS API，并用稳定协议包做运行时校验。
 
 ### 4.7 公开协议包
@@ -257,33 +258,67 @@ interface AgentWikiDeviceConfigV1 {
   }>;
 }
 
+interface CurrentGenerationPointerV1 {
+  schemaVersion: 1;
+  generationId: string;
+  manifestHash: string;
+}
+
+interface MoveHintsV1 {
+  schemaVersion: 1;
+  items: Array<{
+    pageId: string;
+    fromPath: string;
+    toPath: string;
+    observedVaultByteHash: string;
+    recordedAt: string;
+  }>;
+}
+
 interface DeviceLocalStateV1 {
   schemaVersion: 1;
   deviceId: string;
   boundVaultId: string | null;
   credentialSecretId: string | null;
   connectedServerInstanceId: string | null;
-  connectionJournal: null | {
-    phase: "credential_stored" | "activating" | "activated";
-    serverUrl: string;
-    serverInstanceId: string;
-    vaultId: string;
-    credentialId: string;
-    credentialSecretId: string;
-  };
+  connectionJournal: ConnectionJournalV1 | null;
 }
+
+interface ConnectionJournalBaseV1 {
+  serverUrl: string;
+  vaultId: string;
+  exchangeId: string;
+  codeSecretId: string;
+  credentialSecretId: string;
+  deviceName: string;
+  pluginVersion: string;
+}
+
+type ConnectionJournalV1 =
+  | (ConnectionJournalBaseV1 & {
+      phase: "exchange_prepared";
+      serverInstanceId: null;
+      credentialId: null;
+    })
+  | (ConnectionJournalBaseV1 & {
+      phase: "credential_stored" | "activating" | "activated";
+      serverInstanceId: string;
+      credentialId: string;
+    });
 ```
 
 - `serverUrl` 未配置时为空字符串；非空时必须是无用户名和密码的绝对 URL。非 loopback 地址只允许 HTTPS。
 - `serverInstanceId` 来自设备会话响应，用于防止更换域名或服务器后误复用相同 Space ID。
 - `vaultId` 是该 Vault 首次加载时写入 `.agentwiki/vault.json` 的随机 UUID，不是凭据。若新建与读取竞态导致出现两个不同 ID，插件必须停止连接并提示用户保留一个，不能自动改写已连接设备的 identity。
 - `credentialSecretId` 只存在 `DeviceLocalStateV1`，是 Obsidian Secret Storage 中条目的引用名；不进入 Vault 内任何 `.agentwiki/**/*.json`，避免其被其他 Vault 同步机制传到另一设备。
-- 每个 credential 使用独立 Secret ID，固定格式为 `agentwiki-sync-<server-instance-id>-<device-id>-<credential-id>` 的小写字母、数字和连字符；UUID 中的连字符保留。新 provisional 凭据不覆盖旧 active 凭据的 secret。
+- 每次 exchange 使用两个独立 Secret ID：`agentwiki-sync-code-<exchange-id>` 短期保存一次性 code，`agentwiki-sync-credential-<device-id>-<exchange-id>` 保存预生成 credential；均只含小写字母、数字和连字符。exchange 成功或终态失败后立即用空字符串覆写 code secret；credential secret 在新 active 连接完成前不覆盖旧 active secret。
 - 真正的设备凭据只存 Secret Storage。
 - `DeviceLocalStateV1` 使用 `App.saveLocalStorage("agentwiki-sync-device-v1", value)` 保存，不进入 `.agentwiki/`。`deviceId` 首次加载时生成并不随共享 Vault 文件同步，确保每台设备独立连接。
 - `boundVaultId` 在当前设备首次开始连接时固定为当时 `.agentwiki/vault.json` 的 `vaultId`；connection journal 也保存同一值。插件启动、连接恢复以及每次联网或 Vault 写操作前都重新读取 vault identity。若 `vault.json.vaultId`、`boundVaultId`、journal vaultId 或 session 返回的 vaultId 任一不一致，立即冻结该设备的连接和全部映射，不能自动采用外部同步覆盖后的 identity；用户必须显式恢复原 `vault.json` 或执行“作为新 Vault 重新连接”。
 - “已连接”只在当前设备 config 的 `serverInstanceId`、device-local `connectedServerInstanceId`、`boundVaultId`、Secret Storage 中的非空 secret，以及服务端 active session 的 serverInstanceId/deviceId/vaultId 全部与当前 config/device-local/vault identity 一致时成立。
 - 新映射先以 `pending` 保存，只供首次绑定与事务恢复使用，不进入普通 Status/Pull/Push Space 列表。第一个 generation 指针校验成功后才在同一本地提交流程中改为 `active`；取消且没有可恢复 journal 时删除 pending 项。映射 config 是设备本地的；新设备即使已收到共享 Vault 的 Markdown，也必须独立选择 Space/rootPath 并走首次绑定，不复用其他设备的 active 映射。
+
+所有本地持久化结构（vault identity、device config、device-local state、current pointer、manifest、move hints、pending identities 和 Pull/Push journal）都必须有严格运行时 Schema。首版只接受精确 `schemaVersion: 1`：文件缺失走各自的初始化/无基线分支；JSON/字段/hash 损坏进入对应 corrupt/frozen 状态；未知更高版本必须只读冻结并原样保留，提示升级插件，禁止忽略未知字段后覆写。未来较低版本只能通过显式、幂等的 `next/prev` 迁移器升级；迁移任何控制文件前，必须先用其原版本 Schema 恢复或收敛所有 journal。DeviceLocalState 迁移同样先写新 key、重读校验、切换引用，再清理旧 key。
 
 ### 5.3 `manifest.json`
 
@@ -359,8 +394,9 @@ Push journal 状态为：
 - `aborted`
 - `expired`
 - `superseded`（仅本地，表示创建 session 的 credential 已被替换）
+- `failed`（仅本地，表示已确认 payload/sidecar/journal 损坏或无法唯一恢复）
 
-Push journal 保存 base revision、不可变确认 manifest、idempotency key、远端 session ID、创建 session 时的 credential ID、已确认批次 receipt，以及 `payload/p-<page-key>.md` 中用户确认时的规范化正文快照；不保存设备凭据。插件启动时不自动联网恢复 Push；用户下次打开同步中心时，插件先按第 5.8 节的本地幂等状态机恢复。创建 session 的 credential 仍 active 时，`uploading/ready_to_finalize` 可以继续上传或请求 finalize；`finalizing` 必须先查询，不能猜测失败；`published` 只做本地 generation 提交；`aborted/expired/superseded` 不能继续原确认，只能按第 5.8 节收敛并保留 Vault 变化，重新计算预览取得新确认。如果 session 创建响应丢失或 session ID 尚未落盘，先用同一 idempotency key 重试 create 取回同一 session。任何状态都不能用同一 idempotency key 创建不同 payload。
+Push journal 保存 base revision、不可变确认 manifest、idempotency key、远端 session ID、创建 session 时的 credential ID、已确认批次 receipt，以及 `payload/p-<page-key>.md` 中用户确认时的规范化正文快照；不保存设备凭据。插件启动时不自动联网恢复 Push；用户下次打开同步中心时，插件先按第 5.8 节的本地幂等状态机恢复。创建 session 的 credential 仍 active 时，`uploading/ready_to_finalize` 可以继续上传或请求 finalize；`finalizing` 必须先查询，不能猜测失败；`published` 只做本地 generation 提交；`aborted/expired/superseded` 不能继续原确认，只能按第 5.8 节收敛并保留 Vault 变化，重新计算预览取得新确认；`failed` 冻结 Space 并保留所有证据，不能自动重建确认内容。如果 session 创建响应丢失或 session ID 尚未落盘，先用同一 idempotency key 重试 create 取回同一 session。任何状态都不能用同一 idempotency key 创建不同 payload。
 
 成功且本地 `verified`，或明确 abort 后才删除 payload；未知结果、离线、查询失败或本地 generation 未验证时必须保留。服务端已发布时，以 journal 中的确认快照而不是当前 Vault 内容推进 base；用户在确认后的新编辑因此仍会被 Status 判定为 `modified`。
 
@@ -445,6 +481,35 @@ Pull 冲突解决如果使一个不再存在于远端 `toRevision` 的原 page I
 ### 5.8 Push journal Schema
 
 ```ts
+interface PushBatchReceiptFileV1 {
+  schemaVersion: 1;
+  sessionId: string;
+  batchIndex: number;
+  batchHash: string;
+  receipt: string;
+}
+
+interface PushConfirmationSidecarHeaderV1 {
+  schemaVersion: 1;
+  protocolVersion: "1";
+  spaceId: string;
+  baseRevision: string;
+}
+
+interface PushConfirmationSidecarEntryV1 {
+  schemaVersion: 1;
+  ordinal: number;
+  change: PushManifestChangeV1;
+}
+
+interface PushBatchIndexEntryV1 {
+  schemaVersion: 1;
+  batchIndex: number;
+  firstChangeOrdinal: number;
+  lastChangeOrdinal: number;
+  batchHash: string;
+}
+
 interface PushJournalV1 {
   schemaVersion: 1;
   kind: "push_upload";
@@ -455,16 +520,23 @@ interface PushJournalV1 {
   oldGenerationId: string | null;
   newGenerationId: string;
   previewHash: string;
-  confirmationManifest: PushConfirmationManifestV1;
+  confirmationManifestPath: string;
+  confirmationSidecarHash: string;
+  confirmationCanonicalByteLength: number;
   confirmationHash: string;
   changeCount: number;
   totalBodyBytes: number;
   idempotencyKey: string;
+  previewCapabilities: SyncCapabilities;
+  previewCapabilitiesHash: string;
   credentialIdAtCreation: string;
-  remoteState: "not_created" | "uploading" | "ready_to_finalize" | "finalizing" | "published" | "aborted" | "expired" | "superseded";
+  remoteState: "not_created" | "uploading" | "ready_to_finalize" | "finalizing" | "published" | "aborted" | "expired" | "superseded" | "failed";
   sessionId: string | null;
   sessionExpiresAt: string | null;
-  uploadedBatches: Array<{ batchIndex: number; batchHash: string; receipt: string }>;
+  batchIndexPath: string;
+  batchIndexHash: string | null;
+  batchReceiptDirectory: string;
+  uploadedBatchCount: number;
   sessionCapabilities: SyncCapabilities | null;
   publishedRevision: string | null;
   publishedRevisionContentHash: string | null;
@@ -473,11 +545,15 @@ interface PushJournalV1 {
 }
 ```
 
-Push 预览确认后先以 `remoteState: "not_created"` 持久化 journal 与 payload，再创建远端 session。每个 upsert 的正文必须能由 `payload/p-<page-key>.md` 和 confirmation manifest 完整重建。`changeCount/totalBodyBytes` 从该快照计算并在同一 journal 写入中固定；create 成功后立即持久化 `sessionCapabilities`，所有恢复分批都使用该值，不用当前 session 以外的新 capability 重新分批。只有成功查询到 `published` 或成功收到 finalize 响应后，才可用这些快照更新 base 与 manifest。
+Push 预览前先 GET active session，严格校验完整 `SyncCapabilities` 并持久化 `previewCapabilities` 及其 hash。确认后以 `remoteState: "not_created"` 持久化 journal、payload 和 sidecar，再携带该 hash 创建远端 session。`confirmationManifestPath` 指向按 change tuple 排序的 UTF-8 JSONL sidecar：首行是 `PushConfirmationSidecarHeaderV1`；之后每行是 `{ schemaVersion: 1, ordinal, change }` 的严格 `PushConfirmationSidecarEntryV1`，不得省略版本/ordinal。`batchIndexPath` 是创建 session capability 固定后一次生成的不可变 JSONL，每行是完整 `PushBatchIndexEntryV1`。每个成功 receipt 独立写入 `batchReceiptDirectory/b-<index>.json`，用 `.next/.prev` 校验替换；journal 只保存路径、byte length/count/hash 和已确认批次数，不内嵌全部 changes/receipts。每个 upsert 的正文必须能由 `payload/p-<page-key>.md` 和 manifest sidecar 完整重建。JSONL 只是本地存储格式，不进入 HTTP；计算 `confirmationHash` 时把逻辑 manifest canonical 化为不超过 preview capability `maxConfirmationBytes` 的 Uint8Array，结果必须与协议包 `confirmationHash()` 一致。v1 最多 5,000 changes/4 MiB confirmation，因此该单次有界分配符合 32 MiB 预算；超过任一限制在预览前阻塞。`changeCount/totalBodyBytes` 流式计算并在同一 journal 写入中固定；create 只有返回完全相同 capabilities/hash 才接受，否则作为协议错误终止 session并废弃预览；成功后立即持久化 `sessionCapabilities`，所有恢复分批都通过 ordinal 索引流式重建相同 partition/batchHash，不用新 capability。只有成功查询到 `published` 或成功收到 finalize 响应后，才可用这些快照更新 base 与 manifest。
+
+sidecar 写完后必须重读并用 journal 中的 `confirmationSidecarHash/batchIndexHash` 校验；batch index 尚未由 session capability 生成时 hash 为 null。receipt 文件至少绑定 sessionId、batchIndex、batchHash 和 receipt。若远端已接收批次但进程在 receipt 文件或 `uploadedBatchCount` 提交前退出，恢复器以不可变 batch index 重放同一 batch并取得相同 receipt，再扫描全部 receipt 文件重算 uploadedBatchCount；journal 中的计数只是可修复缓存。sidecar/hash 不一致进入 `failed`，不得从当前 Vault 重新生成已经确认的 payload。
+
+journal 中所有控制路径都不是自由输入：加载后必须验证 `confirmationManifestPath/batchIndexPath/batchReceiptDirectory` 精确等于由当前 device namespace、transactionId 和固定文件名推导的规范化路径，payload/base/snapshot/result key 也只能由已校验 pageId/action ordinal 推导。任何绝对路径、`..`、反斜杠、NFC 后不等价或指向 transaction/Space control root 之外的值均按控制目录损坏冻结；Control Store 不对未验证的 journal path 执行 read/write/rename/remove。
 
 `remoteState: "published"` 表示服务端结果已经确定，不表示本地基线已经提交。收到或恢复最终结果后，先原样持久化 `publishedResult` 及 revision/hash，再用固定 `newGenerationId` 从旧 generation 与 payload 幂等构造新 generation，按 `generation_written → pointer_switched → verified` 推进；首次“本地有内容、远端页面为空”时 `oldGenerationId = null`，构造输入固定为首次绑定时远端 head revision `R` 的空页面集；Relation/Memory-only 变更可能使 `R` 不是 `0`。任一阶段重启都重读校验后继续；只有 `verified` 才删除 payload 和 journal。服务端 finalize 返回 `status: "noop"` 时也把 `remoteState` 记为 `published`，但不创建新 generation：只验证当前 generation revision/hash 与响应相同后清理；不相同则要求 Pull。首次本地发布不会生成 noop，因为至少包含一个 upsert。
 
-若当前 active credential ID 不等于 `credentialIdAtCreation`，新凭据只允许查询旧 session，不能继续上传、finalize 或 DELETE。插件先查询：已 `published` 则按持久化结果完成本地提交；仍为 `uploading/ready_to_finalize`、`aborted` 或 `expired` 时把本地 journal 标为 `superseded`，保留 Vault 变化并要求重新 Status/预览，生成新的 idempotency key；查询因不同 credential family 返回不可见时，先比较远端 head，head 前进则必须 Pull，head 仍等于 journal base 才可丢弃旧上传并重新预览。任何分支都不得用旧 idempotency key 创建新 payload。用户确认放弃 superseded journal 后才删除其 payload；远端旧 staging 由 TTL 清理。
+若当前 active credential ID 不等于 `credentialIdAtCreation`，新凭据不能上传、finalize 或 DELETE。sessionId 已知时只 GET；sessionId 为 null 时，允许以原 journal 完全相同的 idempotency key、capability hash 和全部绑定字段 exact create replay，这只是恢复 server session identity/result，不创建新 payload。恢复结果已 `published` 则按持久化结果完成本地提交；仍为 `uploading/ready_to_finalize`、`aborted` 或 `expired` 时把本地 journal 标为 `superseded`，保留 Vault 变化并要求重新 Status/预览，生成新的 idempotency key，不能继续写旧 session。查询/exact replay 因不同 credential family 返回不可见时，先比较远端 head，head 前进则必须 Pull，head 仍等于 journal base 才可丢弃旧上传并重新预览。任何分支都不得用旧 idempotency key 创建新 payload。用户确认放弃 superseded journal 后才删除其 payload；远端旧 staging 由 TTL 清理。
 
 ## 6. 身份、连接与权限
 
@@ -492,9 +568,9 @@ Push 预览确认后先以 `remoteState: "not_created"` 持久化 journal 与 pa
 
 插件不自动打开浏览器、不弹出多步向导。用户可主动点击帮助链接或 AgentWiki 地址。
 
-exchange 返回的 credential 先是最长 10 分钟的 provisional 凭据，仅能调用 session、activate 和撤销端点。落盘顺序固定为：把当前 vaultId 写入 connection journal；把 credential 写入新 credential 专用 Secret ID 并立即读回比对；写入 `phase = "credential_stored"`，但不改当前 `credentialSecretId`；用新 credential 查询 provisional session 并核对 serverInstanceId/deviceId/vaultId；把 phase 改为 `activating` 并请求 activate；再次查询到 active session 后写 config 的 serverUrl/serverInstanceId，原子替换 device-local boundVaultId/secret ID/connectedServerInstanceId 并清除 journal，最后用空字符串覆写旧 Secret ID。SecretStorage API 为同步调用，但写入后仍必须读回比对。旧 secret 清理失败只留待下次本地清理，不回退已验证的新 active 连接。
+插件用 Web Crypto 生成 32 个随机字节的 base64url credential 和随机 exchangeId，先把 code 与 credential 分别写入上述两个 Secret ID 并读回比对，再把请求元数据、两个 Secret ID 和 `phase = "exchange_prepared"` 写入 device-local connection journal；只有这些步骤成功后才发送 exchange。响应不返回 credential，只返回最长 10 分钟的 provisional 元数据。exchange 网络/429/500 结果不确定时，从 journal 和 Secret Storage 重建完全相同的请求重试；响应成功后必须先把 credentialId/serverInstanceId 与 `phase = "credential_stored"` 持久化并重读校验，随后才覆写 code secret。再用该 credential 查询 provisional session并核对 serverInstanceId/deviceId/vaultId，推进 `activating` 并请求 activate；再次查询到 active session 后写 config 的 serverUrl/serverInstanceId，原子替换 device-local boundVaultId/credentialSecretId/connectedServerInstanceId 并清除 journal，最后用空字符串覆写旧 active Secret ID。SecretStorage API 为同步调用，但写入后仍必须读回比对。旧 secret 清理失败只留待下次本地清理，不回退已验证的新 active 连接。
 
-插件启动时不自动联网，但如果有 connection journal，设置页要原地显示“继续连接”。用户点击后：若 secret 存在且 session 已 active，完成本地 config；若仍 provisional，幂等重试 activate；若已过期/撤销，恢复未连接状态并清空 secret。exchange 后、activate 前的任何本地失败都尝试撤销 provisional 凭据；撤销失败也不会留下长期写权，因为未激活凭据会自动过期。activate 已成功但响应丢失时不撤销或猜测，由 journal + session 查询恢复。
+插件启动时不自动联网，但如果有 connection journal，设置页要原地显示“继续连接”。用户点击后：`exchange_prepared` 先用预生成 credential GET session；若已存在 provisional/active session，则从响应补齐 credentialId/serverInstanceId 并先推进/校验 `credential_stored`，无需 code；只有 GET 返回认证失败且 code secret 非空时，才以 Secret Storage 中同一 exchangeId/code/credential 重试 exchange。credential 对应 session 已 active 则完成本地 config；仍 provisional 则幂等重试 activate；已过期/撤销则恢复未连接状态并清空 journal/两个 pending secret。exchange 后、activate 前的任何本地失败都尝试撤销 provisional 凭据；撤销失败也不会留下长期写权，因为未激活凭据会自动过期。activate 已成功但响应丢失时不撤销或猜测，由 journal + session 查询恢复。code 明文只在设置输入内存和短期 Secret Storage 中存在；不进入 device-local JSON、`.agentwiki/`、日志或诊断。
 
 设置页在开始 exchange 前检查当前设备所有 Space 的 Push journal。存在未确定结果或尚未终止的旧 session 时，先在同步中心恢复、查询或终止；不能直接轮换凭据。用户只有在看到“旧 session 之后只能查询、不能继续写”的明确提示后，才可选择强制继续连接；该选择不删除 journal，并在 activate 后按第 5.8 节进入 `published` 恢复或 `superseded` 收敛。外部 Web 撤销等非插件内事件仍由同一恢复规则处理。
 
@@ -502,7 +578,7 @@ exchange 返回的 credential 先是最长 10 分钟的 provisional 凭据，仅
 
 ### 6.2 人类设备凭据
 
-- 安装码只在交换请求期间存在内存，交换结束立即清除输入状态。
+- 安装码只在设置输入内存和本次 exchange 的短期 Secret Storage 中存在；交换成功或终态失败后立即覆写并清除引用。
 - 换取的凭据代表创建安装码的人类用户，而不是 Agent。
 - 每台设备独立交换、独立撤销、独立审计。
 - 每次请求重新检查用户有效状态。
@@ -517,7 +593,7 @@ exchange 返回的 credential 先是最长 10 分钟的 provisional 凭据，仅
 
 1. 活动文件位于某个映射目录时，默认选择该 Space；否则显示 Space 选择器。
 2. 先验证已绑定 `rootPath` 存在且是 `TFolder`，当前 generation 完整，且没有未恢复事务。未完成的 Push 不改写 Vault，所以 Status 仍可扫描并显示本地变化，但必须额外显示 pending Push 并禁止另一个 Pull/Push；未恢复 Pull 或 `failed` journal 则直接冻结该 Space。
-3. 通过 Vault API 枚举该目录下全部可见 Markdown，并逐一读取；枚举、读取或 stat 任一失败都把本次扫描标记为不完整。
+3. 通过 Vault API 枚举该目录下全部可见 Markdown，并逐一读取；枚举、读取或 stat 任一失败都把本次扫描标记为不完整。第 5,001 个 Markdown 使状态成为 `space_too_large`，停止读取正文且禁止绑定/Pull/Push。
 4. 只有完整扫描才能与 manifest 和 base 比较并产生本地状态。
 5. 请求远端 revision head，不下载正文。
 6. 显示本地变化、远端是否领先、附件链接警告和阻塞错误。
@@ -538,6 +614,8 @@ exchange 返回的 credential 先是最长 10 分钟的 provisional 凭据，仅
 - `local_scan_incomplete`
 - `baseline_corrupt`
 - `identity_store_corrupt`
+- `control_version_unsupported`
+- `space_too_large`
 
 离线或请求失败时仍显示本地分类，远端状态显示 `unknown`。Status 永不修改 Vault、manifest、base 或服务端。
 
@@ -549,7 +627,7 @@ exchange 返回的 credential 先是最长 10 分钟的 provisional 凭据，仅
 2. 恢复或冻结未完成事务。
 3. 完成一次与 Status 相同的完整本地扫描；`local_scan_incomplete`、`baseline_corrupt` 或身份歧义不允许进入远端下载/写入预览。
 4. 从 `baseRevision` 分页获取 Delta；服务端无法提供该历史 revision 时获取固定 revision 的分页 Snapshot。
-5. 构造 base、local、remote 三个分支。Delta 模式从旧 generation 逐页复用未变化 base，并用 upsert/archive 覆盖得到精确 remote；Snapshot 模式逐页落盘为 remote。两种模式都以服务端 `toRevisionContentHash` 校验完整 remote manifest 后才能生成预览。即使最终 Page Delta 为空，只要 `toRevision != baseRevision`，Pull 也要生成“仅推进基线”预览并在确认后创建新 generation。
+5. 构造 base、local、remote 三个分支。Delta 模式从旧 generation 逐页复用未变化 base，并用 upsert/archive 覆盖得到精确 remote；Snapshot 模式逐页落盘为 remote。两种模式都以服务端目标 pageCount 和 `toRevisionContentHash` 校验完整 remote manifest；目标或合并后的本地 page identity 集合超过 5,000 时，在生成写入计划前进入 `space_too_large`，不修改 Vault。即使最终 Page Delta 为空，只要 `toRevision != baseRevision`，Pull 也要生成“仅推进基线”预览并在确认后创建新 generation。
 6. 按 page ID 合并路径、标题和正文。
 7. 非重叠正文改动自动合并；冲突转换为结构化冲突块。
 8. 展示新增、修改、移动、回收站删除和冲突解决后的最终预览。
@@ -594,7 +672,7 @@ exchange 返回的 credential 先是最长 10 分钟的 provisional 凭据，仅
 1. 获取 Space 操作锁。
 2. 拒绝存在任何未完成 Pull/Push journal 的新 Push，再完成 Status 同等的完整本地扫描并请求远端 revision head。
 3. 远端领先或状态未知时禁止 Push，要求先 Pull。
-4. 验证路径、正文大小、身份和协议限制。
+4. 验证路径、正文大小、身份、confirmation limits，以及应用 upsert/archive 后远端 pageCount 不超过 5,000。
 5. 展示新增、修改、移动、归档和附件链接警告。
 6. 以确认时的不可变内容快照计算 `confirmationHash` 和幂等键。
 7. 建立 push session，并按服务端能力限制分批上传变更。
@@ -647,7 +725,7 @@ Push 上传、finalize 和本地 generation 提交状态写入 `kind: "push_uplo
 
 首次绑定没有共同 Base，因此不得自动把两份不同正文做 diff3。远端相同 page ID 但不同 path 以远端 path 为准；两个不同 page ID 占用同一路径时，用户必须选定一个保留的 page ID。远端 page ID 优先；本地临时 ID 只有在最终选择发布本地为新页面时保留。
 
-双方都有内容时的身份规则固定为：只有 pathKey 相同的本地/远端页面组成候选同一页，确认后使用远端 page ID。内容 hash 相同但路径不同不自动判为 rename，以免将两篇模板文档误合并；用户可在身份解决界面显式把某个本地路径绑定为某个远端 page ID。本地独有页面只分配新 UUID，远端独有页面保留原 ID。
+双方都有内容时的身份规则固定为：只有 pathKey 相同的本地/远端页面组成候选同一页，确认后使用远端 page ID。内容 hash 相同但路径不同不自动判为 rename，以免将两篇模板文档误合并；用户可在身份解决界面显式把某个本地路径绑定为某个远端 page ID。本地独有页面只分配新 UUID，远端独有页面保留原 ID。候选最终本地 identity 集合超过 5,000 时首次绑定阻塞，不允许靠遗漏页面建立部分基线。
 
 新增 page ID 在第一次展示 Push/首次绑定预览前生成，并写入当前设备的 `.agentwiki/devices/d-<device-key>/spaces/s-<space-key>/pending-identities.json`：
 
@@ -749,6 +827,21 @@ pending identity store 使用 `pending-identities.json.next/.prev` 做同样的�
 - finalize 响应丢失：保留 `finalizing` journal；下次用户主动操作时查询 session 状态，禁止猜测发布结果。
 - finalize 后原 credential 被撤销或轮换：用户以同一 AgentWiki 人类账号为同一 `deviceId + vaultId` 重新连接后，使用服务端恢复授权查询旧 session；若换成不同用户、deviceId、vaultId 或结果已超过保留期，则禁止猜测，保留 journal 并要求 Pull 当前 head。Pull 后若远端已经包含确认 payload，则按普通三方状态收敛；否则原 payload 仍作为本地变化重新预览，绝不盲目重放 finalize。
 
+端点级重试矩阵固定如下。一次用户操作内自动重试最多 3 次、总等待最多 30 秒，指数退避基数 500 ms、上限 8 秒并加入 0–250 ms jitter；`Retry-After` 存在时优先等待该整数秒，但超出剩余 30 秒预算则暂停并显示“继续”。取消只停止尚未发送的下一次尝试，不撤销已发出的请求，也不跨越新的用户确认：
+
+| 请求 | 网络/429/500 后动作 |
+|---|---|
+| 无副作用 GET（session、spaces、head、Snapshot、Delta、查询 Push session） | 在固定 cursor/revision/request 参数下按预算重试；分页任一页最终失败则废弃本次下载，不拼接不同尝试 |
+| exchange | 只从 connection journal + Secret Storage 重放完全相同 exchangeId/code/credential/request；终态 4xx 停止并清理对应 secret |
+| create Push session | 重放同一 idempotency key 和全部绑定字段；不得重新扫描或换 payload |
+| PUT batch | 重放同一 session/batchIndex/batchHash/body；receipt 响应丢失也按同请求恢复 |
+| finalize | 先 GET session；published 则恢复 result，ready_to_finalize 才可重放相同 finalize；uploading/aborted/expired 按状态处理 |
+| DELETE Push session | 先 GET session；aborted/404/410 视为已收敛，published 转本地恢复，仍可终止时才重放 DELETE |
+| activate | 先 GET session；active 则完成，provisional 才重放相同 activate |
+| DELETE current credential | 后续 GET session 返回 401/expired/revoked 视为成功；仍 active 才由用户明确重试 |
+
+非 429 的结构化 `retryable: false` 错误永不自动重放；429 必须服从 Retry-After。`INTERNAL_ERROR` 只允许按上表的幂等/查询收敛路径重试，不能因为 error envelope 标记 retryable 就直接重放任意写请求。
+
 ## 14. 诊断与隐私
 
 诊断允许包含：
@@ -786,9 +879,9 @@ pending identity store 使用 `pending-identities.json.next/.prev` 做同样的�
 - Push 每批默认不超过 100 项且完整 HTTP body 不超过 4 MiB；以服务端返回的更小 capability 为准。
 - 网络、hash、合并和 Vault 写入并发度首版固定为 1；不得把 100 MiB Space 的全部正文拼成一个内存数组或 JSON 字符串。
 - Status 可以在内存保留 5,000 条元数据，但正文逐文件读取、hash 后立即释放。
-- Pull 逐页落到事务 `results/`，Push 逐页落到 `payload/`；UI 只加载当前预览或冲突文件。
+- Pull 逐页落到事务 `results/`，Push 逐页落到 `payload/`，confirmation/batch metadata 使用排序 JSONL sidecar 和 ordinal 索引；UI 对文件列表固定每页最多 100 项，只加载当前页或当前冲突文件。任何路径都不得把 5,000 changes 的正文、全部 receipts 或完整 100 MiB payload 同时解析进内存。
 - 移动端目标是插件同步核心额外峰值 heap 不超过 32 MiB，不含 Obsidian 自身和当前编辑器正文；性能测试通过采样验证。
-- Obsidian 没有跨平台剩余磁盘空间 API。写事务前计算 `estimatedTemporaryBytes = resultBytes + snapshotBytes + newBaseBytes + 10%` 并展示；无法保证剩余空间时必须明确提示。任一 `ENOSPC`/写入失败按事务恢复规则处理。
+- Obsidian 没有跨平台剩余磁盘空间 API。Pull 写事务前计算 `pullTemporaryBytes = resultBytes + snapshotBytes + newBaseBytes + controlMetadataUpperBound + 10%`；Push 确认前先用已固定的 preview capability 对确认快照运行 `partitionPushChanges`，得到精确 batchCount 和每批 canonical body bytes，再计算 `pushTemporaryBytes = payloadBytes + confirmationCanonicalBytes + confirmationSidecarBytes + batchIndexUpperBound + receiptUpperBound + newBaseBytes + controlMetadataUpperBound + 10%`。`batchIndexUpperBound` 按所有实际 batch index entry 序列化 bytes 的 2 倍，`receiptUpperBound` 按精确 batchCount 个最大合法 receipt file bytes 的 2 倍估算；batchCount 必须来自同时应用 `maxBatchItems` 与 `maxBatchBytes` 的 partition 结果，因为字节限制可能使每个 change 独占一批。其他 control metadata 也至少按实际 UTF-8 bytes 的 2 倍保守估算。界面展示对应值；无法保证剩余空间时必须明确提示。任一 `ENOSPC`/写入失败按事务恢复规则处理；服务端已发布后本地 new generation 写入失败时保留 journal/payload，用户释放空间后只继续本地提交，不重复 finalize。
 - Pull 和 Push 每处理一批或 50 个本地文件（取先到者）向事件循环让步并更新进度，移动端 UI 不得长时间无响应。
 
 ## 17. 验证策略
@@ -814,6 +907,7 @@ pending identity store 使用 `pending-identities.json.next/.prev` 做同样的�
 - 预览后、事务开始前、每个 action 前和插件写入后注入用户编辑，验证条件写入不会覆盖新内容。
 - 验证 `Vault.process()` 同步回调仅做 snapshot bytes 比较、不调用异步 Web Crypto，并覆盖 BOM 拒绝、CRLF/LF 与同正文不同原始 bytes 的条件写入。
 - 验证不可变 generation 写入、`current.json.next/current.json.prev` 指针切换、每个 commit 点崩溃恢复、旧 generation 保留和损坏冻结。
+- 验证所有本地 Schema 只接受精确 v1；未知更高版本原样只读冻结，低版本迁移先恢复旧 journal，再通过 next/prev 幂等切换，绝不静默丢字段覆写。
 - 验证 `A ↔ B`、三路径移动环、大小写改名、移动并合并正文，以及 staging 中断后的逆向恢复。
 - 验证 rootPath 缺失、被文件占用、扫描/读取失败和扫描中收到文件事件时禁止产生 deleted/archive。
 - 验证 `scanEpoch` 在 create/modify/delete/rename 事件下使扫描失效，只有未变 epoch 能生成预览。
@@ -830,6 +924,7 @@ pending identity store 使用 `pending-identities.json.next/.prev` 做同样的�
 - 验证插件加载、文件事件和闲置状态不产生网络请求。
 - 验证添加/移除映射、断开、离线忘记凭据和 serverInstanceId 变化。
 - 验证 requestUrl 适配器对直接成功/结构化失败响应的解析，拒绝含 query/fragment/userinfo 的 serverUrl，以及 provisional connection journal 在 Secret Storage、session 验证、activate 前后各个崩溃点的恢复/过期。
+- 验证 exchange 提交后响应丢失时以同一 exchangeId/code/credential 恢复同一 provisional；改动任一绑定字段被拒绝，code/credential 不进入 JSON journal 或诊断。
 - 验证 credentialSecretId 和 connectedServerInstanceId 只存 device-local storage，不出现在任何 `.agentwiki/**/*.json` 或诊断中。
 - 验证 `boundVaultId`、connection journal、当前 `vault.json` 与 session 的 deviceId/vaultId 不一致时冻结所有联网/写入，外部同步替换 vault identity 不会被自动采用。
 - 验证外部 Vault 同步携带多个 `d-<device-key>` namespace 时，每台设备只加载自己的 config/base/journal；新设备独立首次绑定。
@@ -844,6 +939,7 @@ pending identity store 使用 `pending-identities.json.next/.prev` 做同样的�
 - AgentCredential 无法调用人类设备直接发布路径。
 - 所有 AgentWiki Page 写入口推进统一 revision，公开 pageId/path 与服务端字段映射固定。
 - 固定 hash fixture、批次完整 HTTP byte 计数和双限制分页。
+- 逐路由 Request/Response/query/path Schema 覆盖，credentials list envelope，以及 5,000/5,001 changes 与 4 MiB confirmation 边界。
 
 ### 17.4 端到端验收
 
@@ -874,6 +970,7 @@ pending identity store 使用 `pending-identities.json.next/.prev` 做同样的�
 - 生产构建。
 - 构建产物扫描，禁止 Node 内置模块和意外凭据模式。
 - `manifest.json`、版本映射文件和发布产物一致性检查。
+- DataAdapter fake 覆盖隐藏 `.agentwiki/` 的 list/read/write/rename 崩溃点；静态扫描禁止 `FileSystemAdapter`、Node `fs` 和绝对 Vault 路径。
 
 ## 18. 实施依赖与顺序
 

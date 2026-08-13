@@ -37,6 +37,9 @@
 - 与每个跨 HTTP 边界类型同名并以 `Schema` 结尾的运行时 Schema。
 - `normalizeMarkdown(text)`、`normalizeSyncPath(path)`、`pathKey(path)`。
 - `canonicalBytes(value)`、`sha256Hex(bytes)`、`contentHash(body)`、`confirmationHash(manifest)`、`batchHash(batchWithoutHash)` 和 `revisionContentHash(manifest)`。
+- `capabilitiesHash(capabilities)`，对完整 `SyncCapabilities` canonical bytes 求 SHA-256。
+- `exchangeRequestHash(request)`，按第 7.2 节的安全投影计算，不把 code 或明文 credential 交给通用日志/诊断。
+- `parseBatchIndex(text)`、`parsePageLimit(text)`，只接受第 14.1 节 canonical ASCII 十进制字符串并返回安全整数。
 - `idFileKey(id)`，返回已通过第 3.3 节校验的 ID 原字符串 UTF-8 bytes 的 SHA-256 小写十六进制值，不做大小写或 Unicode 改写，供客户端安全映射本地控制文件名。
 - `partitionPushChanges(changes, capabilities)`，实现第 3.4 节确定性批次划分。
 
@@ -45,7 +48,7 @@
 ### 2.1 HTTP 约定
 
 - JSON 请求和响应使用 `application/json; charset=utf-8`。
-- 所有参与 hash 或 byte limit 的请求体必须直接发送协议包产生的 canonical JSON UTF-8 bytes；不得先 hash canonical JSON、再发送字段顺序或转义不同的另一份 JSON。
+- Push confirmation、Push batch 以及明确参与 hash/byte limit 的请求体必须直接发送协议包产生的 canonical JSON UTF-8 bytes；不得先 hash canonical JSON、再发送字段顺序或转义不同的另一份 JSON。exchange 的 requestHash 使用第 7.2 节不含 code/明文 credential 的安全投影；HTTP body 本身仍按 request Schema 序列化并受 TLS 保护，不把含明文 secret 的 bytes 交给通用 hash/诊断流水线。
 - 除 exchange 外，sync v1 与设备会话端点使用 `Authorization: Bearer <device credential>`。
 - 所有时间是 UTC RFC 3339 字符串，精确到毫秒。
 - 所有成功响应都包含 `protocolVersion: "1"`。
@@ -97,7 +100,7 @@
 
 `contentHash` 是规范化 UTF-8 正文的 SHA-256 小写十六进制字符串。
 
-公共 Knowledge ID（page ID、revision ID、Space ID）长度为 1–128，字符集为 `[A-Za-z0-9._-]` 且首字符必须是字母或数字。`deviceId`、`vaultId`、`installationId`、`credentialId`、`sessionId`、`idempotencyKey` 和本地 transaction ID 使用标准小写 UUID v4。`deviceName` 为去除首尾空白后的 1–100 个 Unicode 字符；plugin version 为最长 64 字符的 SemVer。opaque cursor 最长 4,096 字符。
+公共 Knowledge ID（page ID、revision ID、Space ID）长度为 1–128，字符集为 `[A-Za-z0-9._-]` 且首字符必须是字母或数字。`deviceId`、`vaultId`、`installationId`、`exchangeId`、`credentialId`、`credentialFamilyId`、`serverInstanceId`、`sessionId`、`idempotencyKey` 和本地 transaction ID 使用标准小写 UUID v4。`deviceName` 为去除首尾空白后的 1–100 个 Unicode 字符；plugin version 为最长 64 字符的 SemVer。opaque cursor 最长 4,096 字符。
 
 ### 3.4 canonical serialization
 
@@ -139,7 +142,7 @@ type PushManifestChangeV1 =
 
 批次划分是确定性的：先使用 confirmation manifest 的 changes 顺序；从 batch 0 开始贪心加入下一 change，直到再加入会超过 `maxBatchItems` 或完整 PushBatch 的 `maxBatchBytes`，然后开启下一批。单条 change 自身超限返回 `PAGE_TOO_LARGE` 或 `BATCH_TOO_LARGE`。恢复上传时必须用 session 创建时记录的 capability 重新得到相同 partition 和 batchHash。
 
-幂等键是在用户确认预览时生成并持久化的随机 UUID v4，不由 confirmation hash 推导。同一 idempotency key 必须绑定同一 user、credential family、Space、base revision、confirmation hash、changeCount 和 totalBodyBytes；凭据轮换不改变已确认操作的 family identity。数据库唯一键至少为 `(credentialFamilyId, idempotencyKey)`；不同 family 可以使用相同随机 UUID 而不互相探测。
+幂等键是在用户确认预览时生成并持久化的随机 UUID v4，不由 confirmation hash 推导。同一 idempotency key 必须绑定同一 user、credential family、Space、base revision、confirmation hash、confirmationByteLength、changeCount 和 totalBodyBytes；凭据轮换不改变已确认操作的 family identity。数据库唯一键至少为 `(credentialFamilyId, idempotencyKey)`；不同 family 可以使用相同随机 UUID 而不互相探测。
 
 ### 3.5 固定 hash fixture
 
@@ -376,8 +379,7 @@ interface HumanDeviceCredentialRecord {
 
 约束：
 
-- 明文凭据只在 exchange 成功响应中返回一次。
-- 设备凭据是 32 个密码学安全随机字节的 base64url 字符串。数据库保存 `HMAC-SHA-256(serverPepper, credential)`，serverPepper 只来自服务端秘密配置；日志不记录明文或摘要。
+- 设备凭据由插件在 exchange 前用 Web Crypto 生成，是 32 个密码学安全随机字节的 base64url 字符串；先存入 Secret Storage，再只在 exchange 请求的敏感 body 中发送。exchange 响应不返回明文凭据。数据库保存 `HMAC-SHA-256(serverPepper, "human-device-credential\0" + credential)`，serverPepper 只来自服务端秘密配置；服务端日志不记录明文或摘要。
 - exchange 创建的凭据初始为 `provisional`，最长 10 分钟，仅允许调用 `GET session`、`POST credentials/current/activate` 和 `DELETE credentials/current`；不能列 Space、读 Snapshot/Delta 或创建 Push session。成功 activate 后变为长期 `active`；过期 provisional 在认证时原子标记 `expired` 并返回 `DEVICE_CREDENTIAL_EXPIRED`，定时清理只用于回收从未再次访问的过期记录。
 - 只有 `active` 凭据长期有效，直到用户或当前设备撤销。
 - 同一 `userId + deviceId + vaultId` 重新连接时允许保留原 active 凭据并新建一个 provisional 凭据。exchange 必须锁定 credential family、撤销该 family 先前未过期的 provisional，再创建新的 provisional；数据库分别建立“每个 family 最多一个 provisional credential”和“每个 family 最多一个 active credential”的部分唯一约束。这样旧连接在新连接完成前仍可使用，但较早的 provisional 不能在稍后反向覆盖较新的连接尝试。
@@ -396,31 +398,27 @@ interface HumanDeviceCredentialRecord {
 
 - 认证：当前 AgentWiki Web 的人类 JWT。
 - Guard：Human only。
-- 请求：
+- 请求与响应：
 
-```json
-{
-  "pluginId": "agentwiki-sync",
-  "requestedProtocolVersion": "1"
+```ts
+interface CreateObsidianInstallationRequest {
+  pluginId: "agentwiki-sync";
+  requestedProtocolVersion: "1";
 }
-```
 
-- 响应：
-
-```json
-{
-  "protocolVersion": "1",
-  "installationId": "uuid",
-  "code": "one-time-code",
-  "expiresAt": "2026-08-13T11:00:00.000Z"
+interface CreateObsidianInstallationResponse {
+  protocolVersion: "1";
+  installationId: string;
+  code: string;
+  expiresAt: string;
 }
 ```
 
 规则：
 
-- code 至少包含 20 个密码学安全随机字节并以适合人工复制的 base64url 字符串表示，明文只显示一次；数据库只保存同样使用 serverPepper 的 HMAC。
+- code 至少包含 20 个密码学安全随机字节并以适合人工复制的 base64url 字符串表示，明文只显示一次；数据库只保存 `HMAC-SHA-256(serverPepper, "obsidian-installation-code\0" + code)`，与 credential HMAC 做域分离。
 - code 最长有效 10 分钟。
-- 成功交换后立即失效。
+- 首次成功后 code 对任何新 exchange 立即失效；只允许第 7.2 节绑定同一 exchangeId/requestHash/credential 的短期恢复重试。
 - 撤销 installation 后立即失效。
 - 创建行为记录 user ID、时间和安全审计事件，但不记录明文 code。
 
@@ -431,53 +429,43 @@ interface HumanDeviceCredentialRecord {
 `POST /api/integrations/obsidian/exchange`
 
 - 认证：无；以一次性 code 授权。
-- 请求：
+- 请求与响应：
 
-```json
-{
-  "code": "one-time-code",
-  "deviceId": "uuid",
-  "deviceName": "Neomei iPhone",
-  "vaultId": "uuid",
-  "pluginVersion": "0.1.0",
-  "supportedProtocolVersions": ["1"]
+```ts
+interface ExchangeObsidianCredentialRequest {
+  code: string;
+  exchangeId: string;
+  credential: string;
+  deviceId: string;
+  deviceName: string;
+  vaultId: string;
+  pluginVersion: string;
+  supportedProtocolVersions: [string, ...string[]];
 }
-```
 
-- 响应：
-
-```json
-{
-  "protocolVersion": "1",
-  "serverInstanceId": "uuid",
-  "credential": "secret-returned-once",
-  "credentialId": "uuid",
-  "credentialStatus": "provisional",
-  "provisionalExpiresAt": "2026-08-13T11:10:00.000Z",
-  "user": {
-    "id": "uuid",
-    "displayName": "NeoMei"
-  },
-  "capabilities": {
-    "maxPageBytes": 1048576,
-    "maxBatchBytes": 4194304,
-    "maxBatchItems": 100,
-    "maxResponseBytes": 4194304,
-    "maxPageItems": 200,
-    "pushSessionTtlSeconds": 3600
-  }
+interface ExchangeObsidianCredentialResponse {
+  protocolVersion: "1";
+  serverInstanceId: string;
+  credentialId: string;
+  credentialStatus: "provisional";
+  provisionalExpiresAt: string;
+  user: { id: string; displayName: string };
+  capabilities: SyncCapabilities;
 }
 ```
 
 规则：
 
 - 交换端点按 IP、installation ID 和失败次数限流。
-- code 的检查和消费必须原子执行。
-- 对存储在 PostgreSQL 的 installation，exchange 在单个事务中以条件更新把 `pending` 改为 `exchanged`、取得并锁定 credential family、撤销该 family 的旧 provisional、创建唯一新 provisional credential 并写安全审计；任一步失败整体回滚，不消费 code。Redis 可用于限流，不作为 installation 消费和 credential 创建之间的唯一事务边界。
+- code 为 27–256 个 base64url 无填充字符，credential 固定为 32 bytes 对应的 43 个 base64url 无填充字符；supportedProtocolVersions 为 1–8 个不重复的十进制 major 字符串，至少包含 `"1"` 才能协商本契约。
+- 插件在首次发送前生成并持久化 `exchangeId`、credential Secret ID 和除 code 外的完整请求字段；网络结果不确定时只允许从 Secret Storage 取回同一 credential，以完全相同的请求重试。code 检查、请求绑定和消费必须原子执行。
+- 对存储在 PostgreSQL 的 installation，exchange 在单个事务中以条件更新把 `pending` 改为 `exchanged`、绑定 `exchangeId + requestHash`、取得并锁定 credential family、撤销该 family 的旧 provisional、以请求 credential 的 HMAC 创建唯一新 provisional credential、保存非敏感响应字段并写安全审计；任一步失败整体回滚，不消费 code。Redis 可用于限流，不作为这些动作之间的唯一事务边界。
+- `requestHash` 对“移除 code，并把 credential 替换为原 credential bytes 的 SHA-256”的完整 `ExchangeObsidianCredentialRequest` canonical bytes 求 SHA-256，客户端与服务端可独立得到同一值。installation 首次成功后，在 installation 原到期时间与 provisional 到期时间两者较早者之前，携带同一 code、exchangeId、requestHash 和 credential 的重试必须返回语义等价的 `201 + ExchangeObsidianCredentialResponse`；不同 exchangeId、requestHash 或 credential 返回 `INSTALLATION_ALREADY_EXCHANGED / 409`。服务端不需要保存可解密 credential；这解决提交后响应丢失，同时不把交换变成可修改参数的重复授权。
+- 完全相同的恢复重试超过上述窗口后返回 `INSTALLATION_ALREADY_EXCHANGED / 409`；插件覆写 pending code/credential secret并要求生成新 code。若首次 exchange 从未提交而 code 自然过期，则返回 `INSTALLATION_CODE_EXPIRED / 401`。两者都不可继续旧连接尝试。
 - 没有共同协议版本时返回 `PROTOCOL_UNSUPPORTED`，不得消费 code。
 - 成功后创建绑定 code 所属 user 的 HumanDeviceCredential。
-- 成功响应返回 provisional HumanDeviceCredential；此时不撤销该 user/device/vault 的现有 active credential，避免新设备连接流程中断时破坏旧连接。旧 active credential 只在 activate 新凭据的事务中被撤销。
-- 响应与日志必须设置禁止缓存和禁止记录 credential 的安全策略。
+- 首次成功和完全相同的恢复重试都返回同一 provisional credential 的非敏感元数据；此时不撤销该 user/device/vault 的现有 active credential，避免新设备连接流程中断时破坏旧连接。旧 active credential 只在 activate 新凭据的事务中被撤销。
+- exchange 请求/响应与服务端日志必须设置禁止缓存，并对请求中的 code/credential 默认删除或脱敏；响应本身不含 credential。
 - `serverInstanceId` 是数据库持久化的部署实例 UUID；重启和域名变化时保持不变，数据库克隆到独立服务时必须显式轮换。
 
 ## 8. 设备会话
@@ -508,18 +496,29 @@ interface SyncCapabilities {
   maxPageBytes: number;
   maxBatchBytes: number;
   maxBatchItems: number;
+  maxChangeCount: number;
+  maxConfirmationBytes: number;
+  maxClientSpacePages: number;
   maxResponseBytes: number;
   maxPageItems: number;
   pushSessionTtlSeconds: number;
 }
 ```
 
+capability 的 v1 数值边界固定为：`maxPageBytes = 1,048,576`；`maxBatchItems` 为 `1..100`；`maxBatchBytes/maxResponseBytes/maxConfirmationBytes` 为 `1,048,576..4,194,304`，且 maxBatchBytes/maxResponseBytes 必须能容纳一个 maxPageBytes 项及 envelope 开销；`maxPageItems` 为 `1..200`；`maxChangeCount = 5,000`；`maxClientSpacePages = 5,000`；`pushSessionTtlSeconds` 为 `900..86,400`。exchange/session 响应超出这些 hard bounds 属于协议错误，插件不能盲信或扩大本地资源预算。
+
 ### 8.2 激活当前设备凭据
 
 `POST /api/integrations/obsidian/credentials/current/activate`
 
 - 认证：当前 provisional 或已 active HumanDeviceCredential。
-- 请求：`{ "credentialId": "uuid" }`，必须与 Authorization 对应的 credential ID 一致。
+```ts
+interface ActivateCurrentObsidianCredentialRequest {
+  credentialId: string;
+}
+```
+
+请求 credentialId 必须与 Authorization 对应的 credential ID 一致；成功响应为 `HumanDeviceSessionResponse`。
 - provisional 且未过期时，在一个事务中锁定 credential family，确认当前凭据仍是该 family 唯一 provisional，撤销其他 active credential，把当前凭据改为 active、清空 provisionalExpiresAt、写 activatedAt 和审计事件。被后续 exchange 替换的 provisional 必须返回 `DEVICE_CREDENTIAL_REVOKED`，不能重新激活。
 - 当前凭据已 active 时幂等返回 `200 + HumanDeviceSessionResponse`；已过期或已撤销返回 401。
 - 并发 exchange/activate 通过 family 行锁以及 provisional/active 两个部分唯一约束收敛；不得留下两个 active credential，也不得让较早的 provisional 在较新 exchange 完成后重新激活。
@@ -534,7 +533,7 @@ interface SyncCapabilities {
 
 AgentWiki Web 必须允许当前用户查看和撤销自己的 Obsidian 设备：
 
-- `GET /api/integrations/obsidian/credentials` 返回 `HumanDeviceCredentialSummary[]`。
+- `GET /api/integrations/obsidian/credentials` 返回 `HumanDeviceCredentialListResponse`。
 - `DELETE /api/integrations/obsidian/credentials/:credentialId` 只能撤销当前 user 自己的凭据，成功返回 `204`。
 
 ```ts
@@ -573,6 +572,7 @@ interface SyncSpaceSummary {
   canRead: true;
   canPublish: boolean;
   currentRevision: string;
+  pageCount: number;
 }
 
 interface SyncSpaceListResponse {
@@ -599,6 +599,7 @@ interface RevisionHeadResponse {
   revision: string;
   sequence: number;
   revisionContentHash: string;
+  pageCount: number;
   publishedAt: string | null;
 }
 ```
@@ -608,6 +609,14 @@ interface RevisionHeadResponse {
 ## 11. 分页 Snapshot
 
 `GET /api/sync/v1/spaces/:spaceId/snapshot?revision=<id>&cursor=<opaque>&limit=<n>`
+
+```ts
+interface SnapshotQuery {
+  revision: string;
+  cursor?: string;
+  limit?: number;
+}
+```
 
 规则：
 
@@ -631,6 +640,7 @@ interface SnapshotPage {
   revision: string;
   sequence: number;
   revisionContentHash: string;
+  pageCount: number;
   items: SyncPage[];
   nextCursor: string | null;
 }
@@ -649,6 +659,14 @@ interface SyncPage {
 
 `GET /api/sync/v1/spaces/:spaceId/delta?from=<revision>&cursor=<opaque>&limit=<n>`
 
+```ts
+interface DeltaQuery {
+  from: string;
+  cursor?: string;
+  limit?: number;
+}
+```
+
 响应固定 `fromRevision` 和 `toRevision`：
 
 ```ts
@@ -659,6 +677,7 @@ interface DeltaPage {
   toRevision: string;
   toSequence: number;
   toRevisionContentHash: string;
+  toPageCount: number;
   items: DeltaItem[];
   nextCursor: string | null;
 }
@@ -699,13 +718,15 @@ Push 使用临时上传会话，避免把整个 Space 放入单一请求，同�
 interface CreatePushSessionRequest {
   baseRevision: string;
   idempotencyKey: string;
+  capabilitiesHash: string;
   confirmationHash: string;
+  confirmationByteLength: number;
   changeCount: number;
   totalBodyBytes: number;
 }
 ```
 
-服务端处理 create 时先认证 HumanDeviceCredential 并重载当前用户，再以 `(credentialFamilyId, idempotencyKey)` 查询既有 session：存在则校验它属于同一 user/device/vault/Space、全部绑定字段相同且该用户仍可读该 Space，然后直接返回当前状态/result；恢复路径不再要求原 base 等于当前 head，也不要求当前仍有发布权。不存在时才检查 Space 读取/发布能力，并要求 base revision 等于当前 head，不接受仍存在但已经落后的 revision。“查询既有或创建”必须依赖 `(credentialFamilyId, idempotencyKey)` 唯一约束并在唯一冲突后重读既有记录，两个并发 create 不能创建两个 session。finalize 时必须在发布事务内再次检查。创建与 finalize 之间 head 改变时返回 `BASE_STALE`。
+服务端处理 create 时先认证 HumanDeviceCredential 并重载当前用户，再以 `(credentialFamilyId, idempotencyKey)` 查询既有 session：存在则校验它属于同一 user/device/vault/Space、全部绑定字段相同且该用户仍可读该 Space，然后直接返回当前状态/result；恢复路径不再要求原 base 等于当前 head，也不要求当前仍有发布权。不存在时才检查 Space 读取/发布能力、要求 request `capabilitiesHash` 等于服务端当前完整 capability hash，并要求 base revision 等于当前 head；capability 已变化返回 `CAPABILITIES_CHANGED`，不创建 session，不接受客户端确认后静默换限制。“查询既有或创建”必须依赖 `(credentialFamilyId, idempotencyKey)` 唯一约束并在唯一冲突后重读既有记录，两个并发 create 不能创建两个 session。finalize 时必须在发布事务内再次检查。创建与 finalize 之间 head 改变时返回 `BASE_STALE`。
 
 ```ts
 interface CreatePushSessionResponse {
@@ -722,9 +743,9 @@ type PushSessionStatus = "uploading" | "ready_to_finalize" | "published" | "abor
 
 TypeScript 中 `FinalizePushResponse` 与 `PushSessionStatus` 可以按声明提升互相引用；运行时 Schema 必须使用惰性引用或先定义 finalize result Schema，不能产生模块初始化循环。
 
-相同 idempotency key 的创建重试只有在 user、credential family、Space、base revision、confirmation hash、changeCount 和 totalBodyBytes 全部相同时才返回同一 session 的当前状态和已持久化 result，状态码仍为 `201`；任一项不同返回 `IDEMPOTENCY_MISMATCH`。因此 finalize 已成功但本地 session ID 未持久化时，同一 credential 或同 family 的轮换 credential 重试 create 也能恢复同一结果。轮换凭据只能恢复既有 session，不能上传、finalize 或终止它；旧 session 未发布时客户端必须以新确认和新 idempotency key 开始另一 session，旧 staging 按 TTL 清理。
+相同 idempotency key 的创建重试只有在 user、credential family、Space、base revision、capabilities hash、confirmation hash、confirmationByteLength、changeCount 和 totalBodyBytes 全部相同时才返回同一 session 的当前状态和已持久化 result，状态码仍为 `201`；任一项不同返回 `IDEMPOTENCY_MISMATCH`。因此 finalize 已成功但本地 session ID 未持久化时，同一 credential 或同 family 的轮换 credential 重试 create 也能恢复同一结果。轮换凭据只能通过 exact create replay/GET 恢复既有 session，不能上传、finalize 或终止它；旧 session 未发布时客户端必须以新确认和新 idempotency key 开始另一 session，旧 staging 按 TTL 清理。
 
-`changeCount` 是 `0..100000` 的安全整数，`totalBodyBytes` 是非负安全整数且受租户配额限制。`changeCount = 0` 时 `totalBodyBytes` 必须为 0，session 创建后立即为 `ready_to_finalize`，不上传批次；非零时初始为 `uploading`。
+`changeCount` 是 `0..capabilities.maxChangeCount` 的安全整数；v1 服务端 hard maximum 与默认值均为 5,000。`confirmationByteLength` 是正安全整数且不得超过 `maxConfirmationBytes`，v1 hard maximum 与默认值均为 4 MiB；finalize 重建 manifest 后必须同时与声明 byte length/hash 完全相等。`totalBodyBytes` 是非负安全整数且受租户配额限制。`changeCount = 0` 时 `totalBodyBytes` 必须为 0，session 创建后立即为 `ready_to_finalize`，不上传批次；非零时初始为 `uploading`。
 
 响应中的 capabilities 固化到该 session，后续服务端配置变化不影响已创建 session 的批次划分；客户端只用该响应的 capability 构造批次。
 
@@ -785,10 +806,10 @@ interface PushBatchReceipt {
 
 请求：
 
-```json
-{
-  "confirmationHash": "sha256",
-  "userConfirmed": true
+```ts
+interface FinalizePushRequest {
+  confirmationHash: string;
+  userConfirmed: true;
 }
 ```
 
@@ -801,8 +822,9 @@ finalize 必须：
 5. 重建 canonical change manifest 并验证 confirmation hash。
 6. 在发布事务内重新检查当前 revision 等于 base revision。
 7. 校验 page ID、路径、标题、正文、hash 和路径唯一性。
-8. 记录人类用户、设备 credential、来源 `obsidian_sync` 和确认 hash。
-9. 发布所有页面更新和归档，并推进一个新 revision。
+8. 计算发布后的未归档 pageCount 不超过 session capability `maxClientSpacePages`；超过时返回 `SPACE_TOO_LARGE`，不发布。
+9. 记录人类用户、设备 credential、来源 `obsidian_sync` 和确认 hash。
+10. 发布所有页面更新和归档，并推进一个新 revision。
 
 finalize 对同一 session 使用第 13.2 节 PUT 和第 13.6 节 DELETE 共享的数据库行锁，并在同一发布事务内完成所有动作。第一个请求持锁验证 `ready_to_finalize`，写 Page/ChangeSet/revision、`publishedChangeSetId` 和完整 result，然后直接把 session 提交为 `published`。并发 finalize 必须等待该行锁：锁释放后如已 `published` 则返回已持久化的同一 result，不启动第二次发布。事务回滚时 session 仍是 `ready_to_finalize`。服务端不持久 `finalizing` 中间状态；该词只用于客户端本地 journal 表示“finalize 请求已发出但结果未知”。
 
@@ -820,6 +842,7 @@ interface FinalizePushResponse {
   sequence: number;
   publishedAt: string | null;
   revisionContentHash: string;
+  pageCount: number;
   changeSetId: string | null;
 }
 ```
@@ -857,12 +880,48 @@ finalize 已提交但客户端未收到响应时，该端点必须返回持久�
 
 ## 14. 容量和分页要求
 
-- 协议不设置 Space 总页数硬上限。
+- AgentWiki 产品不设置 Space 总页数硬上限；但 Obsidian 插件 v1 的移动端有界实现只绑定不超过 `maxClientSpacePages` 的 Space，该 capability 在 v1 固定为 5,000。Space list/head 返回当前 pageCount，超过时插件只显示不兼容诊断，不请求正文或建立/继续映射。
 - 服务端可以执行租户配额，但必须通过结构化 `QUOTA_EXCEEDED` 返回当前限制。
 - 单页最大正文为 1 MiB。
 - 单批次和单响应限制由 exchange/session capability 返回；服务端 v1 默认均为 4 MiB，客户端不得固化更大的值。
+- 单次 Push 最多 5,000 changes，confirmation canonical bytes 最多 4 MiB；两项都通过 capability 返回且服务端 v1 不得配置得更大。超过 change/confirmation 限制返回 `BATCH_TOO_LARGE`；结果 pageCount 超限返回 `SPACE_TOO_LARGE`。插件阻塞该 Space 的整库 Push 并提示缩小映射；首版不以自动拆分或部分 Push 改变用户确认边界。
 - 首版端到端验收基线：单 Space 5,000 页、规范化正文总计 100 MiB。
 - Snapshot、Delta 和上传必须以有界批次处理；服务端和客户端都不得要求把完整 100 MiB payload 同时保存在一个 JSON 对象中。
+
+### 14.1 路由 Schema 清单
+
+所有 `:spaceId/:sessionId/:credentialId/:installationId/:batchIndex` path 参数和 Snapshot/Delta query 均由协议包导出具名严格 Schema；ID 复用第 3.3 节，batchIndex 是非负安全整数。无 body 的 GET/DELETE 不定义空对象 Schema，204 使用 HTTP `NoContent` 语义。path 类型固定如下；v1 必须导出这些类型及同名 `Schema`：
+
+```ts
+interface SpaceParams { spaceId: string }
+interface PushSessionParams { spaceId: string; sessionId: string }
+interface PushBatchParams { spaceId: string; sessionId: string; batchIndex: string }
+interface CredentialParams { credentialId: string }
+interface InstallationParams { installationId: string }
+```
+
+逐路由 body/query/success 类型如下：
+
+| 路由 | Body / Query | 成功响应 |
+|---|---|---|
+| POST installations | `CreateObsidianInstallationRequest` | `CreateObsidianInstallationResponse` |
+| POST exchange | `ExchangeObsidianCredentialRequest` | `ExchangeObsidianCredentialResponse` |
+| GET session | 无 | `HumanDeviceSessionResponse` |
+| POST activate | `ActivateCurrentObsidianCredentialRequest` | `HumanDeviceSessionResponse` |
+| GET credentials | 无 | `HumanDeviceCredentialListResponse` |
+| GET spaces | 无 | `SyncSpaceListResponse` |
+| GET head | path params | `RevisionHeadResponse` |
+| GET snapshot | `SnapshotQuery` | `SnapshotPage` |
+| GET delta | `DeltaQuery` | `DeltaPage` |
+| POST push-sessions | `CreatePushSessionRequest` | `CreatePushSessionResponse` |
+| PUT batch | path params + `PushBatch` | `PushBatchReceipt` |
+| POST finalize | `FinalizePushRequest` | `FinalizePushResponse` |
+| GET push session | path params | `PushSessionStatusResponse` |
+| DELETE installation/current credential/web credential/push session | path params 或无 | `NoContent` |
+
+表中 `SnapshotQuery/DeltaQuery` 是 query Schema，不参与 JSON body；path param Schema 可组合为 `SpaceParams`、`PushSessionParams`、`CredentialParams`、`InstallationParams` 和 `PushBatchParams` 导出。实现不得以 controller 内临时 DTO 替代公开 Schema。
+
+HTTP 原始 query/path 中 `limit` 与 `batchIndex` 是 ASCII 十进制字符串。path/query Schema 必须拒绝符号、小数、指数、空白、前导 `+`、多余前导零和超范围值；`PushBatchParams.batchIndex` 保持 canonical 十进制字符串，再由公开 `parseBatchIndex()` 转为内部安全整数并与 body `PushBatch.batchIndex` 严格相等。`SnapshotQuery/DeltaQuery.limit` 同理由公开 `parsePageLimit()` 转换；不能依赖 Nest 隐式 coercion。其他 ID/path 参数保持原字符串并严格校验。
 
 ## 15. 错误 envelope
 
@@ -902,12 +961,14 @@ interface SyncApiErrorResponse {
 - `PAGE_ID_CONFLICT`
 - `PAGE_TOO_LARGE`
 - `BATCH_TOO_LARGE`
+- `SPACE_TOO_LARGE`
 - `BATCH_MISMATCH`
 - `PUSH_SESSION_EXPIRED`
 - `PUSH_SESSION_NOT_FOUND`
 - `PUSH_SESSION_STATE_INVALID`
 - `PUSH_SESSION_INCOMPLETE`
 - `IDEMPOTENCY_MISMATCH`
+- `CAPABILITIES_CHANGED`
 - `QUOTA_EXCEEDED`
 - `RATE_LIMITED`
 - `INTERNAL_ERROR`
@@ -925,8 +986,9 @@ interface SyncApiErrorResponse {
 | `INSTALLATION_CODE_INVALID`, `INSTALLATION_CODE_EXPIRED` | 401 | false |
 | `PROTOCOL_UNSUPPORTED` | 409 | false |
 | `CURSOR_INVALID`, `CONFIRMATION_REQUIRED`, `PAYLOAD_INVALID` | 400 | false |
-| `INSTALLATION_ALREADY_EXCHANGED`, `BASE_STALE`, `CONFIRMATION_MISMATCH`, `PATH_COLLISION`, `PAGE_ID_CONFLICT`, `BATCH_MISMATCH`, `PUSH_SESSION_INCOMPLETE`, `PUSH_SESSION_STATE_INVALID`, `IDEMPOTENCY_MISMATCH` | 409 | false |
+| `INSTALLATION_ALREADY_EXCHANGED`, `BASE_STALE`, `CAPABILITIES_CHANGED`, `CONFIRMATION_MISMATCH`, `PATH_COLLISION`, `PAGE_ID_CONFLICT`, `BATCH_MISMATCH`, `PUSH_SESSION_INCOMPLETE`, `PUSH_SESSION_STATE_INVALID`, `IDEMPOTENCY_MISMATCH` | 409 | false |
 | `PAGE_TOO_LARGE`, `BATCH_TOO_LARGE`, `QUOTA_EXCEEDED` | 413 | false |
+| `SPACE_TOO_LARGE` | 409 | false |
 | `RATE_LIMITED` | 429 | true |
 | `INTERNAL_ERROR` | 500 | true |
 
@@ -991,6 +1053,12 @@ interface SyncApiErrorResponse {
 39. credential 轮换后，同 family 新凭据只能恢复查询旧 Push session 的已发布结果；未发布 session 不能继续写或 finalize，客户端以新确认和新 idempotency key 重建。不同 family 无法查询旧 session 时通过 head/Pull 判断并收敛，不盲目重复未知发布。
 40. 两个不同 batch 的并发 PUT 与 DELETE/finalize/expiry cleanup 竞争时全部通过同一 session 行锁线性化；累计数量/字节不丢更新，aborted/published/expired 后无 staging 晚提交，cleanup 不能删除正在 finalize 所需的 staging 或改变确定结果。
 41. 两个 Space 并发创建同一 pageId 时，全局数据库约束只允许一个内部 Page/identity 成功，另一事务返回 `PAGE_ID_CONFLICT`；历史跨 Space 重复会阻塞迁移而非静默重写。
+42. exchange 在服务端提交后丢失响应时，插件用 Secret Storage 中同一 credential 和持久化 exchangeId 重试，取得同一 credentialId/provisional 元数据；不同请求绑定被拒绝，数据库和日志均无明文 credential/code。
+43. 协议包逐路由导出的 body/query/path/success Schema 与服务端 controller 和插件 client 共用；credentials GET 始终返回 envelope，匿名 JSON DTO 不进入实现。
+44. maxChangeCount=5,000、maxConfirmationBytes=4 MiB 的边界在 client/server 一致执行；5,001 项或超 4 MiB confirmation 被阻塞/拒绝，5,000 项 Push 在 32 MiB 插件额外 heap 预算内完成。
+46. create session 的 confirmationByteLength 参与幂等绑定并受 capability 限制；finalize 重建出的 canonical byte length/hash 任一不符都原子拒绝。
+47. Push 预览读取的完整 capability hash 参与 create 和幂等绑定；预览与 create 之间 capability 变化返回 `CAPABILITIES_CHANGED` 且不创建 session，客户端重新预览。
+45. 已绑定 Space 从 5,000 增长到 5,001 时，head/Snapshot/Delta 的 pageCount 使插件在写 Vault 前阻断；Obsidian finalize 的结果页数超过 5,000 时服务端原子拒绝，首次合并也不能产生超限本地集合。
 
 ## 18. 跨仓实施规则
 
