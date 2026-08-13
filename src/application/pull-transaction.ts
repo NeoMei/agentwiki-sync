@@ -107,15 +107,17 @@ export class PullTransaction {
         const bytes = await this.vault.read(temporary.temporary);
         if (bytes) {
           const current = await this.vault.read(temporary.original);
-          if (current) await this.vault.remove(temporary.original);
+          if (current) throw new Error("User created a file at a rename source");
           await this.vault.rename(temporary.temporary, temporary.original);
         } else { const original = await this.vault.read(temporary.original); const hash = original ? await sha256Hex(original) : null; if (hash !== temporary.expectedHash) throw new Error("Rename recovery is ambiguous"); }
       }
       for (const snapshot of journal.snapshots) {
         const current = await this.vault.read(snapshot.path);
         if (snapshot.bytes === null) { if (current) await this.vault.remove(snapshot.path); }
-        else if (!current || await sha256Hex(current) === snapshot.hash || journal.materialized.some((item) => item.path === snapshot.path)) await this.vault.write(snapshot.path, new Uint8Array(snapshot.bytes));
+        else if (!current) await this.vault.write(snapshot.path, new Uint8Array(snapshot.bytes));
+        else if (await sha256Hex(current) !== snapshot.hash) throw new Error("Rollback target was edited after the transaction stopped");
       }
+      for(const snapshot of journal.snapshots){const current=await this.vault.read(snapshot.path);const hash=current?await sha256Hex(current):null;if(hash!==snapshot.hash)throw new Error("Rollback snapshot verification failed");}
       journal.state = "prepared"; journal.materialized = []; journal.temporaryPaths = []; await this.save(journal);
     } catch {
       journal.state = "failed"; await this.save(journal); throw new Error("Pull recovery failed safely");

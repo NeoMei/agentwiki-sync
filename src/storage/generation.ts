@@ -1,5 +1,6 @@
 import { canonicalBytes, contentHash, revisionContentHash } from "../agentwiki/protocol";
 import type { ControlStorePort } from "../ports/control-store";
+import { portablePathKey, validatePortablePath, validateTitle } from "../core/portable-path";
 
 export interface SpaceManifest {
   schemaVersion: 1;
@@ -48,6 +49,7 @@ export class GenerationRepository {
     let manifest: SpaceManifest;
     try { manifest = JSON.parse(raw) as SpaceManifest; } catch { throw new Error("baseline corrupt: invalid manifest"); }
     if (manifest.schemaVersion !== 1 || manifest.generationId !== generationId) throw new Error("baseline corrupt: invalid identity");
+    const pathKeys=new Set<string>();for(const [key,page] of Object.entries(manifest.pages)){if(key!==page.pageId||!page.pageId)throw new Error("baseline corrupt: page identity mismatch");const path=validatePortablePath(page.relativePath);validateTitle(page.title);if(pathKeys.has(path.key))throw new Error("baseline corrupt: path collision");pathKeys.add(portablePathKey(path.path));}
     let bodyBytes = 0;
     for (const page of Object.values(manifest.pages)) {
       const body = await this.store.read(this.path(generationId, `base/${encodeURIComponent(page.pageId)}.md`));

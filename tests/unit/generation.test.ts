@@ -18,4 +18,8 @@ describe("immutable generations", () => {
     await store.write(".agentwiki/device/space/generations/g1/base/p1.md", "tampered");
     await expect(repo.verify("g1")).rejects.toThrow(/corrupt/);
   });
+
+  it("rejects manifest key identity and portable-path collisions", async () => {
+    const store=new MemoryControlStore();const repo=new GenerationRepository(store,".agentwiki/device/space");const manifest:SpaceManifest={schemaVersion:1,protocolVersion:"1",generationId:"g2",spaceId:"s",rootPath:"Wiki",baseRevision:"r1",baseRevisionContentHash:"",basePageCount:1,baseRevisionManifestByteLength:0,baseRevisionBodyBytes:1,lastSuccessfulSyncAt:"2026-08-14T00:00:00.000Z",pages:{wrong:{pageId:"p1",relativePath:"A.md",title:"A",contentHash:""}}};await expect(repo.write(manifest,{wrong:"x"})).rejects.toThrow(/identity/);
+  });
 });

@@ -16,5 +16,6 @@ describe("sync coordinator", () => {
     expect(selectMappingForPath(mappings, "Wiki/A.md")?.spaceId).toBe("s1");
     expect(selectMappingForPath(mappings, "Other/A.md")).toBeNull();
     expect(() => validateMappings([{ spaceId: "a", rootPath: "Wiki", status: "active" }, { spaceId: "b", rootPath: "Wiki/Sub", status: "active" }])).toThrow(/overlap/);
+    expect(() => validateMappings([{ spaceId: "a", rootPath: "Wiki", status: "pending" }, { spaceId: "b", rootPath: "Wiki/Sub", status: "pending" }])).toThrow(/overlap/);
   });
 });

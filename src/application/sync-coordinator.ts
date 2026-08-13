@@ -12,10 +12,10 @@ export class OperationLock {
 }
 
 export function validateMappings(mappings: SpaceMapping[]): void {
-  const active = mappings.filter((mapping) => mapping.status === "active");
-  for (let left = 0; left < active.length; left += 1) for (let right = left + 1; right < active.length; right += 1) {
-    const a = `${portablePathKey(active[left]!.rootPath)}/`;
-    const b = `${portablePathKey(active[right]!.rootPath)}/`;
+  for(const mapping of mappings){if(!mapping.spaceId.trim()||!mapping.rootPath.trim()||mapping.rootPath.startsWith("/")||mapping.rootPath.includes("\\")||mapping.rootPath.split("/").some(part=>!part||part==="."||part===".."))throw new Error("Invalid mapping identity or root");}
+  for (let left = 0; left < mappings.length; left += 1) for (let right = left + 1; right < mappings.length; right += 1) {
+    const a = `${portablePathKey(mappings[left]!.rootPath)}/`;
+    const b = `${portablePathKey(mappings[right]!.rootPath)}/`;
     if (a.startsWith(b) || b.startsWith(a)) throw new Error("Mapping roots overlap");
   }
 }
