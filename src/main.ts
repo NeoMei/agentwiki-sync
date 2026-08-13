@@ -22,7 +22,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
     this.addSettingTab(new AgentWikiSyncSettingTab(this.app, this));
     this.addRibbonIcon("refresh-cw", "AgentWiki Sync", () => this.openSync("status"));
     for (const action of ["status", "pull", "push"] as const) this.addCommand({ id: action, name: action.charAt(0).toUpperCase() + action.slice(1), callback: () => this.openSync(action) });
-    const invalidate=()=>{for(const runtime of this.liveRuntimes)runtime.invalidate();};this.registerEvent(this.app.vault.on("create",invalidate));this.registerEvent(this.app.vault.on("modify",invalidate));this.registerEvent(this.app.vault.on("delete",invalidate));this.registerEvent(this.app.vault.on("rename",invalidate));
+    const invalidate=()=>{for(const runtime of this.liveRuntimes)runtime.invalidate();};this.registerEvent(this.app.vault.on("create",invalidate));this.registerEvent(this.app.vault.on("modify",invalidate));this.registerEvent(this.app.vault.on("delete",invalidate));this.registerEvent(this.app.vault.on("rename",(file,oldPath)=>{invalidate();for(const runtime of this.liveRuntimes)void runtime.recordRename(oldPath,file.path).catch(()=>undefined);}));
   }
   async saveSettings(): Promise<void> { await this.saveData(this.settings); }
   async connect(code: string): Promise<void> {
@@ -45,7 +45,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
     const runtime = await this.runtime(); if (!runtime) { new Notice("Connect AgentWiki and add a Space mapping first."); return; }
     let release:(()=>void)|null=null;try { release=this.locks.acquire(runtime.spaceId);
       if (action === "status") { const status = await runtime.status(); new Notice(`Local +${status.local.added.length} ~${status.local.modified.length} ↔${status.local.renamed.length} -${status.local.deleted.length}; remote ${status.remoteRevision === status.baseRevision ? "clean" : "ahead"}.`); return; }
-      if (action === "pull") { const preview = await runtime.previewPull();const modalRelease=release;new PreviewModal(this.app, "Pull preview", preview.actions.map((item) => `${item.kind}: ${item.path}`), async () => { await runtime.applyPull(preview); await this.saveSettings(); new Notice("Pull complete."); },()=>modalRelease?.()).open(); release=null;return; }
+      if (action === "pull") { const preview = await runtime.previewPull();const modalRelease=release;new PreviewModal(this.app, "Pull preview", [...preview.actions.map((item) => `${item.kind}: ${item.path}`),...preview.initialBindings.map(item=>`bind: ${item.localPath??"new file"} ↔ ${item.remotePath}`)], async () => { await runtime.applyPull(preview); await this.saveSettings(); new Notice("Pull complete."); },()=>modalRelease?.(),preview.initialBindings).open(); release=null;return; }
       const preview = await runtime.previewPush();const modalRelease=release;new PreviewModal(this.app, "Push preview", preview.changes.map((item) => `${item.operation}: ${item.operation === "upsert" ? item.path : item.previousPath}`), async () => { await runtime.applyPush(preview); await this.saveSettings(); new Notice("Push complete."); },()=>modalRelease?.()).open();release=null;
     } catch (error) { new Notice(`${action} failed: ${error instanceof Error ? error.message : "unknown error"}`); } finally { release?.(); }
   }).open(); }

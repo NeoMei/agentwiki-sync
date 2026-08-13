@@ -13,7 +13,7 @@ describe("SyncRuntime", () => {
     const vault = new MemoryVault({});
     const runtime = new SyncRuntime(vault, new MemoryControlStore(), remote, { spaceId: "space", rootPath: "Wiki", status: "pending" });
     const preview = await runtime.previewPull();
-    expect(preview.actions).toEqual([{ kind: "create", path: "Wiki/Guide.md", body: "hello" }]);
+    expect(preview.initialBindings).toHaveLength(1);
     await runtime.applyPull(preview);
     expect(vault.text("Wiki/Guide.md")).toBe("hello");
     expect((await runtime.status()).local.added).toHaveLength(0);
@@ -79,7 +79,7 @@ describe("SyncRuntime", () => {
   });
 
   it("keeps a same-path local document dirty during initial binding", async () => {
-    const remote=new FakeAgentWiki();const vault=new MemoryVault({"Wiki/A.md":"local"});const runtime=new SyncRuntime(vault,new MemoryControlStore(),remote,{spaceId:"space",rootPath:"Wiki",status:"pending"});await remote.seed([{pageId:"p1",path:"A.md",title:"A",body:"remote",contentHash:await contentHash("remote"),updatedAt:"2026-08-14T00:00:00.000Z"}]);const preview=await runtime.previewPull();expect(preview.conflicts).toHaveLength(0);expect(preview.actions).toHaveLength(0);await runtime.applyPull(preview);expect(vault.text("Wiki/A.md")).toBe("local");expect((await runtime.status()).local.modified).toHaveLength(1);
+    const remote=new FakeAgentWiki();const vault=new MemoryVault({"Wiki/A.md":"local"});const runtime=new SyncRuntime(vault,new MemoryControlStore(),remote,{spaceId:"space",rootPath:"Wiki",status:"pending"});await remote.seed([{pageId:"p1",path:"A.md",title:"A",body:"remote",contentHash:await contentHash("remote"),updatedAt:"2026-08-14T00:00:00.000Z"}]);const preview=await runtime.previewPull();expect(preview.initialBindings[0]?.resolution).toBeNull();await expect(runtime.applyPull(preview)).rejects.toThrow(/unresolved/);preview.initialBindings[0]!.resolution="local";await runtime.applyPull(preview);expect(vault.text("Wiki/A.md")).toBe("local");expect((await runtime.status()).local.modified).toHaveLength(1);
   });
 
   it("keeps separate device namespaces for the same space", async () => {
