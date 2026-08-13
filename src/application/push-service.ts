@@ -1,6 +1,7 @@
 import { canonicalBytes, capabilitiesHash, confirmationHash, contentHash, partitionPushChanges, type PushChange, type SyncCapabilities } from "../agentwiki/protocol";
 import type { ControlStorePort } from "../ports/control-store";
 import type { FinalizeResult, PushRemotePort } from "../ports/push-remote";
+import { MutableControlRepository } from "../storage/envelope";
 
 interface PushInput { spaceId: string; baseRevision: string; changes: PushChange[]; capabilities: SyncCapabilities }
 type JournalChange=Exclude<PushChange,{operation:"upsert"}>|Omit<Extract<PushChange,{operation:"upsert"}>,"body">;
@@ -9,12 +10,14 @@ interface PushJournal {
   capabilitiesHash: string; capabilities:SyncCapabilities; changes: JournalChange[]; sessionId: string | null; remoteState: "not_created" | "uploading" | "finalizing" | "published";
   result: FinalizeResult | null; localCommitPhase: "not_started" | "verified";
 }
+function isPushJournal(value:unknown):value is PushJournal{return !!value&&typeof value==="object"&&(value as Partial<PushJournal>).schemaVersion===1&&typeof (value as Partial<PushJournal>).spaceId==="string"&&["not_created","uploading","finalizing","published"].includes((value as Partial<PushJournal>).remoteState??"")&&Array.isArray((value as Partial<PushJournal>).changes);}
 
 export class PushService {
-  constructor(private readonly remote: PushRemotePort, private readonly store: ControlStorePort, private readonly root: string) {}
-  private get path(): string { return `${this.root}/journal.json`; }
-  private async save(journal: PushJournal): Promise<void> { await this.store.write(this.path, JSON.stringify(journal)); }
-  private async load(): Promise<PushJournal> { const raw = await this.store.read(this.path); if (!raw) throw new Error("Missing push journal"); return JSON.parse(raw) as PushJournal; }
+  private readonly journal:MutableControlRepository<PushJournal>;
+  constructor(private readonly remote: PushRemotePort, private readonly store: ControlStorePort, private readonly root: string) {this.journal=new MutableControlRepository(store,`${root}/journal.json`,isPushJournal);}
+  private async save(journal: PushJournal): Promise<void> { await this.journal.write(journal); }
+  private async load(): Promise<PushJournal> { const value=await this.journal.read();if(!value)throw new Error("Missing or corrupt push journal");return value.payload; }
+  async inspect():Promise<Pick<PushJournal,"remoteState"|"result"|"localCommitPhase">|null>{const value=await this.journal.read();return value?{remoteState:value.payload.remoteState,result:value.payload.result,localCommitPhase:value.payload.localCommitPhase}:null;}
   private async persistPayload(changes: PushChange[]): Promise<void> { for (const change of changes) if (change.operation === "upsert") await this.store.write(`${this.root}/payload/${change.pageId}.md`, change.body); }
   private async hydrate(journal:PushJournal):Promise<PushChange[]>{const changes:PushChange[]=[];for(const change of journal.changes){if(change.operation==="archive")changes.push(change);else{const body=await this.store.read(`${this.root}/payload/${change.pageId}.md`);if(body===null||await contentHash(body)!==change.contentHash)throw new Error("Push payload is corrupt");changes.push({...change,body});}}return changes;}
   private async create(journal:PushJournal,changes:PushChange[]){const manifest={protocolVersion:"1" as const,spaceId:journal.spaceId,baseRevision:journal.baseRevision,changes:journal.changes};const totalBodyBytes=changes.reduce((total,change)=>total+(change.operation==="upsert"?new TextEncoder().encode(change.body).byteLength:0),0);return this.remote.createSession({baseRevision:journal.baseRevision,idempotencyKey:journal.idempotencyKey,capabilitiesHash:journal.capabilitiesHash,confirmationHash:journal.confirmationHash,confirmationByteLength:canonicalBytes(manifest).byteLength,changeCount:changes.length,totalBodyBytes});}

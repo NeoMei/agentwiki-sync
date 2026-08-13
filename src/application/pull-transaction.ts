@@ -1,6 +1,7 @@
 import { sha256Hex } from "../agentwiki/protocol";
 import type { ControlStorePort } from "../ports/control-store";
 import type { VaultPort } from "../ports/vault";
+import { MutableControlRepository } from "../storage/envelope";
 
 export type PullAction =
   | { kind: "create" | "write"; path: string; body: string }
@@ -18,15 +19,17 @@ interface PullJournal {
   temporaryPaths: Array<{ original: string; temporary: string; expectedHash: string | null }>;
   materialized: Array<{ path: string; resultHash: string; expectedHash: string | null }>;
 }
+function isPullJournal(value:unknown):value is PullJournal{return !!value&&typeof value==="object"&&(value as Partial<PullJournal>).schemaVersion===1&&typeof (value as Partial<PullJournal>).transactionId==="string"&&["prepared","applying","committed","rolling_back","failed"].includes((value as Partial<PullJournal>).state??"")&&Array.isArray((value as Partial<PullJournal>).actions)&&Array.isArray((value as Partial<PullJournal>).snapshots);}
 
 const encoder = new TextEncoder();
 
 export class PullTransaction {
-  constructor(private readonly vault: VaultPort, private readonly control: ControlStorePort, private readonly root: string) {}
-  private get journalPath(): string { return `${this.root}/journal.json`; }
-
-  private async save(journal: PullJournal): Promise<void> { await this.control.write(this.journalPath, JSON.stringify(journal)); }
-  private async load(): Promise<PullJournal> { const raw = await this.control.read(this.journalPath); if (!raw) throw new Error("Missing pull journal"); return JSON.parse(raw) as PullJournal; }
+  private readonly journal:MutableControlRepository<PullJournal>;
+  constructor(private readonly vault: VaultPort, private readonly control: ControlStorePort, private readonly root: string) {this.journal=new MutableControlRepository(control,`${root}/journal.json`,isPullJournal);}
+  private async save(journal: PullJournal): Promise<void> { await this.journal.write(journal); }
+  private async load(): Promise<PullJournal> { const value=await this.journal.read();if(!value)throw new Error("Missing or corrupt pull journal");return value.payload; }
+  async inspect():Promise<{state:PullJournal["state"];transactionId:string}|null>{const value=await this.journal.read();return value?{state:value.payload.state,transactionId:value.payload.transactionId}:null;}
+  async replaceForRecoveryTest(update:(journal:PullJournal)=>void):Promise<void>{const journal=await this.load();update(journal);await this.save(journal);}
 
   async prepare(actions: PullAction[], scanEpoch: number, transactionId: string = crypto.randomUUID()): Promise<void> {
     const paths = new Set<string>();
