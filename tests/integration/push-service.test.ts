@@ -36,4 +36,12 @@ describe("PushService", () => {
     const remote = new FakePushRemote(capabilities, "r2");
     await expect(new PushService(remote, new MemoryControlStore(), ".agentwiki/push/t3").publish({ spaceId: "s", baseRevision: "r1", changes, capabilities })).rejects.toThrow(/BASE_STALE/);
   });
+
+  it("keeps confirmed bodies in payload files instead of the JSON journal", async () => {
+    const remote = new FakePushRemote(capabilities, "r1"); const store = new MemoryControlStore();
+    await new PushService(remote, store, ".agentwiki/push/t4").publish({ spaceId: "s", baseRevision: "r1", changes, capabilities });
+    const journal = await store.read(".agentwiki/push/t4/journal.json");
+    expect(journal).not.toContain("hello");
+    expect(await store.read(".agentwiki/push/t4/payload/p1.md")).toBe("hello");
+  });
 });
