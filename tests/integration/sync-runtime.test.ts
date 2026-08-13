@@ -150,10 +150,10 @@ describe("SyncRuntime", () => {
     ]);
     const preview = await runtime.previewPull();
     expect(preview.conflicts).toHaveLength(0);
-    expect(preview.actions[0]).toMatchObject({
-      kind: "write",
-      body: "TOP\nmiddle\nBOTTOM",
-    });
+    const write = preview.actions[0];
+    expect(write).toMatchObject({ kind: "write" });
+    if (!write || write.kind === "trash") throw new Error("missing write");
+    expect(await control.read(write.bodyPath!)).toBe("TOP\nmiddle\nBOTTOM");
     await runtime.applyPull(preview);
     expect((await runtime.status()).local.modified).toHaveLength(1);
   });
@@ -266,6 +266,40 @@ describe("SyncRuntime", () => {
     expect(preview.actions).toHaveLength(0);
   });
 
+  it("preserves the archived page identity when Local is chosen for an archive conflict", async () => {
+    const remote = new FakeAgentWiki();
+    await remote.seed([
+      {
+        pageId: "p1",
+        path: "A.md",
+        title: "A",
+        body: "base",
+        contentHash: await contentHash("base"),
+        updatedAt: "2026-08-14T00:00:00.000Z",
+      },
+    ]);
+    const vault = new MemoryVault({});
+    const runtime = new SyncRuntime(vault, new MemoryControlStore(), remote, {
+      spaceId: "space",
+      rootPath: "Wiki",
+      status: "pending",
+    });
+    await runtime.applyPull(await runtime.previewPull());
+    await vault.write("Wiki/A.md", new TextEncoder().encode("local"));
+    await remote.replace([]);
+    const preview = await runtime.previewPull();
+    preview.conflictResolutions[preview.conflicts[0]!.conflictId] = {
+      choice: "local",
+    };
+    await runtime.applyPull(preview);
+    const push = await runtime.previewPush();
+    expect(push.changes[0]).toMatchObject({
+      operation: "upsert",
+      pageId: "p1",
+      path: "A.md",
+    });
+  });
+
   it("returns clean without creating an empty push session", async () => {
     const remote = new FakeAgentWiki();
     const runtime = new SyncRuntime(
@@ -337,11 +371,10 @@ describe("SyncRuntime", () => {
       },
     ]);
     const preview = await runtime.previewPull();
-    expect(preview.actions).toContainEqual({
+    expect(preview.actions[0]).toMatchObject({
       kind: "rename",
       fromPath: "Wiki/Old.md",
       path: "Wiki/New.md",
-      body,
     });
     await runtime.applyPull(preview);
     expect(vault.exists("Wiki/Old.md")).toBe(false);

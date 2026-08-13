@@ -62,6 +62,8 @@ export class AgentWikiPushRemote implements PushRemotePort {
           "PUT",
           `/api/sync/v1/spaces/${encodeURIComponent(this.spaceId)}/push-sessions/${encodeURIComponent(sessionId)}/batches/${batch.batchIndex}`,
           body,
+          true,
+          true,
         )
       ).json,
     );
@@ -97,5 +99,8 @@ export class AgentWikiPushRemote implements PushRemotePort {
   async snapshot(revision = "current"): Promise<SnapshotResult> {
     const value = await this.client.snapshot(this.spaceId, revision);
     return { ...value.metadata, items: value.items };
+  }
+  async *snapshotPages(revision = "current") {
+    yield* this.client.snapshotPages(this.spaceId, revision);
   }
 }

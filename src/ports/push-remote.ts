@@ -1,5 +1,6 @@
 import type {
   PushBatch,
+  SnapshotPage,
   SyncCapabilities,
   SyncPage,
 } from "../agentwiki/protocol";
@@ -58,4 +59,8 @@ export interface PushRemotePort {
     confirmationHash: string,
   ): Promise<FinalizeResult>;
   getSession(sessionId: string): Promise<PushSessionStatusInfo>;
+  snapshotPages?(revision?: string): AsyncIterable<{
+    metadata: Omit<SnapshotPage, "items" | "nextCursor">;
+    items: SyncPage[];
+  }>;
 }

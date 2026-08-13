@@ -150,4 +150,76 @@ export class GenerationRepository {
     }
     return { manifest, bodies };
   }
+  async readManifest(generationId: string): Promise<SpaceManifest> {
+    return this.verify(generationId);
+  }
+  async readBody(
+    generationId: string,
+    pageId: string,
+    expectedHash: string,
+  ): Promise<string> {
+    const body = await this.store.read(
+      this.path(generationId, `base/${await opaqueFileKey(pageId)}.md`),
+    );
+    if (body === null || (await contentHash(body)) !== expectedHash)
+      throw new Error("baseline corrupt: base hash mismatch");
+    return body;
+  }
+  async writeStreaming(
+    input: SpaceManifest,
+    pages: AsyncIterable<{
+      pageId: string;
+      relativePath: string;
+      title: string;
+      contentHash: string;
+      body: string;
+    }>,
+  ): Promise<SpaceManifest> {
+    const pageMap: SpaceManifest["pages"] = {};
+    let bodyBytes = 0;
+    for await (const page of pages) {
+      if (pageMap[page.pageId])
+        throw new Error("baseline corrupt: duplicate page identity");
+      if ((await contentHash(page.body)) !== page.contentHash)
+        throw new Error("baseline corrupt: base hash mismatch");
+      pageMap[page.pageId] = {
+        pageId: page.pageId,
+        relativePath: page.relativePath,
+        title: page.title,
+        contentHash: page.contentHash,
+      };
+      bodyBytes += new TextEncoder().encode(page.body).byteLength;
+      await this.store.write(
+        this.path(
+          input.generationId,
+          `base/${await opaqueFileKey(page.pageId)}.md`,
+        ),
+        page.body,
+      );
+    }
+    const protocolManifest = {
+      pages: Object.values(pageMap).map((page) => ({
+        pageId: page.pageId,
+        path: page.relativePath,
+        title: page.title,
+        contentHash: page.contentHash,
+      })),
+    };
+    const manifest: SpaceManifest = {
+      ...input,
+      pages: pageMap,
+      basePageCount: Object.keys(pageMap).length,
+      baseRevisionBodyBytes: bodyBytes,
+      baseRevisionManifestByteLength: Object.keys(pageMap).length
+        ? canonicalBytes(protocolManifest).byteLength
+        : 0,
+      baseRevisionContentHash: await revisionContentHash(protocolManifest),
+    };
+    await this.store.write(
+      this.path(input.generationId, "manifest.json"),
+      JSON.stringify(manifest),
+    );
+    await this.verify(input.generationId);
+    return manifest;
+  }
 }

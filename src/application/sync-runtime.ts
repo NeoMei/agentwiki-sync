@@ -31,6 +31,7 @@ export interface InitialBindingChoice {
   pageId: string;
   remotePath: string;
   remoteBody: string;
+  remoteBodyPath?: string;
   localPath: string | null;
   localBody: string | null;
   localVaultByteHash: string | null;
@@ -51,6 +52,10 @@ export interface PullPreview {
   conflictResolutions: Record<string, ConflictResolution>;
   initialBindings: InitialBindingChoice[];
   expectedVaultHashes: Record<string, string | null>;
+  conflictValuePaths: Record<
+    string,
+    { base: string; local: string; remote: string }
+  >;
 }
 export interface PushPreview {
   revision: string;
@@ -60,6 +65,10 @@ export interface PushPreview {
 interface RuntimeRemote extends PushRemotePort {
   snapshot(revision?: string): Promise<SnapshotResult>;
   getCapabilities?(): Promise<SyncCapabilities>;
+}
+interface SnapshotDownload {
+  metadata: Omit<SnapshotResult, "items">;
+  pages: SyncPage[];
 }
 interface PendingIdentities {
   schemaVersion: 1;
@@ -98,16 +107,6 @@ const DEFAULT_CAPABILITIES: SyncCapabilities = {
 const safeKey = (value: string) => value.replace(/[^A-Za-z0-9_-]/gu, "_");
 const joinRoot = (root: string, relative: string) =>
   `${root}/${validatePortablePath(relative).path}`;
-const resolvedValue = (
-  conflict: StructuredConflict,
-  resolution: ConflictResolution,
-) =>
-  resolution.choice === "manual"
-    ? (resolution.manualValue ?? conflict.local)
-    : resolution.choice === "remote"
-      ? conflict.remote
-      : conflict.local;
-
 export class SyncRuntime {
   private scanEpoch = 0;
   private readonly root: string;
@@ -173,12 +172,28 @@ export class SyncRuntime {
   private async readBase(): Promise<BaselineState> {
     return this.baseline.read();
   }
+  private async baseBody(page: {
+    pageId: string;
+    body?: string;
+  }): Promise<string> {
+    return page.body ?? this.baseline.readBody(page.pageId);
+  }
   private async stageAndCommit(
     revision: string,
     pages: SyncPage[],
     kind: "pull" | "push" | "initialize",
   ): Promise<void> {
     await this.baseline.prepare(revision, pages, kind);
+    await this.baseline.commit();
+  }
+  private async stageDownloadedAndCommit(
+    revision: string,
+    pages: SyncPage[],
+    kind: "pull" | "push" | "initialize",
+  ): Promise<void> {
+    await this.baseline.prepareStreaming(revision, pages, kind, (page) =>
+      this.remoteBody(revision, page),
+    );
     await this.baseline.commit();
   }
   private async capabilities(): Promise<SyncCapabilities> {
@@ -189,8 +204,15 @@ export class SyncRuntime {
     );
   }
   private async snapshot(revision: string): Promise<SyncPage[]> {
-    const capabilities = await this.capabilities();
     const value = await this.remote.snapshot(revision);
+    await this.validateSnapshotResult(value, revision);
+    return value.items;
+  }
+  private async validateSnapshotResult(
+    value: SnapshotResult,
+    revision: string,
+  ): Promise<void> {
+    const capabilities = await this.capabilities();
     decimalWithinLimit(value.pageCount, capabilities.maxClientSpacePages);
     decimalWithinLimit(
       value.revisionBodyBytes,
@@ -232,7 +254,155 @@ export class SyncRuntime {
       value.revisionContentHash !== hash
     )
       throw new Error("Snapshot integrity mismatch");
-    return value.items;
+  }
+  private async downloadSnapshot(revision: string): Promise<SnapshotDownload> {
+    if (!this.remote.snapshotPages) {
+      const value = await this.remote.snapshot(revision);
+      await this.validateSnapshotResult(value, revision);
+      const { items: pages, ...metadata } = value;
+      return { metadata, pages };
+    }
+    const capabilities = await this.capabilities();
+    let metadata: Omit<SnapshotResult, "items"> | null = null;
+    const pages: SyncPage[] = [];
+    let bodyBytes = 0;
+    const ids = new Set<string>();
+    const keys = new Set<string>();
+    for await (const page of this.remote.snapshotPages(revision)) {
+      const current = {
+        revision: page.metadata.revision,
+        revisionContentHash: page.metadata.revisionContentHash,
+        pageCount: page.metadata.pageCount,
+        revisionManifestByteLength: page.metadata.revisionManifestByteLength,
+        revisionBodyBytes: page.metadata.revisionBodyBytes,
+      };
+      if (metadata && JSON.stringify(metadata) !== JSON.stringify(current))
+        throw new Error("Snapshot pagination metadata changed");
+      metadata ??= current;
+      decimalWithinLimit(current.pageCount, capabilities.maxClientSpacePages);
+      decimalWithinLimit(
+        current.revisionBodyBytes,
+        capabilities.maxClientTotalBodyBytes,
+      );
+      decimalWithinLimit(
+        current.revisionManifestByteLength,
+        capabilities.maxClientManifestBytes,
+      );
+      for (const item of page.items) {
+        const path = validatePortablePath(item.path);
+        if (
+          ids.has(item.pageId) ||
+          keys.has(path.key) ||
+          (await contentHash(item.body)) !== item.contentHash
+        )
+          throw new Error("Snapshot integrity mismatch");
+        ids.add(item.pageId);
+        keys.add(path.key);
+        bodyBytes += new TextEncoder().encode(item.body).byteLength;
+        const sidecar = `${this.root}/downloads/${safeKey(revision)}/${await opaqueFileKey(item.pageId)}.md`;
+        await this.control.write(sidecar, item.body);
+        pages.push({ ...item, body: "" });
+      }
+    }
+    if (!metadata) throw new Error("Snapshot returned no metadata");
+    const manifest = {
+      pages: pages.map((page) => ({
+        pageId: page.pageId,
+        path: page.path,
+        title: page.title,
+        contentHash: page.contentHash,
+      })),
+    };
+    if (
+      metadata.revision !== revision ||
+      metadata.pageCount !== String(pages.length) ||
+      metadata.revisionBodyBytes !== String(bodyBytes) ||
+      metadata.revisionManifestByteLength !==
+        String(pages.length ? canonicalBytes(manifest).byteLength : 0) ||
+      metadata.revisionContentHash !== (await revisionContentHash(manifest))
+    )
+      throw new Error("Snapshot integrity mismatch");
+    return { metadata, pages };
+  }
+  private async remoteBody(revision: string, page: SyncPage): Promise<string> {
+    if (page.body) return page.body;
+    const body = await this.control.read(
+      `${this.root}/downloads/${safeKey(revision)}/${await opaqueFileKey(page.pageId)}.md`,
+    );
+    if (body === null || (await contentHash(body)) !== page.contentHash)
+      throw new Error("Downloaded snapshot body is corrupt");
+    return body;
+  }
+  private async resultAction(
+    kind: "create" | "write",
+    path: string,
+    body: string,
+  ): Promise<PullAction>;
+  private async resultAction(
+    kind: "rename",
+    path: string,
+    body: string,
+    fromPath: string,
+  ): Promise<PullAction>;
+  private async resultAction(
+    kind: "create" | "write" | "rename",
+    path: string,
+    body: string,
+    fromPath?: string,
+  ): Promise<PullAction> {
+    const bodyPath = `${this.root}/pull-preview-results/${crypto.randomUUID()}.md`;
+    await this.control.write(bodyPath, body);
+    return kind === "rename"
+      ? { kind, fromPath: fromPath!, path, bodyPath }
+      : { kind, path, bodyPath };
+  }
+  private async stageConflictValues(
+    conflicts: StructuredConflict[],
+  ): Promise<Record<string, { base: string; local: string; remote: string }>> {
+    const refs: Record<
+      string,
+      { base: string; local: string; remote: string }
+    > = {};
+    for (const conflict of conflicts) {
+      const root = `${this.root}/pull-conflicts/${safeKey(conflict.conflictId)}`;
+      refs[conflict.conflictId] = {
+        base: `${root}/base.md`,
+        local: `${root}/local.md`,
+        remote: `${root}/remote.md`,
+      };
+      await this.control.write(refs[conflict.conflictId]!.base, conflict.base);
+      await this.control.write(
+        refs[conflict.conflictId]!.local,
+        conflict.local,
+      );
+      await this.control.write(
+        refs[conflict.conflictId]!.remote,
+        conflict.remote,
+      );
+      conflict.base = "";
+      conflict.local = "";
+      conflict.remote = "";
+    }
+    return refs;
+  }
+  private async conflictValue(
+    preview: PullPreview,
+    conflict: StructuredConflict,
+    resolution: ConflictResolution,
+  ): Promise<string> {
+    if (resolution.choice === "manual")
+      return (
+        resolution.manualValue ??
+        (await this.control.read(
+          preview.conflictValuePaths[conflict.conflictId]!.local,
+        )) ??
+        ""
+      );
+    return (
+      (await this.control.read(
+        preview.conflictValuePaths[conflict.conflictId]![resolution.choice],
+      )) ?? ""
+    );
   }
   private async scan(): Promise<ScanResult> {
     const epoch = this.scanEpoch;
@@ -304,12 +474,14 @@ export class SyncRuntime {
           : await pushService.resume();
       if (!result) throw new Error("PUSH_RECOVERY_REQUIRED");
       const base = await this.readBase();
-      if (base.revision !== result.revision)
-        await this.stageAndCommit(
+      if (base.revision !== result.revision) {
+        const downloaded = await this.downloadSnapshot(result.revision);
+        await this.stageDownloadedAndCommit(
           result.revision,
-          await this.snapshot(result.revision),
+          downloaded.pages,
           "push",
         );
+      }
       await pushService.markVerified();
     }
   }
@@ -332,10 +504,19 @@ export class SyncRuntime {
       local: computeStatus(base.pages, resolved, scan),
     };
   }
+  async hasUnfinishedPush(): Promise<boolean> {
+    const push = await new PushService(
+      this.remote,
+      this.control,
+      `${this.root}/push`,
+    ).inspect();
+    return !!push && push.localCommitPhase !== "verified";
+  }
   async previewPull(): Promise<PullPreview> {
     const base = await this.readBase();
     const head = await this.remote.getHead(this.mapping.spaceId);
-    const remote = await this.snapshot(head.revision);
+    const downloaded = await this.downloadSnapshot(head.revision);
+    const remote = downloaded.pages;
     const scan = await this.scan();
     const localByPath = new Map(
       scan.files.map((file) => [portablePathKey(file.relativePath), file]),
@@ -364,9 +545,10 @@ export class SyncRuntime {
         initialBindings.push({
           pageId: page.pageId,
           remotePath,
-          remoteBody: page.body,
+          remoteBody: "",
+          remoteBodyPath: `${this.root}/downloads/${safeKey(head.revision)}/${await opaqueFileKey(page.pageId)}.md`,
           localPath: local?.relativePath ?? null,
-          localBody,
+          localBody: null,
           localVaultByteHash: local?.vaultByteHash ?? null,
           localCandidates: scan.files.map((file) => ({
             path: file.relativePath,
@@ -387,9 +569,9 @@ export class SyncRuntime {
             conflictId: `delete:${page.pageId}`,
             pageId: page.pageId,
             field: "delete",
-            base: basePage.body,
+            base: await this.baseBody(basePage),
             local: "",
-            remote: page.body,
+            remote: await this.remoteBody(head.revision, page),
             wholeDocument: true,
           });
         continue;
@@ -400,9 +582,9 @@ export class SyncRuntime {
         remotePath,
       );
       const bodyMerge = await mergeBody(
-        basePage.body,
+        await this.baseBody(basePage),
         localBody!,
-        page.body,
+        await this.remoteBody(head.revision, page),
         page.pageId,
       );
       const pageConflicts = [...bodyMerge.conflicts];
@@ -422,18 +604,22 @@ export class SyncRuntime {
           pathMerge.value.normalize("NFC") !==
           local.relativePath.normalize("NFC")
         )
-          actions.push({
-            kind: "rename",
-            fromPath: joinRoot(this.mapping.rootPath, local.relativePath),
-            path: joinRoot(this.mapping.rootPath, pathMerge.value),
-            body: bodyMerge.body,
-          });
+          actions.push(
+            await this.resultAction(
+              "rename",
+              joinRoot(this.mapping.rootPath, pathMerge.value),
+              bodyMerge.body,
+              joinRoot(this.mapping.rootPath, local.relativePath),
+            ),
+          );
         else if (bodyMerge.body !== localBody)
-          actions.push({
-            kind: "write",
-            path: joinRoot(this.mapping.rootPath, local.relativePath),
-            body: bodyMerge.body,
-          });
+          actions.push(
+            await this.resultAction(
+              "write",
+              joinRoot(this.mapping.rootPath, local.relativePath),
+              bodyMerge.body,
+            ),
+          );
       }
     }
     const remoteIds = new Set(remote.map((page) => page.pageId));
@@ -445,7 +631,7 @@ export class SyncRuntime {
             conflictId: `archive:${page.pageId}`,
             pageId: page.pageId,
             field: "archive",
-            base: page.body,
+            base: await this.baseBody(page),
             local: await this.localBody(local),
             remote: "",
             wholeDocument: true,
@@ -460,6 +646,7 @@ export class SyncRuntime {
     for (const file of scan.files)
       expectedVaultHashes[joinRoot(this.mapping.rootPath, file.relativePath)] =
         file.vaultByteHash;
+    const conflictValuePaths = await this.stageConflictValues(conflicts);
     return {
       scanEpoch: scan.scanEpoch,
       revision: head.revision,
@@ -469,6 +656,7 @@ export class SyncRuntime {
       conflictResolutions: {},
       initialBindings,
       expectedVaultHashes,
+      conflictValuePaths,
     };
   }
   async bindInitialLocal(
@@ -520,6 +708,7 @@ export class SyncRuntime {
       }
     const actions = [...preview.actions];
     const hints: MoveHint[] = [];
+    const restoreEntries: PendingIdentities["entries"] = {};
     for (const choice of preview.initialBindings) {
       const currentBody = choice.localPath
         ? (choice.localBody ??
@@ -530,14 +719,22 @@ export class SyncRuntime {
           ? (choice.manualBody ?? currentBody ?? choice.remoteBody)
           : choice.resolution === "local"
             ? (currentBody ?? choice.remoteBody)
-            : choice.remoteBody;
+            : choice.remoteBody ||
+              (await this.remoteBody(
+                preview.revision,
+                preview.remotePages.find(
+                  (page) => page.pageId === choice.pageId,
+                )!,
+              ));
       if (choice.localPath) {
         if (body !== currentBody)
-          actions.push({
-            kind: "write",
-            path: joinRoot(this.mapping.rootPath, choice.localPath),
-            body,
-          });
+          actions.push(
+            await this.resultAction(
+              "write",
+              joinRoot(this.mapping.rootPath, choice.localPath),
+              body,
+            ),
+          );
         if (choice.localVaultByteHash)
           hints.push({
             pageId: choice.pageId,
@@ -546,11 +743,13 @@ export class SyncRuntime {
             observedVaultByteHash: choice.localVaultByteHash,
           });
       } else
-        actions.push({
-          kind: "create",
-          path: joinRoot(this.mapping.rootPath, choice.remotePath),
-          body,
-        });
+        actions.push(
+          await this.resultAction(
+            "create",
+            joinRoot(this.mapping.rootPath, choice.remotePath),
+            body,
+          ),
+        );
     }
     const base = await this.readBase();
     const scan = await this.scan();
@@ -579,6 +778,19 @@ export class SyncRuntime {
             kind: "trash",
             path: joinRoot(this.mapping.rootPath, local.relativePath),
           });
+        else if (local) {
+          restoreEntries[pageId] = {
+            pageId,
+            path: local.relativePath,
+            contentHash: local.contentHash,
+          };
+          hints.push({
+            pageId,
+            fromPath: basePage?.relativePath ?? local.relativePath,
+            toPath: local.relativePath,
+            observedVaultByteHash: local.vaultByteHash,
+          });
+        }
         continue;
       }
       const deleteConflict = pageConflicts.find(
@@ -590,23 +802,26 @@ export class SyncRuntime {
             "local" &&
           remote
         )
-          actions.push({
-            kind: "create",
-            path: joinRoot(this.mapping.rootPath, remote.path),
-            body: resolvedValue(
-              deleteConflict,
-              preview.conflictResolutions[deleteConflict.conflictId]!,
+          actions.push(
+            await this.resultAction(
+              "create",
+              joinRoot(this.mapping.rootPath, remote.path),
+              await this.conflictValue(
+                preview,
+                deleteConflict,
+                preview.conflictResolutions[deleteConflict.conflictId]!,
+              ),
             ),
-          });
+          );
         continue;
       }
       if (!local || !remote || !basePage)
         throw new Error("Pull conflict page disappeared");
       const currentBody = await this.localBody(local);
       const bodyMerge = await mergeBody(
-        basePage.body,
+        await this.baseBody(basePage),
         currentBody,
-        remote.body,
+        await this.remoteBody(preview.revision, remote),
         pageId,
       );
       const pathMerge = mergeField(
@@ -617,14 +832,16 @@ export class SyncRuntime {
       const bodyConflict = pageConflicts.find((item) => item.field === "body");
       const pathConflict = pageConflicts.find((item) => item.field === "path");
       const finalBody = bodyConflict
-        ? resolvedValue(
+        ? await this.conflictValue(
+            preview,
             bodyConflict,
             preview.conflictResolutions[bodyConflict.conflictId]!,
           )
         : bodyMerge.body;
       const finalRelativePath = pathConflict
         ? validatePortablePath(
-            resolvedValue(
+            await this.conflictValue(
+              preview,
               pathConflict,
               preview.conflictResolutions[pathConflict.conflictId]!,
             ),
@@ -634,23 +851,28 @@ export class SyncRuntime {
         finalRelativePath.normalize("NFC") !==
         local.relativePath.normalize("NFC")
       )
-        actions.push({
-          kind: "rename",
-          fromPath: joinRoot(this.mapping.rootPath, local.relativePath),
-          path: joinRoot(this.mapping.rootPath, finalRelativePath),
-          body: finalBody,
-        });
+        actions.push(
+          await this.resultAction(
+            "rename",
+            joinRoot(this.mapping.rootPath, finalRelativePath),
+            finalBody,
+            joinRoot(this.mapping.rootPath, local.relativePath),
+          ),
+        );
       else if (finalBody !== currentBody)
-        actions.push({
-          kind: "write",
-          path: joinRoot(this.mapping.rootPath, local.relativePath),
-          body: finalBody,
-        });
+        actions.push(
+          await this.resultAction(
+            "write",
+            joinRoot(this.mapping.rootPath, local.relativePath),
+            finalBody,
+          ),
+        );
     }
-    const baselineTx = await this.baseline.prepare(
+    const baselineTx = await this.baseline.prepareStreaming(
       preview.revision,
       preview.remotePages,
       "pull",
+      (page) => this.remoteBody(preview.revision, page),
     );
     await this.baseline.setPhase("applying");
     const tx = new PullTransaction(
@@ -681,6 +903,11 @@ export class SyncRuntime {
     if (hints.length) await this.moveHints.write({ schemaVersion: 1, hints });
     await this.baseline.commit();
     await this.identities.clear();
+    if (Object.keys(restoreEntries).length)
+      await this.identities.write({
+        schemaVersion: 1,
+        entries: restoreEntries,
+      });
     this.mapping.status = "active";
   }
   async previewPush(): Promise<PushPreview> {
@@ -689,7 +916,7 @@ export class SyncRuntime {
     const head = await this.remote.getHead(this.mapping.spaceId);
     if (
       this.mapping.status === "pending" &&
-      (await this.snapshot(head.revision)).length > 0
+      (await this.downloadSnapshot(head.revision)).pages.length > 0
     )
       throw new Error("INITIAL_PULL_REQUIRED");
     const baseRevision =
@@ -770,8 +997,17 @@ export class SyncRuntime {
       changes: preview.changes,
       capabilities: preview.capabilities,
     });
-    const pages = await this.snapshot(result.revision);
-    await this.stageAndCommit(result.revision, pages, "push");
+    const downloaded = await this.downloadSnapshot(result.revision);
+    const pages = downloaded.pages;
+    if (
+      result.pageCount !== downloaded.metadata.pageCount ||
+      result.revisionBodyBytes !== downloaded.metadata.revisionBodyBytes ||
+      result.revisionManifestByteLength !==
+        downloaded.metadata.revisionManifestByteLength ||
+      result.revisionContentHash !== downloaded.metadata.revisionContentHash
+    )
+      throw new Error("Published snapshot does not match finalize result");
+    await this.stageDownloadedAndCommit(result.revision, pages, "push");
     await service.markVerified();
     await this.identities.clear();
     await this.moveHints.clear();

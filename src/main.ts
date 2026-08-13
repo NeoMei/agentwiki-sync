@@ -31,7 +31,7 @@ import { SessionResponseSchema } from "./agentwiki/protocol";
 export default class AgentWikiSyncPlugin extends Plugin {
   settings: AgentWikiSyncSettings = DEFAULT_SETTINGS;
   private readonly locks = new OperationLock();
-  private readonly liveRuntimes = new Set<SyncRuntime>();
+  private readonly liveRuntimes = new Map<string, SyncRuntime>();
   override async onload(): Promise<void> {
     this.settings = parseSettings(await this.loadData());
     this.addSettingTab(new AgentWikiSyncSettingTab(this.app, this));
@@ -45,7 +45,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
         callback: () => this.openSync(action),
       });
     const invalidate = () => {
-      for (const runtime of this.liveRuntimes) runtime.invalidate();
+      for (const runtime of this.liveRuntimes.values()) runtime.invalidate();
     };
     this.registerEvent(this.app.vault.on("create", invalidate));
     this.registerEvent(this.app.vault.on("modify", invalidate));
@@ -53,7 +53,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
         invalidate();
-        for (const runtime of this.liveRuntimes)
+        for (const runtime of this.liveRuntimes.values())
           void runtime.recordRename(oldPath, file.path).catch(() => undefined);
       }),
     );
@@ -71,6 +71,12 @@ export default class AgentWikiSyncPlugin extends Plugin {
     await this.saveSettings();
   }
   async connect(code: string): Promise<void> {
+    if (this.settings.serverInstanceId !== null) {
+      new Notice(
+        "Disconnect this device before connecting a different credential.",
+      );
+      return;
+    }
     if (!this.settings.serverUrl || !code) {
       new Notice("Enter the AgentWiki server and connection code.");
       return;
@@ -161,6 +167,11 @@ export default class AgentWikiSyncPlugin extends Plugin {
     await this.saveSettings();
   }
   async disconnect(): Promise<void> {
+    for (const mapping of this.settings.mappings) {
+      const runtime = await this.runtime(mapping);
+      if (runtime && (await runtime.hasUnfinishedPush()))
+        throw new Error(`Space ${mapping.spaceId} has an unfinished Push`);
+    }
     const local = new ObsidianLocalControlStore(this.app);
     const secretId = await local.read("credential-secret-id");
     if (secretId) new ObsidianSecrets(this.app).set(secretId, "");
@@ -183,6 +194,8 @@ export default class AgentWikiSyncPlugin extends Plugin {
   private async runtime(
     mapping: NonNullable<ReturnType<AgentWikiSyncPlugin["selectedMapping"]>>,
   ): Promise<SyncRuntime | null> {
+    const existing = this.liveRuntimes.get(mapping.spaceId);
+    if (existing) return existing;
     const local = new ObsidianLocalControlStore(this.app);
     await new VaultIdentityService(
       new ObsidianControlStore(this.app.vault.adapter),
@@ -255,7 +268,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       await idFileKey(deviceId),
       await idFileKey(mapping.spaceId),
     );
-    this.liveRuntimes.add(runtime);
+    this.liveRuntimes.set(mapping.spaceId, runtime);
     return runtime;
   }
   private openSync(action: SyncAction): void {

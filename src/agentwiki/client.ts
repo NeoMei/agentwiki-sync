@@ -110,10 +110,26 @@ export class AgentWikiClient {
     metadata: Omit<SnapshotPage, "items" | "nextCursor">;
     items: SyncPage[];
   }> {
+    let metadata: Omit<SnapshotPage, "items" | "nextCursor"> | null = null;
+    const items: SyncPage[] = [];
+    for await (const page of this.snapshotPages(spaceId, revision)) {
+      metadata ??= page.metadata;
+      items.push(...page.items);
+    }
+    if (!metadata) throw new Error("Snapshot returned no metadata");
+    return { metadata, items };
+  }
+
+  async *snapshotPages(
+    spaceId: string,
+    revision = "current",
+  ): AsyncIterable<{
+    metadata: Omit<SnapshotPage, "items" | "nextCursor">;
+    items: SyncPage[];
+  }> {
     let cursor: string | null = null;
     let requestRevision = revision;
     let fixed: Omit<SnapshotPage, "items" | "nextCursor"> | null = null;
-    const items: SyncPage[] = [];
     do {
       const query = new URLSearchParams({ revision: requestRevision });
       if (cursor) query.set("cursor", cursor);
@@ -141,11 +157,10 @@ export class AgentWikiClient {
         throw new Error("Snapshot pagination metadata changed");
       fixed ??= metadata;
       requestRevision = page.revision;
-      items.push(...page.items);
+      yield { metadata, items: page.items };
       cursor = page.nextCursor;
     } while (cursor);
     if (!fixed) throw new Error("Snapshot returned no metadata");
-    return { metadata: fixed, items };
   }
 
   async delta(

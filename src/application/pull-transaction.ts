@@ -4,8 +4,14 @@ import type { VaultPort } from "../ports/vault";
 import { MutableControlRepository } from "../storage/envelope";
 
 export type PullAction =
-  | { kind: "create" | "write"; path: string; body: string }
-  | { kind: "rename"; fromPath: string; path: string; body: string }
+  | { kind: "create" | "write"; path: string; body?: string; bodyPath?: string }
+  | {
+      kind: "rename";
+      fromPath: string;
+      path: string;
+      body?: string;
+      bodyPath?: string;
+    }
   | { kind: "trash"; path: string };
 
 type JournalAction =
@@ -161,8 +167,12 @@ export class PullTransaction {
         continue;
       }
       const resultPath = `${this.root}/results/${index}.md`;
-      const resultHash = await sha256Hex(encoder.encode(action.body));
-      await this.control.write(resultPath, action.body);
+      const body =
+        action.body ??
+        (action.bodyPath ? await this.control.read(action.bodyPath) : null);
+      if (body === null) throw new Error("Pull action body is missing");
+      const resultHash = await sha256Hex(encoder.encode(body));
+      await this.control.write(resultPath, body);
       journalActions.push(
         action.kind === "rename"
           ? {

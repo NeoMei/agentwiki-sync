@@ -17,7 +17,7 @@ export interface BaselineState {
       relativePath: string;
       title: string;
       contentHash: string;
-      body: string;
+      body?: string;
     }
   >;
 }
@@ -81,18 +81,34 @@ export class BaselineRepository {
   async read(): Promise<BaselineState> {
     const current = await this.pointer.read();
     if (!current?.payload.active) return { revision: "0", pages: {} };
-    const value = await this.generations.read(current.payload.generationId);
+    const manifest = await this.generations.readManifest(
+      current.payload.generationId,
+    );
     if (
-      value.manifest.spaceId !== this.spaceId ||
-      value.manifest.rootPath !== this.rootPath ||
-      (await sha256Hex(canonicalBytes(value.manifest))) !==
+      manifest.spaceId !== this.spaceId ||
+      manifest.rootPath !== this.rootPath ||
+      (await sha256Hex(canonicalBytes(manifest))) !==
         current.payload.manifestHash
     )
       throw new Error("baseline corrupt: pointer identity/hash mismatch");
     const pages: BaselineState["pages"] = {};
-    for (const page of Object.values(value.manifest.pages))
-      pages[page.pageId] = { ...page, body: value.bodies[page.pageId]! };
-    return { revision: value.manifest.baseRevision, pages };
+    for (const page of Object.values(manifest.pages))
+      pages[page.pageId] = { ...page };
+    return { revision: manifest.baseRevision, pages };
+  }
+  async readBody(pageId: string): Promise<string> {
+    const current = await this.pointer.read();
+    if (!current?.payload.active) throw new Error("Missing baseline");
+    const manifest = await this.generations.readManifest(
+      current.payload.generationId,
+    );
+    const page = manifest.pages[pageId];
+    if (!page) throw new Error("Missing baseline page");
+    return this.generations.readBody(
+      current.payload.generationId,
+      pageId,
+      page.contentHash,
+    );
   }
   async prepare(
     revision: string,
@@ -131,6 +147,54 @@ export class BaselineRepository {
         pages: pageMap,
       },
       bodies,
+    );
+    const value: BaselineJournal = {
+      schemaVersion: 1,
+      transactionId: crypto.randomUUID(),
+      kind,
+      phase: "prepared",
+      oldGenerationId: current?.payload.active
+        ? current.payload.generationId
+        : null,
+      newGenerationId: generationId,
+    };
+    await this.journal.write(value);
+    return value;
+  }
+  async prepareStreaming(
+    revision: string,
+    pages: SyncPage[],
+    kind: BaselineJournal["kind"],
+    body: (page: SyncPage) => Promise<string>,
+  ): Promise<BaselineJournal> {
+    const current = await this.pointer.read();
+    const generationId = crypto.randomUUID();
+    async function* source() {
+      for (const page of pages)
+        yield {
+          pageId: page.pageId,
+          relativePath: page.path,
+          title: page.title,
+          contentHash: page.contentHash,
+          body: await body(page),
+        };
+    }
+    await this.generations.writeStreaming(
+      {
+        schemaVersion: 1,
+        protocolVersion: "1",
+        generationId,
+        spaceId: this.spaceId,
+        rootPath: this.rootPath,
+        baseRevision: revision,
+        baseRevisionContentHash: "",
+        basePageCount: 0,
+        baseRevisionManifestByteLength: 0,
+        baseRevisionBodyBytes: 0,
+        lastSuccessfulSyncAt: new Date().toISOString(),
+        pages: {},
+      },
+      source(),
     );
     const value: BaselineJournal = {
       schemaVersion: 1,

@@ -357,6 +357,34 @@ describe("AgentWiki connection", () => {
     ).rejects.toThrow(/relative segment|portable/i);
   });
 
+  it("sends push requests using the same canonical bytes that are hashed", async () => {
+    const http = new FakeHttp();
+    http.responses.push({
+      status: 200,
+      json: { protocolVersion: "1", receipt: "ok" },
+    });
+    const client = new AgentWikiClient(
+      "https://wiki.example.com",
+      http,
+      () => "secret",
+    );
+    const remote = new (
+      await import("../../src/agentwiki/push-remote")
+    ).AgentWikiPushRemote(client, "space");
+    const body = {
+      protocolVersion: "1" as const,
+      batchIndex: 0,
+      changes: [
+        { operation: "archive" as const, pageId: "p1", previousPath: "A.md" },
+      ],
+    };
+    const { batchHash, canonicalBytes } =
+      await import("../../src/agentwiki/protocol");
+    const batch = { ...body, batchHash: await batchHash(body) };
+    await remote.uploadBatch("11111111-1111-4111-8111-111111111111", batch);
+    expect(http.calls[0]?.canonicalBody).toEqual(canonicalBytes(batch));
+  });
+
   it("rejects a pending connection journal from another Vault", async () => {
     const control = new MemoryControlStore();
     await control.write(

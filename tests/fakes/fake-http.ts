@@ -17,8 +17,8 @@ export class FakeHttp implements HttpPort {
     method: string;
     path: string;
     body?: unknown;
-    canonicalBody?: Uint8Array;
     authorization?: string;
+    canonicalBody?: Uint8Array;
   }> = [];
   readonly responses: HttpResponse[] = [];
   private readonly routes = new Map<string, HttpResponse>();
@@ -29,6 +29,7 @@ export class FakeHttp implements HttpPort {
     method: string;
     url: string;
     body?: unknown;
+    canonicalBody?: Uint8Array;
     headers?: Record<string, string>;
   }): Promise<HttpResponse> {
     const url = new URL(request.url);
@@ -37,6 +38,7 @@ export class FakeHttp implements HttpPort {
       path: url.pathname + url.search,
       body: request.body,
       authorization: request.headers?.Authorization,
+      canonicalBody: request.canonicalBody,
     });
     return (
       this.responses.shift() ??
