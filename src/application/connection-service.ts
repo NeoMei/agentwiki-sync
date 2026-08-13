@@ -37,7 +37,7 @@ interface ConnectionJournal {
   credentialId?: string;
   serverInstanceId?: string;
 }
-interface ConnectionState {
+export interface ConnectionState {
   schemaVersion: 1;
   serverUrl: string;
   serverInstanceId: string;
@@ -67,7 +67,7 @@ const isConnectionJournal = (value: unknown): value is ConnectionJournal => {
     typeof item.pluginVersion === "string"
   );
 };
-const isConnectionState = (value: unknown): value is ConnectionState => {
+export const isConnectionState = (value: unknown): value is ConnectionState => {
   if (!value || typeof value !== "object") return false;
   const item = value as Partial<ConnectionState>;
   return (

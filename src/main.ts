@@ -7,7 +7,10 @@ import {
 import { AgentWikiSyncSettingTab } from "./obsidian/settings-tab";
 import { SyncModal, type SyncAction } from "./obsidian/sync-modal";
 import { PreviewModal } from "./obsidian/preview-modal";
-import { ConnectionService } from "./application/connection-service";
+import {
+  ConnectionService,
+  isConnectionState,
+} from "./application/connection-service";
 import {
   ObsidianControlStore,
   ObsidianLocalControlStore,
@@ -27,13 +30,40 @@ import { VaultIdentityService } from "./storage/vault-identity";
 import { idFileKey } from "./core/identity-key";
 import { OperationLock } from "./application/sync-coordinator";
 import { SessionResponseSchema } from "./agentwiki/protocol";
+import { MutableControlRepository } from "./storage/envelope";
+
+const isDeviceSettings = (value: unknown): value is AgentWikiSyncSettings => {
+  try {
+    return (
+      parseSettings(value).schemaVersion === 1 &&
+      !!value &&
+      typeof value === "object" &&
+      (value as { schemaVersion?: unknown }).schemaVersion === 1
+    );
+  } catch {
+    return false;
+  }
+};
 
 export default class AgentWikiSyncPlugin extends Plugin {
   settings: AgentWikiSyncSettings = DEFAULT_SETTINGS;
   private readonly locks = new OperationLock();
   private readonly liveRuntimes = new Map<string, SyncRuntime>();
+  private settingsRepo(): MutableControlRepository<AgentWikiSyncSettings> {
+    return new MutableControlRepository(
+      new ObsidianLocalControlStore(this.app),
+      "device-settings.json",
+      isDeviceSettings,
+    );
+  }
   override async onload(): Promise<void> {
-    this.settings = parseSettings(await this.loadData());
+    const local = await this.settingsRepo().read();
+    if (local) this.settings = local.payload;
+    else {
+      this.settings = parseSettings(await this.loadData());
+      await this.settingsRepo().write(this.settings);
+      await this.saveData(DEFAULT_SETTINGS);
+    }
     this.addSettingTab(new AgentWikiSyncSettingTab(this.app, this));
     this.addRibbonIcon("refresh-cw", "AgentWiki Sync", () =>
       this.openSync("status"),
@@ -59,7 +89,8 @@ export default class AgentWikiSyncPlugin extends Plugin {
     );
   }
   async saveSettings(): Promise<void> {
-    await this.saveData(this.settings);
+    validateMappings(this.settings.mappings);
+    await this.settingsRepo().write(this.settings);
   }
   async setServerUrl(value: string): Promise<void> {
     if (
@@ -104,7 +135,6 @@ export default class AgentWikiSyncPlugin extends Plugin {
         pluginVersion: this.manifest.version,
       });
       this.settings.serverInstanceId = result.serverInstanceId;
-      await local.write("credential-secret-id", result.credentialSecretId);
       await identity.bind(vaultId);
       await this.saveSettings();
       new Notice("AgentWiki device connected.");
@@ -173,10 +203,18 @@ export default class AgentWikiSyncPlugin extends Plugin {
         throw new Error(`Space ${mapping.spaceId} has an unfinished Push`);
     }
     const local = new ObsidianLocalControlStore(this.app);
-    const secretId = await local.read("credential-secret-id");
+    const state = await new MutableControlRepository(
+      local,
+      "connection-state.json",
+      isConnectionState,
+    ).read();
+    const secretId = state?.payload.credentialSecretId ?? null;
     if (secretId) new ObsidianSecrets(this.app).set(secretId, "");
-    await local.remove("credential-secret-id");
-    await local.remove("connection-state.json");
+    await new MutableControlRepository(
+      local,
+      "connection-state.json",
+      isConnectionState,
+    ).clear();
     this.settings.serverInstanceId = null;
     await this.saveSettings();
     new Notice(
@@ -201,7 +239,12 @@ export default class AgentWikiSyncPlugin extends Plugin {
       new ObsidianControlStore(this.app.vault.adapter),
       local,
     ).assertBound();
-    const secretId = await local.read("credential-secret-id");
+    const connectionState = await new MutableControlRepository(
+      local,
+      "connection-state.json",
+      isConnectionState,
+    ).read();
+    const secretId = connectionState?.payload.credentialSecretId ?? null;
     const deviceId = await local.read("device-id");
     if (!secretId || !deviceId) return null;
     const secrets = new ObsidianSecrets(this.app);
@@ -210,31 +253,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       new RequestUrlHttp(),
       () => secrets.get(secretId),
     );
-    const connectionRaw = await local.read("connection-state.json");
-    if (!connectionRaw) throw new Error("Connection identity is missing");
-    const connection = JSON.parse(connectionRaw) as {
-      envelopeSchemaVersion?: number;
-      payload?: {
-        schemaVersion?: number;
-        serverUrl?: string;
-        serverInstanceId?: string;
-        credentialId?: string;
-        deviceId?: string;
-        vaultId?: string;
-      };
-      schemaVersion?: number;
-      serverUrl?: string;
-      serverInstanceId?: string;
-      credentialId?: string;
-      deviceId?: string;
-      vaultId?: string;
-    };
-    const state =
-      connection.envelopeSchemaVersion === 1
-        ? connection.payload
-        : connection.schemaVersion === 1
-          ? connection
-          : null;
+    const state = connectionState?.payload ?? null;
     const boundVaultId = await local.read("bound-vault-id");
     if (
       !state ||
