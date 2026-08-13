@@ -22,5 +22,6 @@ npm run check
 - 插件只在用户执行连接、Status、Pull、Push 时联网。
 - Push 必须先确认预览，远端 head 领先时被阻止。
 - credential 与连接码只进入 Obsidian Secret Storage，不进入 Vault 或诊断。
-- `.agentwiki/` 控制状态通过 DataAdapter 相对路径访问；不使用 Node `fs` 或桌面专属 API。
+- `.agentwiki/` 控制状态按 device/space 隔离，通过 DataAdapter 相对路径访问；基线采用不可变 generation + current pointer，不使用 Node `fs` 或桌面专属 API。
+- 所有远端 Markdown 路径须先通过 NFC/casefold 可移植路径校验，Vault 适配器写入时再次执行 mapping-root containment。
 - Secret Storage 不防御用户主动安装的恶意 Obsidian 插件。
