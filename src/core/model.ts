@@ -6,7 +6,7 @@ export interface VaultFile {
 export interface ScannedFile {
   relativePath: string;
   title: string;
-  normalizedBody: string;
+  normalizedBody?: string;
   contentHash: string;
   vaultByteHash: string;
 }

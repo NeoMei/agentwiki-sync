@@ -51,7 +51,12 @@ export interface PushBatch extends PushBatchWithoutHash {
 }
 
 export interface RevisionContentManifest {
-  pages: Array<{ pageId: string; path: string; title: string; contentHash: string }>;
+  pages: Array<{
+    pageId: string;
+    path: string;
+    title: string;
+    contentHash: string;
+  }>;
 }
 
 export interface SyncPage {

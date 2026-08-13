@@ -14,7 +14,8 @@ function assertScalarString(value: string): void {
     const code = value.charCodeAt(index);
     if (code >= 0xd800 && code <= 0xdbff) {
       const next = value.charCodeAt(index + 1);
-      if (!(next >= 0xdc00 && next <= 0xdfff)) throw new TypeError("String contains an unpaired surrogate");
+      if (!(next >= 0xdc00 && next <= 0xdfff))
+        throw new TypeError("String contains an unpaired surrogate");
       index += 1;
     } else if (code >= 0xdc00 && code <= 0xdfff) {
       throw new TypeError("String contains an unpaired surrogate");
@@ -45,15 +46,19 @@ function serialize(value: unknown, seen: Set<object>): string {
   if (typeof value === "string") return quote(value);
   if (typeof value === "boolean") return value ? "true" : "false";
   if (typeof value === "number") {
-    if (!Number.isSafeInteger(value)) throw new TypeError("Protocol numbers must be safe integers");
+    if (!Number.isSafeInteger(value))
+      throw new TypeError("Protocol numbers must be safe integers");
     return String(value);
   }
-  if (typeof value === "undefined") throw new TypeError("Protocol values cannot contain undefined");
-  if (typeof value !== "object") throw new TypeError(`Unsupported protocol value: ${typeof value}`);
+  if (typeof value === "undefined")
+    throw new TypeError("Protocol values cannot contain undefined");
+  if (typeof value !== "object")
+    throw new TypeError(`Unsupported protocol value: ${typeof value}`);
   if (seen.has(value)) throw new TypeError("Protocol values cannot be cyclic");
   seen.add(value);
   try {
-    if (Array.isArray(value)) return `[${value.map((item) => serialize(item, seen)).join(",")}]`;
+    if (Array.isArray(value))
+      return `[${value.map((item) => serialize(item, seen)).join(",")}]`;
     const object = value as Record<string, unknown>;
     const entries = Object.keys(object)
       .sort(compareCodePoints)
@@ -68,8 +73,24 @@ export function canonicalBytes(value: unknown): Uint8Array {
   return encoder.encode(serialize(value, new Set()));
 }
 
-export function comparePushChanges<T extends { pageId: string; operation: string }>(left: T, right: T): number {
-  const leftPath = "path" in left ? String(left.path) : "previousPath" in left ? String(left.previousPath) : "";
-  const rightPath = "path" in right ? String(right.path) : "previousPath" in right ? String(right.previousPath) : "";
-  return compareCodePoints(left.pageId, right.pageId) || compareCodePoints(left.operation, right.operation) || compareCodePoints(leftPath, rightPath);
+export function comparePushChanges<
+  T extends { pageId: string; operation: string },
+>(left: T, right: T): number {
+  const leftPath =
+    "path" in left
+      ? String(left.path)
+      : "previousPath" in left
+        ? String(left.previousPath)
+        : "";
+  const rightPath =
+    "path" in right
+      ? String(right.path)
+      : "previousPath" in right
+        ? String(right.previousPath)
+        : "";
+  return (
+    compareCodePoints(left.pageId, right.pageId) ||
+    compareCodePoints(left.operation, right.operation) ||
+    compareCodePoints(leftPath, rightPath)
+  );
 }

@@ -10,3 +10,7 @@ export async function idFileKey(id: string): Promise<string> {
   validatePublicId(id);
   return sha256Hex(new TextEncoder().encode(id));
 }
+export async function opaqueFileKey(id: string): Promise<string> {
+  if (!id) throw new TypeError("Empty file identity");
+  return `p-${await sha256Hex(new TextEncoder().encode(id))}`;
+}

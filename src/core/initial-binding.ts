@@ -24,10 +24,22 @@ export interface BoundPage {
   contentHash: string;
 }
 
-export function buildInitialBindingPreview(local: ScannedFile[], remote: RemoteBindingPage[], choices: ExplicitBindingChoice[] = []): { base: BoundPage[]; vault: BoundPage[]; dirty: string[] } {
+export function buildInitialBindingPreview(
+  local: ScannedFile[],
+  remote: RemoteBindingPage[],
+  choices: ExplicitBindingChoice[] = [],
+): { base: BoundPage[]; vault: BoundPage[]; dirty: string[] } {
   const localByPath = new Map(local.map((page) => [page.relativePath, page]));
-  const choicesByRemote = new Map(choices.map((choice) => [choice.remotePageId, choice]));
-  const base = remote.map((page) => ({ pageId: page.pageId, relativePath: page.path, title: page.title, body: page.body, contentHash: page.contentHash }));
+  const choicesByRemote = new Map(
+    choices.map((choice) => [choice.remotePageId, choice]),
+  );
+  const base = remote.map((page) => ({
+    pageId: page.pageId,
+    relativePath: page.path,
+    title: page.title,
+    body: page.body,
+    contentHash: page.contentHash,
+  }));
   const vault: BoundPage[] = [];
   const dirty: string[] = [];
   for (const remotePage of remote) {
@@ -35,14 +47,44 @@ export function buildInitialBindingPreview(local: ScannedFile[], remote: RemoteB
     const samePath = localByPath.get(remotePage.path);
     if (choice) {
       const localPage = localByPath.get(choice.localPath);
-      if (!localPage) throw new TypeError("Explicit binding references a missing local page");
-      vault.push({ pageId: remotePage.pageId, relativePath: choice.finalPath, title: titleFromPath(choice.finalPath), body: choice.finalBody, contentHash: localPage.contentHash });
-      if (choice.finalPath !== remotePage.path || choice.finalBody !== remotePage.body || titleFromPath(choice.finalPath) !== remotePage.title) dirty.push(remotePage.pageId);
+      if (!localPage)
+        throw new TypeError("Explicit binding references a missing local page");
+      vault.push({
+        pageId: remotePage.pageId,
+        relativePath: choice.finalPath,
+        title: titleFromPath(choice.finalPath),
+        body: choice.finalBody,
+        contentHash: localPage.contentHash,
+      });
+      if (
+        choice.finalPath !== remotePage.path ||
+        choice.finalBody !== remotePage.body ||
+        titleFromPath(choice.finalPath) !== remotePage.title
+      )
+        dirty.push(remotePage.pageId);
     } else if (samePath) {
-      vault.push({ pageId: remotePage.pageId, relativePath: samePath.relativePath, title: samePath.title, body: samePath.normalizedBody, contentHash: samePath.contentHash });
-      if (samePath.contentHash !== remotePage.contentHash || samePath.title !== remotePage.title) dirty.push(remotePage.pageId);
+      if (samePath.normalizedBody === undefined)
+        throw new TypeError("Initial binding requires retained local bodies");
+      vault.push({
+        pageId: remotePage.pageId,
+        relativePath: samePath.relativePath,
+        title: samePath.title,
+        body: samePath.normalizedBody,
+        contentHash: samePath.contentHash,
+      });
+      if (
+        samePath.contentHash !== remotePage.contentHash ||
+        samePath.title !== remotePage.title
+      )
+        dirty.push(remotePage.pageId);
     } else {
-      vault.push({ pageId: remotePage.pageId, relativePath: remotePage.path, title: remotePage.title, body: remotePage.body, contentHash: remotePage.contentHash });
+      vault.push({
+        pageId: remotePage.pageId,
+        relativePath: remotePage.path,
+        title: remotePage.title,
+        body: remotePage.body,
+        contentHash: remotePage.contentHash,
+      });
     }
   }
   return { base, vault, dirty };
