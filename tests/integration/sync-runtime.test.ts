@@ -60,4 +60,17 @@ describe("SyncRuntime", () => {
     const preview = await runtime.previewPull(); expect(preview.conflicts).toHaveLength(1);
     await expect(runtime.applyPull(preview)).rejects.toThrow(/conflict/);
   });
+
+  it("treats remote archive versus local edit as a conflict", async () => {
+    const remote = new FakeAgentWiki(); const original = "base";
+    await remote.seed([{ pageId: "p1", path: "A.md", title: "A", body: original, contentHash: await contentHash(original), updatedAt: "2026-08-14T00:00:00.000Z" }]);
+    const vault = new MemoryVault({}); const runtime = new SyncRuntime(vault, new MemoryControlStore(), remote, { spaceId: "space", rootPath: "Wiki", status: "pending" });
+    await runtime.applyPull(await runtime.previewPull()); await vault.write("Wiki/A.md", new TextEncoder().encode("local edit")); await remote.replace([]);
+    const preview = await runtime.previewPull(); expect(preview.conflicts).toHaveLength(1); expect(preview.actions).toHaveLength(0);
+  });
+
+  it("returns clean without creating an empty push session", async () => {
+    const remote = new FakeAgentWiki(); const runtime = new SyncRuntime(new MemoryVault({}), new MemoryControlStore(), remote, { spaceId: "space", rootPath: "Wiki", status: "pending" });
+    await runtime.establishEmptyBase(); const preview = await runtime.previewPush(); expect(preview.changes).toHaveLength(0); await runtime.applyPush(preview); expect(remote.sessionCount()).toBe(0);
+  });
 });

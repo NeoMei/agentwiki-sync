@@ -48,7 +48,11 @@ export class SyncRuntime {
       }
     }
     const remoteIds = new Set(remote.map((page) => page.pageId));
-    for (const page of Object.values(base.pages)) if (!remoteIds.has(page.pageId) && localByPath.has(page.relativePath)) actions.push({ kind: "trash", path: `${this.mapping.rootPath}/${page.relativePath}` });
+    for (const page of Object.values(base.pages)) if (!remoteIds.has(page.pageId)) {
+      const local = localByPath.get(page.relativePath);
+      if (local && local.contentHash !== page.contentHash) conflicts.push((await mergeBody(page.body, local.normalizedBody, "", page.pageId)).conflicts[0] ?? { conflictId: page.pageId, base: page.body, local: local.normalizedBody, remote: "", wholeDocument: true });
+      else if (local) actions.push({ kind: "trash", path: `${this.mapping.rootPath}/${page.relativePath}` });
+    }
     return { scanEpoch: scan.scanEpoch, revision: (await this.remote.getHead(this.mapping.spaceId)).revision, actions, remotePages: remote, conflicts };
   }
   async applyPull(preview: PullPreview): Promise<void> { if (preview.conflicts.length > 0) throw new Error("Pull has unresolved structured conflicts"); const tx = new PullTransaction(this.vault, this.control, `${this.root}/pull`); await tx.prepare(preview.actions, preview.scanEpoch); await tx.apply(this.scanEpoch); await this.writeBase(preview.revision, preview.remotePages); this.mapping.status = "active"; }
@@ -62,5 +66,5 @@ export class SyncRuntime {
     for (const page of local.deleted) changes.push({ operation: "archive", pageId: page.pageId, previousPath: page.relativePath });
     return { revision: base.revision, changes, capabilities: this.capabilities };
   }
-  async applyPush(preview: PushPreview): Promise<void> { const result = await new PushService(this.remote, this.control, `${this.root}/push`).publish({ spaceId: this.mapping.spaceId, baseRevision: preview.revision, changes: preview.changes, capabilities: preview.capabilities }); await this.writeBase(result.revision, await this.remote.snapshot(this.mapping.spaceId)); await this.control.remove(this.identitiesPath); this.mapping.status = "active"; }
+  async applyPush(preview: PushPreview): Promise<void> { if (preview.changes.length === 0) return; const result = await new PushService(this.remote, this.control, `${this.root}/push`).publish({ spaceId: this.mapping.spaceId, baseRevision: preview.revision, changes: preview.changes, capabilities: preview.capabilities }); await this.writeBase(result.revision, await this.remote.snapshot(this.mapping.spaceId)); await this.control.remove(this.identitiesPath); this.mapping.status = "active"; }
 }
