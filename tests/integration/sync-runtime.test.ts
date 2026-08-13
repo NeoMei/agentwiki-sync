@@ -26,8 +26,38 @@ describe("SyncRuntime", () => {
     await runtime.establishEmptyBase();
     const preview = await runtime.previewPush();
     expect(preview.changes).toHaveLength(1);
+    const repeated = await runtime.previewPush();
+    expect(repeated.changes[0]?.pageId).toBe(preview.changes[0]?.pageId);
     expect(await remote.snapshot()).toHaveLength(0);
     await runtime.applyPush(preview);
     expect((await remote.snapshot())[0]?.body).toBe("new");
+  });
+
+  it("three-way merges non-overlapping local and remote edits and keeps local-only changes dirty", async () => {
+    const remote = new FakeAgentWiki();
+    const original = "top\nmiddle\nbottom";
+    await remote.seed([{ pageId: "p1", path: "Guide.md", title: "Guide", body: original, contentHash: await contentHash(original), updatedAt: "2026-08-14T00:00:00.000Z" }]);
+    const vault = new MemoryVault({}); const control = new MemoryControlStore();
+    const runtime = new SyncRuntime(vault, control, remote, { spaceId: "space", rootPath: "Wiki", status: "pending" });
+    await runtime.applyPull(await runtime.previewPull());
+    await vault.write("Wiki/Guide.md", new TextEncoder().encode("TOP\nmiddle\nbottom"));
+    const remoteEdit = "top\nmiddle\nBOTTOM";
+    await remote.replace([{ pageId: "p1", path: "Guide.md", title: "Guide", body: remoteEdit, contentHash: await contentHash(remoteEdit), updatedAt: "2026-08-14T00:01:00.000Z" }]);
+    const preview = await runtime.previewPull();
+    expect(preview.conflicts).toHaveLength(0);
+    expect(preview.actions[0]).toMatchObject({ kind: "write", body: "TOP\nmiddle\nBOTTOM" });
+    await runtime.applyPull(preview);
+    expect((await runtime.status()).local.modified).toHaveLength(1);
+  });
+
+  it("blocks Pull application until structured conflicts are resolved", async () => {
+    const remote = new FakeAgentWiki(); const original = "same";
+    await remote.seed([{ pageId: "p1", path: "A.md", title: "A", body: original, contentHash: await contentHash(original), updatedAt: "2026-08-14T00:00:00.000Z" }]);
+    const vault = new MemoryVault({}); const runtime = new SyncRuntime(vault, new MemoryControlStore(), remote, { spaceId: "space", rootPath: "Wiki", status: "pending" });
+    await runtime.applyPull(await runtime.previewPull());
+    await vault.write("Wiki/A.md", new TextEncoder().encode("local"));
+    await remote.replace([{ pageId: "p1", path: "A.md", title: "A", body: "remote", contentHash: await contentHash("remote"), updatedAt: "2026-08-14T00:01:00.000Z" }]);
+    const preview = await runtime.previewPull(); expect(preview.conflicts).toHaveLength(1);
+    await expect(runtime.applyPull(preview)).rejects.toThrow(/conflict/);
   });
 });
