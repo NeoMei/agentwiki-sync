@@ -1,0 +1,20 @@
+import { describe, expect, it } from "vitest";
+import { OperationLock, selectMappingForPath, validateMappings } from "../../src/application/sync-coordinator";
+
+describe("sync coordinator", () => {
+  it("serializes each space without blocking another space", async () => {
+    const lock = new OperationLock();
+    const release = lock.acquire("s1");
+    expect(() => lock.acquire("s1")).toThrow(/already/);
+    expect(() => lock.acquire("s2")).not.toThrow();
+    release();
+    expect(() => lock.acquire("s1")).not.toThrow();
+  });
+
+  it("selects the active mapping for an open file and rejects overlaps", () => {
+    const mappings = [{ spaceId: "s1", rootPath: "Wiki", status: "active" as const }, { spaceId: "s2", rootPath: "Other", status: "pending" as const }];
+    expect(selectMappingForPath(mappings, "Wiki/A.md")?.spaceId).toBe("s1");
+    expect(selectMappingForPath(mappings, "Other/A.md")).toBeNull();
+    expect(() => validateMappings([{ spaceId: "a", rootPath: "Wiki", status: "active" }, { spaceId: "b", rootPath: "Wiki/Sub", status: "active" }])).toThrow(/overlap/);
+  });
+});
