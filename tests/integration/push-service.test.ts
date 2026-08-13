@@ -34,6 +34,8 @@ describe("PushService", () => {
     expect(remote.finalizeCalls).toBe(1);
   });
 
+  it("resumes an interrupted upload from persisted payloads",async()=>{const remote=new FakePushRemote(capabilities,"r1");remote.loseFirstUploadOnce=true;const store=new MemoryControlStore();const service=new PushService(remote,store,".agentwiki/push/resume");await expect(service.publish({spaceId:"s",baseRevision:"r1",changes,capabilities})).rejects.toThrow(/interrupted/);const result=await service.resume();expect(result?.status).toBe("published");expect(remote.batches).toHaveLength(2);});
+
   it("refuses to publish when remote head is ahead", async () => {
     const remote = new FakePushRemote(capabilities, "r2");
     await expect(new PushService(remote, new MemoryControlStore(), ".agentwiki/push/t3").publish({ spaceId: "s", baseRevision: "r1", changes, capabilities })).rejects.toThrow(/BASE_STALE/);

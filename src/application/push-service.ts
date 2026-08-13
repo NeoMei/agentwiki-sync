@@ -3,9 +3,10 @@ import type { ControlStorePort } from "../ports/control-store";
 import type { FinalizeResult, PushRemotePort } from "../ports/push-remote";
 
 interface PushInput { spaceId: string; baseRevision: string; changes: PushChange[]; capabilities: SyncCapabilities }
+type JournalChange=Exclude<PushChange,{operation:"upsert"}>|Omit<Extract<PushChange,{operation:"upsert"}>,"body">;
 interface PushJournal {
   schemaVersion: 1; spaceId: string; baseRevision: string; idempotencyKey: string; confirmationHash: string;
-  capabilitiesHash: string; changes: Array<Omit<PushChange, "body">>; sessionId: string | null; remoteState: "not_created" | "uploading" | "finalizing" | "published";
+  capabilitiesHash: string; capabilities:SyncCapabilities; changes: JournalChange[]; sessionId: string | null; remoteState: "not_created" | "uploading" | "finalizing" | "published";
   result: FinalizeResult | null; localCommitPhase: "not_started" | "verified";
 }
 
@@ -15,6 +16,8 @@ export class PushService {
   private async save(journal: PushJournal): Promise<void> { await this.store.write(this.path, JSON.stringify(journal)); }
   private async load(): Promise<PushJournal> { const raw = await this.store.read(this.path); if (!raw) throw new Error("Missing push journal"); return JSON.parse(raw) as PushJournal; }
   private async persistPayload(changes: PushChange[]): Promise<void> { for (const change of changes) if (change.operation === "upsert") await this.store.write(`${this.root}/payload/${change.pageId}.md`, change.body); }
+  private async hydrate(journal:PushJournal):Promise<PushChange[]>{const changes:PushChange[]=[];for(const change of journal.changes){if(change.operation==="archive")changes.push(change);else{const body=await this.store.read(`${this.root}/payload/${change.pageId}.md`);if(body===null||await contentHash(body)!==change.contentHash)throw new Error("Push payload is corrupt");changes.push({...change,body});}}return changes;}
+  private async create(journal:PushJournal,changes:PushChange[]){const manifest={protocolVersion:"1" as const,spaceId:journal.spaceId,baseRevision:journal.baseRevision,changes:journal.changes};const totalBodyBytes=changes.reduce((total,change)=>total+(change.operation==="upsert"?new TextEncoder().encode(change.body).byteLength:0),0);return this.remote.createSession({baseRevision:journal.baseRevision,idempotencyKey:journal.idempotencyKey,capabilitiesHash:journal.capabilitiesHash,confirmationHash:journal.confirmationHash,confirmationByteLength:canonicalBytes(manifest).byteLength,changeCount:changes.length,totalBodyBytes});}
 
   async publish(input: PushInput): Promise<FinalizeResult> {
     if ((await this.remote.getHead(input.spaceId)).revision !== input.baseRevision) throw new Error("BASE_STALE");
@@ -22,7 +25,7 @@ export class PushService {
     const manifest = { protocolVersion: "1" as const, spaceId: input.spaceId, baseRevision: input.baseRevision, changes: input.changes.map((change) => change.operation === "upsert" ? ({ operation: change.operation, pageId: change.pageId, path: change.path, title: change.title, contentHash: change.contentHash }) : change) };
     const manifestHash = await confirmationHash(manifest);
     const journalChanges = input.changes.map((change) => change.operation === "upsert" ? ({ operation: change.operation, pageId: change.pageId, path: change.path, title: change.title, contentHash: change.contentHash }) : change);
-    const journal: PushJournal = { schemaVersion: 1, spaceId: input.spaceId, baseRevision: input.baseRevision, idempotencyKey: crypto.randomUUID(), confirmationHash: manifestHash, capabilitiesHash: await capabilitiesHash(input.capabilities), changes: journalChanges, sessionId: null, remoteState: "not_created", result: null, localCommitPhase: "not_started" };
+    const journal: PushJournal = { schemaVersion: 1, spaceId: input.spaceId, baseRevision: input.baseRevision, idempotencyKey: crypto.randomUUID(), confirmationHash: manifestHash, capabilitiesHash: await capabilitiesHash(input.capabilities), capabilities:input.capabilities, changes: journalChanges, sessionId: null, remoteState: "not_created", result: null, localCommitPhase: "not_started" };
     await this.persistPayload(input.changes);
     await this.save(journal);
     const totalBodyBytes = input.changes.reduce((total, change) => total + (change.operation === "upsert" ? new TextEncoder().encode(change.body).byteLength : 0), 0);
@@ -37,10 +40,9 @@ export class PushService {
 
   async resume(): Promise<FinalizeResult | null> {
     const journal = await this.load();
-    if (!journal.sessionId) return null;
-    const session = await this.remote.getSession(journal.sessionId);
-    if (session.status !== "published" || !session.result) return null;
-    return this.commitResult(journal, session.result);
+    const changes=await this.hydrate(journal);let capabilities=journal.capabilities;let received=new Set<number>();
+    if(!journal.sessionId){const created=await this.create(journal,changes);journal.sessionId=created.sessionId;journal.remoteState="uploading";capabilities=created.capabilities;await this.save(journal);}else{const session=await this.remote.getSession(journal.sessionId);if(session.status==="published"&&session.result)return this.commitResult(journal,session.result);if(session.status==="aborted"||session.status==="expired")throw new Error("Push session is no longer recoverable");received=new Set(session.receivedBatchIndexes);}
+    const batches=await partitionPushChanges(changes,capabilities);for(const batch of batches)if(!received.has(batch.batchIndex)){const receipt=await this.remote.uploadBatch(journal.sessionId!,batch);await this.store.write(`${this.root}/receipts/${batch.batchIndex}.json`,JSON.stringify({batchIndex:batch.batchIndex,batchHash:batch.batchHash,receipt:receipt.receipt}));}journal.remoteState="finalizing";await this.save(journal);return this.commitResult(journal,await this.remote.finalize(journal.sessionId!,journal.confirmationHash));
   }
 
   private async commitResult(journal: PushJournal, result: FinalizeResult): Promise<FinalizeResult> {
