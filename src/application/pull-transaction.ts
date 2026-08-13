@@ -10,6 +10,7 @@ export type PullAction =
 interface SnapshotEntry { path: string; bytes: number[] | null; hash: string | null }
 interface PullJournal {
   schemaVersion: 1;
+  transactionId: string;
   state: "prepared" | "applying" | "committed" | "rolling_back" | "failed";
   scanEpoch: number;
   actions: PullAction[];
@@ -27,7 +28,7 @@ export class PullTransaction {
   private async save(journal: PullJournal): Promise<void> { await this.control.write(this.journalPath, JSON.stringify(journal)); }
   private async load(): Promise<PullJournal> { const raw = await this.control.read(this.journalPath); if (!raw) throw new Error("Missing pull journal"); return JSON.parse(raw) as PullJournal; }
 
-  async prepare(actions: PullAction[], scanEpoch: number): Promise<void> {
+  async prepare(actions: PullAction[], scanEpoch: number, transactionId: string = crypto.randomUUID()): Promise<void> {
     const paths = new Set<string>();
     for (const action of actions) {
       paths.add(action.path);
@@ -38,7 +39,7 @@ export class PullTransaction {
       const bytes = await this.vault.read(path);
       snapshots.push({ path, bytes: bytes ? Array.from(bytes) : null, hash: bytes ? await sha256Hex(bytes) : null });
     }
-    const journal: PullJournal = { schemaVersion: 1, state: "prepared", scanEpoch, actions, snapshots, temporaryPaths: [], materialized: [] };
+    const journal: PullJournal = { schemaVersion: 1, transactionId, state: "prepared", scanEpoch, actions, snapshots, temporaryPaths: [], materialized: [] };
     await this.save(journal);
     for (let index = 0; index < actions.length; index += 1) {
       const action = actions[index]!;
