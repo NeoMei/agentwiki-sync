@@ -20,6 +20,13 @@ describe("AgentWiki connection", () => {
     await expect(client.head("space")).rejects.toThrow(/redirect/);
   });
 
+  it("rejects mixed snapshot pages before returning any combined result", async () => {
+    const http = new FakeHttp();
+    const page = { protocolVersion: "1", spaceId: "space", revision: "r1", sequence: 1, revisionContentHash: "h1", pageCount: "2", revisionManifestByteLength: "10", revisionBodyBytes: "2", items: [], nextCursor: "next" };
+    http.responses.push({ status: 200, json: page }, { status: 200, json: { ...page, revisionContentHash: "changed", nextCursor: null } });
+    await expect(new AgentWikiClient("https://wiki.example.com", http, () => "secret").snapshot("space")).rejects.toThrow(/metadata changed/);
+  });
+
   it("stores a credential before exchange and activates only after verification", async () => {
     const http = new FakeHttp();
     http.route("POST", "/api/integrations/obsidian/exchange", { status: 201, json: { protocolVersion: "1", serverInstanceId: "11111111-1111-4111-8111-111111111111", credentialId: "22222222-2222-4222-8222-222222222222", credentialStatus: "provisional", provisionalExpiresAt: "2026-08-14T01:00:00.000Z", user: { id: "u", displayName: "U" }, capabilities: FakeHttp.capabilities } });

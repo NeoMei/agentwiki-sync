@@ -9,6 +9,7 @@ import { AgentWikiClient } from "./agentwiki/client";
 import { AgentWikiPushRemote } from "./agentwiki/push-remote";
 import { SyncRuntime } from "./application/sync-runtime";
 import { selectMappingForPath, validateMappings } from "./application/sync-coordinator";
+import { VaultIdentityService } from "./storage/vault-identity";
 
 export default class AgentWikiSyncPlugin extends Plugin {
   settings: AgentWikiSyncSettings = DEFAULT_SETTINGS;
@@ -21,18 +22,17 @@ export default class AgentWikiSyncPlugin extends Plugin {
   async saveSettings(): Promise<void> { await this.saveData(this.settings); }
   async connect(code: string): Promise<void> {
     if (!this.settings.serverUrl || !code) { new Notice("Enter the AgentWiki server and connection code."); return; }
-    const local = new ObsidianLocalControlStore(this.app); let deviceId = await local.read("device-id"); let vaultId = await local.read("vault-id");
+    const local = new ObsidianLocalControlStore(this.app); const shared = new ObsidianControlStore(this.app.vault.adapter); let deviceId = await local.read("device-id"); const identity = new VaultIdentityService(shared, local); const vaultId = await identity.getOrCreate();
     if (!deviceId) { deviceId = crypto.randomUUID(); await local.write("device-id", deviceId); }
-    if (!vaultId) { vaultId = crypto.randomUUID(); await local.write("vault-id", vaultId); }
     try {
       const result = await new ConnectionService(new RequestUrlHttp(), new ObsidianSecrets(this.app), local).connect({ serverUrl: this.settings.serverUrl, code, deviceId, deviceName: this.app.vault.getName(), vaultId, pluginVersion: this.manifest.version });
-      this.settings.serverInstanceId = result.serverInstanceId; await local.write("credential-secret-id", result.credentialSecretId); await this.saveSettings(); new Notice("AgentWiki device connected.");
+      this.settings.serverInstanceId = result.serverInstanceId; await local.write("credential-secret-id", result.credentialSecretId); await identity.bind(vaultId); await this.saveSettings(); new Notice("AgentWiki device connected.");
     } catch (error) { new Notice(`Connection failed: ${error instanceof Error ? error.message : "unknown error"}`); }
   }
   async addMapping(spaceId: string, rootPath: string): Promise<void> { const next = [...this.settings.mappings, { spaceId, rootPath, status: "pending" as const }]; validateMappings(next); this.settings.mappings = next; await this.saveSettings(); }
   private async runtime(): Promise<SyncRuntime | null> {
     const activePath = this.app.workspace.getActiveFile()?.path ?? ""; const mapping = selectMappingForPath(this.settings.mappings, activePath) ?? this.settings.mappings[0];
-    if (!mapping) return null; const local = new ObsidianLocalControlStore(this.app); const secretId = await local.read("credential-secret-id"); if (!secretId) return null;
+    if (!mapping) return null; const local = new ObsidianLocalControlStore(this.app); await new VaultIdentityService(new ObsidianControlStore(this.app.vault.adapter), local).assertBound(); const secretId = await local.read("credential-secret-id"); if (!secretId) return null;
     const secrets = new ObsidianSecrets(this.app); const client = new AgentWikiClient(this.settings.serverUrl, new RequestUrlHttp(), () => secrets.get(secretId));
     return new SyncRuntime(new ObsidianVaultPort(this.app.vault, this.app.fileManager), new ObsidianControlStore(this.app.vault.adapter), new AgentWikiPushRemote(client, mapping.spaceId), mapping);
   }
