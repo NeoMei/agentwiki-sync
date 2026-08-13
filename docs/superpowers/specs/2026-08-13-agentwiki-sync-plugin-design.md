@@ -5,7 +5,7 @@
 - 产品名称：`AgentWiki Sync`
 - Obsidian 插件 ID：`agentwiki-sync`
 - 设计确认日期：2026-08-13
-- 状态：已完成对话确认，等待书面 spec 复核
+- 状态：已完成对话确认与实现完整性复审，等待修订版书面 spec 复核
 - 依赖契约：[`docs/contracts/agentwiki-obsidian-sync-api-v1.md`](../../contracts/agentwiki-obsidian-sync-api-v1.md)
 
 ## 1. 背景与目标
@@ -30,7 +30,7 @@ AgentWiki Sync 是独立发布、独立版本化的 Obsidian 社区插件。首�
 - 一个 Vault 映射多个 Space。
 - 每个 Space 映射一个 Vault 相对目录。
 - 映射目录互不相同、互不嵌套。
-- 仅同步映射目录中 Obsidian Vault API 可见的 `.md` 文件。
+- 仅同步映射目录中 Obsidian Vault API 可见、扩展名按 ASCII 大小写不敏感等于 `.md` 的文件；保留实际路径大小写。
 - 保留 Markdown 的嵌套相对目录结构。
 - 提供设置页、功能区入口、同步中心、命令面板命令、预览和冲突解决界面。
 - 提供首次绑定、Status、Pull、Push、可恢复删除、三方合并和事务回滚。
@@ -57,6 +57,7 @@ AgentWiki Sync 是独立发布、独立版本化的 Obsidian 社区插件。首�
 - Space 是同步、版本、事务和冲突处理的最小边界。
 - 一个 Vault 可以绑定多个 Space。
 - 每个 Space 绑定一个 Vault 相对目录，例如 `Knowledge/Product/`。
+- `rootPath` 必须是非空目录路径；首版不允许把 Vault 根目录本身映射给 Space。
 - 未映射目录完全不参与扫描和同步。
 - 两个映射目录不能相同或相互嵌套。
 - 映射目录不能包含 Vault 根目录的 `.agentwiki/` 控制目录。
@@ -79,7 +80,7 @@ AgentWiki Sync 是独立发布、独立版本化的 Obsidian 社区插件。首�
 - AgentWiki `path`：`Guides/Setup.md`
 - AgentWiki `title`：`Setup`
 - AgentWiki `body`：文件的完整 Markdown 字符串
-- AgentWiki `pageId`：稳定 UUID，由远端 Snapshot 取得或在本地新增页面第一次发布时生成
+- AgentWiki `pageId`：公开、稳定且不透明的 Knowledge ID；现有页面使用 AgentWiki `Page.knowledgeKey`，本地新增页面使用 UUID v4
 
 正文不要求首行是 H1。为避免远端 title 无法在纯 Markdown 中无损表示，title 使用以下方向性规则：
 
@@ -89,6 +90,10 @@ AgentWiki Sync 是独立发布、独立版本化的 Obsidian 社区插件。首�
 - 远端 title-only 变化写入 manifest，不改名本地文件；后续 body-only Push 保留 manifest 中的远端 title，不用文件名覆盖它。
 
 因此，只有本地新增或文件名变化会从文件名派生 title。移动或重命名不会生成新的 page ID。
+
+`Page.id` 是 AgentWiki 服务端内部数据库 ID，不得出现在同步协议中。公开 `pageId` 永远映射到 `Page.knowledgeKey`。本地新增页在第一次进入 Push 预览时生成 UUID v4；该 ID 与预览一起持久化，即使取消上传、网络重试或应用重启也保持不变，直到用户删除该本地新增文件或成功建立远端基线。
+
+AgentWiki 必须为每个 Page 保存正式的 `syncPath` 与大小写无关的 `syncPathKey`。协议中的 `path` 对应 `syncPath`，不能再临时从 title、slug 或 sourcePath 推导。详细迁移和统一 revision 规则见上游 API 契约第 4–5 节。
 
 ### 3.4 文本规范化
 
@@ -100,6 +105,8 @@ AgentWiki Sync 是独立发布、独立版本化的 Obsidian 社区插件。首�
 - 为保证跨平台恢复，Status 必须拒绝 Unicode 归一化后重复或仅大小写不同的路径碰撞。
 - 禁止绝对路径、空路径段、`.`、`..`、NUL 和逃逸映射根目录的路径。
 - 路径最长 1,024 个字符，标题最长 500 个字符，规范化正文最长 1 MiB。
+- 目标文件路径不能已被文件夹占用，任何父路径也不能是普通文件；这些情况属于阻塞性 `invalid`。
+- Pull 可以创建缺失父目录。回滚只删除本事务创建且仍为空的目录；普通空目录不参与同步，也不会因 Pull/Push 自动删除。
 
 ## 4. 架构
 
@@ -160,6 +167,10 @@ flowchart TB
 
 纯 TypeScript 模块，负责 page identity、路径、标题和正文的三方比较。正文使用 `node-diff3` 3.x 逐行合并。输出只包含自动合并结果和结构化冲突块，不包含写文件行为。
 
+正文先按第 3.4 节规范化，再拆为不含 `\n` 的行数组，并单独保存 `hasFinalNewline`。正文行交给 diff3；末尾换行按一个独立布尔字段执行同样的 base/local/remote 三方规则。合并后用 `\n` 连接并按最终布尔值恢复末尾换行，确保空文件、单行文件和缺少末尾换行不会互相误判。
+
+每个冲突块至少包含 `conflictId`、base/local/remote 行范围和三份文本；`conflictId` 是 page ID、三个范围及三份内容 hash 的 SHA-256，重新生成相同预览时保持稳定。用户的逐块选择按 conflictId 保存，只能应用到 previewHash 相同的预览。
+
 ### 4.5 Transaction Engine
 
 负责把 Pull 计划转换为持久化事务：准备 journal、保存受影响文件快照、依序应用、推进 manifest、提交或回滚。
@@ -191,12 +202,17 @@ flowchart TB
 ├── spaces/
 │   └── <space-id>/
 │       ├── manifest.json
+│       ├── pending-identities.json
 │       └── base/
 │           └── <page-id>.md
-└── transactions/
-    └── <transaction-id>/
-        ├── journal.json
-        └── snapshots/
+├── transactions/
+│   └── <transaction-id>/
+│       ├── journal.json
+│       ├── snapshots/
+│       ├── results/
+│       └── payload/
+└── detached/
+    └── <timestamp>-<space-id>/
 ```
 
 `.agentwiki/` 永不进入 AgentWiki 同步 payload。所有内容只在本地 Vault 中使用。
@@ -207,8 +223,9 @@ flowchart TB
 interface AgentWikiConfigV1 {
   schemaVersion: 1;
   serverUrl: string;
+  serverInstanceId: string | null;
   vaultId: string;
-  credentialSecretId: string;
+  credentialSecretId: string | null;
   spaces: Array<{
     spaceId: string;
     displayName: string;
@@ -217,9 +234,11 @@ interface AgentWikiConfigV1 {
 }
 ```
 
-- `serverUrl` 必须是无用户名和密码的绝对 URL。非 loopback 地址只允许 HTTPS。
+- `serverUrl` 未配置时为空字符串；非空时必须是无用户名和密码的绝对 URL。非 loopback 地址只允许 HTTPS。
+- `serverInstanceId` 来自设备会话响应，用于防止更换域名或服务器后误复用相同 Space ID。
 - `vaultId` 是该 Vault 的随机 UUID，不是凭据。
 - `credentialSecretId` 只是 Obsidian Secret Storage 中条目的引用名。
+- Secret ID 固定格式为 `agentwiki-sync-<server-instance-id>-<device-id>` 的小写字母、数字和连字符；UUID 中的连字符保留。
 - 真正的设备凭据只存 Secret Storage。
 - `deviceId` 使用 Obsidian vault-local local storage 保存，不进入 `.agentwiki/`，确保每台设备独立连接。
 
@@ -238,12 +257,15 @@ interface SpaceManifestV1 {
     relativePath: string;
     title: string;
     contentHash: string;
-    updatedAt: string;
   }>;
 }
 ```
 
 manifest 只在成功建立基线或成功完成 Pull/Push 后整体替换。临时或部分执行结果不得写入有效 manifest。
+
+`pages` 以 `pageId` 为 key。服务端 `updatedAt` 不属于同步正确性条件，不保存到 manifest；并发控制只使用 Space `baseRevision` 和本地内容 hash。
+
+加载 manifest 时必须执行运行时 Schema 校验，并验证 space ID、rootPath、page ID 唯一性、relativePath/pathKey 唯一性，以及每个 `base/<page-id>.md` 的规范化 hash 等于 manifest contentHash。任一失败都把 Space 标记为 `baseline_corrupt` 并禁止 Push；不能跳过坏条目继续运行。
 
 ### 5.4 `base/`
 
@@ -286,7 +308,95 @@ Push journal 状态为：
 - `aborted`
 - `expired`
 
-Push journal 保存 base revision、不可变预览 hash、idempotency key、远端 session ID 和已确认批次 receipt，不保存设备凭据。插件启动时不自动联网恢复 Push；用户下次打开同步中心时，插件查询 session 状态并显示“继续上传”“重新确认并 finalize”或“丢弃”。`finalizing` 状态必须先查询服务端结果，不能假定请求失败，也不能创建不同 payload 的新 session。
+Push journal 保存 base revision、不可变确认 manifest、idempotency key、远端 session ID、已确认批次 receipt，以及 `payload/<page-id>.md` 中用户确认时的规范化正文快照；不保存设备凭据。插件启动时不自动联网恢复 Push；用户下次打开同步中心时，插件查询 session 状态并显示“继续上传”“重新确认并 finalize”或“丢弃”。`finalizing` 状态必须先查询服务端结果，不能假定请求失败，也不能创建不同 payload 的新 session。
+
+成功或明确 abort 后删除 payload；未知结果、离线或查询失败时必须保留。服务端已发布时，以 journal 中的确认快照而不是当前 Vault 内容推进 base；用户在确认后的新编辑因此仍会被 Status 判定为 `modified`。
+
+### 5.7 Pull journal Schema 与条件写入
+
+```ts
+interface PullJournalV1 {
+  schemaVersion: 1;
+  kind: "pull_apply";
+  transactionId: string;
+  spaceId: string;
+  fromRevision: string;
+  toRevision: string;
+  previewHash: string;
+  state: "prepared" | "applying" | "committing" | "committed" | "rolling_back" | "failed";
+  nextActionIndex: number;
+  actions: PullActionV1[];
+  failure?: { code: string; actionIndex: number; path?: string };
+}
+
+type PullActionV1 =
+  | {
+      kind: "create";
+      path: string;
+      expected: { exists: false };
+      resultContentHash: string;
+    }
+  | {
+      kind: "write";
+      path: string;
+      expected: { exists: true; contentHash: string };
+      resultContentHash: string;
+    }
+  | {
+      kind: "rename";
+      fromPath: string;
+      toPath: string;
+      expected: { fromExists: true; fromContentHash: string; toExists: false };
+      resultContentHash: string;
+    }
+  | {
+      kind: "trash";
+      path: string;
+      expected: { exists: true; contentHash: string };
+    };
+```
+
+`rename` 是复合动作：以 expected 验证源和目标后，把 `results/` 中的最终正文写入目标路径并移除源路径；因此它同时覆盖“移动且正文被合并”的情形，不是假设正文保持不变。创建/写入/rename 的结果正文都必须能由 `results/` 按 action index 找到。
+
+`previewHash` 是 `{ schemaVersion: 1, spaceId, fromRevision, toRevision, actions }` 的 canonical UTF-8 bytes SHA-256；action 按最终目标路径、kind、源路径排序，且包含 expected 与 result hash。UI 的确认对象同时保存该 hash；确认 hash 与 journal 不一致时禁止应用。
+
+每个 action 的结果正文保存在事务目录的 `results/`，操作前原始正文保存在 `snapshots/`。journal、snapshot 和 result 全部写完并重新读取校验后，状态才能从 `prepared` 进入 `applying`。
+
+条件写入规则：
+
+1. 预览确认时记录每个受影响路径的 `expected`。
+2. 进入事务前重新扫描全部 expected；任一不匹配则不创建 `applying` 状态，废弃预览。
+3. 每个 action 执行前再次验证自己的 expected。修改已有文件优先使用 Obsidian `Vault.process()` 在同一读改写操作中比较当前 hash；其他动作由 Vault Adapter 执行最接近的条件操作。
+4. 每次插件写入后记录 `resultContentHash`，并在 action 完成后重新读取验证。
+5. 所有 Vault action 成功后，再以临时文件 + rename 方式替换 base 与 manifest，并进入 `committing`。
+6. 最后重新扫描全部预期结果；全部一致才进入 `committed`。
+
+如果预览后用户继续编辑，步骤 2 或 3 必须中止并要求重新 Pull，不能覆盖新编辑。如果用户在插件写入后又修改同一文件，回滚只在当前内容仍等于插件记录的 `resultContentHash` 时自动恢复；否则 journal 进入 `failed` 并冻结 Space，避免回滚再次覆盖用户的新内容。
+
+回滚按已完成 action 的逆序执行：create 删除插件创建的文件；write 从 snapshot 恢复；rename 移回原路径；trash 使用 snapshot 在原路径重建。已经进入 Obsidian 或系统回收站的副本可能保留，但活动 Vault 必须恢复到事务前内容。控制文件替换保留 `.prev`，恢复时根据 journal 选择旧 manifest/base；不依赖底层 rename 具备操作系统级原子性。
+
+### 5.8 Push journal Schema
+
+```ts
+interface PushJournalV1 {
+  schemaVersion: 1;
+  kind: "push_upload";
+  transactionId: string;
+  spaceId: string;
+  baseRevision: string;
+  previewHash: string;
+  confirmationManifest: PushConfirmationManifestV1;
+  confirmationHash: string;
+  idempotencyKey: string;
+  state: "uploading" | "ready_to_finalize" | "finalizing" | "published" | "aborted" | "expired";
+  sessionId: string | null;
+  sessionExpiresAt: string | null;
+  uploadedBatches: Array<{ batchIndex: number; batchHash: string; receipt: string }>;
+  publishedRevision: string | null;
+}
+```
+
+Push 预览确认后先持久化 journal 与 payload，再创建远端 session。每个 upsert 的正文必须能由 `payload/<page-id>.md` 和 confirmation manifest 完整重建。只有成功查询到 `published` 或成功收到 finalize 响应后，才可用这些快照更新 base 与 manifest。
 
 ## 6. 身份、连接与权限
 
@@ -300,6 +410,8 @@ Push journal 保存 base revision、不可变预览 hash、idempotency key、远
 4. 连接成功后原地展开 Space 目录映射。
 
 插件不自动打开浏览器、不弹出多步向导。用户可主动点击帮助链接或 AgentWiki 地址。
+
+交换成功后的落盘顺序固定为：把 credential 写入 Secret Storage；立即读取比对；用该 credential 查询设备 session；最后才写 config 中的 secret ID、serverInstanceId 和连接状态。任一步失败都不保存“已连接”状态。Secret Storage 写入/校验失败时，插件必须用仍在内存中的 credential 请求撤销；撤销也失败时只显示 credential ID 和 AgentWiki Web 撤销指引，绝不显示或记录明文 credential。
 
 ### 6.2 人类设备凭据
 
@@ -321,6 +433,8 @@ Push journal 保存 base revision、不可变预览 hash、idempotency key、远
 3. 与 manifest 和 base 比较，产生本地状态。
 4. 请求远端 revision head，不下载正文。
 5. 显示本地变化、远端是否领先、附件链接警告和阻塞错误。
+
+附件链接警告通过 Obsidian MetadataCache 中已解析的 embeds/links 加原始 Markdown 链接扫描生成：目标不是同一映射目录内 `.md` 的链接标记为“不随 AgentWiki 同步”。警告不阻止同步，也不读取或上传附件内容；代码块中的文本不作为链接扫描 fallback 的命中。
 
 状态分类：
 
@@ -345,10 +459,11 @@ Push journal 保存 base revision、不可变预览 hash、idempotency key、远
 5. 按 page ID 合并路径、标题和正文。
 6. 非重叠正文改动自动合并；冲突转换为结构化冲突块。
 7. 展示新增、修改、移动、回收站删除和冲突解决后的最终预览。
-8. 用户确认后生成 journal 和文件快照。
-9. 应用全部 Vault 变化。
-10. 写入新的 base 和 manifest。
-11. 标记 committed 并清理事务。
+8. 用户确认后记录每个受影响路径的 expected hash，并生成 journal、结果文件和原始文件快照。
+9. 事务开始前重新验证全部 expected；不匹配则废弃预览，不写入 Vault。
+10. 使用条件写入应用全部 Vault 变化。
+11. 写入新的 base 和 manifest，并验证最终文件 hash。
+12. 标记 committed 并清理事务。
 
 这是应用层原子性，不宣称操作系统级原子写入。
 
@@ -362,6 +477,19 @@ Push journal 保存 base revision、不可变预览 hash、idempotency key、远
 - 两台设备基于同一 base 独立新增相同路径但产生不同 page ID。
 
 存在任何未解决冲突时，不修改任何文件。相同路径的并发新增解决后必须保留一个 page ID；远端已存在 page ID 时优先沿用远端 ID，本地临时 ID 被丢弃。
+
+路径和标题按字段独立做三方合并：
+
+| Base → Local | Base → Remote | 结果 |
+|---|---|---|
+| 不变 | 不变 | Base |
+| 改变 | 不变 | Local |
+| 不变 | 改变 | Remote |
+| 改成相同值 | 改成相同值 | 该新值 |
+| 改成不同值 | 改成不同值 | 字段冲突 |
+| 删除页面 | 任意修改 | 删除/修改冲突 |
+
+正文使用相同原则，但“改成不同值”先交给逐行 diff3：非重叠区间自动合并，重叠区间才产生正文冲突。字段冲突、正文冲突和最终路径碰撞全部解决后，才产生可确认的 Pull 计划。
 
 ### 8.3 删除
 
@@ -386,7 +514,7 @@ Push journal 保存 base revision、不可变预览 hash、idempotency key、远
 
 服务端 finalize 返回 `BASE_STALE` 时不推进本地基线。网络重试复用幂等键；相同幂等键和相同 payload 返回原结果，相同幂等键和不同 payload 返回错误。
 
-Push 上传和 finalize 状态写入 `kind: "push_upload"` 的本地 journal。finalize 响应丢失时，下次用户主动打开同步中心后查询同一 session；服务端已发布则按原确认快照推进 base，未发布则允许以同一 idempotency key 安全重试。
+Push 上传和 finalize 状态写入 `kind: "push_upload"` 的本地 journal。finalize 响应丢失时，下次用户主动打开同步中心后查询同一 session；服务端已发布则按 journal 中的原确认快照推进 base，未发布则允许以同一 idempotency key 安全重试。成功响应的 `revisionContentHash` 必须与随后由本地确认快照重建的 manifest hash 一致，否则不推进本地基线并要求重新 Pull。
 
 ## 10. 首次绑定
 
@@ -398,6 +526,40 @@ Push 上传和 finalize 状态写入 `kind: "push_upload"` 的本地 journal。f
 - 两边都空：直接记录当前远端 revision 为空基线。
 
 首次绑定失败或取消不得写入有效 manifest。换设备没有控制目录时，重新获取远端 Snapshot 并进入同一首次绑定流程。
+
+首次绑定逐路径使用以下真值表：
+
+| 本地 | 远端 | 默认提案 |
+|---|---|---|
+| 不存在 | 存在 | 创建本地文件并采用远端 page ID/title/body |
+| 存在 | 不存在 | 生成稳定本地 UUID，提案为远端新增 |
+| 存在 | 存在，规范化正文相同 | 绑定远端 page ID；远端 title 写入 manifest，不改本地文件名 |
+| 存在 | 存在，正文不同 | 冲突；Base 为空，只允许用户选择 Local、Remote 或手工最终正文 |
+| 多个本地路径经 NFC/大小写折叠后相同 | 任意 | 阻塞，必须先在 Vault 中改名 |
+| 任意 | 多个远端 pathKey 相同 | 协议错误，禁止建立基线 |
+
+首次绑定没有共同 Base，因此不得自动把两份不同正文做 diff3。远端相同 page ID 但不同 path 以远端 path 为准；两个不同 page ID 占用同一路径时，用户必须选定一个保留的 page ID。远端 page ID 优先；本地临时 ID 只有在最终选择发布本地为新页面时保留。
+
+新增 page ID 在第一次展示 Push/首次绑定预览前生成，并写入 `.agentwiki/spaces/<space-id>/pending-identities.json`：
+
+```ts
+interface PendingIdentityV1 {
+  schemaVersion: 1;
+  items: Array<{ relativePath: string; contentHashAtCreation: string; pageId: string }>;
+}
+```
+
+同一路径和同一内容的重试复用 page ID；文件删除后清除；路径或内容变化时保留原 ID并更新 pending 记录，除非用户明确选择“作为另一新页面”。成功同步后记录移入 manifest。
+
+### 10.1 映射和连接配置迁移
+
+- 添加映射：目标目录与其他映射互斥后进入首次绑定，不得直接创建有效 manifest。目标目录不存在时在确认首次绑定后创建；失败时可留下空目录，但不得留下有效 manifest。
+- 移除映射：要求没有活动事务；只移除 active mapping，不删除 Markdown。manifest/base 移到 `.agentwiki/detached/<timestamp>-<space-id>/`，用户可手动清理。
+- 更改已绑定目录：首版不支持原地改 rootPath。用户必须先在 clean 且远端 head 等于 base 时移除映射，再添加新目录并重新首次绑定。
+- 断开设备：撤销成功后用 `SecretStorage.setSecret(secretId, "")` 覆写本地值，再清除 config 中的引用；Obsidian 1.11.5 API 没有插件级 deleteSecret。保留 Markdown 和控制状态，所有 Space 显示 disconnected。
+- 离线断开：只能用空字符串覆写并在本地忘记凭据，必须明确警告远端凭据仍需稍后在 AgentWiki Web 撤销。
+- 切换服务地址：只有无活动事务且已断开时允许。服务端 session 返回稳定 `serverInstanceId`；新地址的 instance ID 不同则所有旧映射保持 detached，不能按相同 Space ID 自动复用。
+- Space 重命名：只更新显示名，不影响 space ID、目录或基线。
 
 ## 11. 用户界面
 
@@ -486,35 +648,54 @@ Push 上传和 finalize 状态写入 `kind: "push_upload"` 的本地 journal。f
 - `manifest.json` 设置 `minAppVersion: "1.11.5"`、`isDesktopOnly: false`。
 - 运行时禁止 Node 内置模块、Shell、本地服务、daemon 和桌面专属文件系统 API。
 
-## 16. 验证策略
+## 16. 资源预算与有界处理
 
-### 16.1 单元测试
+- Snapshot/Delta 每个 HTTP 响应同时受 `maxPageItems` 和 `maxResponseBytes` 限制，默认请求不超过 200 项且响应不超过 4 MiB；单个 1 MiB 页面必须能单独成页。
+- Push 每批默认不超过 100 项且完整 HTTP body 不超过 4 MiB；以服务端返回的更小 capability 为准。
+- 网络、hash、合并和 Vault 写入并发度首版固定为 1；不得把 100 MiB Space 的全部正文拼成一个内存数组或 JSON 字符串。
+- Status 可以在内存保留 5,000 条元数据，但正文逐文件读取、hash 后立即释放。
+- Pull 逐页落到事务 `results/`，Push 逐页落到 `payload/`；UI 只加载当前预览或冲突文件。
+- 移动端目标是插件同步核心额外峰值 heap 不超过 32 MiB，不含 Obsidian 自身和当前编辑器正文；性能测试通过采样验证。
+- Obsidian 没有跨平台剩余磁盘空间 API。写事务前计算 `estimatedTemporaryBytes = resultBytes + snapshotBytes + newBaseBytes + 10%` 并展示；无法保证剩余空间时必须明确提示。任一 `ENOSPC`/写入失败按事务恢复规则处理。
+- Pull 和 Push 每处理一批或 50 个本地文件（取先到者）向事件循环让步并更新进度，移动端 UI 不得长时间无响应。
+
+## 17. 验证策略
+
+### 17.1 单元测试
 
 - 路径规范化、非法路径、Unicode/大小写碰撞和目录重叠。
 - 状态分类和 rename hint/hash fallback/身份歧义。
 - LF 规范化、hash、canonical serialization 和 confirmation hash。
 - diff3 非重叠合并、重叠冲突、删除/修改和双向移动。
 - 首次 Clone、本地首次发布和首次双方合并。
+- 首次绑定完整真值表、pending identity 在取消/重启/重试中的稳定性。
+- path/title 字段合并真值表及 title-only 远端变化。
 - 权限能力映射和错误码到 UI 状态的转换。
 - 诊断脱敏。
 
-### 16.2 适配器与故障注入测试
+### 17.2 适配器与故障注入测试
 
 - 使用内存 Vault 和 fake HTTP 实现测试端口契约。
 - 在每个 Pull journal 阶段注入异常，验证回滚或冻结结果。
+- 预览后、事务开始前、每个 action 前和插件写入后注入用户编辑，验证条件写入不会覆盖新内容。
+- 验证 manifest 临时替换损坏、`.prev` 恢复、回滚逆序和回收站残留语义。
 - 验证回收站失败、控制目录损坏、分页 cursor 失效和 push session 过期。
+- 验证 Push journal 保存确认正文、finalize 响应丢失后以确认快照推进 base。
 - 验证 Secret 从不进入普通设置、控制目录和日志。
 - 验证插件加载、文件事件和闲置状态不产生网络请求。
+- 验证添加/移除映射、断开、离线忘记凭据和 serverInstanceId 变化。
 
-### 16.3 API 契约测试
+### 17.3 API 契约测试
 
 - 协议包同时验证插件请求、服务端响应和错误 envelope。
 - 分页 Snapshot/Delta 固定 revision，不混入后续发布。
 - 分批上传支持相同批次幂等重试，拒绝同索引不同 hash。
 - finalize 原子检查 base、确认 hash、用户状态和实时角色。
 - AgentCredential 无法调用人类设备直接发布路径。
+- 所有 AgentWiki Page 写入口推进统一 revision，公开 pageId/path 与服务端字段映射固定。
+- 固定 hash fixture、批次完整 HTTP byte 计数和双限制分页。
 
-### 16.4 端到端验收
+### 17.4 端到端验收
 
 使用独立测试 Vault 和本地 AgentWiki：
 
@@ -526,8 +707,10 @@ Push 上传和 finalize 状态写入 `kind: "push_upload"` 的本地 journal。f
 6. Push 期间角色降为 viewer，服务端拒绝且本地 base 不推进。
 7. Pull 应用中断后，下次启动恢复到事务前状态。
 8. 5,000 篇、100 MiB 的 Space 完成分页 Pull、Status 和分批 Push；界面持续显示进度且保持可交互。
+9. Pull 预览期间继续编辑受影响文件，确认时安全失效且不覆盖新编辑。
+10. finalize 成功但响应丢失，重启后查询 session 并以确认快照恢复正确 base，同时保留之后的新编辑。
 
-### 16.5 持续集成门禁
+### 17.5 持续集成门禁
 
 - 格式检查。
 - ESLint。
@@ -537,7 +720,7 @@ Push 上传和 finalize 状态写入 `kind: "push_upload"` 的本地 journal。f
 - 构建产物扫描，禁止 Node 内置模块和意外凭据模式。
 - `manifest.json`、版本映射文件和发布产物一致性检查。
 
-## 17. 实施依赖与顺序
+## 18. 实施依赖与顺序
 
 本设计包含两个仓库边界明确的交付物：
 
