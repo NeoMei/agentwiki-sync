@@ -39,11 +39,13 @@ describe("AgentWiki connection", () => {
     );
     http.route("POST", "/api/integrations/obsidian/credentials/current/activate", { status: 200, json: { protocolVersion: "1", credentialStatus: "active" } });
     const secrets = new MemorySecrets();
-    const service = new ConnectionService(http, secrets, new MemoryControlStore());
+    const control = new MemoryControlStore(); const service = new ConnectionService(http, secrets, control);
     const result = await service.connect({ serverUrl: "https://wiki.example.com", code: "a".repeat(27), deviceId: "33333333-3333-4333-8333-333333333333", deviceName: "Phone", vaultId: "44444444-4444-4444-8444-444444444444", pluginVersion: "0.1.0" });
     expect(result.credentialSecretId).toMatch(/^agentwiki-sync-secret-[0-9a-f]{32}$/);
     expect(secrets.get(result.credentialSecretId)).toHaveLength(43);
     expect(http.calls.map((call) => call.path)).toEqual(["/api/integrations/obsidian/exchange", "/api/integrations/obsidian/session", "/api/integrations/obsidian/credentials/current/activate", "/api/integrations/obsidian/session"]);
+    expect(await control.read("connection-journal.json")).toBeNull();
+    expect(await control.read("connection-state.json")).toContain(result.credentialId);
   });
 
   it("keeps the code and rotates credential material on an explicit collision", async () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { OperationLock, selectMappingForPath, validateMappings } from "../../src/application/sync-coordinator";
+import { OperationLock, removeMapping, selectMappingForPath, validateMappings } from "../../src/application/sync-coordinator";
 
 describe("sync coordinator", () => {
   it("serializes each space without blocking another space", async () => {
@@ -10,6 +10,8 @@ describe("sync coordinator", () => {
     release();
     expect(() => lock.acquire("s1")).not.toThrow();
   });
+
+  it("removes pending mappings but requires clean proof for active mappings",()=>{const pending=[{spaceId:"s",rootPath:"Wiki",status:"pending" as const}];expect(removeMapping(pending,"s",{activeTransaction:false,localClean:false,remoteAtBase:false})).toEqual([]);const active=[{spaceId:"s",rootPath:"Wiki",status:"active" as const}];expect(()=>removeMapping(active,"s",{activeTransaction:true,localClean:true,remoteAtBase:true})).toThrow(/transaction/);expect(()=>removeMapping(active,"s",{activeTransaction:false,localClean:false,remoteAtBase:true})).toThrow(/clean/);expect(removeMapping(active,"s",{activeTransaction:false,localClean:true,remoteAtBase:true})).toEqual([]);});
 
   it("selects the active mapping for an open file and rejects overlaps", () => {
     const mappings = [{ spaceId: "s1", rootPath: "Wiki", status: "active" as const }, { spaceId: "s2", rootPath: "Other", status: "pending" as const }];

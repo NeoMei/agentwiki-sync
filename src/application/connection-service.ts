@@ -2,7 +2,7 @@ import { AgentWikiClient, AgentWikiHttpError, normalizeServerUrl } from "../agen
 import type { ControlStorePort } from "../ports/control-store";
 import type { HttpPort } from "../ports/http";
 import type { SecretPort } from "../ports/secrets";
-import { ExchangeResponseSchema, parseCapabilities, SessionResponseSchema } from "../agentwiki/protocol";
+import { ActivateCurrentObsidianCredentialRequestSchema, ExchangeObsidianCredentialRequestSchema, ExchangeResponseSchema, parseCapabilities, SessionResponseSchema } from "../agentwiki/protocol";
 
 interface ConnectInput { serverUrl: string; code: string; deviceId: string; deviceName: string; vaultId: string; pluginVersion: string }
 interface ConnectionJournal { schemaVersion: 1; phase: "exchange_prepared" | "credential_stored" | "activating" | "activated"; serverUrl: string; exchangeId: string; codeSecretId: string; credentialSecretId: string; deviceId: string; deviceName: string; vaultId: string; pluginVersion: string; credentialId?: string; serverInstanceId?: string }
@@ -28,7 +28,7 @@ export class ConnectionService {
     let client = new AgentWikiClient(serverUrl, this.http, () => this.secrets.get(credentialSecretId));
     let exchanged: { credentialId: string; serverInstanceId: string } | null = null;
     for (let collisionCount = 0; collisionCount < 3 && !exchanged; collisionCount += 1) {
-      const request = { code: input.code, exchangeId: journal.exchangeId, credential, deviceId: input.deviceId, deviceName: input.deviceName, vaultId: input.vaultId, pluginVersion: input.pluginVersion, supportedProtocolVersions: ["1"] };
+      const request = ExchangeObsidianCredentialRequestSchema.parse({ code: input.code, exchangeId: journal.exchangeId, credential, deviceId: input.deviceId, deviceName: input.deviceName, vaultId: input.vaultId, pluginVersion: input.pluginVersion, supportedProtocolVersions: ["1"] });
       try { const value = ExchangeResponseSchema.parse((await client.raw("POST", "/api/integrations/obsidian/exchange", request, false)).json); parseCapabilities(value.capabilities); exchanged = value; }
       catch (error) {
         const code = error instanceof AgentWikiHttpError && typeof error.body === "object" && error.body !== null ? (error.body as { error?: { code?: string } }).error?.code : null;
@@ -43,10 +43,10 @@ export class ConnectionService {
     this.secrets.set(codeSecretId, "");
     const session = SessionResponseSchema.parse((await client.raw("GET", "/api/integrations/obsidian/session")).json); this.assertSession(session, journal, exchanged);
     journal = { ...journal, phase: "activating" }; await this.state.write("connection-journal.json", JSON.stringify(journal));
-    await client.raw("POST", "/api/integrations/obsidian/credentials/current/activate", { credentialId: exchanged.credentialId });
+    await client.raw("POST", "/api/integrations/obsidian/credentials/current/activate", ActivateCurrentObsidianCredentialRequestSchema.parse({ credentialId: exchanged.credentialId }));
     const active = SessionResponseSchema.parse((await client.raw("GET", "/api/integrations/obsidian/session")).json); this.assertSession(active, journal, exchanged);
     if (active.credentialStatus !== "active") throw new Error("Credential activation was not confirmed");
-    journal = { ...journal, phase: "activated" }; await this.state.write("connection-journal.json", JSON.stringify(journal));
+    journal = { ...journal, phase: "activated" }; await this.state.write("connection-journal.json", JSON.stringify(journal));await this.state.write("connection-state.json",JSON.stringify({schemaVersion:1,serverUrl,serverInstanceId:exchanged.serverInstanceId,credentialId:exchanged.credentialId,credentialSecretId,deviceId:input.deviceId,vaultId:input.vaultId}));await this.state.remove("connection-journal.json");this.secrets.set(codeSecretId,"");
     return { credentialSecretId, credentialId: exchanged.credentialId, serverInstanceId: exchanged.serverInstanceId };
   }
 
@@ -61,16 +61,16 @@ export class ConnectionService {
     try {
       const session = SessionResponseSchema.parse((await client.raw("GET", "/api/integrations/obsidian/session")).json);
       const exchanged = { credentialId: session.credentialId, serverInstanceId: session.serverInstanceId }; this.assertSession(session, journal, exchanged);
-      if (session.credentialStatus === "provisional") await client.raw("POST", "/api/integrations/obsidian/credentials/current/activate", { credentialId: session.credentialId });
+      if (session.credentialStatus === "provisional") await client.raw("POST", "/api/integrations/obsidian/credentials/current/activate", ActivateCurrentObsidianCredentialRequestSchema.parse({ credentialId: session.credentialId }));
       const active = SessionResponseSchema.parse((await client.raw("GET", "/api/integrations/obsidian/session")).json); this.assertSession(active, journal, exchanged); if (active.credentialStatus !== "active") throw new Error("Credential activation was not confirmed");
-      this.secrets.set(journal.codeSecretId, ""); await this.state.write("connection-journal.json", JSON.stringify({ ...journal, phase: "activated", credentialId: session.credentialId, serverInstanceId: session.serverInstanceId })); return { credentialSecretId: journal.credentialSecretId, ...exchanged };
+      this.secrets.set(journal.codeSecretId, ""); await this.state.write("connection-state.json",JSON.stringify({schemaVersion:1,serverUrl:journal.serverUrl,serverInstanceId:session.serverInstanceId,credentialId:session.credentialId,credentialSecretId:journal.credentialSecretId,deviceId:journal.deviceId,vaultId:journal.vaultId}));await this.state.remove("connection-journal.json");return { credentialSecretId: journal.credentialSecretId, ...exchanged };
     } catch (error) {
       if (!(error instanceof AgentWikiHttpError) || error.status !== 401 || journal.phase !== "exchange_prepared") throw error;
       let prepared = journal;
       for (let attempt = 0; attempt < 3; attempt += 1) {
         const storedCode = this.secrets.get(prepared.codeSecretId); const storedCredential = this.secrets.get(prepared.credentialSecretId);
         if (!storedCode || !storedCredential) throw new Error("Pending exchange secrets are missing");
-        const request = { code: storedCode, exchangeId: prepared.exchangeId, credential: storedCredential, deviceId: prepared.deviceId, deviceName: prepared.deviceName, vaultId: prepared.vaultId, pluginVersion: prepared.pluginVersion, supportedProtocolVersions: ["1"] };
+        const request = ExchangeObsidianCredentialRequestSchema.parse({ code: storedCode, exchangeId: prepared.exchangeId, credential: storedCredential, deviceId: prepared.deviceId, deviceName: prepared.deviceName, vaultId: prepared.vaultId, pluginVersion: prepared.pluginVersion, supportedProtocolVersions: ["1"] });
         try {
           const value = ExchangeResponseSchema.parse((await client.raw("POST", "/api/integrations/obsidian/exchange", request, false)).json); parseCapabilities(value.capabilities);
           prepared = { ...prepared, phase: "credential_stored", credentialId: value.credentialId, serverInstanceId: value.serverInstanceId }; await this.state.write("connection-journal.json", JSON.stringify(prepared));

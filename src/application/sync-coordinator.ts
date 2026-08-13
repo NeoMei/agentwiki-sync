@@ -25,4 +25,6 @@ export function selectMappingForPath(mappings: SpaceMapping[], path: string): Sp
   return mappings.find((mapping) => mapping.status === "active" && (key === portablePathKey(mapping.rootPath) || key.startsWith(`${portablePathKey(mapping.rootPath)}/`))) ?? null;
 }
 
+export function removeMapping(mappings:SpaceMapping[],spaceId:string,gate:{activeTransaction:boolean;localClean:boolean;remoteAtBase:boolean}):SpaceMapping[]{const mapping=mappings.find(item=>item.spaceId===spaceId);if(!mapping)throw new Error("Mapping not found");if(gate.activeTransaction)throw new Error("Mapping has an active transaction");if(mapping.status==="active"&&(!gate.localClean||!gate.remoteAtBase))throw new Error("Active mapping must be clean and at remote base before removal");return mappings.filter(item=>item.spaceId!==spaceId);}
+
 export async function yieldToUi(): Promise<void> { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }

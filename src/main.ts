@@ -8,7 +8,7 @@ import { ObsidianControlStore, ObsidianLocalControlStore, ObsidianSecrets, Obsid
 import { AgentWikiClient } from "./agentwiki/client";
 import { AgentWikiPushRemote } from "./agentwiki/push-remote";
 import { SyncRuntime } from "./application/sync-runtime";
-import { selectMappingForPath, validateMappings } from "./application/sync-coordinator";
+import { removeMapping, selectMappingForPath, validateMappings } from "./application/sync-coordinator";
 import { VaultIdentityService } from "./storage/vault-identity";
 import { idFileKey } from "./core/identity-key";
 import { OperationLock } from "./application/sync-coordinator";
@@ -35,6 +35,8 @@ export default class AgentWikiSyncPlugin extends Plugin {
     } catch (error) { new Notice(`Connection failed: ${error instanceof Error ? error.message : "unknown error"}`); }
   }
   async addMapping(spaceId: string, rootPath: string): Promise<void> { const next = [...this.settings.mappings, { spaceId, rootPath, status: "pending" as const }]; validateMappings(next); this.settings.mappings = next; await this.saveSettings(); }
+  async removeMapping(spaceId:string):Promise<void>{const mapping=this.settings.mappings.find(item=>item.spaceId===spaceId);if(!mapping)return;let gate={activeTransaction:false,localClean:true,remoteAtBase:true};if(mapping.status==="active"){const release=this.locks.acquire(spaceId);try{const runtime=await this.runtime(mapping);if(!runtime)throw new Error("Connect AgentWiki before removing an active mapping");await runtime.recover();const status=await runtime.status();gate={activeTransaction:false,localClean:status.local.added.length+status.local.modified.length+status.local.renamed.length+status.local.deleted.length>0?false:true,remoteAtBase:status.remoteRevision===status.baseRevision};}finally{release();}}this.settings.mappings=removeMapping(this.settings.mappings,spaceId,gate);await this.saveSettings();}
+  async disconnect():Promise<void>{const local=new ObsidianLocalControlStore(this.app);const secretId=await local.read("credential-secret-id");if(secretId)new ObsidianSecrets(this.app).set(secretId,"");await local.remove("credential-secret-id");await local.remove("connection-state.json");this.settings.serverInstanceId=null;await this.saveSettings();new Notice("Device disconnected locally. Revoke it in AgentWiki Web if the server could not be reached.");}
   private selectedMapping() { const activePath=this.app.workspace.getActiveFile()?.path??"";return selectMappingForPath(this.settings.mappings,activePath)??this.settings.mappings[0]??null; }
   private async runtime(mapping: NonNullable<ReturnType<AgentWikiSyncPlugin["selectedMapping"]>>): Promise<SyncRuntime | null> {
     const local = new ObsidianLocalControlStore(this.app); await new VaultIdentityService(new ObsidianControlStore(this.app.vault.adapter), local).assertBound(); const secretId = await local.read("credential-secret-id"); const deviceId=await local.read("device-id"); if (!secretId||!deviceId) return null;
