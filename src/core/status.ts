@@ -39,7 +39,7 @@ export function resolvePageIdentities(manifest: Record<string, ManifestPage>, fi
     result.push({ ...file, pageId: page?.pageId ?? null, identityStatus: page ? "resolved" : "new" });
   }
   for (const file of result.filter((item) => item.pageId === null)) {
-    const hintMatches = hints.filter((hint) => hint.toPath === file.relativePath && hint.observedVaultByteHash === file.vaultByteHash && manifest[hint.pageId] && !resolvedIds.has(hint.pageId));
+    const hintMatches = hints.filter((hint) => hint.toPath === file.relativePath && manifest[hint.pageId] && !resolvedIds.has(hint.pageId));
     const hashMatches = Object.values(manifest).filter((page) => !resolvedIds.has(page.pageId) && page.contentHash === file.contentHash);
     const candidates = hintMatches.length === 1 ? hintMatches.map((hint) => manifest[hint.pageId]!) : hashMatches;
     if (candidates.length === 1) {
