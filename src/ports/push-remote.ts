@@ -40,7 +40,7 @@ export interface SnapshotResult {
   items: SyncPage[];
 }
 export interface PushRemotePort {
-  getHead(spaceId: string): Promise<{ revision: string }>;
+  getHead(spaceId: string): Promise<{ revision: string; pageCount?: string }>;
   createSession(input: {
     baseRevision: string;
     idempotencyKey: string;

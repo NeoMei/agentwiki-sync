@@ -36,8 +36,11 @@ export class FakeAgentWiki implements PushRemotePort {
   private revision = 0;
   private readonly pages = new Map<string, SyncPage>();
   private readonly sessions = new Map<string, Session>();
-  async getHead(): Promise<{ revision: string }> {
-    return { revision: String(this.revision) };
+  async getHead(): Promise<{ revision: string; pageCount?: string }> {
+    return {
+      revision: String(this.revision),
+      pageCount: String(this.pages.size),
+    };
   }
   async getCapabilities(): Promise<SyncCapabilities> {
     return this.capabilities;

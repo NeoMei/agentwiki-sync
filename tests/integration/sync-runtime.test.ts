@@ -520,4 +520,27 @@ describe("SyncRuntime", () => {
     );
     expect((await push.inspect())?.remoteState).toBe("superseded");
   });
+
+  it("clones an empty-bodied page without treating it as a missing sidecar", async () => {
+    const remote = new FakeAgentWiki();
+    await remote.seed([
+      {
+        pageId: "empty",
+        path: "Empty.md",
+        title: "Empty",
+        body: "",
+        contentHash: await contentHash(""),
+        updatedAt: "2026-08-14T00:00:00.000Z",
+      },
+    ]);
+    const vault = new MemoryVault({});
+    const runtime = new SyncRuntime(vault, new MemoryControlStore(), remote, {
+      spaceId: "space",
+      rootPath: "Wiki",
+      status: "pending",
+    });
+    const preview = await runtime.previewPull();
+    await runtime.applyPull(preview);
+    expect(vault.text("Wiki/Empty.md")).toBe("");
+  });
 });

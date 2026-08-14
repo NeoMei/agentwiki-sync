@@ -23,7 +23,7 @@ export class AgentWikiPushRemote implements PushRemotePort {
     private readonly client: AgentWikiClient,
     private readonly spaceId: string,
   ) {}
-  async getHead(): Promise<{ revision: string }> {
+  async getHead(): Promise<{ revision: string; pageCount?: string }> {
     return this.client.head(this.spaceId);
   }
   async getCapabilities() {

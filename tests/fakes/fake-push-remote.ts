@@ -17,7 +17,7 @@ export class FakePushRemote implements PushRemotePort {
     readonly capabilities: SyncCapabilities,
     private revision: string,
   ) {}
-  async getHead(): Promise<{ revision: string }> {
+  async getHead(): Promise<{ revision: string; pageCount?: string }> {
     return { revision: this.revision };
   }
   async createSession(): Promise<PushSessionInfo> {

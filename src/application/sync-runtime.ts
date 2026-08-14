@@ -360,11 +360,6 @@ export class SyncRuntime {
         : this.fallbackCapabilities,
     );
   }
-  private async snapshot(revision: string): Promise<SyncPage[]> {
-    const value = await this.remote.snapshot(revision);
-    await this.validateSnapshotResult(value, revision);
-    return value.items;
-  }
   private async validateSnapshotResult(
     value: SnapshotResult,
     revision: string,
@@ -484,15 +479,10 @@ export class SyncRuntime {
       throw new Error("Snapshot integrity mismatch");
     return { metadata, pages, previewId };
   }
-  private async remoteBody(
-    revision: string,
-    page: SyncPage,
-    previewId?: string,
-  ): Promise<string> {
-    if (page.body) return page.body;
-    const bodyPath =
-      (page as SyncPage & { bodyPath?: string }).bodyPath ??
-      `${this.root}/downloads/${safeKey(previewId ?? revision)}/${await opaqueFileKey(page.pageId)}.md`;
+  private async remoteBody(revision: string, page: SyncPage): Promise<string> {
+    void revision;
+    const bodyPath = (page as SyncPage & { bodyPath?: string }).bodyPath;
+    if (bodyPath === undefined) return page.body;
     const body = await this.control.read(bodyPath);
     if (body === null || (await contentHash(body)) !== page.contentHash)
       throw new Error("Downloaded snapshot body is corrupt");
@@ -1161,11 +1151,13 @@ export class SyncRuntime {
     const capabilities = await this.capabilities();
     const base = await this.readBase();
     const head = await this.remote.getHead(this.mapping.spaceId);
-    if (
-      this.mapping.status === "pending" &&
-      (await this.downloadSnapshot(head.revision)).pages.length > 0
-    )
-      throw new Error("INITIAL_PULL_REQUIRED");
+    if (this.mapping.status === "pending") {
+      const remoteHasPages =
+        head.pageCount !== undefined
+          ? head.pageCount !== "0"
+          : (await this.downloadSnapshot(head.revision)).pages.length > 0;
+      if (remoteHasPages) throw new Error("INITIAL_PULL_REQUIRED");
+    }
     const baseRevision =
       this.mapping.status === "pending" && Object.keys(base.pages).length === 0
         ? head.revision
