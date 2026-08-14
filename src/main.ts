@@ -227,7 +227,13 @@ export default class AgentWikiSyncPlugin extends Plugin {
   }
   async disconnect(): Promise<void> {
     for (const mapping of this.settings.mappings) {
-      const runtime = await this.runtime(mapping);
+      let runtime: SyncRuntime | null = null;
+      try {
+        runtime = await this.runtime(mapping);
+      } catch {
+        // Offline or identity mismatch: local disconnect is the escape hatch.
+        continue;
+      }
       if (runtime && (await runtime.hasUnfinishedPush()))
         throw new Error(`Space ${mapping.spaceId} has an unfinished Push`);
     }
@@ -391,7 +397,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
             new Notice("Push complete.");
           },
           () => {
-            void runtime.discardPushPreview().finally(() => modalRelease?.());
+            void runtime.discardPushPreview(preview).finally(() => modalRelease?.());
           },
         ).open();
         release = null;
