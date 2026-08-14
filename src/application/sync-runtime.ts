@@ -195,7 +195,7 @@ const DEFAULT_CAPABILITIES: SyncCapabilities = {
   maxClientManifestBytes: 4194304,
   maxClientTotalBodyBytes: 104857600,
   maxResponseBytes: 4194304,
-  maxPageItems: 200,
+  maxPageItems: 100,
   pushSessionTtlSeconds: 900,
 };
 const safeKey = (value: string) => value.replace(/[^A-Za-z0-9_-]/gu, "_");
