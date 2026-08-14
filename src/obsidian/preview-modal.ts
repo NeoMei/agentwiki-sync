@@ -3,8 +3,18 @@ import type {
   InitialBindingChoice,
   PullPreview,
 } from "../application/sync-runtime";
+import type { StructuredConflict } from "../core/merge";
+import {
+  applyBindingMode,
+  applyBindingPath,
+  applyBindingSearch,
+  applyConflictResolution,
+  conflictManualValue,
+  pageCount,
+  pageSlice,
+  PREVIEW_PAGE_SIZE,
+} from "./preview-logic";
 
-const PAGE_SIZE = 100;
 export class PreviewModal extends Modal {
   private released = false;
   private bindingPage = 0;
@@ -34,10 +44,10 @@ export class PreviewModal extends Modal {
     page: number,
     setPage: (page: number) => void,
   ): void {
-    if (total <= PAGE_SIZE) return;
+    if (total <= PREVIEW_PAGE_SIZE) return;
     new Setting(this.contentEl)
       .setDesc(
-        `Page ${page + 1} / ${Math.ceil(total / PAGE_SIZE)} · ${total} items`,
+        `Page ${page + 1} / ${pageCount(total)} · ${total} items`,
       )
       .addButton((button) =>
         button
@@ -51,7 +61,7 @@ export class PreviewModal extends Modal {
       .addButton((button) =>
         button
           .setButtonText("Next")
-          .setDisabled((page + 1) * PAGE_SIZE >= total)
+          .setDisabled((page + 1) * PREVIEW_PAGE_SIZE >= total)
           .onClick(() => {
             setPage(page + 1);
             this.render();
@@ -62,27 +72,19 @@ export class PreviewModal extends Modal {
     this.contentEl.empty();
     this.contentEl.createEl("h2", { text: this.title });
     const list = this.contentEl.createEl("ul");
-    for (const line of this.lines.slice(0, PAGE_SIZE))
+    for (const line of pageSlice(this.lines, 0))
       list.createEl("li", { text: line });
-    if (this.lines.length > PAGE_SIZE)
+    if (this.lines.length > PREVIEW_PAGE_SIZE)
       this.contentEl.createEl("p", {
-        text: `${this.lines.length - PAGE_SIZE} more actions are summarized by the paged controls below.`,
+        text: `${this.lines.length - PREVIEW_PAGE_SIZE} more actions are summarized by the paged controls below.`,
       });
-    const bindingStart = this.bindingPage * PAGE_SIZE;
-    for (const binding of this.bindings.slice(
-      bindingStart,
-      bindingStart + PAGE_SIZE,
-    ))
+    for (const binding of pageSlice(this.bindings, this.bindingPage))
       this.renderBinding(binding);
     this.pager(this.bindings.length, this.bindingPage, (page) => {
       this.bindingPage = page;
     });
     const conflicts = this.pullPreview?.conflicts ?? [];
-    const conflictStart = this.conflictPage * PAGE_SIZE;
-    for (const conflict of conflicts.slice(
-      conflictStart,
-      conflictStart + PAGE_SIZE,
-    ))
+    for (const conflict of pageSlice(conflicts, this.conflictPage))
       this.renderConflict(conflict);
     this.pager(conflicts.length, this.conflictPage, (page) => {
       this.conflictPage = page;
@@ -115,44 +117,45 @@ export class PreviewModal extends Modal {
       .setDesc(
         "Choose an optional local page and Local, Remote, or manual content.",
       );
+    let searchTouched = false;
+    if (binding.remoteBodyPath)
+      void this.app.vault.adapter
+        .read(binding.remoteBodyPath)
+        .then((body) => {
+          if (!searchTouched)
+            setting.setDesc(`Remote preview: ${body.slice(0, 160)}`);
+        })
+        .catch(() => {
+          if (!searchTouched)
+            setting.setDesc("Remote preview unavailable.");
+        });
     setting.addText((text) =>
       text
         .setPlaceholder("Exact local path (searches all candidates)")
         .onChange((value) => {
+          searchTouched = true;
           const candidates = this.pullPreview?.localCandidates ?? [];
-          const candidate = candidates.find((item) => item.path === value);
-          if (candidate) {
-            binding.localPath = candidate.path;
-            binding.localVaultByteHash = candidate.vaultByteHash;
-            binding.resolution = null;
-          }
-          const matches = candidates
-            .filter((item) =>
-              item.path.toLocaleLowerCase().includes(value.toLocaleLowerCase()),
-            )
-            .slice(0, 20);
+          const matches = applyBindingSearch(binding, candidates, value);
           setting.setDesc(
             matches.length
-              ? `Matches: ${matches.map((item) => item.path).join(" · ")}`
-              : "No matching local path.",
+              ? `Matches: ${matches.join(" · ")}`
+              : "No matching local path. Leave empty to create/use remote path.",
           );
         }),
     );
     setting.addDropdown((dropdown) => {
       dropdown.addOption("", "Create/use remote path");
-      for (const candidate of (this.pullPreview?.localCandidates ?? []).slice(
+      for (const candidate of pageSlice(
+        this.pullPreview?.localCandidates ?? [],
         0,
-        PAGE_SIZE,
       ))
         dropdown.addOption(candidate.path, candidate.path);
       dropdown.setValue(binding.localPath ?? "").onChange((value) => {
-        const candidate = this.pullPreview?.localCandidates.find(
-          (item) => item.path === value,
+        applyBindingPath(
+          binding,
+          this.pullPreview?.localCandidates ?? [],
+          value,
         );
-        binding.localPath = candidate?.path ?? null;
-        binding.localBody = null;
-        binding.localVaultByteHash = candidate?.vaultByteHash ?? null;
-        binding.resolution = candidate ? null : "remote";
       });
     });
     setting.addDropdown((dropdown) =>
@@ -163,19 +166,19 @@ export class PreviewModal extends Modal {
         .addOption("manual", "Manual body")
         .setValue(binding.resolution ?? "")
         .onChange((value) => {
-          binding.resolution =
-            value === "local" || value === "remote" || value === "manual"
-              ? value
-              : null;
+          applyBindingMode(binding, value);
         }),
     );
     setting.addTextArea((text) =>
-      text.setPlaceholder("Manual body").onChange((value) => {
-        binding.manualBody = value;
-      }),
+      text
+        .setPlaceholder("Manual body (used only with Manual body)")
+        .setValue(binding.manualBody ?? "")
+        .onChange((value) => {
+          binding.manualBody = value;
+        }),
     );
   }
-  private renderConflict(conflict: PullPreview["conflicts"][number]): void {
+  private renderConflict(conflict: StructuredConflict): void {
     const setting = new Setting(this.contentEl)
       .setName(`${conflict.field}: ${conflict.pageId}`)
       .setDesc("Loading Base / Local / Remote preview…");
@@ -196,6 +199,10 @@ export class PreviewModal extends Modal {
             "Conflict preview unavailable; choose a side or enter a manual value.",
           ),
         );
+    else
+      setting.setDesc(
+        `Base: ${conflict.base.slice(0, 120)} · Local: ${conflict.local.slice(0, 120)} · Remote: ${conflict.remote.slice(0, 120)}`,
+      );
     setting.addDropdown((dropdown) =>
       dropdown
         .addOption("", "Resolve…")
@@ -208,21 +215,31 @@ export class PreviewModal extends Modal {
         )
         .onChange((value) => {
           if (!this.pullPreview) return;
-          if (value === "local" || value === "remote" || value === "manual")
-            this.pullPreview.conflictResolutions[conflict.conflictId] = {
-              choice: value,
-            };
-          else delete this.pullPreview.conflictResolutions[conflict.conflictId];
+          applyConflictResolution(
+            this.pullPreview,
+            conflict.conflictId,
+            value,
+            conflictManualValue(this.pullPreview, conflict.conflictId),
+          );
         }),
     );
     setting.addTextArea((text) =>
-      text.setPlaceholder("Manual final value").onChange((value) => {
-        if (this.pullPreview)
-          this.pullPreview.conflictResolutions[conflict.conflictId] = {
-            choice: "manual",
-            manualValue: value,
-          };
-      }),
+      text
+        .setPlaceholder("Manual final value")
+        .setValue(
+          this.pullPreview
+            ? conflictManualValue(this.pullPreview, conflict.conflictId)
+            : "",
+        )
+        .onChange((value) => {
+          if (this.pullPreview)
+            applyConflictResolution(
+              this.pullPreview,
+              conflict.conflictId,
+              "manual",
+              value,
+            );
+        }),
     );
   }
 }

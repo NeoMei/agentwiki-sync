@@ -1,4 +1,4 @@
-import { PluginSettingTab, Setting, type App } from "obsidian";
+import { Notice, PluginSettingTab, Setting, type App } from "obsidian";
 import type AgentWikiSyncPlugin from "../main";
 
 export class AgentWikiSyncSettingTab extends PluginSettingTab {
@@ -49,6 +49,10 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
               await this.plugin.connect(this.connectionCode);
               this.connectionCode = "";
               this.display();
+            } catch (error) {
+              new Notice(
+                `Connection failed: ${error instanceof Error ? error.message : "unknown error"}`,
+              );
             } finally {
               button.setDisabled(false);
             }
@@ -76,6 +80,10 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
               try {
                 await this.plugin.removeMapping(mapping.spaceId);
                 this.display();
+              } catch (error) {
+                new Notice(
+                  `Remove mapping failed: ${error instanceof Error ? error.message : "unknown error"}`,
+                );
               } finally {
                 button.setDisabled(false);
               }
@@ -94,9 +102,19 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
           const [spaceId, rootPath] = input
             .split("|")
             .map((part) => part.trim());
-          if (spaceId && rootPath) {
+          if (!spaceId || !rootPath) {
+            new Notice("Enter a Space ID and folder as space-id | folder/path.");
+            return;
+          }
+          button.setDisabled(true);
+          try {
             await this.plugin.addMapping(spaceId, rootPath);
             this.display();
+          } catch (error) {
+            new Notice(
+              `Add mapping failed: ${error instanceof Error ? error.message : "unknown error"}`,
+            );
+            button.setDisabled(false);
           }
         }),
       );
@@ -110,8 +128,16 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
           .setButtonText("Disconnect")
           .setWarning()
           .onClick(async () => {
-            await this.plugin.disconnect();
-            this.display();
+            button.setDisabled(true);
+            try {
+              await this.plugin.disconnect();
+              this.display();
+            } catch (error) {
+              new Notice(
+                `Disconnect failed: ${error instanceof Error ? error.message : "unknown error"}`,
+              );
+              button.setDisabled(false);
+            }
           }),
       );
   }
