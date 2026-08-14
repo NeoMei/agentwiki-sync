@@ -1,4 +1,4 @@
-import { Modal, Setting, type App } from "obsidian";
+import { Modal, Notice, Setting, type App } from "obsidian";
 import type {
   InitialBindingChoice,
   PullPreview,
@@ -103,6 +103,10 @@ export class PreviewModal extends Modal {
             try {
               await this.confirm();
               this.close();
+            } catch (error) {
+              new Notice(
+                `Sync failed: ${error instanceof Error ? error.message : "unknown error"}`,
+              );
             } finally {
               button.setDisabled(false);
             }
