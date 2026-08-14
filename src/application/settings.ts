@@ -1,4 +1,4 @@
-import type { SpaceMapping } from "./sync-coordinator";
+import { validateMappings, type SpaceMapping } from "./sync-coordinator";
 
 export interface AgentWikiSyncSettings {
   schemaVersion: 1;
@@ -31,10 +31,20 @@ export function parseSettings(value: unknown): AgentWikiSyncSettings {
     !Array.isArray(input.mappings)
   )
     return DEFAULT_SETTINGS;
+  const mappings = input.mappings.map((mapping) => ({
+    spaceId: mapping.spaceId,
+    rootPath: mapping.rootPath,
+    status: mapping.status,
+  }));
+  try {
+    validateMappings(mappings);
+  } catch {
+    throw new Error("Settings contain invalid Space mappings");
+  }
   return {
     schemaVersion: 1,
     serverUrl: input.serverUrl,
     serverInstanceId: input.serverInstanceId,
-    mappings: input.mappings,
+    mappings,
   };
 }

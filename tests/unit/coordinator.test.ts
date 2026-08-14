@@ -64,6 +64,17 @@ describe("sync coordinator", () => {
     ).toThrow(/newer settings version/);
   });
 
+  it("rejects settings whose Space mappings are structurally invalid", () => {
+    expect(() =>
+      parseSettings({
+        schemaVersion: 1,
+        serverUrl: "https://wiki.example.com",
+        serverInstanceId: null,
+        mappings: [{ spaceId: "s", rootPath: "../escape", status: "active" }],
+      }),
+    ).toThrow(/invalid Space mappings/);
+  });
+
   it("selects the active mapping for an open file and rejects overlaps", () => {
     const mappings = [
       { spaceId: "s1", rootPath: "Wiki", status: "active" as const },
