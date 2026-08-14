@@ -1,4 +1,5 @@
 import type { ControlStorePort } from "../ports/control-store";
+import { DeviceStateRepository } from "./device-state";
 
 interface VaultIdentity {
   schemaVersion: 1;
@@ -8,10 +9,13 @@ const UUID_V4 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 export class VaultIdentityService {
+  private readonly deviceState: DeviceStateRepository | null;
   constructor(
     private readonly shared: ControlStorePort,
     private readonly local?: ControlStorePort,
-  ) {}
+  ) {
+    this.deviceState = local ? new DeviceStateRepository(local) : null;
+  }
   async getOrCreate(): Promise<string> {
     const paths = [
       ".agentwiki/vault.json",
@@ -55,10 +59,13 @@ export class VaultIdentityService {
     return vaultId;
   }
   async bind(vaultId: string): Promise<void> {
-    await (this.local ?? this.shared).write("bound-vault-id", vaultId);
+    if (this.deviceState) await this.deviceState.setBoundVaultId(vaultId);
+    else await this.shared.write("bound-vault-id", vaultId);
   }
   async assertBound(): Promise<void> {
-    const expected = await (this.local ?? this.shared).read("bound-vault-id");
+    const expected = this.deviceState
+      ? await this.deviceState.getBoundVaultId()
+      : await this.shared.read("bound-vault-id");
     const actual = await this.getOrCreate();
     if (expected !== actual) throw new Error("Vault identity mismatch");
   }

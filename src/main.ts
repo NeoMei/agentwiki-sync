@@ -31,6 +31,7 @@ import { idFileKey } from "./core/identity-key";
 import { OperationLock } from "./application/sync-coordinator";
 import { SessionResponseSchema } from "./agentwiki/protocol";
 import { MutableControlRepository } from "./storage/envelope";
+import { DeviceStateRepository } from "./storage/device-state";
 
 const isDeviceSettings = (value: unknown): value is AgentWikiSyncSettings => {
   try {
@@ -141,13 +142,10 @@ export default class AgentWikiSyncPlugin extends Plugin {
     }
     const local = new ObsidianLocalControlStore(this.app);
     const shared = new ObsidianControlStore(this.app.vault.adapter);
-    let deviceId = await local.read("device-id");
+    const deviceState = new DeviceStateRepository(local);
+    const deviceId = await deviceState.getOrCreateDeviceId();
     const identity = new VaultIdentityService(shared, local);
     const vaultId = await identity.getOrCreate();
-    if (!deviceId) {
-      deviceId = crypto.randomUUID();
-      await local.write("device-id", deviceId);
-    }
     try {
       const result = await new ConnectionService(
         new RequestUrlHttp(),
@@ -282,7 +280,8 @@ export default class AgentWikiSyncPlugin extends Plugin {
       isConnectionState,
     ).read();
     const secretId = connectionState?.payload.credentialSecretId ?? null;
-    const deviceId = await local.read("device-id");
+    const deviceState = new DeviceStateRepository(local);
+    const deviceId = (await deviceState.read())?.deviceId;
     if (!secretId || !deviceId) return null;
     const secrets = new ObsidianSecrets(this.app);
     const client = new AgentWikiClient(
@@ -291,7 +290,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       () => secrets.get(secretId),
     );
     const state = connectionState?.payload ?? null;
-    const boundVaultId = await local.read("bound-vault-id");
+    const boundVaultId = await deviceState.getBoundVaultId();
     if (
       !state ||
       state.serverUrl !== this.settings.serverUrl ||
