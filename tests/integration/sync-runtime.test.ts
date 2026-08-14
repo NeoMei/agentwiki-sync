@@ -4,6 +4,7 @@ import { FakeAgentWiki } from "../fakes/fake-agentwiki";
 import { MemoryControlStore } from "../fakes/memory-control-store";
 import { MemoryVault } from "../fakes/memory-vault";
 import { contentHash } from "../../src/agentwiki/protocol";
+import { PushService } from "../../src/application/push-service";
 
 describe("SyncRuntime", () => {
   it("clones a pending remote mapping, then reports clean", async () => {
@@ -473,5 +474,50 @@ describe("SyncRuntime", () => {
         (item) => item.operation === "upsert" && item.path === "New.md",
       )?.pageId,
     ).toBe(firstId);
+  });
+
+  it("supersedes an unfinished Push after credential rotation instead of replaying it", async () => {
+    const remote = new FakeAgentWiki();
+    const vault = new MemoryVault({ "Wiki/A.md": "a" });
+    const control = new MemoryControlStore();
+    const mapping = {
+      spaceId: "space",
+      rootPath: "Wiki",
+      status: "pending" as const,
+    };
+    const runtimeA = new SyncRuntime(
+      vault,
+      control,
+      remote,
+      mapping,
+      undefined,
+      "device",
+      "space",
+      "cred-a",
+    );
+    await runtimeA.establishEmptyBase();
+    remote.canPublish = false;
+    const preview = await runtimeA.previewPush();
+    await expect(runtimeA.applyPush(preview)).rejects.toThrow(
+      /SPACE_READ_ONLY/,
+    );
+    remote.canPublish = true;
+    const runtimeB = new SyncRuntime(
+      vault,
+      control,
+      remote,
+      mapping,
+      undefined,
+      "device",
+      "space",
+      "cred-b",
+    );
+    await runtimeB.recover();
+    const push = new PushService(
+      remote,
+      control,
+      ".agentwiki/devices/d-device/spaces/s-space/push",
+    );
+    expect((await push.inspect())?.remoteState).toBe("superseded");
   });
 });

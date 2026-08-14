@@ -218,6 +218,7 @@ export class SyncRuntime {
     private readonly fallbackCapabilities = DEFAULT_CAPABILITIES,
     deviceKey = "local",
     spaceKey = safeKey(mapping.spaceId),
+    private readonly credentialId: string | null = null,
   ) {
     this.root = `.agentwiki/devices/d-${safeKey(deviceKey)}/spaces/s-${safeKey(spaceKey)}`;
     this.baseline = new BaselineRepository(
@@ -652,24 +653,36 @@ export class SyncRuntime {
     );
     const push = await pushService.inspect();
     if (push && push.localCommitPhase !== "verified") {
-      const result =
-        push.remoteState === "published" && push.result
-          ? push.result
-          : await pushService.resume();
-      if (!result) throw new Error("PUSH_RECOVERY_REQUIRED");
-      const base = await this.readBase();
-      if (base.revision !== result.revision) {
-        const downloaded = await this.downloadSnapshot(result.revision);
-        this.verifyPublishedSnapshot(result, downloaded.metadata);
-        await this.stageDownloadedAndCommit(
-          result.revision,
-          downloaded.pages,
-          "push",
-        );
+      const credentialRotated =
+        this.credentialId !== null &&
+        push.credentialIdAtCreation !== null &&
+        this.credentialId !== push.credentialIdAtCreation;
+      if (
+        credentialRotated &&
+        push.remoteState !== "published" &&
+        push.remoteState !== "superseded"
+      ) {
+        await pushService.supersede();
+      } else if (push.remoteState !== "superseded") {
+        const result =
+          push.remoteState === "published" && push.result
+            ? push.result
+            : await pushService.resume();
+        if (!result) throw new Error("PUSH_RECOVERY_REQUIRED");
+        const base = await this.readBase();
+        if (base.revision !== result.revision) {
+          const downloaded = await this.downloadSnapshot(result.revision);
+          this.verifyPublishedSnapshot(result, downloaded.metadata);
+          await this.stageDownloadedAndCommit(
+            result.revision,
+            downloaded.pages,
+            "push",
+          );
+        }
+        await this.identities.clear();
+        await this.moveHints.clear();
+        await pushService.markVerified();
       }
-      await this.identities.clear();
-      await this.moveHints.clear();
-      await pushService.markVerified();
     }
   }
   async status(): Promise<{
@@ -1228,6 +1241,7 @@ export class SyncRuntime {
       baseRevision: preview.revision,
       changes: preview.changes,
       capabilities: preview.capabilities,
+      credentialId: this.credentialId,
     });
     const downloaded = await this.downloadSnapshot(result.revision);
     const pages = downloaded.pages;

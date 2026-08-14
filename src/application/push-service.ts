@@ -19,6 +19,7 @@ interface PushInput {
   baseRevision: string;
   changes: PushChange[];
   capabilities: SyncCapabilities;
+  credentialId?: string | null;
 }
 type JournalChange =
   | Exclude<PushChange, { operation: "upsert" }>
@@ -34,6 +35,7 @@ interface PreparedPushInput {
   baseRevision: string;
   changes: PreparedPushChange[];
   capabilities: SyncCapabilities;
+  credentialId?: string | null;
 }
 interface PushJournal {
   schemaVersion: 1;
@@ -46,22 +48,32 @@ interface PushJournal {
   changes: JournalChange[];
   totalBodyBytes: number;
   sessionId: string | null;
-  remoteState: "not_created" | "uploading" | "finalizing" | "published";
+  credentialIdAtCreation: string | null;
+  remoteState:
+    "not_created" | "uploading" | "finalizing" | "published" | "superseded";
   result: FinalizeResult | null;
   localCommitPhase: "not_started" | "verified";
 }
 function isPushJournal(value: unknown): value is PushJournal {
+  const item = value as Partial<PushJournal>;
   return (
     !!value &&
     typeof value === "object" &&
-    (value as Partial<PushJournal>).schemaVersion === 1 &&
-    typeof (value as Partial<PushJournal>).spaceId === "string" &&
-    Number.isSafeInteger((value as Partial<PushJournal>).totalBodyBytes) &&
-    ((value as Partial<PushJournal>).totalBodyBytes ?? -1) >= 0 &&
-    ["not_created", "uploading", "finalizing", "published"].includes(
-      (value as Partial<PushJournal>).remoteState ?? "",
-    ) &&
-    Array.isArray((value as Partial<PushJournal>).changes)
+    item.schemaVersion === 1 &&
+    typeof item.spaceId === "string" &&
+    Number.isSafeInteger(item.totalBodyBytes) &&
+    (item.totalBodyBytes ?? -1) >= 0 &&
+    (item.credentialIdAtCreation === undefined ||
+      item.credentialIdAtCreation === null ||
+      typeof item.credentialIdAtCreation === "string") &&
+    [
+      "not_created",
+      "uploading",
+      "finalizing",
+      "published",
+      "superseded",
+    ].includes(item.remoteState ?? "") &&
+    Array.isArray(item.changes)
   );
 }
 
@@ -88,7 +100,7 @@ export class PushService {
   }
   async inspect(): Promise<Pick<
     PushJournal,
-    "remoteState" | "result" | "localCommitPhase"
+    "remoteState" | "result" | "localCommitPhase" | "credentialIdAtCreation"
   > | null> {
     const value = await this.journal.read();
     return value
@@ -96,6 +108,7 @@ export class PushService {
           remoteState: value.payload.remoteState,
           result: value.payload.result,
           localCommitPhase: value.payload.localCommitPhase,
+          credentialIdAtCreation: value.payload.credentialIdAtCreation ?? null,
         }
       : null;
   }
@@ -250,6 +263,7 @@ export class PushService {
       changes: journalChanges,
       totalBodyBytes,
       sessionId: null,
+      credentialIdAtCreation: input.credentialId ?? null,
       remoteState: "not_created",
       result: null,
       localCommitPhase: "not_started",
@@ -314,6 +328,7 @@ export class PushService {
       changes: journalChanges,
       totalBodyBytes,
       sessionId: null,
+      credentialIdAtCreation: input.credentialId ?? null,
       remoteState: "not_created",
       result: null,
       localCommitPhase: "not_started",
@@ -375,6 +390,13 @@ export class PushService {
     if (journal.remoteState !== "published" || !journal.result)
       throw new Error("Push result is not published");
     journal.localCommitPhase = "verified";
+    await this.save(journal);
+  }
+  async supersede(): Promise<void> {
+    const journal = await this.load();
+    if (journal.remoteState === "published")
+      throw new Error("Published push cannot be superseded");
+    journal.remoteState = "superseded";
     await this.save(journal);
   }
 }

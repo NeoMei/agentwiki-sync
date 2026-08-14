@@ -9,7 +9,7 @@
 - `npm run build`：browser platform 单 bundle，`obsidian` external。
 - `npm run check:bundle`：禁止 Node 文件系统/子进程、桌面 adapter 和秘密模式；检查发布版本一致性。
 
-本轮收口结果（2026-08-14）：24 个测试文件、105 项测试全部通过；Prettier 格式检查、ESLint、strict typecheck、production build 与 bundle 安全检查通过。覆盖 fixed-revision 分页、非法远端路径拒绝、connection exact replay、pageId/case-only rename、首次绑定和普通冲突、Vault CAS 与回滚故障点、不可变 generation/current pointer、设备隔离、Push 发布后指标验证和响应丢失恢复；另补 UI 交互纯逻辑（分页、候选匹配、绑定选择、冲突解析、手动值回填）与 Obsidian 适配器契约（控制目录越界、localStorage 命名空间、secret 转发、Vault CAS/根路径边界、HTTP 序列化）。
+本轮收口结果（2026-08-14）：24 个测试文件、107 项测试全部通过；Prettier 格式检查、ESLint、strict typecheck、production build 与 bundle 安全检查通过。覆盖 fixed-revision 分页、非法远端路径拒绝、connection exact replay、pageId/case-only rename、首次绑定和普通冲突、Vault CAS 与回滚故障点、不可变 generation/current pointer、设备隔离、Push 发布后指标验证、响应丢失恢复与凭据轮换 supersede；另补 UI 交互纯逻辑（分页、候选匹配、绑定选择、冲突解析、手动值回填）与 Obsidian 适配器契约（控制目录越界、localStorage 命名空间、secret 转发、Vault CAS/根路径边界、HTTP 序列化）。
 
 ## 客户端交付边界
 

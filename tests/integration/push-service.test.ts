@@ -159,4 +159,22 @@ describe("PushService", () => {
     ).rejects.toThrow(/CAPABILITIES_CHANGED/);
     expect(remote.batches).toHaveLength(0);
   });
+
+  it("records the credential that created a push session for rotation checks", async () => {
+    const remote = new FakePushRemote(capabilities, "r1");
+    const store = new MemoryControlStore();
+    const service = new PushService(
+      remote,
+      store,
+      ".agentwiki/push/credential",
+    );
+    await service.publish({
+      spaceId: "s",
+      baseRevision: "r1",
+      changes,
+      capabilities,
+      credentialId: "cred-1",
+    });
+    expect((await service.inspect())?.credentialIdAtCreation).toBe("cred-1");
+  });
 });

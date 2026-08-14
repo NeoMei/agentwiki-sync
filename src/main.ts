@@ -323,6 +323,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       undefined,
       await idFileKey(deviceId),
       await idFileKey(mapping.spaceId),
+      state.credentialId,
     );
     this.liveRuntimes.set(runtimeKey, runtime);
     return runtime;
