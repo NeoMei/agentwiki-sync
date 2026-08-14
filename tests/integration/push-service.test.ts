@@ -177,4 +177,20 @@ describe("PushService", () => {
     });
     expect((await service.inspect())?.credentialIdAtCreation).toBe("cred-1");
   });
+
+  it("clears staged payloads and receipts once the local commit is verified", async () => {
+    const remote = new FakePushRemote(capabilities, "r1");
+    const store = new MemoryControlStore();
+    const service = new PushService(remote, store, ".agentwiki/push/cleanup");
+    await service.publish({
+      spaceId: "s",
+      baseRevision: "r1",
+      changes,
+      capabilities,
+    });
+    const payloadPath = `.agentwiki/push/cleanup/payload/${await opaqueFileKey("p1")}.md`;
+    expect(await store.read(payloadPath)).toBe("hello");
+    await service.markVerified();
+    expect(await store.read(payloadPath)).toBeNull();
+  });
 });

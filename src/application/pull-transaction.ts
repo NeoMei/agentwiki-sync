@@ -108,6 +108,15 @@ export class PullTransaction {
   private async save(journal: PullJournal): Promise<void> {
     await this.journal.write(journal);
   }
+  private async discardSidecars(): Promise<void> {
+    for (const dir of ["snapshots", "results"]) {
+      try {
+        await this.control.removeTree?.(`${this.root}/${dir}`);
+      } catch {
+        // Best-effort: residual sidecars are inert after a terminal state.
+      }
+    }
+  }
   private async load(): Promise<PullJournal> {
     const value = await this.journal.read();
     if (!value) throw new Error("Missing or corrupt pull journal");
@@ -272,6 +281,7 @@ export class PullTransaction {
           await this.vault.remove(temporary.temporary);
       journal.state = "committed";
       await this.save(journal);
+      await this.discardSidecars();
     } catch (error) {
       journal.state = "rolling_back";
       await this.save(journal);
@@ -287,6 +297,7 @@ export class PullTransaction {
     if (await this.isFullyMaterialized(journal)) {
       journal.state = "committed";
       await this.save(journal);
+      await this.discardSidecars();
       return;
     }
     await this.rollback(journal);
@@ -380,6 +391,7 @@ export class PullTransaction {
       journal.materialized = [];
       journal.temporaryPaths = [];
       await this.save(journal);
+      await this.discardSidecars();
     } catch {
       journal.state = "failed";
       await this.save(journal);

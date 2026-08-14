@@ -391,6 +391,13 @@ export class PushService {
       throw new Error("Push result is not published");
     journal.localCommitPhase = "verified";
     await this.save(journal);
+    for (const dir of ["payload", "receipts"]) {
+      try {
+        await this.store.removeTree?.(`${this.root}/${dir}`);
+      } catch {
+        // Best-effort: a verified push no longer needs staged payloads.
+      }
+    }
   }
   async supersede(): Promise<void> {
     const journal = await this.load();

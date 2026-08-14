@@ -629,6 +629,7 @@ export class SyncRuntime {
     await this.stageAndCommit(head.revision, [], "initialize");
   }
   async recover(): Promise<void> {
+    await this.discardOrphanPreviews();
     const pullTx = new PullTransaction(
       this.vault,
       this.control,
@@ -915,6 +916,20 @@ export class SyncRuntime {
     await this.control.removeTree?.(
       `${this.root}/push-preview/${safeKey(preview.previewId)}`,
     );
+  }
+  private async discardOrphanPreviews(): Promise<void> {
+    for (const dir of [
+      "downloads",
+      "pull-preview-results",
+      "pull-conflicts",
+      "push-preview",
+    ]) {
+      try {
+        await this.control.removeTree?.(`${this.root}/${dir}`);
+      } catch {
+        // Best-effort: orphaned preview artifacts are inert.
+      }
+    }
   }
   async applyPull(preview: PullPreview): Promise<void> {
     if (
