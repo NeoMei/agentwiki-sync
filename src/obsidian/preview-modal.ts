@@ -146,11 +146,19 @@ export class PreviewModal extends Modal {
     );
     setting.addDropdown((dropdown) => {
       dropdown.addOption("", "Create/use remote path");
-      for (const candidate of pageSlice(
+      const visibleCandidates = pageSlice(
         this.pullPreview?.localCandidates ?? [],
         0,
-      ))
+      );
+      for (const candidate of visibleCandidates)
         dropdown.addOption(candidate.path, candidate.path);
+      if (
+        binding.localPath &&
+        !visibleCandidates.some(
+          (candidate) => candidate.path === binding.localPath,
+        )
+      )
+        dropdown.addOption(binding.localPath, binding.localPath);
       dropdown.setValue(binding.localPath ?? "").onChange((value) => {
         applyBindingPath(
           binding,
