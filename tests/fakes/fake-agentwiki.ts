@@ -18,6 +18,7 @@ interface Session {
   batches: Map<number, PushBatch>;
 }
 export class FakeAgentWiki implements PushRemotePort {
+  readonly spaceId = "space";
   readonly capabilities: SyncCapabilities = {
     maxPageBytes: 1048576,
     maxBatchBytes: 4194304,
@@ -94,6 +95,8 @@ export class FakeAgentWiki implements PushRemotePort {
       }
     this.revision += 1;
     const manifest = {
+      protocolVersion: "1" as const,
+      spaceId: this.spaceId,
       pages: [...this.pages.values()].map((page) => ({
         pageId: page.pageId,
         path: page.path,
@@ -133,6 +136,8 @@ export class FakeAgentWiki implements PushRemotePort {
   async snapshot() {
     const all = [...this.pages.values()].map((page) => ({ ...page }));
     const manifest = {
+      protocolVersion: "1" as const,
+      spaceId: this.spaceId,
       pages: all.map((page) => ({
         pageId: page.pageId,
         path: page.path,

@@ -51,6 +51,8 @@ export interface PushBatch extends PushBatchWithoutHash {
 }
 
 export interface RevisionContentManifest {
+  protocolVersion: "1";
+  spaceId: string;
   pages: Array<{
     pageId: string;
     path: string;

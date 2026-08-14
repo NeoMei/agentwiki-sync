@@ -15,6 +15,7 @@
     "check": "npm run check:format && npm run lint && npm run typecheck && npm test && npm run build && npm run check:bundle"
   },
   "dependencies": {
+    "@neomei/agentwiki-sync-protocol": "^0.1.0",
     "node-diff3": "^3.2.0",
     "unicode-case-folding": "^1.1.1",
     "zod": "^4.0.0"

@@ -48,6 +48,7 @@ export async function revisionContentHash(
   if (manifest.pages.length === 0) return sha256Hex(new Uint8Array());
   return sha256Hex(
     canonicalBytes({
+      ...manifest,
       pages: [...manifest.pages].sort((a, b) =>
         a.pageId < b.pageId ? -1 : a.pageId > b.pageId ? 1 : 0,
       ),

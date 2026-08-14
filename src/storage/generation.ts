@@ -57,6 +57,8 @@ export class GenerationRepository {
       );
     }
     const protocolManifest = {
+      protocolVersion: "1" as const,
+      spaceId: input.spaceId,
       pages: Object.values(pages).map((page) => ({
         pageId: page.pageId,
         path: page.relativePath,
@@ -114,6 +116,8 @@ export class GenerationRepository {
       bodyBytes += new TextEncoder().encode(body).byteLength;
     }
     const protocolManifest = {
+      protocolVersion: "1" as const,
+      spaceId: manifest.spaceId,
       pages: Object.values(manifest.pages).map((page) => ({
         pageId: page.pageId,
         path: page.relativePath,
@@ -198,6 +202,8 @@ export class GenerationRepository {
       );
     }
     const protocolManifest = {
+      protocolVersion: "1" as const,
+      spaceId: input.spaceId,
       pages: Object.values(pageMap).map((page) => ({
         pageId: page.pageId,
         path: page.relativePath,

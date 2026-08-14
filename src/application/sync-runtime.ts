@@ -388,6 +388,8 @@ export class SyncRuntime {
       bodyBytes += new TextEncoder().encode(page.body).byteLength;
     }
     const manifest = {
+      protocolVersion: "1" as const,
+      spaceId: this.mapping.spaceId,
       pages: value.items.map((page) => ({
         pageId: page.pageId,
         path: page.path,
@@ -461,6 +463,8 @@ export class SyncRuntime {
     }
     if (!metadata) throw new Error("Snapshot returned no metadata");
     const manifest = {
+      protocolVersion: "1" as const,
+      spaceId: this.mapping.spaceId,
       pages: pages.map((page) => ({
         pageId: page.pageId,
         path: page.path,
