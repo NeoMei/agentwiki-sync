@@ -46,9 +46,7 @@ export class PreviewModal extends Modal {
   ): void {
     if (total <= PREVIEW_PAGE_SIZE) return;
     new Setting(this.contentEl)
-      .setDesc(
-        `Page ${page + 1} / ${pageCount(total)} · ${total} items`,
-      )
+      .setDesc(`Page ${page + 1} / ${pageCount(total)} · ${total} items`)
       .addButton((button) =>
         button
           .setButtonText("Previous")
@@ -126,8 +124,7 @@ export class PreviewModal extends Modal {
             setting.setDesc(`Remote preview: ${body.slice(0, 160)}`);
         })
         .catch(() => {
-          if (!searchTouched)
-            setting.setDesc("Remote preview unavailable.");
+          if (!searchTouched) setting.setDesc("Remote preview unavailable.");
         });
     setting.addText((text) =>
       text

@@ -103,7 +103,9 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
             .split("|")
             .map((part) => part.trim());
           if (!spaceId || !rootPath) {
-            new Notice("Enter a Space ID and folder as space-id | folder/path.");
+            new Notice(
+              "Enter a Space ID and folder as space-id | folder/path.",
+            );
             return;
           }
           button.setDisabled(true);

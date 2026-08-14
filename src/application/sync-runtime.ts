@@ -32,7 +32,7 @@ import { BaselineRepository, type BaselineState } from "../storage/baseline";
 import { MutableControlRepository } from "../storage/envelope";
 import { PullTransaction, type PullAction } from "./pull-transaction";
 import { PushService, type PreparedPushChange } from "./push-service";
-import { opaqueFileKey,validatePublicId } from "../core/identity-key";
+import { opaqueFileKey, validatePublicId } from "../core/identity-key";
 import type { SpaceMapping } from "./sync-coordinator";
 
 export interface InitialBindingChoice {
@@ -70,7 +70,7 @@ export interface PushPreview {
   revision: string;
   changes: PreparedPushChange[];
   capabilities: SyncCapabilities;
-  previewId:string;
+  previewId: string;
 }
 interface RuntimeRemote extends PushRemotePort {
   snapshot(revision?: string): Promise<SnapshotResult>;
@@ -98,7 +98,14 @@ interface PendingIdentities {
   >;
 }
 const isPendingIdentities = (value: unknown): value is PendingIdentities => {
-  if (!value || typeof value !== "object"||Object.keys(value).some(key=>!["schemaVersion","entries"].includes(key))) return false;
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Object.keys(value).some(
+      (key) => !["schemaVersion", "entries"].includes(key),
+    )
+  )
+    return false;
   const state = value as Partial<PendingIdentities>;
   if (
     state.schemaVersion !== 1 ||
@@ -116,7 +123,22 @@ const isPendingIdentities = (value: unknown): value is PendingIdentities => {
       !["create", "restore"].includes(entry.intent)
     )
       return false;
-    try {validatePublicId(entry.pageId);const allowed=entry.intent==="create"?["intent","pageId","path","contentHash"]:["intent","pageId","path","contentHash","archivedBasePath","archivedBaseTitle","archivedBaseContentHash"];if(Object.keys(entry).some(field=>!allowed.includes(field)))return false;
+    try {
+      validatePublicId(entry.pageId);
+      const allowed =
+        entry.intent === "create"
+          ? ["intent", "pageId", "path", "contentHash"]
+          : [
+              "intent",
+              "pageId",
+              "path",
+              "contentHash",
+              "archivedBasePath",
+              "archivedBaseTitle",
+              "archivedBaseContentHash",
+            ];
+      if (Object.keys(entry).some((field) => !allowed.includes(field)))
+        return false;
       const path = validatePortablePath(entry.path);
       if (paths.has(path.key)) return false;
       paths.add(path.key);
@@ -127,7 +149,8 @@ const isPendingIdentities = (value: unknown): value is PendingIdentities => {
           !/^[0-9a-f]{64}$/.test(entry.archivedBaseContentHash))
       )
         return false;
-      if(entry.intent==="restore")validatePortablePath(entry.archivedBasePath);
+      if (entry.intent === "restore")
+        validatePortablePath(entry.archivedBasePath);
     } catch {
       return false;
     }
@@ -267,7 +290,15 @@ export class SyncRuntime {
     )
       return;
     await this.identities.write(after.payload.identities);
-    const current=(await this.moveHints.read())?.payload.hints??[];const merged=new Map(after.payload.moveHints.hints.map(hint=>[hint.pageId,hint]));for(const hint of current)merged.set(hint.pageId,hint);await this.moveHints.write({schemaVersion:1,hints:[...merged.values()]});
+    const current = (await this.moveHints.read())?.payload.hints ?? [];
+    const merged = new Map(
+      after.payload.moveHints.hints.map((hint) => [hint.pageId, hint]),
+    );
+    for (const hint of current) merged.set(hint.pageId, hint);
+    await this.moveHints.write({
+      schemaVersion: 1,
+      hints: [...merged.values()],
+    });
     await this.pullControlAfter.write({ ...after.payload, phase: "applied" });
   }
   private async readBase(): Promise<BaselineState> {
@@ -710,7 +741,7 @@ export class SyncRuntime {
           pageId: page.pageId,
           remotePath,
           remoteBody: "",
-          remoteBodyPath:(page as SyncPage&{bodyPath?:string}).bodyPath,
+          remoteBodyPath: (page as SyncPage & { bodyPath?: string }).bodyPath,
           localPath: local?.relativePath ?? null,
           localBody: null,
           localVaultByteHash: local?.vaultByteHash ?? null,
@@ -867,8 +898,10 @@ export class SyncRuntime {
     for (const root of preview.artifactRoots)
       await this.control.removeTree?.(root);
   }
-  async discardPushPreview(preview:PushPreview): Promise<void> {
-    await this.control.removeTree?.(`${this.root}/push-preview/${safeKey(preview.previewId)}`);
+  async discardPushPreview(preview: PushPreview): Promise<void> {
+    await this.control.removeTree?.(
+      `${this.root}/push-preview/${safeKey(preview.previewId)}`,
+    );
   }
   async applyPull(preview: PullPreview): Promise<void> {
     if (
@@ -1124,7 +1157,8 @@ export class SyncRuntime {
       schemaVersion: 1,
       entries: {},
     };
-    const changes: PreparedPushChange[] = [];const previewId=crypto.randomUUID();
+    const changes: PreparedPushChange[] = [];
+    const previewId = crypto.randomUUID();
     const changed = new Map<string, (typeof local.added)[number]>();
     for (const file of [...local.added, ...local.modified, ...local.renamed])
       changed.set(
@@ -1180,7 +1214,7 @@ export class SyncRuntime {
         pageId: page.pageId,
         previousPath: page.relativePath,
       });
-    return { revision: baseRevision, changes, capabilities,previewId };
+    return { revision: baseRevision, changes, capabilities, previewId };
   }
   async applyPush(preview: PushPreview): Promise<void> {
     if (!preview.changes.length) return;

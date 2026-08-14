@@ -1,11 +1,11 @@
 {
     "schema_version": 2,
-    "commit": "",
-    "indexed_at": "2026-08-13T10:24:59Z",
-    "project": "agentwiki-obsidian",
-    "nodes": 9,
-    "edges": 8,
-    "original_size": 1179648,
-    "compressed_size": 2819,
-    "compression_level": 9
+    "commit": "98ad428e8f39b3f2d2bc5b5f9e6cf4bee2ba895b",
+    "indexed_at": "2026-08-14T00:34:26Z",
+    "project": "Users-neomei-e9a1b9e79bae-codexprojects-AgentWiki-Obsidian",
+    "nodes": 876,
+    "edges": 2440,
+    "original_size": 4915200,
+    "compressed_size": 636215,
+    "compression_level": 3
 }

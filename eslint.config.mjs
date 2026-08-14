@@ -7,21 +7,29 @@ export default [
   js.configs.recommended,
   {
     files: ["**/*.mjs"],
-    languageOptions: { globals: { process: "readonly", console: "readonly" } }
+    languageOptions: { globals: { process: "readonly", console: "readonly" } },
   },
   {
     files: ["**/*.ts"],
     languageOptions: {
       parser: tsparser,
       parserOptions: { ecmaVersion: "latest", sourceType: "module" },
-      globals: { crypto: "readonly", TextDecoder: "readonly", TextEncoder: "readonly", URL: "readonly", URLSearchParams: "readonly", btoa: "readonly", setTimeout: "readonly" }
+      globals: {
+        crypto: "readonly",
+        TextDecoder: "readonly",
+        TextEncoder: "readonly",
+        URL: "readonly",
+        URLSearchParams: "readonly",
+        btoa: "readonly",
+        setTimeout: "readonly",
+      },
     },
     plugins: { "@typescript-eslint": tseslint },
     rules: {
       ...tseslint.configs.recommended.rules,
       "@typescript-eslint/consistent-type-imports": "error",
       "@typescript-eslint/no-explicit-any": "error",
-      "no-control-regex": "off"
-    }
-  }
+      "no-control-regex": "off",
+    },
+  },
 ];

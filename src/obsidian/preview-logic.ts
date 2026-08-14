@@ -1,4 +1,7 @@
-import type { InitialBindingChoice, PullPreview } from "../application/sync-runtime";
+import type {
+  InitialBindingChoice,
+  PullPreview,
+} from "../application/sync-runtime";
 
 export const PREVIEW_PAGE_SIZE = 100;
 
@@ -7,10 +10,7 @@ export interface LocalCandidate {
   vaultByteHash: string;
 }
 
-export function pageCount(
-  total: number,
-  pageSize = PREVIEW_PAGE_SIZE,
-): number {
+export function pageCount(total: number, pageSize = PREVIEW_PAGE_SIZE): number {
   return Math.max(1, Math.ceil(Math.max(0, total) / pageSize));
 }
 

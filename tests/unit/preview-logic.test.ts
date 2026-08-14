@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import type { InitialBindingChoice, PullPreview } from "../../src/application/sync-runtime";
+import type {
+  InitialBindingChoice,
+  PullPreview,
+} from "../../src/application/sync-runtime";
 import {
   applyBindingMode,
   applyBindingPath,
@@ -13,7 +16,9 @@ import {
   PREVIEW_PAGE_SIZE,
 } from "../../src/obsidian/preview-logic";
 
-function binding(overrides: Partial<InitialBindingChoice> = {}): InitialBindingChoice {
+function binding(
+  overrides: Partial<InitialBindingChoice> = {},
+): InitialBindingChoice {
   return {
     pageId: "p1",
     remotePath: "Remote.md",

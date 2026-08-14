@@ -91,15 +91,15 @@ class FakeVault {
     this.folders.add(path);
   }
   async modifyBinary(file: TFile, data: ArrayBuffer): Promise<void> {
-    this.files.set(
-      file.path,
-      new TextDecoder().decode(new Uint8Array(data)),
-    );
+    this.files.set(file.path, new TextDecoder().decode(new Uint8Array(data)));
   }
   async createBinary(path: string, data: ArrayBuffer): Promise<void> {
     this.files.set(path, new TextDecoder().decode(new Uint8Array(data)));
   }
-  async process(file: TFile, callback: (text: string) => string): Promise<void> {
+  async process(
+    file: TFile,
+    callback: (text: string) => string,
+  ): Promise<void> {
     this.files.set(file.path, callback(this.files.get(file.path) ?? ""));
   }
   async delete(file: TFile): Promise<void> {
@@ -149,10 +149,7 @@ describe("ObsidianControlStore", () => {
 describe("ObsidianLocalControlStore", () => {
   it("namespaces keys and treats null as deletion", async () => {
     const app = new FakeLocalApp();
-    const store = new ObsidianLocalControlStore(
-      app as unknown as App,
-      "ns",
-    );
+    const store = new ObsidianLocalControlStore(app as unknown as App, "ns");
     expect(await store.read("device-id")).toBeNull();
     await store.write("device-id", "d1");
     expect(app.storage.get("ns:device-id")).toBe("d1");
@@ -192,9 +189,9 @@ describe("ObsidianVaultPort", () => {
       "Wiki",
     );
     await expect(port.read("../Outside.md")).rejects.toThrow(/escapes/);
-    await expect(
-      port.write("Other.md", new Uint8Array([1])),
-    ).rejects.toThrow(/escapes/);
+    await expect(port.write("Other.md", new Uint8Array([1]))).rejects.toThrow(
+      /escapes/,
+    );
   });
 
   it("classifies the mapping root", async () => {
@@ -242,11 +239,7 @@ describe("ObsidianVaultPort", () => {
       "Wiki",
     );
     expect(
-      await port.compareAndSwap(
-        "Wiki/New.md",
-        null,
-        encoder.encode("created"),
-      ),
+      await port.compareAndSwap("Wiki/New.md", null, encoder.encode("created")),
     ).toBe(true);
     expect(vault.files.get("Wiki/New.md")).toBe("created");
     expect(

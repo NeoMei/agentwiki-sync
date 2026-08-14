@@ -397,7 +397,9 @@ export default class AgentWikiSyncPlugin extends Plugin {
             new Notice("Push complete.");
           },
           () => {
-            void runtime.discardPushPreview(preview).finally(() => modalRelease?.());
+            void runtime
+              .discardPushPreview(preview)
+              .finally(() => modalRelease?.());
           },
         ).open();
         release = null;
