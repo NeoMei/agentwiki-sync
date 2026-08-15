@@ -23,7 +23,7 @@ describe("status", () => {
     });
     expect(() =>
       computeStatus(base, resolvePageIdentities(base, scan.files, []), scan),
-    ).toThrow(/incomplete/);
+    ).toThrow(/不完整/);
   });
 
   it("preserves identity through a valid move hint", async () => {

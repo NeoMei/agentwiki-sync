@@ -4,7 +4,6 @@ import {
   GenerationRepository,
   type SpaceManifest,
 } from "../../src/storage/generation";
-import { opaqueFileKey } from "../../src/core/identity-key";
 
 describe("immutable generations", () => {
   it("writes and verifies manifest, base bodies and revision metrics", async () => {
@@ -29,11 +28,12 @@ describe("immutable generations", () => {
     await repo.write(manifest, { p1: "hello" });
     const verified = await repo.verify("g1");
     expect(verified.basePageCount).toBe(1);
+    // 现在使用可读路径 A.md 而不是哈希路径
     await store.write(
-      `.agentwiki/device/space/generations/g1/base/${await opaqueFileKey("p1")}.md`,
+      `.agentwiki/device/space/generations/g1/base/A.md`,
       "tampered",
     );
-    await expect(repo.verify("g1")).rejects.toThrow(/corrupt/);
+    await expect(repo.verify("g1")).rejects.toThrow(/损坏/);
   });
 
   it("rejects manifest key identity and portable-path collisions", async () => {
@@ -60,8 +60,6 @@ describe("immutable generations", () => {
         },
       },
     };
-    await expect(repo.write(manifest, { wrong: "x" })).rejects.toThrow(
-      /identity/,
-    );
+    await expect(repo.write(manifest, { wrong: "x" })).rejects.toThrow(/身份/);
   });
 });

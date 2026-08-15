@@ -33,6 +33,7 @@ import { MutableControlRepository } from "../storage/envelope";
 import { PullTransaction, type PullAction } from "./pull-transaction";
 import { PushService, type PreparedPushChange } from "./push-service";
 import { opaqueFileKey, validatePublicId } from "../core/identity-key";
+import { isValidSyncPath } from "../core/sync-path";
 import type { SpaceMapping } from "./sync-coordinator";
 
 export interface InitialBindingChoice {
@@ -201,6 +202,13 @@ const DEFAULT_CAPABILITIES: SyncCapabilities = {
 const safeKey = (value: string) => value.replace(/[^A-Za-z0-9_-]/gu, "_");
 const joinRoot = (root: string, relative: string) =>
   `${root}/${validatePortablePath(relative).path}`;
+const localFileName = async (
+  pageId: string,
+  relativePath: string,
+): Promise<string> => {
+  if (relativePath && isValidSyncPath(relativePath)) return relativePath;
+  return `p-${await opaqueFileKey(pageId)}.md`;
+};
 export class SyncRuntime {
   private pinnedBase: BaselineState | null = null;
   private scanEpoch = 0;
@@ -351,7 +359,7 @@ export class SyncRuntime {
         metadata.revisionManifestByteLength ||
       result.revisionContentHash !== metadata.revisionContentHash
     )
-      throw new Error("Published snapshot does not match finalize result");
+      throw new Error("已发布的快照与最终结果不匹配");
   }
   private async capabilities(): Promise<SyncCapabilities> {
     return parseCapabilities(
@@ -380,11 +388,11 @@ export class SyncRuntime {
     for (const page of value.items) {
       const path = validatePortablePath(page.path);
       if (pageIds.has(page.pageId) || pathKeys.has(path.key))
-        throw new Error("Snapshot contains duplicate page identity or path");
+        throw new Error("快照包含重复的页面身份或路径");
       pageIds.add(page.pageId);
       pathKeys.add(path.key);
       if ((await contentHash(page.body)) !== page.contentHash)
-        throw new Error("Snapshot page content hash mismatch");
+        throw new Error("快照页面内容哈希不匹配");
       bodyBytes += new TextEncoder().encode(page.body).byteLength;
     }
     const manifest = {
@@ -407,7 +415,7 @@ export class SyncRuntime {
       value.revisionManifestByteLength !== String(manifestBytes) ||
       value.revisionContentHash !== hash
     )
-      throw new Error("Snapshot integrity mismatch");
+      throw new Error("快照完整性不匹配");
   }
   private async downloadSnapshot(
     revision: string,
@@ -434,7 +442,7 @@ export class SyncRuntime {
         revisionBodyBytes: page.metadata.revisionBodyBytes,
       };
       if (metadata && JSON.stringify(metadata) !== JSON.stringify(current))
-        throw new Error("Snapshot pagination metadata changed");
+        throw new Error("快照分页元数据已变更");
       metadata ??= current;
       decimalWithinLimit(current.pageCount, capabilities.maxClientSpacePages);
       decimalWithinLimit(
@@ -452,16 +460,16 @@ export class SyncRuntime {
           keys.has(path.key) ||
           (await contentHash(item.body)) !== item.contentHash
         )
-          throw new Error("Snapshot integrity mismatch");
+          throw new Error("快照完整性不匹配");
         ids.add(item.pageId);
         keys.add(path.key);
         bodyBytes += new TextEncoder().encode(item.body).byteLength;
-        const sidecar = `${this.root}/downloads/${safeKey(previewId)}/${await opaqueFileKey(item.pageId)}.md`;
+        const sidecar = `${this.root}/downloads/${safeKey(previewId)}/${await localFileName(item.pageId, item.path)}`;
         await this.control.write(sidecar, item.body);
         pages.push({ ...item, body: "", bodyPath: sidecar } as SyncPage);
       }
     }
-    if (!metadata) throw new Error("Snapshot returned no metadata");
+    if (!metadata) throw new Error("快照未返回元数据");
     const manifest = {
       protocolVersion: "1" as const,
       spaceId: this.mapping.spaceId,
@@ -480,7 +488,7 @@ export class SyncRuntime {
         String(pages.length ? canonicalBytes(manifest).byteLength : 0) ||
       metadata.revisionContentHash !== (await revisionContentHash(manifest))
     )
-      throw new Error("Snapshot integrity mismatch");
+      throw new Error("快照完整性不匹配");
     return { metadata, pages, previewId };
   }
   private async remoteBody(revision: string, page: SyncPage): Promise<string> {
@@ -489,7 +497,7 @@ export class SyncRuntime {
     if (bodyPath === undefined) return page.body;
     const body = await this.control.read(bodyPath);
     if (body === null || (await contentHash(body)) !== page.contentHash)
-      throw new Error("Downloaded snapshot body is corrupt");
+      throw new Error("下载的快照内容已损坏");
     return body;
   }
   private async resultAction(
@@ -579,9 +587,9 @@ export class SyncRuntime {
   private async scan(): Promise<ScanResult> {
     const epoch = this.scanEpoch;
     const status = await this.vault.rootStatus(this.mapping.rootPath);
-    if (status === "file") throw new Error("Mapping root is a file");
+    if (status === "file") throw new Error("映射根是文件");
     if (status === "missing" && this.mapping.status === "active")
-      throw new Error("local scan incomplete: mapping root is missing");
+      throw new Error("本地扫描不完整：映射根目录缺失");
     const capabilities = await this.capabilities();
     try {
       const result = await scanMapping(
@@ -599,11 +607,11 @@ export class SyncRuntime {
           },
         },
       );
-      if (epoch !== this.scanEpoch) throw new Error("scan epoch changed");
+      if (epoch !== this.scanEpoch) throw new Error("扫描纪元已变更");
       return result;
     } catch (error) {
       throw new Error(
-        `local scan incomplete: ${error instanceof Error ? error.message : "read failure"}`,
+        `本地扫描不完整：${error instanceof Error ? error.message : "读取失败"}`,
       );
     }
   }
@@ -615,7 +623,7 @@ export class SyncRuntime {
     const bytes = await this.vault.read(
       joinRoot(this.mapping.rootPath, file.relativePath),
     );
-    if (!bytes) throw new Error("Local file disappeared during preview");
+    if (!bytes) throw new Error("预览期间本地文件消失");
     return decodeVaultMarkdown(bytes).normalized;
   }
   async establishEmptyBase(): Promise<void> {
@@ -877,8 +885,7 @@ export class SyncRuntime {
     localPath: string,
   ): Promise<void> {
     const scan = await this.scan();
-    if (scan.scanEpoch !== preview.scanEpoch)
-      throw new Error("scan epoch changed");
+    if (scan.scanEpoch !== preview.scanEpoch) throw new Error("扫描纪元已变更");
     const local = scan.files.find(
       (file) =>
         portablePathKey(file.relativePath) === portablePathKey(localPath),
@@ -886,8 +893,7 @@ export class SyncRuntime {
     const binding = preview.initialBindings.find(
       (item) => item.pageId === pageId,
     );
-    if (!local || !binding)
-      throw new Error("Initial binding candidate is missing");
+    if (!local || !binding) throw new Error("初始绑定候选项缺失");
     if (
       preview.initialBindings.some(
         (item) =>
@@ -896,7 +902,7 @@ export class SyncRuntime {
           portablePathKey(item.localPath) === portablePathKey(localPath),
       )
     )
-      throw new Error("Local page is already bound");
+      throw new Error("本地页面已绑定");
     binding.localPath = local.relativePath;
     binding.localBody = await this.localBody(local);
     binding.localVaultByteHash = local.vaultByteHash;
@@ -932,13 +938,12 @@ export class SyncRuntime {
       ) ||
       preview.initialBindings.some((item) => item.resolution === null)
     )
-      throw new Error("Pull has unresolved structured conflicts");
+      throw new Error("拉取存在未解决的结构化冲突");
     const boundKeys = new Set<string>();
     for (const item of preview.initialBindings)
       if (item.localPath) {
         const key = portablePathKey(item.localPath);
-        if (boundKeys.has(key))
-          throw new Error("Local page is bound more than once");
+        if (boundKeys.has(key)) throw new Error("本地页面被多次绑定");
         boundKeys.add(key);
       }
     const actions = [...preview.actions];
@@ -1054,8 +1059,7 @@ export class SyncRuntime {
           );
         continue;
       }
-      if (!local || !remote || !basePage)
-        throw new Error("Pull conflict page disappeared");
+      if (!local || !remote || !basePage) throw new Error("拉取冲突页面消失");
       const currentBody = await this.localBody(local);
       const bodyMerge = await mergeBody(
         await this.baseBody(basePage),
@@ -1215,7 +1219,7 @@ export class SyncRuntime {
         identities.entries[pageId] = identity;
       }
       const body = await this.localBody(file);
-      const payloadPath = `${this.root}/push-preview/${safeKey(previewId)}/${await opaqueFileKey(pageId)}.md`;
+      const payloadPath = `${this.root}/push-preview/${safeKey(previewId)}/${await localFileName(pageId, file.relativePath)}`;
       await this.control.write(payloadPath, body);
       changes.push({
         operation: "upsert",

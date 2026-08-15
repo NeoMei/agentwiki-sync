@@ -46,7 +46,7 @@ export class PreviewModal extends Modal {
   ): void {
     if (total <= PREVIEW_PAGE_SIZE) return;
     new Setting(this.contentEl)
-      .setDesc(`Page ${page + 1} / ${pageCount(total)} · ${total} items`)
+      .setDesc(`第 ${page + 1} / ${pageCount(total)} 页 · 共 ${total} 项`)
       .addButton((button) =>
         button
           .setButtonText("上一页")
@@ -74,7 +74,7 @@ export class PreviewModal extends Modal {
       list.createEl("li", { text: line });
     if (this.lines.length > PREVIEW_PAGE_SIZE)
       this.contentEl.createEl("p", {
-        text: `${this.lines.length - PREVIEW_PAGE_SIZE} more actions are summarized by the paged controls below.`,
+        text: `${this.lines.length - PREVIEW_PAGE_SIZE} 其余变更已在下方分页中列出.`,
       });
     for (const binding of pageSlice(this.bindings, this.bindingPage))
       this.renderBinding(binding);
@@ -103,7 +103,7 @@ export class PreviewModal extends Modal {
               this.close();
             } catch (error) {
               new Notice(
-                `Sync failed: ${error instanceof Error ? error.message : "unknown error"}`,
+                `同步失败：${error instanceof Error ? error.message : "未知错误"}`,
               );
             } finally {
               button.setDisabled(false);
@@ -113,7 +113,7 @@ export class PreviewModal extends Modal {
   }
   private renderBinding(binding: InitialBindingChoice): void {
     const setting = new Setting(this.contentEl)
-      .setName(`${binding.localPath ?? "new file"} ↔ ${binding.remotePath}`)
+      .setName(`${binding.localPath ?? "新文件"} ↔ ${binding.remotePath}`)
       .setDesc("选择本地文件对应关系，或使用远端版本。");
     let searchTouched = false;
     if (binding.remoteBodyPath)
@@ -209,7 +209,7 @@ export class PreviewModal extends Modal {
         .addOption("", "请选择…")
         .addOption("local", "保留本地")
         .addOption("remote", "使用远端")
-        .addOption("manual", "Manual value")
+        .addOption("manual", "手动内容")
         .setValue(
           this.pullPreview?.conflictResolutions[conflict.conflictId]?.choice ??
             "",

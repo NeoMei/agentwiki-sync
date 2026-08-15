@@ -67,7 +67,7 @@ export class MutableControlRepository<T> {
     );
     const classifications = raws.map(classifyRaw);
     if (classifications.includes("unsupported"))
-      throw new Error("CONTROL_STORE_UNSUPPORTED_VERSION");
+      throw new Error("不支持的控制存储版本");
     const candidates = await Promise.all(
       raws.map((raw) => parseEnvelope(raw, this.guard)),
     );
@@ -75,7 +75,7 @@ export class MutableControlRepository<T> {
       candidates.every((candidate) => candidate === null) &&
       classifications.some((item) => item !== "absent")
     )
-      throw new Error("CONTROL_STORE_CORRUPT");
+      throw new Error("控制存储已损坏");
     return candidates.filter(
       (candidate): candidate is MutableControlEnvelope<T> => candidate !== null,
     );
@@ -91,7 +91,7 @@ export class MutableControlRepository<T> {
         candidate.writeGeneration === highest.writeGeneration &&
         candidate.payloadHash !== highest.payloadHash,
     );
-    if (forks.length > 0) throw new Error("CONTROL_STORE_FORK");
+    if (forks.length > 0) throw new Error("控制存储存在分叉");
     return highest;
   }
 
@@ -114,7 +114,7 @@ export class MutableControlRepository<T> {
       this.guard,
     );
     if (!verified || verified.payloadHash !== envelope.payloadHash)
-      throw new Error("Control write verification failed");
+      throw new Error("控制写入验证失败");
     await this.store.remove(`${this.path}.prev`);
     if ((await this.store.read(this.path)) !== null)
       await this.store.rename(this.path, `${this.path}.prev`);

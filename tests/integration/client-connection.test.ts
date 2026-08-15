@@ -63,7 +63,7 @@ describe("AgentWiki connection", () => {
         http,
         () => "secret",
       ).snapshot("space"),
-    ).rejects.toThrow(/metadata changed/);
+    ).rejects.toThrow(/元数据已变更/);
   });
 
   it("stores a credential before exchange and activates only after verification", async () => {
@@ -416,7 +416,7 @@ describe("AgentWiki connection", () => {
         vaultId: "99999999-9999-4999-8999-999999999999",
         pluginVersion: "0.1.0",
       }),
-    ).rejects.toThrow(/identity mismatch/);
+    ).rejects.toThrow(/身份不匹配/);
   });
 });
 

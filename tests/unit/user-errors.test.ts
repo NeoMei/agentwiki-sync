@@ -22,9 +22,7 @@ describe("userErrorMessage", () => {
         new TypeError("Path contains an empty or relative segment"),
       ),
     ).toContain("路径");
-    expect(userErrorMessage(new TypeError("Mapping roots overlap"))).toContain(
-      "重叠",
-    );
+    expect(userErrorMessage(new TypeError("映射根路径重叠"))).toContain("重叠");
   });
 
   it("falls back to raw message for unknown errors", () => {

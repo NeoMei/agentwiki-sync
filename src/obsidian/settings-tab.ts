@@ -186,6 +186,14 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
             new Notice("请输入本地文件夹名，如 Wiki");
             return;
           }
+          const selectedSpace = this.availableSpaces?.find(
+            (s) => s.spaceId === this.selectedSpaceId,
+          );
+          if (selectedSpace && !selectedSpace.canPublish) {
+            new Notice("此空间为只读，无法推送。请选择可编辑空间。");
+            button.setDisabled(false);
+            return;
+          }
           button.setDisabled(true);
           try {
             await this.plugin.addMapping(

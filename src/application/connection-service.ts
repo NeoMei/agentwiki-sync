@@ -131,7 +131,7 @@ export class ConnectionService {
       try {
         parsed = JSON.parse(raw);
       } catch {
-        throw new Error("Connection journal is corrupt");
+        throw new Error("连接日志已损坏");
       }
       if (isConnectionJournal(parsed)) {
         await this.state.remove("connection-journal.json");
@@ -184,7 +184,7 @@ export class ConnectionService {
         existing.vaultId !== input.vaultId ||
         existing.pluginVersion !== input.pluginVersion
       )
-        throw new Error("Pending connection identity mismatch");
+        throw new Error("待处理连接身份不匹配");
       // A fresh, different code supersedes the failed attempt: discard
       // dead secrets instead of replaying them and getting stuck.
       const storedCode = this.secrets.get(existing.codeSecretId);
@@ -203,7 +203,7 @@ export class ConnectionService {
       this.secrets.get(codeSecretId) !== input.code ||
       this.secrets.get(credentialSecretId) !== credential
     )
-      throw new Error("Secret Storage verification failed");
+      throw new Error("密钥存储验证失败");
     let journal: ConnectionJournal = {
       schemaVersion: 1,
       phase: "exchange_prepared",
@@ -267,7 +267,7 @@ export class ConnectionService {
         );
       }
     }
-    if (!exchanged) throw new Error("Repeated credential collision");
+    if (!exchanged) throw new Error("重复凭据冲突");
     journal = {
       ...journal,
       phase: "credential_stored",
@@ -276,7 +276,7 @@ export class ConnectionService {
     };
     await this.writeJournal(journal);
     if ((await this.journal.read()) === null)
-      throw new Error("Connection journal verification failed");
+      throw new Error("连接日志验证失败");
     this.secrets.set(codeSecretId, "");
     const session = SessionResponseSchema.parse(
       (await client.raw("GET", "/api/integrations/obsidian/session")).json,
@@ -295,8 +295,7 @@ export class ConnectionService {
       (await client.raw("GET", "/api/integrations/obsidian/session")).json,
     );
     this.assertSession(active, journal, exchanged);
-    if (active.credentialStatus !== "active")
-      throw new Error("Credential activation was not confirmed");
+    if (active.credentialStatus !== "active") throw new Error("凭据激活未确认");
     journal = { ...journal, phase: "activated" };
     await this.writeJournal(journal);
     await this.commitConnection({
@@ -332,17 +331,16 @@ export class ConnectionService {
       session.deviceId !== journal.deviceId ||
       session.vaultId !== journal.vaultId
     )
-      throw new Error("Device session identity mismatch");
+      throw new Error("设备会话身份不匹配");
   }
   private parseJournal(raw: string): ConnectionJournal {
     let value: unknown;
     try {
       value = JSON.parse(raw);
     } catch {
-      throw new Error("Connection journal is corrupt");
+      throw new Error("连接日志已损坏");
     }
-    if (!isConnectionJournal(value))
-      throw new Error("Connection journal is corrupt");
+    if (!isConnectionJournal(value)) throw new Error("连接日志已损坏");
     return value;
   }
 
@@ -356,7 +354,7 @@ export class ConnectionService {
   }> {
     void code;
     const credential = this.secrets.get(journal.credentialSecretId);
-    if (!credential) throw new Error("Pending credential is missing");
+    if (!credential) throw new Error("待处理凭据缺失");
     const client = new AgentWikiClient(
       journal.serverUrl,
       this.http,
@@ -384,7 +382,7 @@ export class ConnectionService {
       );
       this.assertSession(active, journal, exchanged);
       if (active.credentialStatus !== "active")
-        throw new Error("Credential activation was not confirmed");
+        throw new Error("凭据激活未确认");
       this.secrets.set(journal.codeSecretId, "");
       await this.commitConnection({
         schemaVersion: 1,
@@ -408,7 +406,7 @@ export class ConnectionService {
         const storedCode = this.secrets.get(prepared.codeSecretId);
         const storedCredential = this.secrets.get(prepared.credentialSecretId);
         if (!storedCode || !storedCredential)
-          throw new Error("Pending exchange secrets are missing");
+          throw new Error("待处理交换密钥缺失");
         const request = ExchangeObsidianCredentialRequestSchema.parse({
           code: storedCode,
           exchangeId: prepared.exchangeId,
@@ -456,7 +454,7 @@ export class ConnectionService {
           await this.writeJournal(prepared);
         }
       }
-      throw new Error("Repeated credential collision");
+      throw new Error("重复凭据冲突");
     }
   }
 }

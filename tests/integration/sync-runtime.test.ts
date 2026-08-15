@@ -108,9 +108,7 @@ describe("SyncRuntime", () => {
       remote,
       { spaceId: "space", rootPath: "Wiki", status: "pending" },
     );
-    await expect(runtime.previewPull()).rejects.toThrow(
-      /content hash mismatch/,
-    );
+    await expect(runtime.previewPull()).rejects.toThrow(/内容哈希不匹配/);
   });
 
   it("three-way merges non-overlapping local and remote edits and keeps local-only changes dirty", async () => {
@@ -192,7 +190,7 @@ describe("SyncRuntime", () => {
     ]);
     const preview = await runtime.previewPull();
     expect(preview.conflicts).toHaveLength(1);
-    await expect(runtime.applyPull(preview)).rejects.toThrow(/conflict/);
+    await expect(runtime.applyPull(preview)).rejects.toThrow(/冲突/);
     preview.conflictResolutions[preview.conflicts[0]!.conflictId] = {
       choice: "remote",
     };
@@ -337,7 +335,7 @@ describe("SyncRuntime", () => {
     });
     await runtime.applyPull(await runtime.previewPull());
     remote.truncateNextSnapshot = true;
-    await expect(runtime.previewPull()).rejects.toThrow(/snapshot integrity/i);
+    await expect(runtime.previewPull()).rejects.toThrow(/快照完整性/);
     expect(vault.text("Wiki/A.md")).toBe("base");
   });
 
@@ -402,7 +400,7 @@ describe("SyncRuntime", () => {
     ]);
     const preview = await runtime.previewPull();
     expect(preview.initialBindings[0]?.resolution).toBeNull();
-    await expect(runtime.applyPull(preview)).rejects.toThrow(/unresolved/);
+    await expect(runtime.applyPull(preview)).rejects.toThrow(/未解决/);
     preview.initialBindings[0]!.resolution = "local";
     await runtime.applyPull(preview);
     expect(vault.text("Wiki/A.md")).toBe("local");

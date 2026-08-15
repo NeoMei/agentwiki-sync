@@ -29,14 +29,14 @@ export class VaultIdentityService {
       try {
         identity = JSON.parse(raw) as VaultIdentity;
       } catch {
-        throw new Error("Invalid Vault identity");
+        throw new Error("无效的库身份");
       }
       if (identity.schemaVersion !== 1 || !UUID_V4.test(identity.vaultId))
-        throw new Error("Invalid Vault identity");
+        throw new Error("无效的库身份");
       return [identity];
     });
     const ids = new Set(candidates.map((item) => item.vaultId));
-    if (ids.size > 1) throw new Error("Vault identity fork");
+    if (ids.size > 1) throw new Error("库身份分叉");
     if (candidates[0]) {
       if (!raws[0])
         await this.shared.write(paths[0]!, JSON.stringify(candidates[0]));
@@ -50,8 +50,7 @@ export class VaultIdentityService {
     const verify = JSON.parse(
       (await this.shared.read(".agentwiki/vault.json.next")) ?? "null",
     ) as VaultIdentity | null;
-    if (verify?.vaultId !== vaultId)
-      throw new Error("Vault identity verification failed");
+    if (verify?.vaultId !== vaultId) throw new Error("库身份验证失败");
     await this.shared.rename(
       ".agentwiki/vault.json.next",
       ".agentwiki/vault.json",
@@ -67,6 +66,6 @@ export class VaultIdentityService {
       ? await this.deviceState.getBoundVaultId()
       : await this.shared.read("bound-vault-id");
     const actual = await this.getOrCreate();
-    if (expected !== actual) throw new Error("Vault identity mismatch");
+    if (expected !== actual) throw new Error("库身份不匹配");
   }
 }

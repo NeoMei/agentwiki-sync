@@ -51,7 +51,7 @@ describe("PullTransaction", () => {
       ".agentwiki/tx/t3",
     );
     await transaction.prepare([{ kind: "create", path: "A.md", body: "a" }], 1);
-    await expect(transaction.apply(2)).rejects.toThrow(/scan epoch/);
+    await expect(transaction.apply(2)).rejects.toThrow(/扫描纪元/);
   });
 
   it("recognizes a fully materialized rename after temporary cleanup as committed", async () => {
@@ -102,7 +102,7 @@ describe("PullTransaction", () => {
       1,
     );
     await vault.write("A.md", new TextEncoder().encode("user"));
-    await expect(transaction.recover()).rejects.toThrow(/failed safely/);
+    await expect(transaction.recover()).rejects.toThrow(/恢复失败/);
     expect(vault.text("A.md")).toBe("user");
     expect((await transaction.inspect())?.state).toBe("failed");
   });

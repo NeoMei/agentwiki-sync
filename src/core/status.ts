@@ -126,7 +126,7 @@ export function computeStatus(
   files: ResolvedFile[],
   scan: ScanResult,
 ): LocalStatus {
-  if (!scan.complete) throw new Error("local scan incomplete");
+  if (!scan.complete) throw new Error("本地扫描不完整");
   const seen = new Set(
     files.flatMap((file) => (file.pageId ? [file.pageId] : [])),
   );

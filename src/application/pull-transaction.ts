@@ -119,7 +119,7 @@ export class PullTransaction {
   }
   private async load(): Promise<PullJournal> {
     const value = await this.journal.read();
-    if (!value) throw new Error("Missing or corrupt pull journal");
+    if (!value) throw new Error("拉取日志缺失或已损坏");
     return value.payload;
   }
   async inspect(): Promise<{
@@ -158,7 +158,7 @@ export class PullTransaction {
       const bytes = await this.vault.read(path);
       const hash = bytes ? await sha256Hex(bytes) : null;
       if (Object.hasOwn(expectedHashes, path) && expectedHashes[path] !== hash)
-        throw new Error("Vault changed after preview");
+        throw new Error("预览后库已变更");
       const snapshotPath = bytes ? `${this.root}/snapshots/${index}.bin` : null;
       if (bytes && snapshotPath)
         await this.control.write(snapshotPath, encodeBase64(bytes));
@@ -179,7 +179,7 @@ export class PullTransaction {
       const body =
         action.body ??
         (action.bodyPath ? await this.control.read(action.bodyPath) : null);
-      if (body === null) throw new Error("Pull action body is missing");
+      if (body === null) throw new Error("拉取操作内容缺失");
       const resultHash = await sha256Hex(encoder.encode(body));
       await this.control.write(resultPath, body);
       journalActions.push(
@@ -209,12 +209,11 @@ export class PullTransaction {
 
   async apply(scanEpoch: number): Promise<void> {
     const journal = await this.load();
-    if (journal.scanEpoch !== scanEpoch) throw new Error("scan epoch changed");
+    if (journal.scanEpoch !== scanEpoch) throw new Error("扫描纪元已变更");
     for (const snapshot of journal.snapshots) {
       const current = await this.vault.read(snapshot.path);
       const hash = current ? await sha256Hex(current) : null;
-      if (hash !== snapshot.hash)
-        throw new Error("Vault changed after preview");
+      if (hash !== snapshot.hash) throw new Error("预览后库已变更");
     }
     journal.state = "applying";
     await this.save(journal);
@@ -244,7 +243,7 @@ export class PullTransaction {
           const current = await this.vault.read(action.path);
           const currentHash = current ? await sha256Hex(current) : null;
           if (currentHash !== (expected?.hash ?? null))
-            throw new Error("Vault changed before trash");
+            throw new Error("删除前库已变更");
           await this.vault.trashFile(action.path);
         } else {
           const result = await this.control.read(action.resultPath);
@@ -252,7 +251,7 @@ export class PullTransaction {
             result === null ||
             (await sha256Hex(encoder.encode(result))) !== action.resultHash
           )
-            throw new Error("Pull result sidecar is corrupt");
+            throw new Error("拉取结果边车已损坏");
           const body = encoder.encode(result);
           const snapshot = journal.snapshots.find(
             (item) => item.path === action.path,
@@ -273,7 +272,7 @@ export class PullTransaction {
           await this.save(journal);
           await this.vault.ensureParentDirectories(action.path);
           if (!(await this.vault.compareAndSwap(action.path, expected, body)))
-            throw new Error("Vault changed before conditional write");
+            throw new Error("条件写入前库已变更");
         }
       }
       for (const temporary of journal.temporaryPaths)
@@ -344,21 +343,20 @@ export class PullTransaction {
         const currentHash = current ? await sha256Hex(current) : null;
         if (currentHash === materialized.expectedHash) continue;
         if (currentHash !== materialized.resultHash)
-          throw new Error("User edited an applied result");
+          throw new Error("用户编辑了已应用的结果");
         if (current) await this.vault.remove(materialized.path);
       }
       for (const temporary of [...journal.temporaryPaths].reverse()) {
         const bytes = await this.vault.read(temporary.temporary);
         if (bytes) {
           const current = await this.vault.read(temporary.original);
-          if (current)
-            throw new Error("User created a file at a rename source");
+          if (current) throw new Error("用户在重命名源处创建了文件");
           await this.vault.rename(temporary.temporary, temporary.original);
         } else {
           const original = await this.vault.read(temporary.original);
           const hash = original ? await sha256Hex(original) : null;
           if (hash !== temporary.expectedHash)
-            throw new Error("Rename recovery is ambiguous");
+            throw new Error("重命名恢复不明确");
         }
       }
       const materializedPaths = new Set(
@@ -368,24 +366,19 @@ export class PullTransaction {
         const current = await this.vault.read(snapshot.path);
         if (snapshot.snapshotPath === null) {
           if (current && !materializedPaths.has(snapshot.path))
-            throw new Error(
-              "A file appeared at an originally empty transaction path",
-            );
+            throw new Error("原本为空的事务路径出现了文件");
         } else if (!current)
           await this.vault.write(
             snapshot.path,
             await this.snapshotBytes(snapshot),
           );
         else if ((await sha256Hex(current)) !== snapshot.hash)
-          throw new Error(
-            "Rollback target was edited after the transaction stopped",
-          );
+          throw new Error("事务停止后回滚目标被编辑");
       }
       for (const snapshot of journal.snapshots) {
         const current = await this.vault.read(snapshot.path);
         const hash = current ? await sha256Hex(current) : null;
-        if (hash !== snapshot.hash)
-          throw new Error("Rollback snapshot verification failed");
+        if (hash !== snapshot.hash) throw new Error("回滚快照验证失败");
       }
       journal.state = "rolled_back";
       journal.materialized = [];
@@ -395,17 +388,16 @@ export class PullTransaction {
     } catch {
       journal.state = "failed";
       await this.save(journal);
-      throw new Error("Pull recovery failed safely");
+      throw new Error("拉取恢复失败");
     }
   }
   private async snapshotBytes(snapshot: SnapshotEntry): Promise<Uint8Array> {
-    if (!snapshot.snapshotPath)
-      throw new Error("Missing snapshot sidecar reference");
+    if (!snapshot.snapshotPath) throw new Error("快照边车引用缺失");
     const raw = await this.control.read(snapshot.snapshotPath);
-    if (raw === null) throw new Error("Pull snapshot sidecar is missing");
+    if (raw === null) throw new Error("拉取快照边车缺失");
     const bytes = decodeBase64(raw);
     if ((await sha256Hex(bytes)) !== snapshot.hash)
-      throw new Error("Pull snapshot sidecar is corrupt");
+      throw new Error("拉取快照边车已损坏");
     return bytes;
   }
 }

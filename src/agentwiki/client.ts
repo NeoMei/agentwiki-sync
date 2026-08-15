@@ -124,7 +124,7 @@ export class AgentWikiClient {
       metadata ??= page.metadata;
       items.push(...page.items);
     }
-    if (!metadata) throw new Error("Snapshot returned no metadata");
+    if (!metadata) throw new Error("快照未返回元数据");
     return { metadata, items };
   }
 
@@ -162,13 +162,13 @@ export class AgentWikiClient {
         revisionBodyBytes: page.revisionBodyBytes,
       };
       if (fixed && JSON.stringify(fixed) !== JSON.stringify(metadata))
-        throw new Error("Snapshot pagination metadata changed");
+        throw new Error("快照分页元数据已变更");
       fixed ??= metadata;
       requestRevision = page.revision;
       yield { metadata, items: page.items };
       cursor = page.nextCursor;
     } while (cursor);
-    if (!fixed) throw new Error("Snapshot returned no metadata");
+    if (!fixed) throw new Error("快照未返回元数据");
   }
 
   async delta(
@@ -200,8 +200,7 @@ export class AgentWikiClient {
         page.toRevisionManifestByteLength,
         page.toRevisionBodyBytes,
       ]);
-      if (fixed && fixed !== signature)
-        throw new Error("Delta pagination metadata changed");
+      if (fixed && fixed !== signature) throw new Error("增量分页元数据已变更");
       fixed ??= signature;
       items.push(...page.items);
       cursor = page.nextCursor;

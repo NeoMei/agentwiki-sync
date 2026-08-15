@@ -6,7 +6,6 @@ import type {
   PushChange,
   SyncCapabilities,
 } from "../../src/agentwiki/protocol";
-import { opaqueFileKey } from "../../src/core/identity-key";
 
 const capabilities: SyncCapabilities = {
   maxPageBytes: 1048576,
@@ -110,11 +109,8 @@ describe("PushService", () => {
     });
     const journal = await store.read(".agentwiki/push/t4/journal.json");
     expect(journal).not.toContain("hello");
-    expect(
-      await store.read(
-        `.agentwiki/push/t4/payload/${await opaqueFileKey("p1")}.md`,
-      ),
-    ).toBe("hello");
+    // 现在使用可读路径 A.md 而不是哈希路径
+    expect(await store.read(`.agentwiki/push/t4/payload/A.md`)).toBe("hello");
   });
 
   it("publishes a prepared sidecar payload without placing its body in preview metadata", async () => {
@@ -188,7 +184,8 @@ describe("PushService", () => {
       changes,
       capabilities,
     });
-    const payloadPath = `.agentwiki/push/cleanup/payload/${await opaqueFileKey("p1")}.md`;
+    // 现在使用可读路径 A.md 而不是哈希路径
+    const payloadPath = `.agentwiki/push/cleanup/payload/A.md`;
     expect(await store.read(payloadPath)).toBe("hello");
     await service.markVerified();
     expect(await store.read(payloadPath)).toBeNull();

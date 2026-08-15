@@ -13,6 +13,7 @@ import type { ControlStorePort } from "../ports/control-store";
 import type { FinalizeResult, PushRemotePort } from "../ports/push-remote";
 import { MutableControlRepository } from "../storage/envelope";
 import { opaqueFileKey } from "../core/identity-key";
+import { isValidSyncPath } from "../core/sync-path";
 
 interface PushInput {
   spaceId: string;
@@ -95,7 +96,7 @@ export class PushService {
   }
   private async load(): Promise<PushJournal> {
     const value = await this.journal.read();
-    if (!value) throw new Error("Missing or corrupt push journal");
+    if (!value) throw new Error("推送日志缺失或已损坏");
     return value.payload;
   }
   async inspect(): Promise<Pick<
@@ -112,22 +113,39 @@ export class PushService {
         }
       : null;
   }
-  private async payloadPath(pageId: string): Promise<string> {
-    return `${this.root}/payload/${await opaqueFileKey(pageId)}.md`;
+  /**
+   * 生成可读的 payload 文件名
+   * 优先使用 syncPath（如果合法），否则回退到哈希文件名
+   */
+  private async payloadFileName(
+    pageId: string,
+    path?: string,
+  ): Promise<string> {
+    if (path && isValidSyncPath(path)) return path;
+    return `p-${await opaqueFileKey(pageId)}.md`;
+  }
+  private async payloadPath(pageId: string, path?: string): Promise<string> {
+    return `${this.root}/payload/${await this.payloadFileName(pageId, path)}`;
   }
   private async persistPayload(changes: PushChange[]): Promise<void> {
     for (const change of changes)
       if (change.operation === "upsert")
         await this.store.write(
-          await this.payloadPath(change.pageId),
+          await this.payloadPath(change.pageId, change.path),
           change.body,
         );
   }
   private async hydrateChange(change: JournalChange): Promise<PushChange> {
     if (change.operation === "archive") return change;
-    const body = await this.store.read(await this.payloadPath(change.pageId));
+    // 尝试可读路径，如果不存在则回退到哈希路径
+    let body = await this.store.read(
+      await this.payloadPath(change.pageId, change.path),
+    );
+    if (body === null) {
+      body = await this.store.read(await this.payloadPath(change.pageId));
+    }
     if (body === null || (await contentHash(body)) !== change.contentHash)
-      throw new Error("Push payload is corrupt");
+      throw new Error("推送负载已损坏");
     return { ...change, body };
   }
   private async create(journal: PushJournal) {
@@ -293,12 +311,14 @@ export class PushService {
       if (change.operation === "upsert") {
         const body = await this.store.read(change.payloadPath);
         if (body === null || (await contentHash(body)) !== change.contentHash)
-          throw new Error("Push preview payload is corrupt");
+          throw new Error("推送预览数据损坏");
         const bytes = new TextEncoder().encode(body).byteLength;
-        if (bytes !== change.bodyBytes)
-          throw new Error("Push preview payload length changed");
+        if (bytes !== change.bodyBytes) throw new Error("推送预览数据长度变化");
         totalBodyBytes += bytes;
-        await this.store.write(await this.payloadPath(change.pageId), body);
+        await this.store.write(
+          await this.payloadPath(change.pageId, change.path),
+          body,
+        );
       }
     const journalChanges: JournalChange[] = sorted.map((change) =>
       change.operation === "archive"
@@ -364,7 +384,7 @@ export class PushService {
       if (session.status === "published" && session.result)
         return this.commitResult(journal, session.result);
       if (session.status === "aborted" || session.status === "expired")
-        throw new Error("Push session is no longer recoverable");
+        throw new Error("推送会话无法恢复");
       received = new Set(session.receivedBatchIndexes);
     }
     await this.uploadBatches(journal, capabilities, received);
@@ -388,7 +408,7 @@ export class PushService {
   async markVerified(): Promise<void> {
     const journal = await this.load();
     if (journal.remoteState !== "published" || !journal.result)
-      throw new Error("Push result is not published");
+      throw new Error("推送结果未发布");
     journal.localCommitPhase = "verified";
     await this.save(journal);
     for (const dir of ["payload", "receipts"]) {
@@ -402,7 +422,7 @@ export class PushService {
   async supersede(): Promise<void> {
     const journal = await this.load();
     if (journal.remoteState === "published")
-      throw new Error("Published push cannot be superseded");
+      throw new Error("已发布的推送无法被替代");
     journal.remoteState = "superseded";
     await this.save(journal);
   }

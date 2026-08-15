@@ -91,7 +91,7 @@ export class BaselineRepository {
       (await sha256Hex(canonicalBytes(manifest))) !==
         current.payload.manifestHash
     )
-      throw new Error("baseline corrupt: pointer identity/hash mismatch");
+      throw new Error("基线损坏: 指针身份/哈希不匹配");
     const pages: BaselineState["pages"] = {};
     for (const page of Object.values(manifest.pages))
       pages[page.pageId] = { ...page };
@@ -106,19 +106,29 @@ export class BaselineRepository {
     generationId?: string,
     expectedHash?: string,
   ): Promise<string> {
-    if (generationId && expectedHash)
-      return this.generations.readBody(generationId, pageId, expectedHash);
+    if (generationId && expectedHash) {
+      // 从 manifest 读取 relativePath 传给 generation
+      const manifest = await this.generations.readManifest(generationId);
+      const page = manifest.pages[pageId];
+      return this.generations.readBody(
+        generationId,
+        pageId,
+        expectedHash,
+        page?.relativePath,
+      );
+    }
     const current = await this.pointer.read();
-    if (!current?.payload.active) throw new Error("Missing baseline");
+    if (!current?.payload.active) throw new Error("基线缺失");
     const manifest = await this.generations.readManifest(
       current.payload.generationId,
     );
     const page = manifest.pages[pageId];
-    if (!page) throw new Error("Missing baseline page");
+    if (!page) throw new Error("基线页面缺失");
     return this.generations.readBody(
       current.payload.generationId,
       pageId,
       page.contentHash,
+      page.relativePath,
     );
   }
   async prepare(
@@ -222,12 +232,12 @@ export class BaselineRepository {
   }
   async setPhase(phase: BaselineJournal["phase"]): Promise<void> {
     const current = await this.journal.read();
-    if (!current) throw new Error("Missing baseline journal");
+    if (!current) throw new Error("基线日志缺失");
     await this.journal.write({ ...current.payload, phase });
   }
   async commit(): Promise<void> {
     const current = await this.journal.read();
-    if (!current) throw new Error("Missing baseline journal");
+    if (!current) throw new Error("基线日志缺失");
     await this.journal.write({ ...current.payload, phase: "committing" });
     const manifest = await this.generations.verify(
       current.payload.newGenerationId,
@@ -236,7 +246,7 @@ export class BaselineRepository {
       manifest.spaceId !== this.spaceId ||
       manifest.rootPath !== this.rootPath
     )
-      throw new Error("baseline identity mismatch");
+      throw new Error("基线身份不匹配");
     const manifestHash = await sha256Hex(canonicalBytes(manifest));
     await this.pointer.write({
       schemaVersion: 1,

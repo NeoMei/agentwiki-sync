@@ -34,6 +34,19 @@ import { userErrorMessage } from "./core/user-errors";
 import type { SyncSpaceSummary } from "./agentwiki/protocol";
 import { MutableControlRepository } from "./storage/envelope";
 import { DeviceStateRepository } from "./storage/device-state";
+import { StorageMigration } from "./storage/migration";
+
+const actionLabel = (kind: string): string => {
+  const labels: Record<string, string> = {
+    write: "写入",
+    create: "创建",
+    rename: "重命名",
+    trash: "删除",
+    upsert: "更新",
+    archive: "归档",
+  };
+  return labels[kind] || kind;
+};
 
 const isDeviceSettings = (value: unknown): value is AgentWikiSyncSettings => {
   try {
@@ -69,6 +82,9 @@ export default class AgentWikiSyncPlugin extends Plugin {
       await this.settingsRepo().write(this.settings);
       await this.saveData(DEFAULT_SETTINGS);
     }
+
+    // Run storage migration to convert hash filenames to readable paths
+    await this.runStorageMigration();
     const localStore = new ObsidianLocalControlStore(this.app);
     const connection = await new MutableControlRepository(
       localStore,
@@ -80,7 +96,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
         this.settings.serverUrl &&
         this.settings.serverUrl !== connection.payload.serverUrl
       )
-        throw new Error("Connection and device settings server mismatch");
+        throw new Error("连接与设备设置的服务器不匹配");
       this.settings.serverUrl = connection.payload.serverUrl;
       this.settings.serverInstanceId = connection.payload.serverInstanceId;
       await new VaultIdentityService(
@@ -116,6 +132,46 @@ export default class AgentWikiSyncPlugin extends Plugin {
       }),
     );
   }
+  private async runStorageMigration(): Promise<void> {
+    try {
+      const controlStore = new ObsidianControlStore(this.app.vault.adapter);
+      const migration = new StorageMigration(controlStore);
+
+      // Scan for device directories
+      const deviceRoot = ".agentwiki/devices";
+      if (!(await this.app.vault.adapter.exists(deviceRoot))) return;
+
+      const deviceFiles = await this.app.vault.adapter.list(deviceRoot);
+      for (const deviceDir of deviceFiles.folders) {
+        const spacesRoot = `${deviceDir}/spaces`;
+        if (!(await this.app.vault.adapter.exists(spacesRoot))) continue;
+
+        const spaceFiles = await this.app.vault.adapter.list(spacesRoot);
+        for (const spaceDir of spaceFiles.folders) {
+          // Migrate generations
+          const generationsDir = `${spaceDir}/generations`;
+          if (await this.app.vault.adapter.exists(generationsDir)) {
+            const genFiles = await this.app.vault.adapter.list(generationsDir);
+            for (const genDir of genFiles.folders) {
+              const genId = genDir.split("/").pop();
+              if (genId) {
+                await migration.migrateGeneration(spaceDir, genId);
+              }
+            }
+          }
+
+          // Migrate push payloads
+          const pushDir = `${spaceDir}/push`;
+          if (await this.app.vault.adapter.exists(pushDir)) {
+            await migration.migratePushPayloads(pushDir);
+          }
+        }
+      }
+    } catch {
+      // Migration failure should not block plugin startup
+    }
+  }
+
   async saveSettings(): Promise<void> {
     validateMappings(this.settings.mappings);
     await this.settingsRepo().write(this.settings);
@@ -125,15 +181,13 @@ export default class AgentWikiSyncPlugin extends Plugin {
       this.settings.serverInstanceId !== null &&
       value !== this.settings.serverUrl
     )
-      throw new Error("Disconnect before changing the AgentWiki server");
+      throw new Error("请先断开连接再更改 AgentWiki 服务器");
     this.settings.serverUrl = value;
     await this.saveSettings();
   }
   async connect(code: string): Promise<void> {
     if (this.settings.serverInstanceId !== null) {
-      new Notice(
-        "Disconnect this device before connecting a different credential.",
-      );
+      new Notice("请先断开当前设备连接，再连接新的凭据。");
       return;
     }
     if (!this.settings.serverUrl || !code) {
@@ -162,7 +216,6 @@ export default class AgentWikiSyncPlugin extends Plugin {
       this.settings.serverInstanceId = result.serverInstanceId;
       await identity.bind(vaultId);
       await this.saveSettings();
-      new Notice("连接成功。");
     } catch (error) {
       new Notice(userErrorMessage(error));
     }
@@ -175,7 +228,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       isConnectionState,
     ).read();
     const secretId = state?.payload.credentialSecretId ?? null;
-    if (!secretId) throw new Error("Not connected");
+    if (!secretId) throw new Error("未连接");
     const secrets = new ObsidianSecrets(this.app);
     const client = new AgentWikiClient(
       this.settings.serverUrl,
@@ -209,10 +262,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       const release = this.locks.acquire(spaceId);
       try {
         const runtime = await this.runtime(mapping);
-        if (!runtime)
-          throw new Error(
-            "Connect AgentWiki before removing an active mapping",
-          );
+        if (!runtime) throw new Error("请先连接 AgentWiki 再移除活跃映射");
         await runtime.recover();
         const status = await runtime.status();
         gate = {
@@ -250,7 +300,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
         continue;
       }
       if (runtime && (await runtime.hasUnfinishedPush()))
-        throw new Error(`Space ${mapping.spaceId} has an unfinished Push`);
+        throw new Error(`Space ${mapping.spaceId} 有未完成的推送`);
     }
     const local = new ObsidianLocalControlStore(this.app);
     const state = await new MutableControlRepository(
@@ -269,7 +319,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
     this.liveRuntimes.clear();
     await this.saveSettings();
     new Notice(
-      "Device disconnected locally. Revoke it in AgentWiki Web if the server could not be reached.",
+      "已在本地断开连接。如服务器不可达，请在 AgentWiki 网页中撤销该设备。",
     );
   }
   private selectedMapping() {
@@ -315,7 +365,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       state.deviceId !== deviceId ||
       state.vaultId !== boundVaultId
     )
-      throw new Error("Connection identity mismatch");
+      throw new Error("连接身份不匹配");
     const session = SessionResponseSchema.parse(
       (await client.raw("GET", "/api/integrations/obsidian/session")).json,
     );
@@ -326,7 +376,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       session.vaultId !== state.vaultId ||
       session.credentialStatus !== "active"
     )
-      throw new Error("Authenticated session identity mismatch");
+      throw new Error("认证会话身份不匹配");
     const runtime = new SyncRuntime(
       new ObsidianVaultPort(
         this.app.vault,
@@ -375,7 +425,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
     try {
       const runtime = await this.runtime(mapping);
       if (!runtime) {
-        this.statusBarEl.setText("AgentWiki: not connected");
+        this.statusBarEl.setText("AgentWiki: 未连接");
         return;
       }
       const status = await runtime.status();
@@ -388,9 +438,9 @@ export default class AgentWikiSyncPlugin extends Plugin {
         parts.push("=" + status.local.renamed.length);
       if (status.local.deleted.length)
         parts.push("-" + status.local.deleted.length);
-      const localPart = parts.length > 0 ? parts.join(" ") : "clean";
+      const localPart = parts.length > 0 ? parts.join(" ") : "已同步";
       const remotePart =
-        status.remoteRevision === status.baseRevision ? "" : " remote ahead";
+        status.remoteRevision === status.baseRevision ? "" : " 远端有更新";
       this.statusBarEl.setText("AgentWiki: " + localPart + remotePart);
     } catch {
       this.statusBarEl.setText("AgentWiki");
@@ -415,7 +465,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
         if (action === "status") {
           const status = await runtime.status();
           new Notice(
-            `Local +${status.local.added.length} ~${status.local.modified.length} ↔${status.local.renamed.length} -${status.local.deleted.length}; remote ${status.remoteRevision === status.baseRevision ? "clean" : "ahead"}.`,
+            `本地 +${status.local.added.length} ~${status.local.modified.length} ↔${status.local.renamed.length} -${status.local.deleted.length}；远端${status.remoteRevision === status.baseRevision ? "已同步" : "有更新"}.`,
           );
           return;
         }
@@ -424,15 +474,17 @@ export default class AgentWikiSyncPlugin extends Plugin {
           const modalRelease = release;
           new PreviewModal(
             this.app,
-            "Pull preview",
+            "拉取预览",
             [
-              ...preview.actions.map((item) => `${item.kind}: ${item.path}`),
+              ...preview.actions.map(
+                (item) => `${actionLabel(item.kind)}: ${item.path}`,
+              ),
               ...preview.initialBindings.map(
                 (item) =>
-                  `bind: ${item.localPath ?? "new file"} ↔ ${item.remotePath}`,
+                  `绑定: ${item.localPath ?? "新文件"} ↔ ${item.remotePath}`,
               ),
               ...preview.conflicts.map(
-                (item) => `conflict: ${item.field} ${item.pageId}`,
+                (item) => `冲突: ${item.field} ${item.pageId}`,
               ),
             ],
             async () => {
@@ -455,10 +507,10 @@ export default class AgentWikiSyncPlugin extends Plugin {
         const modalRelease = release;
         new PreviewModal(
           this.app,
-          "Push preview",
+          "推送预览",
           preview.changes.map(
             (item) =>
-              `${item.operation}: ${item.operation === "upsert" ? item.path : item.previousPath}`,
+              `${actionLabel(item.operation)}: ${item.operation === "upsert" ? item.path : item.previousPath}`,
           ),
           async () => {
             await runtime.applyPush(preview);

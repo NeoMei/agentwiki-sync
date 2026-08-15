@@ -18,9 +18,7 @@ export function parseSettings(value: unknown): AgentWikiSyncSettings {
   if (typeof value !== "object" || value === null) return DEFAULT_SETTINGS;
   const input = value as Partial<AgentWikiSyncSettings>;
   if (typeof input.schemaVersion === "number" && input.schemaVersion > 1)
-    throw new Error(
-      "This Vault uses a newer settings version; update AgentWiki Sync before continuing",
-    );
+    throw new Error("此库使用更新的设置版本；请先更新 AgentWiki Sync");
   if (
     input.schemaVersion !== 1 ||
     typeof input.serverUrl !== "string" ||
@@ -39,7 +37,7 @@ export function parseSettings(value: unknown): AgentWikiSyncSettings {
   try {
     validateMappings(mappings);
   } catch {
-    throw new Error("Settings contain invalid Space mappings");
+    throw new Error("设置包含无效的空间映射");
   }
   return {
     schemaVersion: 1,

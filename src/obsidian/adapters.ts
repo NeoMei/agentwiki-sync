@@ -78,7 +78,7 @@ export class ObsidianLocalControlStore implements ControlStorePort {
   }
   async rename(from: string, to: string): Promise<void> {
     const value = await this.read(from);
-    if (value === null) throw new Error("Missing local control source");
+    if (value === null) throw new Error("本地控制源缺失");
     await this.write(to, value);
     await this.remove(from);
   }
@@ -177,7 +177,7 @@ export class ObsidianVaultPort implements VaultPort {
     for (const part of parts) {
       current = current ? `${current}/${part}` : part;
       const entry = this.vault.getAbstractFileByPath(current);
-      if (entry instanceof TFile) throw new Error("Parent path is a file");
+      if (entry instanceof TFile) throw new Error("父路径是文件");
       if (!entry) await this.vault.createFolder(current);
     }
   }
@@ -228,13 +228,13 @@ export class ObsidianVaultPort implements VaultPort {
   }
   async rename(from: string, to: string): Promise<void> {
     const file = this.file(from);
-    if (!file) throw new Error("Missing rename source");
+    if (!file) throw new Error("重命名源缺失");
     await this.ensureParentDirectories(to);
     await this.vault.rename(file, this.safe(to));
   }
   async trashFile(path: string): Promise<void> {
     const file = this.file(path);
-    if (!file) throw new Error("Missing trash source");
+    if (!file) throw new Error("删除源缺失");
     await this.fileManager.trashFile(file);
   }
 }

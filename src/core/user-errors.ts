@@ -59,12 +59,18 @@ export function userErrorMessage(error: unknown): string {
   if (error instanceof Error) {
     if (error.message.includes("Path contains"))
       return "路径格式不正确。请使用相对路径，不要包含 .. 或 / 开头。";
-    if (error.message.includes("Mapping roots overlap"))
+    if (error.message.includes("映射根路径重叠"))
       return "映射目录不能重叠。请选择不同的文件夹。";
-    if (error.message.includes("Connection journal"))
+    if (error.message.includes("库身份不匹配"))
+      return "库身份不匹配。请检查是否连接了正确的服务器和库。";
+    if (error.message.includes("设备会话身份不匹配"))
+      return "会话身份验证失败。请断开后重新连接。";
+    if (error.message.includes("凭据激活未确认"))
+      return "凭据激活未确认。请断开后重新连接。";
+    if (error.message.includes("连接日志"))
       return "连接状态异常。请断开后重新连接。";
     if (error.message.includes("Secret Storage"))
-      return "无法访问系统安全存储。请重启 Obsidian 后重试。";
+      return "无法访问安全存储。请重启 Obsidian 后重试。";
     if (error.message.includes("network"))
       return "网络连接失败。请检查网络和服务器地址。";
     if (error.message.includes("fetch failed"))

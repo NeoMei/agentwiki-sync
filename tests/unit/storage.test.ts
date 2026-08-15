@@ -74,8 +74,8 @@ describe("crash-safe control storage", () => {
       "state.json",
       JSON.stringify({ envelopeSchemaVersion: 2 }),
     );
-    await expect(repo.read()).rejects.toThrow(/UNSUPPORTED/);
+    await expect(repo.read()).rejects.toThrow(/不支持的/);
     await store.write("state.json", "not-json");
-    await expect(repo.read()).rejects.toThrow(/CORRUPT/);
+    await expect(repo.read()).rejects.toThrow(/损坏/);
   });
 });

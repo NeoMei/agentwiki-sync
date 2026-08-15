@@ -166,7 +166,7 @@ describe("ObsidianLocalControlStore", () => {
     await store.rename("a", "b");
     expect(await store.read("a")).toBeNull();
     expect(await store.read("b")).toBe("value");
-    await expect(store.rename("missing", "c")).rejects.toThrow(/Missing/);
+    await expect(store.rename("missing", "c")).rejects.toThrow(/缺失/);
   });
 });
 

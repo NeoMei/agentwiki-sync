@@ -11,7 +11,7 @@ describe("sync coordinator", () => {
   it("serializes each space without blocking another space", async () => {
     const lock = new OperationLock();
     const release = lock.acquire("s1");
-    expect(() => lock.acquire("s1")).toThrow(/already/);
+    expect(() => lock.acquire("s1")).toThrow(/已有/);
     expect(() => lock.acquire("s2")).not.toThrow();
     release();
     expect(() => lock.acquire("s1")).not.toThrow();
@@ -37,14 +37,14 @@ describe("sync coordinator", () => {
         localClean: true,
         remoteAtBase: true,
       }),
-    ).toThrow(/transaction/);
+    ).toThrow(/事务/);
     expect(() =>
       removeMapping(active, "s", {
         activeTransaction: false,
         localClean: false,
         remoteAtBase: true,
       }),
-    ).toThrow(/clean/);
+    ).toThrow(/干净/);
     expect(
       removeMapping(active, "s", {
         activeTransaction: false,
@@ -61,7 +61,7 @@ describe("sync coordinator", () => {
         serverInstanceId: null,
         mappings: [],
       }),
-    ).toThrow(/newer settings version/);
+    ).toThrow(/更新的设置版本/);
   });
 
   it("rejects settings whose Space mappings are structurally invalid", () => {
@@ -72,7 +72,7 @@ describe("sync coordinator", () => {
         serverInstanceId: null,
         mappings: [{ spaceId: "s", rootPath: "../escape", status: "active" }],
       }),
-    ).toThrow(/invalid Space mappings/);
+    ).toThrow(/无效的空间映射/);
   });
 
   it("selects the active mapping for an open file and rejects overlaps", () => {
@@ -87,12 +87,12 @@ describe("sync coordinator", () => {
         { spaceId: "a", rootPath: "Wiki", status: "active" },
         { spaceId: "b", rootPath: "Wiki/Sub", status: "active" },
       ]),
-    ).toThrow(/overlap/);
+    ).toThrow(/重叠/);
     expect(() =>
       validateMappings([
         { spaceId: "a", rootPath: "Wiki", status: "pending" },
         { spaceId: "b", rootPath: "Wiki/Sub", status: "pending" },
       ]),
-    ).toThrow(/overlap/);
+    ).toThrow(/重叠/);
   });
 });

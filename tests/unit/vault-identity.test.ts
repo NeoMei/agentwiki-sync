@@ -15,6 +15,6 @@ describe("VaultIdentityService", () => {
       ".agentwiki/vault.json",
       JSON.stringify({ schemaVersion: 1, vaultId: crypto.randomUUID() }),
     );
-    await expect(service.assertBound()).rejects.toThrow(/identity mismatch/);
+    await expect(service.assertBound()).rejects.toThrow(/身份不匹配/);
   });
 });
