@@ -147,6 +147,29 @@ export class ConnectionService {
     await this.journal.clear();
   }
 
+  private isTerminalResumeError(error: unknown): boolean {
+    if (!(error instanceof AgentWikiHttpError)) return false;
+    if (error.status === 401 || error.status === 403) return true;
+    const code = (error.body as { error?: { code?: string } } | undefined)
+      ?.error?.code;
+    return (
+      code === "DEVICE_CREDENTIAL_EXPIRED" ||
+      code === "DEVICE_CREDENTIAL_REVOKED" ||
+      code === "INSTALLATION_CODE_EXPIRED" ||
+      code === "INSTALLATION_CODE_INVALID" ||
+      code === "INSTALLATION_ALREADY_EXCHANGED" ||
+      code === "USER_INACTIVE"
+    );
+  }
+
+  private async discardPendingConnection(
+    journal: ConnectionJournal,
+  ): Promise<void> {
+    this.secrets.set(journal.codeSecretId, "");
+    this.secrets.set(journal.credentialSecretId, "");
+    await this.journal.clear();
+  }
+
   async connect(input: ConnectInput): Promise<{
     credentialSecretId: string;
     credentialId: string;
@@ -162,7 +185,14 @@ export class ConnectionService {
         existing.pluginVersion !== input.pluginVersion
       )
         throw new Error("Pending connection identity mismatch");
-      return this.resume(existing, input.code);
+      // A fresh, different code supersedes the failed attempt: discard
+      // dead secrets instead of replaying them and getting stuck.
+      const storedCode = this.secrets.get(existing.codeSecretId);
+      if (input.code && storedCode !== input.code) {
+        await this.discardPendingConnection(existing);
+      } else {
+        return this.resume(existing, input.code);
+      }
     }
     const codeSecretId = `agentwiki-sync-secret-${randomHex(16)}`;
     const credentialSecretId = `agentwiki-sync-secret-${randomHex(16)}`;

@@ -354,3 +354,24 @@ export const DeltaPageSchema = z
     nextCursor: CursorSchema.nullable(),
   })
   .passthrough();
+
+const SyncSpaceSummarySchema = z
+  .object({
+    spaceId: PublicIdSchema,
+    displayName: z.string(),
+    role: z.enum(["viewer", "editor", "admin", "owner"]),
+    canRead: z.literal(true),
+    canPublish: z.boolean(),
+    currentRevision: PublicIdSchema,
+    pageCount: DecimalCountSchema,
+    revisionManifestByteLength: DecimalByteCountSchema,
+    revisionBodyBytes: DecimalByteCountSchema,
+  })
+  .passthrough();
+
+export const SyncSpaceListResponseSchema = z
+  .object({
+    protocolVersion: z.literal("1"),
+    spaces: z.array(SyncSpaceSummarySchema),
+  })
+  .passthrough();

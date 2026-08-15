@@ -145,3 +145,20 @@ export interface SyncApiErrorResponse {
     details?: Record<string, string | number | boolean | null>;
   };
 }
+
+export interface SyncSpaceSummary {
+  spaceId: string;
+  displayName: string;
+  role: "viewer" | "editor" | "admin" | "owner";
+  canRead: true;
+  canPublish: boolean;
+  currentRevision: string;
+  pageCount: string;
+  revisionManifestByteLength: string;
+  revisionBodyBytes: string;
+}
+
+export interface SyncSpaceListResponse {
+  protocolVersion: "1";
+  spaces: SyncSpaceSummary[];
+}

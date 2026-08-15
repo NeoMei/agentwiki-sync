@@ -2,9 +2,11 @@ import {
   DeltaPageSchema,
   RevisionHeadResponseSchema,
   SnapshotPageSchema,
+  SyncSpaceListResponseSchema,
   type DeltaItem,
   type RevisionHeadResponse,
   type SnapshotPage,
+  type SyncSpaceListResponse,
   type SyncPage,
 } from "./protocol";
 import type { HttpPort, HttpResponse } from "../ports/http";
@@ -100,6 +102,12 @@ export class AgentWikiClient {
           )
         ).json,
       ),
+    );
+  }
+
+  async spaces(): Promise<SyncSpaceListResponse> {
+    return SyncSpaceListResponseSchema.parse(
+      (await this.raw("GET", "/api/sync/v1/spaces")).json,
     );
   }
 

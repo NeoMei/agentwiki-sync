@@ -1,6 +1,28 @@
 import { Modal, Setting, type App } from "obsidian";
 
 export type SyncAction = "status" | "pull" | "push";
+
+const actionLabels: Record<
+  SyncAction,
+  { title: string; desc: string; button: string }
+> = {
+  status: {
+    title: "状态",
+    desc: "扫描本地文件并与远端版本比较。",
+    button: "查看状态",
+  },
+  pull: {
+    title: "拉取",
+    desc: "将远端变更下载到本地。执行前会显示预览。",
+    button: "继续到预览",
+  },
+  push: {
+    title: "推送",
+    desc: "将本地变更发布到远端。执行前会显示预览。",
+    button: "继续到预览",
+  },
+};
+
 export class SyncModal extends Modal {
   constructor(
     app: App,
@@ -11,27 +33,23 @@ export class SyncModal extends Modal {
   }
   onOpen(): void {
     this.contentEl.empty();
-    this.contentEl.createEl("h2", {
-      text: this.action[0]!.toUpperCase() + this.action.slice(1),
-    });
-    this.contentEl.createEl("p", {
-      text:
-        this.action === "status"
-          ? "Scan local files and compare the remote revision."
-          : "Review is required before any files or remote pages change.",
-    });
+    const labels = actionLabels[this.action];
+    this.contentEl.createEl("h2", { text: labels.title });
+    this.contentEl.createEl("p", { text: labels.desc });
     new Setting(this.contentEl).addButton((button) =>
       button
-        .setButtonText(
-          this.action === "status" ? "Run status" : "Continue to preview",
-        )
+        .setButtonText(labels.button)
         .setCta()
         .onClick(async () => {
           button.setDisabled(true);
+          const original = button.buttonEl.textContent;
+          button.setButtonText("执行中…");
           try {
             await this.run();
+            this.close();
           } finally {
             button.setDisabled(false);
+            button.setButtonText(original ?? labels.button);
           }
         }),
     );

@@ -30,6 +30,8 @@ import { VaultIdentityService } from "./storage/vault-identity";
 import { idFileKey } from "./core/identity-key";
 import { OperationLock } from "./application/sync-coordinator";
 import { SessionResponseSchema } from "./agentwiki/protocol";
+import { userErrorMessage } from "./core/user-errors";
+import type { SyncSpaceSummary } from "./agentwiki/protocol";
 import { MutableControlRepository } from "./storage/envelope";
 import { DeviceStateRepository } from "./storage/device-state";
 
@@ -50,6 +52,8 @@ export default class AgentWikiSyncPlugin extends Plugin {
   settings: AgentWikiSyncSettings = DEFAULT_SETTINGS;
   private readonly locks = new OperationLock();
   private readonly liveRuntimes = new Map<string, SyncRuntime>();
+  private statusBarEl: HTMLElement | null = null;
+  private statusBarTimer: number | null = null;
   private settingsRepo(): MutableControlRepository<AgentWikiSyncSettings> {
     return new MutableControlRepository(
       new ObsidianLocalControlStore(this.app),
@@ -86,6 +90,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       await this.saveSettings();
     }
     this.addSettingTab(new AgentWikiSyncSettingTab(this.app, this));
+    this.initStatusBar();
     this.addRibbonIcon("refresh-cw", "AgentWiki Sync", () =>
       this.openSync("status"),
     );
@@ -107,12 +112,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
         for (const runtime of this.liveRuntimes.values())
           void runtime
             .recordRename(oldPath, file.path)
-            .catch(
-              (error) =>
-                new Notice(
-                  `AgentWiki rename tracking failed: ${error instanceof Error ? error.message : "unknown error"}`,
-                ),
-            );
+            .catch((error) => new Notice(userErrorMessage(error)));
       }),
     );
   }
@@ -137,7 +137,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       return;
     }
     if (!this.settings.serverUrl || !code) {
-      new Notice("Enter the AgentWiki server and connection code.");
+      new Notice("请先在设置中填写服务器地址和连接码。");
       return;
     }
     const local = new ObsidianLocalControlStore(this.app);
@@ -162,13 +162,30 @@ export default class AgentWikiSyncPlugin extends Plugin {
       this.settings.serverInstanceId = result.serverInstanceId;
       await identity.bind(vaultId);
       await this.saveSettings();
-      new Notice("AgentWiki device connected.");
+      new Notice("连接成功。");
     } catch (error) {
-      new Notice(
-        `Connection failed: ${error instanceof Error ? error.message : "unknown error"}`,
-      );
+      new Notice(userErrorMessage(error));
     }
   }
+  async listAccessibleSpaces(): Promise<SyncSpaceSummary[]> {
+    const local = new ObsidianLocalControlStore(this.app);
+    const state = await new MutableControlRepository(
+      local,
+      "connection-state.json",
+      isConnectionState,
+    ).read();
+    const secretId = state?.payload.credentialSecretId ?? null;
+    if (!secretId) throw new Error("Not connected");
+    const secrets = new ObsidianSecrets(this.app);
+    const client = new AgentWikiClient(
+      this.settings.serverUrl,
+      new RequestUrlHttp(),
+      () => secrets.get(secretId),
+    );
+    const response = await client.spaces();
+    return response.spaces;
+  }
+
   async addMapping(spaceId: string, rootPath: string): Promise<void> {
     const next = [
       ...this.settings.mappings,
@@ -327,11 +344,63 @@ export default class AgentWikiSyncPlugin extends Plugin {
     this.liveRuntimes.set(runtimeKey, runtime);
     return runtime;
   }
+  // Status bar indicator
+  private initStatusBar(): void {
+    this.statusBarEl = this.addStatusBarItem();
+    this.statusBarEl.addClass("agentwiki-sync-status");
+    this.statusBarEl.setText("AgentWiki");
+    this.registerEvent(
+      this.app.workspace.on("file-open", () => this.refreshStatusBar()),
+    );
+  }
+
+  private refreshStatusBar(): void {
+    if (!this.statusBarEl) return;
+    if (this.statusBarTimer !== null) {
+      window.clearTimeout(this.statusBarTimer);
+    }
+    this.statusBarTimer = window.setTimeout(
+      () => void this.updateStatusBar(),
+      500,
+    );
+  }
+
+  private async updateStatusBar(): Promise<void> {
+    if (!this.statusBarEl) return;
+    const mapping = this.selectedMapping();
+    if (!mapping) {
+      this.statusBarEl.setText("AgentWiki");
+      return;
+    }
+    try {
+      const runtime = await this.runtime(mapping);
+      if (!runtime) {
+        this.statusBarEl.setText("AgentWiki: not connected");
+        return;
+      }
+      const status = await runtime.status();
+      const parts: string[] = [];
+      if (status.local.added.length)
+        parts.push("+" + status.local.added.length);
+      if (status.local.modified.length)
+        parts.push("~" + status.local.modified.length);
+      if (status.local.renamed.length)
+        parts.push("=" + status.local.renamed.length);
+      if (status.local.deleted.length)
+        parts.push("-" + status.local.deleted.length);
+      const localPart = parts.length > 0 ? parts.join(" ") : "clean";
+      const remotePart =
+        status.remoteRevision === status.baseRevision ? "" : " remote ahead";
+      this.statusBarEl.setText("AgentWiki: " + localPart + remotePart);
+    } catch {
+      this.statusBarEl.setText("AgentWiki");
+    }
+  }
   private openSync(action: SyncAction): void {
     new SyncModal(this.app, action, async () => {
       const mapping = this.selectedMapping();
       if (!mapping) {
-        new Notice("Connect AgentWiki and add a Space mapping first.");
+        new Notice("请先连接并在设置中添加空间映射。");
         return;
       }
       let release: (() => void) | null = null;
@@ -339,7 +408,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
         release = this.locks.acquire(mapping.spaceId);
         const runtime = await this.runtime(mapping);
         if (!runtime) {
-          new Notice("Connect AgentWiki and add a Space mapping first.");
+          new Notice("请先连接并在设置中添加空间映射。");
           return;
         }
         await runtime.recover();
@@ -369,7 +438,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
             async () => {
               await runtime.applyPull(preview);
               await this.saveSettings();
-              new Notice("Pull complete.");
+              new Notice("拉取完成。");
             },
             () => {
               void runtime
@@ -394,7 +463,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
           async () => {
             await runtime.applyPush(preview);
             await this.saveSettings();
-            new Notice("Push complete.");
+            new Notice("推送完成。");
           },
           () => {
             void runtime
@@ -404,9 +473,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
         ).open();
         release = null;
       } catch (error) {
-        new Notice(
-          `${action} failed: ${error instanceof Error ? error.message : "unknown error"}`,
-        );
+        new Notice(userErrorMessage(error));
       } finally {
         release?.();
       }

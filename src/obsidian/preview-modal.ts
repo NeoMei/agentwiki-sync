@@ -49,7 +49,7 @@ export class PreviewModal extends Modal {
       .setDesc(`Page ${page + 1} / ${pageCount(total)} · ${total} items`)
       .addButton((button) =>
         button
-          .setButtonText("Previous")
+          .setButtonText("上一页")
           .setDisabled(page === 0)
           .onClick(() => {
             setPage(page - 1);
@@ -58,7 +58,7 @@ export class PreviewModal extends Modal {
       )
       .addButton((button) =>
         button
-          .setButtonText("Next")
+          .setButtonText("下一页")
           .setDisabled((page + 1) * PREVIEW_PAGE_SIZE >= total)
           .onClick(() => {
             setPage(page + 1);
@@ -88,15 +88,13 @@ export class PreviewModal extends Modal {
       this.conflictPage = page;
     });
     new Setting(this.contentEl)
-      .setDesc(
-        "This confirmation applies only to the complete preview, including other pages.",
-      )
+      .setDesc("确认将应用以上全部变更（包括其他分页）。")
       .addButton((button) =>
-        button.setButtonText("Cancel").onClick(() => this.close()),
+        button.setButtonText("取消").onClick(() => this.close()),
       )
       .addButton((button) =>
         button
-          .setButtonText("Confirm")
+          .setButtonText("确认执行")
           .setWarning()
           .onClick(async () => {
             button.setDisabled(true);
@@ -116,36 +114,32 @@ export class PreviewModal extends Modal {
   private renderBinding(binding: InitialBindingChoice): void {
     const setting = new Setting(this.contentEl)
       .setName(`${binding.localPath ?? "new file"} ↔ ${binding.remotePath}`)
-      .setDesc(
-        "Choose an optional local page and Local, Remote, or manual content.",
-      );
+      .setDesc("选择本地文件对应关系，或使用远端版本。");
     let searchTouched = false;
     if (binding.remoteBodyPath)
       void this.app.vault.adapter
         .read(binding.remoteBodyPath)
         .then((body) => {
           if (!searchTouched)
-            setting.setDesc(`Remote preview: ${body.slice(0, 160)}`);
+            setting.setDesc(`远端内容预览：${body.slice(0, 160)}`);
         })
         .catch(() => {
-          if (!searchTouched) setting.setDesc("Remote preview unavailable.");
+          if (!searchTouched) setting.setDesc("无法加载远端预览。");
         });
     setting.addText((text) =>
-      text
-        .setPlaceholder("Exact local path (searches all candidates)")
-        .onChange((value) => {
-          searchTouched = true;
-          const candidates = this.pullPreview?.localCandidates ?? [];
-          const matches = applyBindingSearch(binding, candidates, value);
-          setting.setDesc(
-            matches.length
-              ? `Matches: ${matches.join(" · ")}`
-              : "No matching local path. Leave empty to create/use remote path.",
-          );
-        }),
+      text.setPlaceholder("输入本地文件路径（支持搜索）").onChange((value) => {
+        searchTouched = true;
+        const candidates = this.pullPreview?.localCandidates ?? [];
+        const matches = applyBindingSearch(binding, candidates, value);
+        setting.setDesc(
+          matches.length
+            ? `匹配：${matches.join(" · ")}`
+            : "未找到匹配的本地文件。留空则使用远端路径。",
+        );
+      }),
     );
     setting.addDropdown((dropdown) => {
-      dropdown.addOption("", "Create/use remote path");
+      dropdown.addOption("", "使用远端路径");
       const visibleCandidates = pageSlice(
         this.pullPreview?.localCandidates ?? [],
         0,
@@ -169,10 +163,10 @@ export class PreviewModal extends Modal {
     });
     setting.addDropdown((dropdown) =>
       dropdown
-        .addOption("", "Choose…")
-        .addOption("local", "Keep Local")
-        .addOption("remote", "Use Remote")
-        .addOption("manual", "Manual body")
+        .addOption("", "请选择…")
+        .addOption("local", "保留本地")
+        .addOption("remote", "使用远端")
+        .addOption("manual", "手动内容")
         .setValue(binding.resolution ?? "")
         .onChange((value) => {
           applyBindingMode(binding, value);
@@ -180,7 +174,7 @@ export class PreviewModal extends Modal {
     );
     setting.addTextArea((text) =>
       text
-        .setPlaceholder("Manual body (used only with Manual body)")
+        .setPlaceholder("手动内容（选择手动模式时生效）")
         .setValue(binding.manualBody ?? "")
         .onChange((value) => {
           binding.manualBody = value;
@@ -190,7 +184,7 @@ export class PreviewModal extends Modal {
   private renderConflict(conflict: StructuredConflict): void {
     const setting = new Setting(this.contentEl)
       .setName(`${conflict.field}: ${conflict.pageId}`)
-      .setDesc("Loading Base / Local / Remote preview…");
+      .setDesc("正在加载预览…");
     const refs = this.pullPreview?.conflictValuePaths[conflict.conflictId];
     if (refs)
       void Promise.all(
@@ -200,23 +194,21 @@ export class PreviewModal extends Modal {
       )
         .then(([base, local, remote]) =>
           setting.setDesc(
-            `Base: ${(base ?? "").slice(0, 120)} · Local: ${(local ?? "").slice(0, 120)} · Remote: ${(remote ?? "").slice(0, 120)}`,
+            `原版：${(base ?? "").slice(0, 120)} · 本地：${(local ?? "").slice(0, 120)} · 远端：${(remote ?? "").slice(0, 120)}`,
           ),
         )
         .catch(() =>
-          setting.setDesc(
-            "Conflict preview unavailable; choose a side or enter a manual value.",
-          ),
+          setting.setDesc("无法加载冲突预览。请直接选择一方或手动输入。"),
         );
     else
       setting.setDesc(
-        `Base: ${conflict.base.slice(0, 120)} · Local: ${conflict.local.slice(0, 120)} · Remote: ${conflict.remote.slice(0, 120)}`,
+        `原版：${conflict.base.slice(0, 120)} · 本地：${conflict.local.slice(0, 120)} · 远端：${conflict.remote.slice(0, 120)}`,
       );
     setting.addDropdown((dropdown) =>
       dropdown
-        .addOption("", "Resolve…")
-        .addOption("local", "Keep Local")
-        .addOption("remote", "Use Remote")
+        .addOption("", "请选择…")
+        .addOption("local", "保留本地")
+        .addOption("remote", "使用远端")
         .addOption("manual", "Manual value")
         .setValue(
           this.pullPreview?.conflictResolutions[conflict.conflictId]?.choice ??
@@ -234,7 +226,7 @@ export class PreviewModal extends Modal {
     );
     setting.addTextArea((text) =>
       text
-        .setPlaceholder("Manual final value")
+        .setPlaceholder("手动输入最终内容")
         .setValue(
           this.pullPreview
             ? conflictManualValue(this.pullPreview, conflict.conflictId)
