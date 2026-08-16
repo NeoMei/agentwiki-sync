@@ -17799,7 +17799,7 @@ var GenerationRepository = class {
    */
   async localFileName(pageId, relativePath) {
     if (relativePath && isValidSyncPath(relativePath)) return relativePath;
-    return `p-${await opaqueFileKey(pageId)}.md`;
+    return `${await opaqueFileKey(pageId)}.md`;
   }
   path(generationId, suffix) {
     return `${this.root}/generations/${generationId}/${suffix}`;
@@ -17867,12 +17867,16 @@ var GenerationRepository = class {
     }
     let bodyBytes = 0;
     for (const page of Object.values(manifest.pages)) {
-      const body = await this.store.read(
+      let body = await this.store.read(
         this.path(
           generationId,
           `base/${await this.localFileName(page.pageId, page.relativePath)}`
         )
       );
+      if (body === null)
+        body = await this.store.read(
+          this.path(generationId, `base/${await opaqueFileKey(page.pageId)}.md`)
+        );
       if (body === null || await contentHash(body) !== page.contentHash)
         throw new Error("\u57FA\u7EBF\u635F\u574F: \u57FA\u7840\u54C8\u5E0C\u4E0D\u5339\u914D");
       bodyBytes += new TextEncoder().encode(body).byteLength;
@@ -17917,13 +17921,13 @@ var GenerationRepository = class {
       const page = manifest.pages[pageId];
       if (page) path = page.relativePath;
     }
-    const fileName = path ? await this.localFileName(pageId, path) : `p-${await opaqueFileKey(pageId)}.md`;
+    const fileName = path ? await this.localFileName(pageId, path) : `${await opaqueFileKey(pageId)}.md`;
     let body = await this.store.read(
       this.path(generationId, `base/${fileName}`)
     );
     if (body === null && path && isValidSyncPath(path)) {
       body = await this.store.read(
-        this.path(generationId, `base/p-${await opaqueFileKey(pageId)}.md`)
+        this.path(generationId, `base/${await opaqueFileKey(pageId)}.md`)
       );
     }
     if (body === null || await contentHash(body) !== expectedHash)
@@ -18521,7 +18525,7 @@ var PushService = class {
    */
   async payloadFileName(pageId, path) {
     if (path && isValidSyncPath(path)) return path;
-    return `p-${await opaqueFileKey(pageId)}.md`;
+    return `${await opaqueFileKey(pageId)}.md`;
   }
   async payloadPath(pageId, path) {
     return `${this.root}/payload/${await this.payloadFileName(pageId, path)}`;
@@ -18846,7 +18850,7 @@ var safeKey = (value) => value.replace(/[^A-Za-z0-9_-]/gu, "_");
 var joinRoot = (root, relative) => `${root}/${validatePortablePath(relative).path}`;
 var localFileName = async (pageId, relativePath) => {
   if (relativePath && isValidSyncPath(relativePath)) return relativePath;
-  return `p-${await opaqueFileKey(pageId)}.md`;
+  return `${await opaqueFileKey(pageId)}.md`;
 };
 var SyncRuntime = class {
   constructor(vault, control, remote, mapping, fallbackCapabilities = DEFAULT_CAPABILITIES, deviceKey = "local", spaceKey = safeKey(mapping.spaceId), credentialId = null) {
@@ -19914,7 +19918,7 @@ var StorageMigration = class {
           continue;
         }
         const pageData = page;
-        const hashFileName = `p-${await opaqueFileKey(pageId)}.md`;
+        const hashFileName = `${await opaqueFileKey(pageId)}.md`;
         const hashPath = `${generationRoot}/generations/${generationId}/base/${hashFileName}`;
         if (!isValidSyncPath(pageData.relativePath)) {
           result.skipped++;
@@ -19962,7 +19966,7 @@ var StorageMigration = class {
       for (const change of journal.payload.changes) {
         if (!isChangeRecord(change)) continue;
         if (change.operation !== "upsert") continue;
-        const hashFileName = `p-${await opaqueFileKey(change.pageId)}.md`;
+        const hashFileName = `${await opaqueFileKey(change.pageId)}.md`;
         const hashPath = `${pushRoot}/payload/${hashFileName}`;
         if (!change.path || !isValidSyncPath(change.path)) {
           result.skipped++;

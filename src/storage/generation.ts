@@ -45,7 +45,7 @@ export class GenerationRepository {
     relativePath: string,
   ): Promise<string> {
     if (relativePath && isValidSyncPath(relativePath)) return relativePath;
-    return `p-${await opaqueFileKey(pageId)}.md`;
+    return `${await opaqueFileKey(pageId)}.md`;
   }
 
   private path(generationId: string, suffix: string): string {
@@ -122,12 +122,16 @@ export class GenerationRepository {
     }
     let bodyBytes = 0;
     for (const page of Object.values(manifest.pages)) {
-      const body = await this.store.read(
+      let body = await this.store.read(
         this.path(
           generationId,
           `base/${await this.localFileName(page.pageId, page.relativePath)}`,
         ),
       );
+      if (body === null)
+        body = await this.store.read(
+          this.path(generationId, `base/${await opaqueFileKey(page.pageId)}.md`),
+        );
       if (body === null || (await contentHash(body)) !== page.contentHash)
         throw new Error("基线损坏: 基础哈希不匹配");
       bodyBytes += new TextEncoder().encode(body).byteLength;
@@ -192,14 +196,14 @@ export class GenerationRepository {
     }
     const fileName = path
       ? await this.localFileName(pageId, path)
-      : `p-${await opaqueFileKey(pageId)}.md`;
+      : `${await opaqueFileKey(pageId)}.md`;
     // 尝试可读路径，如果不存在则回退到哈希路径（向后兼容）
     let body = await this.store.read(
       this.path(generationId, `base/${fileName}`),
     );
     if (body === null && path && isValidSyncPath(path)) {
       body = await this.store.read(
-        this.path(generationId, `base/p-${await opaqueFileKey(pageId)}.md`),
+        this.path(generationId, `base/${await opaqueFileKey(pageId)}.md`),
       );
     }
     if (body === null || (await contentHash(body)) !== expectedHash)
@@ -265,4 +269,3 @@ export class GenerationRepository {
     return manifest;
   }
 }
-

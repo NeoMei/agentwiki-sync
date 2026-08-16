@@ -211,7 +211,7 @@ const localFileName = async (
   relativePath: string,
 ): Promise<string> => {
   if (relativePath && isValidSyncPath(relativePath)) return relativePath;
-  return `p-${await opaqueFileKey(pageId)}.md`;
+  return `${await opaqueFileKey(pageId)}.md`;
 };
 export class SyncRuntime {
   private pinnedBase: BaselineState | null = null;

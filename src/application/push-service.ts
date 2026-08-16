@@ -122,7 +122,7 @@ export class PushService {
     path?: string,
   ): Promise<string> {
     if (path && isValidSyncPath(path)) return path;
-    return `p-${await opaqueFileKey(pageId)}.md`;
+    return `${await opaqueFileKey(pageId)}.md`;
   }
   private async payloadPath(pageId: string, path?: string): Promise<string> {
     return `${this.root}/payload/${await this.payloadFileName(pageId, path)}`;

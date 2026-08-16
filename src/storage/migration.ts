@@ -105,7 +105,7 @@ export class StorageMigration {
           continue;
         }
         const pageData = page;
-        const hashFileName = `p-${await opaqueFileKey(pageId)}.md`;
+        const hashFileName = `${await opaqueFileKey(pageId)}.md`;
         const hashPath = `${generationRoot}/generations/${generationId}/base/${hashFileName}`;
 
         // 检查是否使用可读路径
@@ -183,7 +183,7 @@ export class StorageMigration {
         if (!isChangeRecord(change)) continue;
         if (change.operation !== "upsert") continue;
 
-        const hashFileName = `p-${await opaqueFileKey(change.pageId)}.md`;
+        const hashFileName = `${await opaqueFileKey(change.pageId)}.md`;
         const hashPath = `${pushRoot}/payload/${hashFileName}`;
 
         // 检查是否使用可读路径
