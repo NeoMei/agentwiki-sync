@@ -15994,6 +15994,7 @@ var AgentWikiClient = class {
   async delta(spaceId, from) {
     let cursor = null;
     let fixed = null;
+    let fixedRevision = null;
     const items = [];
     do {
       const query = new URLSearchParams({ from });
@@ -16017,11 +16018,12 @@ var AgentWikiClient = class {
       ]);
       if (fixed && fixed !== signature) throw new Error("\u589E\u91CF\u5206\u9875\u5143\u6570\u636E\u5DF2\u53D8\u66F4");
       fixed ??= signature;
+      fixedRevision ??= page.toRevision;
       items.push(...page.items);
       cursor = page.nextCursor;
     } while (cursor);
     return {
-      toRevision: fixed ? JSON.parse(fixed)[1] : from,
+      toRevision: fixedRevision ?? from,
       items
     };
   }
@@ -16127,7 +16129,7 @@ var AgentWikiSyncSettingTab = class extends import_obsidian.PluginSettingTab {
     }
   }
   renderConnectionSection() {
-    this.containerEl.createEl("h3", { text: "\u8FDE\u63A5" });
+    new import_obsidian.Setting(this.containerEl).setName("\u8FDE\u63A5").setHeading();
     new import_obsidian.Setting(this.containerEl).setName("AgentWiki \u670D\u52A1\u5668").setDesc(
       this.plugin.settings.serverInstanceId ? "\u5DF2\u8FDE\u63A5\u3002\u65AD\u5F00\u540E\u53EF\u66F4\u6539\u670D\u52A1\u5668\u3002" : "\u8F93\u5165\u670D\u52A1\u5668\u5730\u5740\uFF0C\u5982 https://agentwiki.quukk.com"
     ).addText(
@@ -16173,7 +16175,7 @@ var AgentWikiSyncSettingTab = class extends import_obsidian.PluginSettingTab {
     }
   }
   renderMappingSection() {
-    this.containerEl.createEl("h3", { text: "\u7A7A\u95F4\u6620\u5C04" });
+    new import_obsidian.Setting(this.containerEl).setName("\u7A7A\u95F4\u6620\u5C04").setHeading();
     for (const mapping of this.plugin.settings.mappings) {
       const space = this.availableSpaces?.find(
         (s) => s.spaceId === mapping.spaceId
@@ -19747,6 +19749,18 @@ init_protocol();
 
 // src/storage/migration.ts
 init_protocol();
+function isManifestRecord(value) {
+  return typeof value === "object" && value !== null && "pages" in value && typeof value.pages === "object" && value.pages !== null;
+}
+function isPageRecord(value) {
+  return typeof value === "object" && value !== null && typeof value.relativePath === "string";
+}
+function isJournalRecord(value) {
+  return typeof value === "object" && value !== null && "payload" in value && typeof value.payload === "object" && value.payload !== null && Array.isArray(value.payload.changes);
+}
+function isChangeRecord(value) {
+  return typeof value === "object" && value !== null && typeof value.operation === "string" && typeof value.pageId === "string";
+}
 var StorageMigration = class {
   constructor(store) {
     this.store = store;
@@ -19764,11 +19778,15 @@ var StorageMigration = class {
         return result;
       }
       const manifest = JSON.parse(manifestRaw);
-      if (!manifest.pages || typeof manifest.pages !== "object") {
+      if (!isManifestRecord(manifest)) {
         result.errors.push(`Invalid manifest: missing pages`);
         return result;
       }
       for (const [pageId, page] of Object.entries(manifest.pages)) {
+        if (!isPageRecord(page)) {
+          result.skipped++;
+          continue;
+        }
         const pageData = page;
         const hashFileName = `p-${await opaqueFileKey(pageId)}.md`;
         const hashPath = `${generationRoot}/generations/${generationId}/base/${hashFileName}`;
@@ -19812,10 +19830,11 @@ var StorageMigration = class {
         return result;
       }
       const journal = JSON.parse(journalRaw);
-      if (!journal.payload?.changes || !Array.isArray(journal.payload.changes)) {
+      if (!isJournalRecord(journal)) {
         return result;
       }
       for (const change of journal.payload.changes) {
+        if (!isChangeRecord(change)) continue;
         if (change.operation !== "upsert") continue;
         const hashFileName = `p-${await opaqueFileKey(change.pageId)}.md`;
         const hashPath = `${pushRoot}/payload/${hashFileName}`;

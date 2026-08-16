@@ -36,7 +36,7 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
   }
 
   private renderConnectionSection(): void {
-    this.containerEl.createEl("h3", { text: "连接" });
+    new Setting(this.containerEl).setName("连接").setHeading();
     new Setting(this.containerEl)
       .setName("AgentWiki 服务器")
       .setDesc(
@@ -102,7 +102,7 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
   }
 
   private renderMappingSection(): void {
-    this.containerEl.createEl("h3", { text: "空间映射" });
+    new Setting(this.containerEl).setName("空间映射").setHeading();
 
     for (const mapping of this.plugin.settings.mappings) {
       const space = this.availableSpaces?.find(

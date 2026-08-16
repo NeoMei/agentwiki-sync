@@ -177,6 +177,7 @@ export class AgentWikiClient {
   ): Promise<{ toRevision: string; items: DeltaItem[] }> {
     let cursor: string | null = null;
     let fixed: string | null = null;
+    let fixedRevision: string | null = null;
     const items: DeltaItem[] = [];
     do {
       const query = new URLSearchParams({ from });
@@ -202,11 +203,12 @@ export class AgentWikiClient {
       ]);
       if (fixed && fixed !== signature) throw new Error("增量分页元数据已变更");
       fixed ??= signature;
+      fixedRevision ??= page.toRevision;
       items.push(...page.items);
       cursor = page.nextCursor;
     } while (cursor);
     return {
-      toRevision: fixed ? (JSON.parse(fixed)[1] as string) : from,
+      toRevision: fixedRevision ?? from,
       items,
     };
   }
