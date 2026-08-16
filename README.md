@@ -2,13 +2,66 @@
 
 AgentWiki Sync 是一个移动端兼容的 Obsidian 社区插件，用 Git 风格的 Status、Pull、Push 将映射目录与 AgentWiki Space 同步。
 
-## 当前状态
+## Installation
 
-插件核心、事务恢复、原生 UI 和公开 API 客户端已实现。AgentWiki 服务端的人类设备同步 API v1 与 `@neomei/agentwiki-sync-protocol` 仍未发布，因此当前版本默认不会把连接码发送到不支持该契约的服务端。仓库使用独立 fake AgentWiki 验证端到端客户端流程，不复制 AgentWiki 主项目内部实现。
+### From Obsidian Community Plugins
 
-## 开发
+1. Open Obsidian Settings → Community Plugins
+2. Disable Restricted mode if enabled
+3. Click Browse and search for "AgentWiki Sync"
+4. Click Install, then Enable
 
-要求 Node.js 24 LTS：
+### Manual Installation
+
+1. Download `main.js`, `manifest.json`, and `styles.css` from the [latest release](https://github.com/NeoMei/agentwiki-sync/releases/latest)
+2. Create a folder `agentwiki-sync` in your vault's `.obsidian/plugins/` directory
+3. Copy the three files into that folder
+4. Restart Obsidian and enable the plugin in Settings → Community Plugins
+
+## Usage
+
+### 1. Connect to AgentWiki
+
+1. Open Settings → AgentWiki Sync
+2. Enter your AgentWiki server URL (e.g., `https://agentwiki.quukk.com`)
+3. Enter the connection code from your AgentWiki account settings
+4. Click Connect
+
+### 2. Map Folders to Spaces
+
+1. After connecting, select an AgentWiki Space from the dropdown
+2. Choose a vault folder to map to that Space
+3. Click Add Mapping
+
+### 3. Sync Your Notes
+
+Use the three sync commands from the ribbon or Command Palette:
+
+- **Status** — Check what changed locally and remotely since last sync
+- **Pull** — Download remote changes to your vault (merges with local edits)
+- **Push** — Upload local changes to AgentWiki (requires preview confirmation)
+
+Conflicts are resolved with Git-style three-way merge. When both sides changed the same block, the plugin keeps both versions with conflict markers for you to resolve manually.
+
+## Features
+
+- Bidirectional sync between Obsidian folders and AgentWiki Spaces
+- Git-style Status / Pull / Push workflow with three-way merge
+- Human-readable file paths (no hash filenames)
+- Conflict markers for manual resolution
+- Mobile compatible (no desktop-only APIs)
+- Credentials stored in Obsidian Secret Storage only
+
+## Security
+
+- The plugin only connects when you run Connect, Status, Pull, or Push
+- Push requires preview confirmation before uploading
+- Credentials and connection codes never enter your vault or diagnostics
+- All remote Markdown paths pass NFC/casefold portable path validation
+
+## Development
+
+Requires Node.js 24 LTS:
 
 ```bash
 npm ci
