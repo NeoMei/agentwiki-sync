@@ -16287,50 +16287,139 @@ var AgentWikiSyncSettingTab = class extends import_obsidian.PluginSettingTab {
   }
 };
 
-// src/obsidian/sync-modal.ts
+// src/obsidian/sync-center-modal.ts
 var import_obsidian2 = require("obsidian");
-var actionLabels = {
-  status: {
-    title: "\u72B6\u6001",
-    desc: "\u626B\u63CF\u672C\u5730\u6587\u4EF6\u5E76\u4E0E\u8FDC\u7AEF\u7248\u672C\u6BD4\u8F83\u3002",
-    button: "\u67E5\u770B\u72B6\u6001"
-  },
-  pull: {
-    title: "\u62C9\u53D6",
-    desc: "\u5C06\u8FDC\u7AEF\u53D8\u66F4\u4E0B\u8F7D\u5230\u672C\u5730\u3002\u6267\u884C\u524D\u4F1A\u663E\u793A\u9884\u89C8\u3002",
-    button: "\u7EE7\u7EED\u5230\u9884\u89C8"
-  },
-  push: {
-    title: "\u63A8\u9001",
-    desc: "\u5C06\u672C\u5730\u53D8\u66F4\u53D1\u5E03\u5230\u8FDC\u7AEF\u3002\u6267\u884C\u524D\u4F1A\u663E\u793A\u9884\u89C8\u3002",
-    button: "\u7EE7\u7EED\u5230\u9884\u89C8"
-  }
-};
-var SyncModal = class extends import_obsidian2.Modal {
-  constructor(app, action, run) {
+var countDiff = (diff) => diff.localAdded.length + diff.localModified.length + diff.localRenamed.length + diff.localDeleted.length;
+var SyncCenterModal = class extends import_obsidian2.Modal {
+  constructor(app, handlers) {
     super(app);
-    this.action = action;
-    this.run = run;
+    this.handlers = handlers;
   }
+  diff = null;
+  loadError = null;
+  running = false;
   onOpen() {
+    void this.refresh();
+  }
+  async refresh() {
+    this.diff = null;
+    this.loadError = null;
+    this.running = false;
+    this.renderLoading();
+    try {
+      this.diff = await this.handlers.loadDiff();
+    } catch (error51) {
+      this.loadError = userErrorMessage(error51);
+    }
+    this.render();
+  }
+  renderLoading() {
     this.contentEl.empty();
-    const labels = actionLabels[this.action];
-    this.contentEl.createEl("h2", { text: labels.title });
-    this.contentEl.createEl("p", { text: labels.desc });
+    this.contentEl.createEl("h2", { text: "AgentWiki \u540C\u6B65" });
+    this.contentEl.createEl("p", { text: "\u6B63\u5728\u6BD4\u8F83\u672C\u5730\u4E0E\u670D\u52A1\u5668\u5DEE\u5F02\u2026" });
+  }
+  render() {
+    this.contentEl.empty();
+    if (this.loadError) {
+      this.renderError();
+      return;
+    }
+    const diff = this.diff;
+    if (!diff) return;
+    this.contentEl.createEl("h2", { text: "AgentWiki \u540C\u6B65" });
+    const localCount = countDiff(diff);
+    const remoteCount = diff.remoteUpdated.length + diff.remoteArchived.length;
+    let summary;
+    if (diff.remoteAhead) {
+      summary = remoteCount > 0 && diff.remoteListed ? `\u672C\u5730 ${localCount} \u5904\u53D8\u66F4 \xB7 \u670D\u52A1\u5668 ${remoteCount} \u5904\u66F4\u65B0` : "\u670D\u52A1\u5668\u6709\u66F4\u65B0";
+    } else {
+      summary = localCount > 0 ? `\u672C\u5730 ${localCount} \u5904\u53D8\u66F4 \xB7 \u670D\u52A1\u5668\u5DF2\u662F\u57FA\u7EBF\u7248\u672C` : "\u672C\u5730\u4E0E\u670D\u52A1\u5668\u5DF2\u540C\u6B65\uFF0C\u65E0\u9700\u64CD\u4F5C\u3002";
+    }
+    this.contentEl.createEl("p", {
+      text: summary,
+      cls: "agentwiki-sync-summary"
+    });
+    this.renderLocalSection(diff);
+    this.renderRemoteSection(diff);
+    this.renderActions();
+  }
+  renderError() {
+    this.contentEl.createEl("h2", { text: "AgentWiki \u540C\u6B65" });
+    this.contentEl.createEl("p", {
+      text: `\u52A0\u8F7D\u5DEE\u5F02\u5931\u8D25\uFF1A${this.loadError}`
+    });
     new import_obsidian2.Setting(this.contentEl).addButton(
-      (button) => button.setButtonText(labels.button).setCta().onClick(async () => {
-        button.setDisabled(true);
-        const original = button.buttonEl.textContent;
-        button.setButtonText("\u6267\u884C\u4E2D\u2026");
-        try {
-          await this.run();
-          this.close();
-        } finally {
-          button.setDisabled(false);
-          button.setButtonText(original ?? labels.button);
-        }
-      })
+      (button) => button.setButtonText("\u91CD\u8BD5").onClick(() => void this.refresh())
+    ).addButton(
+      (button) => button.setButtonText("\u5173\u95ED").onClick(() => this.close())
     );
+  }
+  renderLocalSection(diff) {
+    new import_obsidian2.Setting(this.contentEl).setName("\u672C\u5730\u53D8\u66F4").setHeading();
+    if (countDiff(diff) === 0) {
+      this.contentEl.createEl("p", { text: "\u672C\u5730\u6CA1\u6709\u672A\u63A8\u9001\u7684\u53D8\u66F4\u3002" });
+      return;
+    }
+    const list = this.contentEl.createEl("ul");
+    for (const path of diff.localAdded)
+      list.createEl("li", { text: `+ ${path}` });
+    for (const path of diff.localModified)
+      list.createEl("li", { text: `~ ${path}` });
+    for (const path of diff.localRenamed)
+      list.createEl("li", { text: `\u2192 ${path}` });
+    for (const path of diff.localDeleted)
+      list.createEl("li", { text: `- ${path}` });
+  }
+  renderRemoteSection(diff) {
+    new import_obsidian2.Setting(this.contentEl).setName("\u670D\u52A1\u5668\u53D8\u66F4").setHeading();
+    if (!diff.remoteAhead) {
+      this.contentEl.createEl("p", { text: "\u670D\u52A1\u5668\u6CA1\u6709\u65B0\u7684\u53D8\u66F4\u3002" });
+      return;
+    }
+    if (diff.remoteFirstBind) {
+      this.contentEl.createEl("p", {
+        text: "\u9996\u6B21\u540C\u6B65\uFF1A\u670D\u52A1\u5668\u5185\u5BB9\u5C06\u5728\u62C9\u53D6\u65F6\u4E0E\u672C\u5730\u6587\u4EF6\u5EFA\u7ACB\u5BF9\u5E94\u5173\u7CFB\u3002"
+      });
+      return;
+    }
+    if (!diff.remoteListed || diff.remoteUpdated.length + diff.remoteArchived.length === 0) {
+      this.contentEl.createEl("p", {
+        text: diff.remoteListed ? "\u670D\u52A1\u5668\u53D8\u66F4\u5DF2\u4E0E\u5408\u5E76\u57FA\u7EBF\u4E00\u81F4\u3002" : "\u670D\u52A1\u5668\u6709\u66F4\u65B0\uFF08\u660E\u7EC6\u6682\u65F6\u4E0D\u53EF\u7528\uFF0C\u53EF\u5728\u5408\u5E76\u9884\u89C8\u4E2D\u67E5\u770B\uFF09\u3002"
+      });
+      return;
+    }
+    const list = this.contentEl.createEl("ul");
+    for (const path of diff.remoteUpdated)
+      list.createEl("li", { text: `\u2191 ${path}` });
+    for (const path of diff.remoteArchived)
+      list.createEl("li", { text: `\u2715 ${path}` });
+  }
+  renderActions() {
+    new import_obsidian2.Setting(this.contentEl).setDesc(
+      "\u81EA\u52A8\u5408\u5E76\u4FDD\u7559\u53CC\u65B9\u4E0D\u51B2\u7A81\u7684\u4FEE\u6539\uFF0C\u51B2\u7A81\u65F6\u53EF\u5728\u9884\u89C8\u4E2D\u9010\u9879\u9009\u62E9\uFF1B\u4F7F\u7528\u672C\u5730/\u670D\u52A1\u5668\u5185\u5BB9\u4F1A\u5728\u51B2\u7A81\u5904\u76F4\u63A5\u91C7\u7528\u6240\u9009\u4E00\u4FA7\u3002"
+    ).addButton(
+      (button) => button.setButtonText(this.running ? "\u6267\u884C\u4E2D\u2026" : "\u81EA\u52A8\u5408\u5E76\uFF08\u63A8\u8350\uFF09").setCta().setDisabled(this.running).onClick(() => void this.run("auto"))
+    ).addButton(
+      (button) => button.setButtonText("\u4F7F\u7528\u672C\u5730\u5185\u5BB9").setDisabled(this.running).onClick(() => void this.run("local"))
+    ).addButton(
+      (button) => button.setButtonText("\u4F7F\u7528\u670D\u52A1\u5668\u5185\u5BB9").setDisabled(this.running).onClick(() => void this.run("server"))
+    );
+    new import_obsidian2.Setting(this.contentEl).addButton(
+      (button) => button.setButtonText("\u5237\u65B0\u5DEE\u5F02").setDisabled(this.running).onClick(() => void this.refresh())
+    );
+  }
+  async run(strategy) {
+    if (this.running) return;
+    this.running = true;
+    this.render();
+    try {
+      await this.handlers.runStrategy(strategy);
+      this.close();
+    } catch (error51) {
+      new import_obsidian2.Notice(`\u540C\u6B65\u5931\u8D25\uFF1A${userErrorMessage(error51)}`);
+      this.running = false;
+      this.render();
+    }
   }
 };
 
@@ -17192,6 +17281,9 @@ var AgentWikiPushRemote = class {
   }
   async getHead() {
     return this.client.head(this.spaceId);
+  }
+  async delta(fromRevision) {
+    return this.client.delta(this.spaceId, fromRevision);
   }
   async getCapabilities() {
     return parseCapabilities(
@@ -19139,6 +19231,40 @@ var SyncRuntime = class {
       local: computeStatus(base.pages, resolved, scan)
     };
   }
+  async remoteDelta() {
+    const base = await this.readBase();
+    const head = await this.remote.getHead(this.mapping.spaceId);
+    const ahead = head.revision !== base.revision;
+    if (!ahead || base.revision === "0" || !this.remote.delta)
+      return {
+        baseRevision: base.revision,
+        remoteRevision: head.revision,
+        ahead,
+        items: [],
+        listed: false,
+        remotePageCount: head.pageCount
+      };
+    try {
+      const delta = await this.remote.delta(base.revision);
+      return {
+        baseRevision: base.revision,
+        remoteRevision: delta.toRevision,
+        ahead: true,
+        items: delta.items,
+        listed: true,
+        remotePageCount: head.pageCount
+      };
+    } catch {
+      return {
+        baseRevision: base.revision,
+        remoteRevision: head.revision,
+        ahead: true,
+        items: [],
+        listed: false,
+        remotePageCount: head.pageCount
+      };
+    }
+  }
   async hasUnfinishedPush() {
     const push = await new PushService(
       this.remote,
@@ -19930,14 +20056,13 @@ var AgentWikiSyncPlugin = class extends import_obsidian5.Plugin {
     this.addRibbonIcon(
       "refresh-cw",
       "AgentWiki Sync",
-      () => this.openSync("status")
+      () => this.openSyncCenter()
     );
-    for (const action of ["status", "pull", "push"])
-      this.addCommand({
-        id: action,
-        name: action.charAt(0).toUpperCase() + action.slice(1),
-        callback: () => this.openSync(action)
-      });
+    this.addCommand({
+      id: "open-sync-center",
+      name: "\u6253\u5F00\u540C\u6B65\u4E2D\u5FC3",
+      callback: () => this.openSyncCenter()
+    });
     const invalidate = () => {
       for (const runtime of this.liveRuntimes.values()) runtime.invalidate();
     };
@@ -20183,6 +20308,11 @@ var AgentWikiSyncPlugin = class extends import_obsidian5.Plugin {
     this.registerEvent(
       this.app.workspace.on("file-open", () => this.refreshStatusBar())
     );
+    this.registerDomEvent(
+      this.statusBarEl,
+      "click",
+      () => this.openSyncCenter()
+    );
   }
   refreshStatusBar() {
     if (!this.statusBarEl) return;
@@ -20224,65 +20354,156 @@ var AgentWikiSyncPlugin = class extends import_obsidian5.Plugin {
       this.statusBarEl.setText("AgentWiki");
     }
   }
-  openSync(action) {
-    new SyncModal(this.app, action, async () => {
-      const mapping = this.selectedMapping();
-      if (!mapping) {
-        new import_obsidian5.Notice("\u8BF7\u5148\u8FDE\u63A5\u5E76\u5728\u8BBE\u7F6E\u4E2D\u6DFB\u52A0\u7A7A\u95F4\u6620\u5C04\u3002");
+  openSyncCenter() {
+    new SyncCenterModal(this.app, {
+      loadDiff: () => this.collectSyncDiff(),
+      runStrategy: (strategy) => this.runSyncStrategy(strategy)
+    }).open();
+  }
+  async collectSyncDiff() {
+    const mapping = this.selectedMapping();
+    if (!mapping) throw new Error("\u8BF7\u5148\u8FDE\u63A5\u5E76\u5728\u8BBE\u7F6E\u4E2D\u6DFB\u52A0\u7A7A\u95F4\u6620\u5C04\u3002");
+    const runtime = await this.runtime(mapping);
+    if (!runtime) throw new Error("\u8BF7\u5148\u8FDE\u63A5\u5E76\u5728\u8BBE\u7F6E\u4E2D\u6DFB\u52A0\u7A7A\u95F4\u6620\u5C04\u3002");
+    await runtime.recover();
+    const [status, delta] = await Promise.all([
+      runtime.status(),
+      runtime.remoteDelta()
+    ]);
+    return {
+      remoteAhead: delta.ahead,
+      localAdded: status.local.added.map((file2) => file2.relativePath),
+      localModified: status.local.modified.map((file2) => file2.relativePath),
+      localRenamed: status.local.renamed.map((file2) => file2.relativePath),
+      localDeleted: status.local.deleted.map((page) => page.relativePath),
+      remoteUpdated: delta.items.filter((item) => item.operation === "upsert").map((item) => item.page.path),
+      remoteArchived: delta.items.filter((item) => item.operation === "archive").map((item) => item.previousPath),
+      remoteListed: delta.listed,
+      remoteFirstBind: delta.ahead && delta.baseRevision === "0"
+    };
+  }
+  async runSyncStrategy(strategy) {
+    const mapping = this.selectedMapping();
+    if (!mapping) throw new Error("\u8BF7\u5148\u8FDE\u63A5\u5E76\u5728\u8BBE\u7F6E\u4E2D\u6DFB\u52A0\u7A7A\u95F4\u6620\u5C04\u3002");
+    const flow = new SyncFlowLock(this.locks.acquire(mapping.spaceId));
+    try {
+      const runtime = await this.runtime(mapping);
+      if (!runtime) throw new Error("\u8BF7\u5148\u8FDE\u63A5\u5E76\u5728\u8BBE\u7F6E\u4E2D\u6DFB\u52A0\u7A7A\u95F4\u6620\u5C04\u3002");
+      await runtime.recover();
+      if (strategy === "server") {
+        await this.syncUseServer(runtime, flow);
         return;
       }
-      let release = null;
+      if (strategy === "local") {
+        await this.syncUseLocal(runtime, flow);
+        return;
+      }
+      await this.syncAutoMerge(runtime, flow);
+    } catch (error51) {
+      flow.finish();
+      throw error51;
+    }
+  }
+  async syncUseServer(runtime, flow) {
+    const delta = await runtime.remoteDelta();
+    if (!delta.ahead) {
+      new import_obsidian5.Notice("\u670D\u52A1\u5668\u6CA1\u6709\u65B0\u7684\u53D8\u66F4\u53EF\u5E94\u7528\u3002");
+      flow.finish();
+      return;
+    }
+    const preview = await runtime.previewPull();
+    for (const conflict2 of preview.conflicts)
+      preview.conflictResolutions[conflict2.conflictId] = {
+        choice: "remote"
+      };
+    for (const binding of preview.initialBindings)
+      if (binding.resolution === null) binding.resolution = "remote";
+    new PreviewModal(
+      this.app,
+      "\u4EE5\u670D\u52A1\u5668\u5185\u5BB9\u4E3A\u51C6",
+      [
+        ...preview.actions.map(
+          (item) => `${actionLabel(item.kind)}: ${item.path}`
+        ),
+        ...preview.conflicts.map(
+          (item) => `\u51B2\u7A81\u4EE5\u670D\u52A1\u5668\u4E3A\u51C6: ${item.field} ${item.pageId}`
+        ),
+        ...preview.initialBindings.map(
+          (item) => `\u65B0\u9875\u9762\u5199\u5165\u670D\u52A1\u5668\u5185\u5BB9: ${item.remotePath}`
+        )
+      ],
+      async () => {
+        await runtime.applyPull(preview);
+        await this.saveSettings();
+        new import_obsidian5.Notice("\u5DF2\u6309\u670D\u52A1\u5668\u5185\u5BB9\u66F4\u65B0\u672C\u5730\u3002");
+      },
+      () => {
+        void runtime.discardPullPreview(preview).finally(() => flow.finish());
+      }
+    ).open();
+  }
+  async syncUseLocal(runtime, flow) {
+    const delta = await runtime.remoteDelta();
+    if (delta.ahead) {
+      const preview = await runtime.previewPull();
+      for (const conflict2 of preview.conflicts)
+        preview.conflictResolutions[conflict2.conflictId] = {
+          choice: "local"
+        };
+      for (const binding of preview.initialBindings)
+        if (binding.resolution === null)
+          binding.resolution = binding.localPath ? "local" : "remote";
+      await runtime.applyPull(preview);
+    }
+    this.openPushPreview(runtime, flow, "\u63A8\u9001\u9884\u89C8\uFF08\u4EE5\u672C\u5730\u5185\u5BB9\u4E3A\u51C6\uFF09");
+  }
+  async syncAutoMerge(runtime, flow) {
+    const delta = await runtime.remoteDelta();
+    if (!delta.ahead) {
+      this.openPushPreview(runtime, flow, "\u63A8\u9001\u9884\u89C8");
+      return;
+    }
+    const preview = await runtime.previewPull();
+    const needsResolution = preview.conflicts.some(
+      (item) => !preview.conflictResolutions[item.conflictId]
+    ) || preview.initialBindings.some((item) => item.resolution === null);
+    new PreviewModal(
+      this.app,
+      needsResolution ? "\u81EA\u52A8\u5408\u5E76 \u2014 \u5904\u7406\u51B2\u7A81\u4E0E\u7ED1\u5B9A" : "\u81EA\u52A8\u5408\u5E76 \u2014 \u62C9\u53D6\u9884\u89C8",
+      [
+        ...preview.actions.map(
+          (item) => `${actionLabel(item.kind)}: ${item.path}`
+        ),
+        ...preview.initialBindings.filter((item) => item.resolution === null).map((item) => `\u8FDC\u7AEF\u65B0\u9875\u9762\u5F85\u7ED1\u5B9A: ${item.remotePath}`),
+        ...preview.conflicts.map(
+          (item) => `\u51B2\u7A81\u5F85\u5904\u7406: ${item.field} ${item.pageId}`
+        )
+      ],
+      async () => {
+        await runtime.applyPull(preview);
+        await this.saveSettings();
+        flow.advance();
+        this.openPushPreview(runtime, flow, "\u81EA\u52A8\u5408\u5E76 \u2014 \u63A8\u9001\u672C\u5730\u53D8\u66F4");
+      },
+      () => {
+        void runtime.discardPullPreview(preview).finally(() => flow.phaseRelease()());
+      },
+      preview.initialBindings,
+      preview
+    ).open();
+  }
+  openPushPreview(runtime, flow, title) {
+    void (async () => {
       try {
-        release = this.locks.acquire(mapping.spaceId);
-        const runtime = await this.runtime(mapping);
-        if (!runtime) {
-          new import_obsidian5.Notice("\u8BF7\u5148\u8FDE\u63A5\u5E76\u5728\u8BBE\u7F6E\u4E2D\u6DFB\u52A0\u7A7A\u95F4\u6620\u5C04\u3002");
-          return;
-        }
-        await runtime.recover();
-        if (action === "status") {
-          const status = await runtime.status();
-          new import_obsidian5.Notice(
-            `\u672C\u5730 +${status.local.added.length} ~${status.local.modified.length} \u2194${status.local.renamed.length} -${status.local.deleted.length}\uFF1B\u8FDC\u7AEF${status.remoteRevision === status.baseRevision ? "\u5DF2\u540C\u6B65" : "\u6709\u66F4\u65B0"}.`
-          );
-          return;
-        }
-        if (action === "pull") {
-          const preview2 = await runtime.previewPull();
-          const modalRelease2 = release;
-          new PreviewModal(
-            this.app,
-            "\u62C9\u53D6\u9884\u89C8",
-            [
-              ...preview2.actions.map(
-                (item) => `${actionLabel(item.kind)}: ${item.path}`
-              ),
-              ...preview2.initialBindings.map(
-                (item) => `\u7ED1\u5B9A: ${item.localPath ?? "\u65B0\u6587\u4EF6"} \u2194 ${item.remotePath}`
-              ),
-              ...preview2.conflicts.map(
-                (item) => `\u51B2\u7A81: ${item.field} ${item.pageId}`
-              )
-            ],
-            async () => {
-              await runtime.applyPull(preview2);
-              await this.saveSettings();
-              new import_obsidian5.Notice("\u62C9\u53D6\u5B8C\u6210\u3002");
-            },
-            () => {
-              void runtime.discardPullPreview(preview2).finally(() => modalRelease2?.());
-            },
-            preview2.initialBindings,
-            preview2
-          ).open();
-          release = null;
-          return;
-        }
         const preview = await runtime.previewPush();
-        const modalRelease = release;
+        if (!preview.changes.length) {
+          new import_obsidian5.Notice("\u672C\u5730\u6CA1\u6709\u5F85\u63A8\u9001\u7684\u53D8\u66F4\u3002");
+          flow.finish();
+          return;
+        }
         new PreviewModal(
           this.app,
-          "\u63A8\u9001\u9884\u89C8",
+          title,
           preview.changes.map(
             (item) => `${actionLabel(item.operation)}: ${item.operation === "upsert" ? item.path : item.previousPath}`
           ),
@@ -20292,15 +20513,34 @@ var AgentWikiSyncPlugin = class extends import_obsidian5.Plugin {
             new import_obsidian5.Notice("\u63A8\u9001\u5B8C\u6210\u3002");
           },
           () => {
-            void runtime.discardPushPreview(preview).finally(() => modalRelease?.());
+            void runtime.discardPushPreview(preview).finally(() => flow.finish());
           }
         ).open();
-        release = null;
       } catch (error51) {
         new import_obsidian5.Notice(userErrorMessage(error51));
-      } finally {
-        release?.();
+        flow.finish();
       }
-    }).open();
+    })();
+  }
+};
+var SyncFlowLock = class {
+  release;
+  advanced = false;
+  constructor(release) {
+    this.release = release;
+  }
+  advance() {
+    this.advanced = true;
+  }
+  phaseRelease() {
+    return () => {
+      if (!this.advanced) this.finish();
+    };
+  }
+  finish() {
+    if (this.release) {
+      this.release();
+      this.release = null;
+    }
   }
 };

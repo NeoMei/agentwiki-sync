@@ -8,6 +8,106 @@ import { SyncRuntime } from "../../src/application/sync-runtime";
 import { MemoryVault } from "../fakes/memory-vault";
 
 describe("manual multi-device sync", () => {
+  it("rebases a conflicting remote update with local-wins resolutions, then pushes local content", async () => {
+    const remote = new FakeAgentWiki();
+    const body = "one\ntwo";
+    await remote.seed([
+      {
+        pageId: "p1",
+        path: "Guide.md",
+        title: "Guide",
+        body,
+        contentHash: await contentHash(body),
+        updatedAt: "2026-08-14T00:00:00.000Z",
+      },
+    ]);
+    const vault = new MemoryVault({});
+    const runtime = new SyncRuntime(vault, new MemoryControlStore(), remote, {
+      spaceId: "space",
+      rootPath: "Wiki",
+      status: "pending",
+    });
+    const initial = await runtime.previewPull();
+    await runtime.applyPull(initial);
+
+    const remoteBody = "ONE\ntwo";
+    await remote.replace([
+      {
+        pageId: "p1",
+        path: "Guide.md",
+        title: "Guide",
+        body: remoteBody,
+        contentHash: await contentHash(remoteBody),
+        updatedAt: "2026-08-14T00:00:00.000Z",
+      },
+    ]);
+    await vault.write(
+      "Wiki/Guide.md",
+      new TextEncoder().encode("one\nTWO"),
+    );
+
+    const rebase = await runtime.previewPull();
+    expect(rebase.conflicts.length).toBeGreaterThan(0);
+    for (const conflict of rebase.conflicts)
+      rebase.conflictResolutions[conflict.conflictId] = { choice: "local" };
+    await runtime.applyPull(rebase);
+    expect(vault.text("Wiki/Guide.md")).toBe("one\nTWO");
+
+    const push = await runtime.previewPush();
+    expect(push.changes).toHaveLength(1);
+    await runtime.applyPush(push);
+    expect((await remote.snapshot()).items[0]?.body).toBe("one\nTWO");
+  });
+
+  it("overwrites conflicting local edits with server-wins resolutions", async () => {
+    const remote = new FakeAgentWiki();
+    const body = "one\ntwo";
+    await remote.seed([
+      {
+        pageId: "p1",
+        path: "Guide.md",
+        title: "Guide",
+        body,
+        contentHash: await contentHash(body),
+        updatedAt: "2026-08-14T00:00:00.000Z",
+      },
+    ]);
+    const vault = new MemoryVault({});
+    const runtime = new SyncRuntime(vault, new MemoryControlStore(), remote, {
+      spaceId: "space",
+      rootPath: "Wiki",
+      status: "pending",
+    });
+    const initial = await runtime.previewPull();
+    await runtime.applyPull(initial);
+
+    const remoteBody = "ONE\ntwo";
+    await remote.replace([
+      {
+        pageId: "p1",
+        path: "Guide.md",
+        title: "Guide",
+        body: remoteBody,
+        contentHash: await contentHash(remoteBody),
+        updatedAt: "2026-08-14T00:00:00.000Z",
+      },
+    ]);
+    await vault.write(
+      "Wiki/Guide.md",
+      new TextEncoder().encode("one\nTWO"),
+    );
+
+    const pull = await runtime.previewPull();
+    expect(pull.conflicts.length).toBeGreaterThan(0);
+    for (const conflict of pull.conflicts)
+      pull.conflictResolutions[conflict.conflictId] = { choice: "remote" };
+    await runtime.applyPull(pull);
+    expect(vault.text("Wiki/Guide.md")).toBe("ONE\ntwo");
+    const status = await runtime.status();
+    expect(status.local.added).toHaveLength(0);
+    expect(status.local.modified).toHaveLength(0);
+  });
+
   it("publishes from desktop, pulls on mobile, then preserves independent edits", async () => {
     const remote = new FakeAgentWiki();
     const desktop = new PushService(

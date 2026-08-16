@@ -17,6 +17,7 @@ import type {
   PushSessionStatusInfo,
   SnapshotResult,
 } from "../ports/push-remote";
+import type { DeltaItem } from "./protocol";
 
 export class AgentWikiPushRemote implements PushRemotePort {
   constructor(
@@ -25,6 +26,11 @@ export class AgentWikiPushRemote implements PushRemotePort {
   ) {}
   async getHead(): Promise<{ revision: string; pageCount?: string }> {
     return this.client.head(this.spaceId);
+  }
+  async delta(
+    fromRevision: string,
+  ): Promise<{ toRevision: string; items: DeltaItem[] }> {
+    return this.client.delta(this.spaceId, fromRevision);
   }
   async getCapabilities() {
     return parseCapabilities(

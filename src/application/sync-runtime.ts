@@ -1,6 +1,7 @@
 import {
   canonicalBytes,
   contentHash,
+  type DeltaItem,
   decimalWithinLimit,
   parseCapabilities,
   revisionContentHash,
@@ -76,6 +77,9 @@ export interface PushPreview {
 interface RuntimeRemote extends PushRemotePort {
   snapshot(revision?: string): Promise<SnapshotResult>;
   getCapabilities?(): Promise<SyncCapabilities>;
+  delta?(
+    fromRevision: string,
+  ): Promise<{ toRevision: string; items: DeltaItem[] }>;
 }
 interface SnapshotDownload {
   metadata: Omit<SnapshotResult, "items">;
@@ -706,6 +710,47 @@ export class SyncRuntime {
       remoteRevision: head.revision,
       local: computeStatus(base.pages, resolved, scan),
     };
+  }
+  async remoteDelta(): Promise<{
+    baseRevision: string;
+    remoteRevision: string;
+    ahead: boolean;
+    items: DeltaItem[];
+    listed: boolean;
+    remotePageCount?: string;
+  }> {
+    const base = await this.readBase();
+    const head = await this.remote.getHead(this.mapping.spaceId);
+    const ahead = head.revision !== base.revision;
+    if (!ahead || base.revision === "0" || !this.remote.delta)
+      return {
+        baseRevision: base.revision,
+        remoteRevision: head.revision,
+        ahead,
+        items: [],
+        listed: false,
+        remotePageCount: head.pageCount,
+      };
+    try {
+      const delta = await this.remote.delta(base.revision);
+      return {
+        baseRevision: base.revision,
+        remoteRevision: delta.toRevision,
+        ahead: true,
+        items: delta.items,
+        listed: true,
+        remotePageCount: head.pageCount,
+      };
+    } catch {
+      return {
+        baseRevision: base.revision,
+        remoteRevision: head.revision,
+        ahead: true,
+        items: [],
+        listed: false,
+        remotePageCount: head.pageCount,
+      };
+    }
   }
   async hasUnfinishedPush(): Promise<boolean> {
     const push = await new PushService(

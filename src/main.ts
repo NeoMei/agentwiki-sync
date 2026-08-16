@@ -5,7 +5,11 @@ import {
   type AgentWikiSyncSettings,
 } from "./application/settings";
 import { AgentWikiSyncSettingTab } from "./obsidian/settings-tab";
-import { SyncModal, type SyncAction } from "./obsidian/sync-modal";
+import {
+  SyncCenterModal,
+  type SyncDiff,
+  type SyncStrategy,
+} from "./obsidian/sync-center-modal";
 import { PreviewModal } from "./obsidian/preview-modal";
 import {
   ConnectionService,
@@ -108,14 +112,13 @@ export default class AgentWikiSyncPlugin extends Plugin {
     this.addSettingTab(new AgentWikiSyncSettingTab(this.app, this));
     this.initStatusBar();
     this.addRibbonIcon("refresh-cw", "AgentWiki Sync", () =>
-      this.openSync("status"),
+      this.openSyncCenter(),
     );
-    for (const action of ["status", "pull", "push"] as const)
-      this.addCommand({
-        id: action,
-        name: action.charAt(0).toUpperCase() + action.slice(1),
-        callback: () => this.openSync(action),
-      });
+    this.addCommand({
+      id: "open-sync-center",
+      name: "打开同步中心",
+      callback: () => this.openSyncCenter(),
+    });
     const invalidate = () => {
       for (const runtime of this.liveRuntimes.values()) runtime.invalidate();
     };
@@ -402,6 +405,9 @@ export default class AgentWikiSyncPlugin extends Plugin {
     this.registerEvent(
       this.app.workspace.on("file-open", () => this.refreshStatusBar()),
     );
+    this.registerDomEvent(this.statusBarEl, "click", () =>
+      this.openSyncCenter(),
+    );
   }
 
   private refreshStatusBar(): void {
@@ -446,68 +452,187 @@ export default class AgentWikiSyncPlugin extends Plugin {
       this.statusBarEl.setText("AgentWiki");
     }
   }
-  private openSync(action: SyncAction): void {
-    new SyncModal(this.app, action, async () => {
-      const mapping = this.selectedMapping();
-      if (!mapping) {
-        new Notice("请先连接并在设置中添加空间映射。");
+  private openSyncCenter(): void {
+    new SyncCenterModal(this.app, {
+      loadDiff: () => this.collectSyncDiff(),
+      runStrategy: (strategy) => this.runSyncStrategy(strategy),
+    }).open();
+  }
+
+  private async collectSyncDiff(): Promise<SyncDiff> {
+    const mapping = this.selectedMapping();
+    if (!mapping) throw new Error("请先连接并在设置中添加空间映射。");
+    const runtime = await this.runtime(mapping);
+    if (!runtime) throw new Error("请先连接并在设置中添加空间映射。");
+    await runtime.recover();
+    const [status, delta] = await Promise.all([
+      runtime.status(),
+      runtime.remoteDelta(),
+    ]);
+    return {
+      remoteAhead: delta.ahead,
+      localAdded: status.local.added.map((file) => file.relativePath),
+      localModified: status.local.modified.map((file) => file.relativePath),
+      localRenamed: status.local.renamed.map((file) => file.relativePath),
+      localDeleted: status.local.deleted.map((page) => page.relativePath),
+      remoteUpdated: delta.items
+        .filter((item) => item.operation === "upsert")
+        .map((item) => item.page.path),
+      remoteArchived: delta.items
+        .filter((item) => item.operation === "archive")
+        .map((item) => item.previousPath),
+      remoteListed: delta.listed,
+      remoteFirstBind: delta.ahead && delta.baseRevision === "0",
+    };
+  }
+
+  private async runSyncStrategy(strategy: SyncStrategy): Promise<void> {
+    const mapping = this.selectedMapping();
+    if (!mapping) throw new Error("请先连接并在设置中添加空间映射。");
+    const flow = new SyncFlowLock(this.locks.acquire(mapping.spaceId));
+    try {
+      const runtime = await this.runtime(mapping);
+      if (!runtime) throw new Error("请先连接并在设置中添加空间映射。");
+      await runtime.recover();
+      if (strategy === "server") {
+        await this.syncUseServer(runtime, flow);
         return;
       }
-      let release: (() => void) | null = null;
+      if (strategy === "local") {
+        await this.syncUseLocal(runtime, flow);
+        return;
+      }
+      await this.syncAutoMerge(runtime, flow);
+    } catch (error) {
+      flow.finish();
+      throw error;
+    }
+  }
+
+  private async syncUseServer(
+    runtime: SyncRuntime,
+    flow: SyncFlowLock,
+  ): Promise<void> {
+    const delta = await runtime.remoteDelta();
+    if (!delta.ahead) {
+      new Notice("服务器没有新的变更可应用。");
+      flow.finish();
+      return;
+    }
+    const preview = await runtime.previewPull();
+    for (const conflict of preview.conflicts)
+      preview.conflictResolutions[conflict.conflictId] = {
+        choice: "remote",
+      };
+    for (const binding of preview.initialBindings)
+      if (binding.resolution === null) binding.resolution = "remote";
+    new PreviewModal(
+      this.app,
+      "以服务器内容为准",
+      [
+        ...preview.actions.map(
+          (item) => `${actionLabel(item.kind)}: ${item.path}`,
+        ),
+        ...preview.conflicts.map(
+          (item) => `冲突以服务器为准: ${item.field} ${item.pageId}`,
+        ),
+        ...preview.initialBindings.map(
+          (item) => `新页面写入服务器内容: ${item.remotePath}`,
+        ),
+      ],
+      async () => {
+        await runtime.applyPull(preview);
+        await this.saveSettings();
+        new Notice("已按服务器内容更新本地。");
+      },
+      () => {
+        void runtime
+          .discardPullPreview(preview)
+          .finally(() => flow.finish());
+      },
+    ).open();
+  }
+
+  private async syncUseLocal(
+    runtime: SyncRuntime,
+    flow: SyncFlowLock,
+  ): Promise<void> {
+    const delta = await runtime.remoteDelta();
+    if (delta.ahead) {
+      const preview = await runtime.previewPull();
+      for (const conflict of preview.conflicts)
+        preview.conflictResolutions[conflict.conflictId] = {
+          choice: "local",
+        };
+      for (const binding of preview.initialBindings)
+        if (binding.resolution === null)
+          binding.resolution = binding.localPath ? "local" : "remote";
+      await runtime.applyPull(preview);
+    }
+    this.openPushPreview(runtime, flow, "推送预览（以本地内容为准）");
+  }
+
+  private async syncAutoMerge(
+    runtime: SyncRuntime,
+    flow: SyncFlowLock,
+  ): Promise<void> {
+    const delta = await runtime.remoteDelta();
+    if (!delta.ahead) {
+      this.openPushPreview(runtime, flow, "推送预览");
+      return;
+    }
+    const preview = await runtime.previewPull();
+    const needsResolution =
+      preview.conflicts.some(
+        (item) => !preview.conflictResolutions[item.conflictId],
+      ) ||
+      preview.initialBindings.some((item) => item.resolution === null);
+    new PreviewModal(
+      this.app,
+      needsResolution ? "自动合并 — 处理冲突与绑定" : "自动合并 — 拉取预览",
+      [
+        ...preview.actions.map(
+          (item) => `${actionLabel(item.kind)}: ${item.path}`,
+        ),
+        ...preview.initialBindings
+          .filter((item) => item.resolution === null)
+          .map((item) => `远端新页面待绑定: ${item.remotePath}`),
+        ...preview.conflicts.map(
+          (item) => `冲突待处理: ${item.field} ${item.pageId}`,
+        ),
+      ],
+      async () => {
+        await runtime.applyPull(preview);
+        await this.saveSettings();
+        flow.advance();
+        this.openPushPreview(runtime, flow, "自动合并 — 推送本地变更");
+      },
+      () => {
+        void runtime
+          .discardPullPreview(preview)
+          .finally(() => flow.phaseRelease()());
+      },
+      preview.initialBindings,
+      preview,
+    ).open();
+  }
+
+  private openPushPreview(
+    runtime: SyncRuntime,
+    flow: SyncFlowLock,
+    title: string,
+  ): void {
+    void (async () => {
       try {
-        release = this.locks.acquire(mapping.spaceId);
-        const runtime = await this.runtime(mapping);
-        if (!runtime) {
-          new Notice("请先连接并在设置中添加空间映射。");
-          return;
-        }
-        await runtime.recover();
-        if (action === "status") {
-          const status = await runtime.status();
-          new Notice(
-            `本地 +${status.local.added.length} ~${status.local.modified.length} ↔${status.local.renamed.length} -${status.local.deleted.length}；远端${status.remoteRevision === status.baseRevision ? "已同步" : "有更新"}.`,
-          );
-          return;
-        }
-        if (action === "pull") {
-          const preview = await runtime.previewPull();
-          const modalRelease = release;
-          new PreviewModal(
-            this.app,
-            "拉取预览",
-            [
-              ...preview.actions.map(
-                (item) => `${actionLabel(item.kind)}: ${item.path}`,
-              ),
-              ...preview.initialBindings.map(
-                (item) =>
-                  `绑定: ${item.localPath ?? "新文件"} ↔ ${item.remotePath}`,
-              ),
-              ...preview.conflicts.map(
-                (item) => `冲突: ${item.field} ${item.pageId}`,
-              ),
-            ],
-            async () => {
-              await runtime.applyPull(preview);
-              await this.saveSettings();
-              new Notice("拉取完成。");
-            },
-            () => {
-              void runtime
-                .discardPullPreview(preview)
-                .finally(() => modalRelease?.());
-            },
-            preview.initialBindings,
-            preview,
-          ).open();
-          release = null;
-          return;
-        }
         const preview = await runtime.previewPush();
-        const modalRelease = release;
+        if (!preview.changes.length) {
+          new Notice("本地没有待推送的变更。");
+          flow.finish();
+          return;
+        }
         new PreviewModal(
           this.app,
-          "推送预览",
+          title,
           preview.changes.map(
             (item) =>
               `${actionLabel(item.operation)}: ${item.operation === "upsert" ? item.path : item.previousPath}`,
@@ -520,15 +645,35 @@ export default class AgentWikiSyncPlugin extends Plugin {
           () => {
             void runtime
               .discardPushPreview(preview)
-              .finally(() => modalRelease?.());
+              .finally(() => flow.finish());
           },
         ).open();
-        release = null;
       } catch (error) {
         new Notice(userErrorMessage(error));
-      } finally {
-        release?.();
+        flow.finish();
       }
-    }).open();
+    })();
+  }
+}
+
+class SyncFlowLock {
+  private release: (() => void) | null;
+  private advanced = false;
+  constructor(release: () => void) {
+    this.release = release;
+  }
+  advance(): void {
+    this.advanced = true;
+  }
+  phaseRelease(): () => void {
+    return () => {
+      if (!this.advanced) this.finish();
+    };
+  }
+  finish(): void {
+    if (this.release) {
+      this.release();
+      this.release = null;
+    }
   }
 }
