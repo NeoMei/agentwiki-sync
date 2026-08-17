@@ -15794,9 +15794,10 @@ function removeMapping(mappings, spaceId, gate) {
 }
 
 // src/application/settings.ts
+var DEFAULT_SERVER_URL = "https://agentwiki.quukk.com";
 var DEFAULT_SETTINGS = {
   schemaVersion: 1,
-  serverUrl: "",
+  serverUrl: DEFAULT_SERVER_URL,
   serverInstanceId: null,
   mappings: []
 };
@@ -16129,11 +16130,13 @@ var AgentWikiSyncSettingTab = class extends import_obsidian.PluginSettingTab {
     }
   }
   renderConnectionSection() {
-    new import_obsidian.Setting(this.containerEl).setName("\u8FDE\u63A5").setHeading();
+    this.containerEl.createEl("h3", { text: "\u8FDE\u63A5" });
     new import_obsidian.Setting(this.containerEl).setName("AgentWiki \u670D\u52A1\u5668").setDesc(
       this.plugin.settings.serverInstanceId ? "\u5DF2\u8FDE\u63A5\u3002\u65AD\u5F00\u540E\u53EF\u66F4\u6539\u670D\u52A1\u5668\u3002" : "\u8F93\u5165\u670D\u52A1\u5668\u5730\u5740\uFF0C\u5982 https://agentwiki.quukk.com"
     ).addText(
-      (text) => text.setPlaceholder("https://agentwiki.quukk.com").setValue(this.plugin.settings.serverUrl).setDisabled(this.plugin.settings.serverInstanceId !== null).onChange(async (value) => {
+      (text) => text.setPlaceholder("https://agentwiki.quukk.com").setValue(
+        this.plugin.settings.serverUrl || (this.plugin.settings.serverInstanceId === null ? DEFAULT_SERVER_URL : "")
+      ).setDisabled(this.plugin.settings.serverInstanceId !== null).onChange(async (value) => {
         if (this.plugin.settings.serverInstanceId !== null) return;
         this.plugin.settings.serverUrl = value.trim().replace(/\/+$/, "");
         await this.plugin.saveSettings();
@@ -16151,8 +16154,9 @@ var AgentWikiSyncSettingTab = class extends import_obsidian.PluginSettingTab {
       ).addButton(
         (button) => button.setButtonText("\u8FDE\u63A5").setCta().onClick(async () => {
           if (!this.plugin.settings.serverUrl) {
-            new import_obsidian.Notice("\u8BF7\u5148\u8F93\u5165\u670D\u52A1\u5668\u5730\u5740\u3002");
-            return;
+            if (this.plugin.settings.serverInstanceId !== null) return;
+            this.plugin.settings.serverUrl = DEFAULT_SERVER_URL;
+            await this.plugin.saveSettings();
           }
           if (!this.connectionCode) {
             new import_obsidian.Notice("\u8BF7\u7C98\u8D34\u8FDE\u63A5\u7801\u3002");
@@ -16175,7 +16179,7 @@ var AgentWikiSyncSettingTab = class extends import_obsidian.PluginSettingTab {
     }
   }
   renderMappingSection() {
-    new import_obsidian.Setting(this.containerEl).setName("\u7A7A\u95F4\u6620\u5C04").setHeading();
+    this.containerEl.createEl("h3", { text: "\u7A7A\u95F4\u6620\u5C04" });
     for (const mapping of this.plugin.settings.mappings) {
       const space = this.availableSpaces?.find(
         (s) => s.spaceId === mapping.spaceId
@@ -16849,13 +16853,16 @@ var ConnectionService = class {
     const serverUrl = normalizeServerUrl(input.serverUrl);
     const existing = await this.readJournal();
     if (existing) {
-      if (existing.serverUrl !== serverUrl || existing.deviceId !== input.deviceId || existing.vaultId !== input.vaultId || existing.pluginVersion !== input.pluginVersion)
-        throw new Error("\u5F85\u5904\u7406\u8FDE\u63A5\u8EAB\u4EFD\u4E0D\u5339\u914D");
-      const storedCode = this.secrets.get(existing.codeSecretId);
-      if (input.code && storedCode !== input.code) {
+      const identityMatches = existing.serverUrl === serverUrl && existing.deviceId === input.deviceId && existing.vaultId === input.vaultId && existing.pluginVersion === input.pluginVersion;
+      if (!identityMatches) {
         await this.discardPendingConnection(existing);
       } else {
-        return this.resume(existing, input.code);
+        const storedCode = this.secrets.get(existing.codeSecretId);
+        if (input.code && storedCode !== input.code) {
+          await this.discardPendingConnection(existing);
+        } else {
+          return this.resume(existing, input.code);
+        }
       }
     }
     const codeSecretId = `agentwiki-sync-secret-${randomHex(16)}`;
@@ -17875,7 +17882,10 @@ var GenerationRepository = class {
       );
       if (body === null)
         body = await this.store.read(
-          this.path(generationId, `base/${await opaqueFileKey(page.pageId)}.md`)
+          this.path(
+            generationId,
+            `base/${await opaqueFileKey(page.pageId)}.md`
+          )
         );
       if (body === null || await contentHash(body) !== page.contentHash)
         throw new Error("\u57FA\u7EBF\u635F\u574F: \u57FA\u7840\u54C8\u5E0C\u4E0D\u5339\u914D");
@@ -20137,25 +20147,21 @@ var AgentWikiSyncPlugin = class extends import_obsidian5.Plugin {
     const deviceId = await deviceState.getOrCreateDeviceId();
     const identity = new VaultIdentityService(shared, local);
     const vaultId = await identity.getOrCreate();
-    try {
-      const result = await new ConnectionService(
-        new RequestUrlHttp(),
-        new ObsidianSecrets(this.app),
-        local
-      ).connect({
-        serverUrl: this.settings.serverUrl,
-        code,
-        deviceId,
-        deviceName: this.app.vault.getName(),
-        vaultId,
-        pluginVersion: this.manifest.version
-      });
-      this.settings.serverInstanceId = result.serverInstanceId;
-      await identity.bind(vaultId);
-      await this.saveSettings();
-    } catch (error51) {
-      new import_obsidian5.Notice(userErrorMessage(error51));
-    }
+    const result = await new ConnectionService(
+      new RequestUrlHttp(),
+      new ObsidianSecrets(this.app),
+      local
+    ).connect({
+      serverUrl: this.settings.serverUrl,
+      code,
+      deviceId,
+      deviceName: this.app.vault.getName(),
+      vaultId,
+      pluginVersion: this.manifest.version
+    });
+    this.settings.serverInstanceId = result.serverInstanceId;
+    await identity.bind(vaultId);
+    await this.saveSettings();
   }
   async listAccessibleSpaces() {
     const local = new ObsidianLocalControlStore(this.app);

@@ -130,7 +130,10 @@ export class GenerationRepository {
       );
       if (body === null)
         body = await this.store.read(
-          this.path(generationId, `base/${await opaqueFileKey(page.pageId)}.md`),
+          this.path(
+            generationId,
+            `base/${await opaqueFileKey(page.pageId)}.md`,
+          ),
         );
       if (body === null || (await contentHash(body)) !== page.contentHash)
         throw new Error("基线损坏: 基础哈希不匹配");

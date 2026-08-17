@@ -96,8 +96,8 @@ describe("immutable generations", () => {
       baseRevision: "r1",
       baseRevisionContentHash: await revisionContentHash(protocolManifest),
       basePageCount: 1,
-      baseRevisionManifestByteLength: canonicalBytes(protocolManifest)
-        .byteLength,
+      baseRevisionManifestByteLength:
+        canonicalBytes(protocolManifest).byteLength,
       baseRevisionBodyBytes: new TextEncoder().encode(body).byteLength,
       lastSuccessfulSyncAt: "2026-08-14T00:00:00.000Z",
       pages: {

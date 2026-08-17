@@ -1,7 +1,7 @@
 {
   "id": "agentwiki-sync",
   "name": "AgentWiki Sync",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "minAppVersion": "1.11.5",
   "description": "Synchronize mapped vault folders with AgentWiki spaces.",
   "author": "NeoMei",

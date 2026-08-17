@@ -41,10 +41,7 @@ describe("manual multi-device sync", () => {
         updatedAt: "2026-08-14T00:00:00.000Z",
       },
     ]);
-    await vault.write(
-      "Wiki/Guide.md",
-      new TextEncoder().encode("one\nTWO"),
-    );
+    await vault.write("Wiki/Guide.md", new TextEncoder().encode("one\nTWO"));
 
     const rebase = await runtime.previewPull();
     expect(rebase.conflicts.length).toBeGreaterThan(0);
@@ -92,10 +89,7 @@ describe("manual multi-device sync", () => {
         updatedAt: "2026-08-14T00:00:00.000Z",
       },
     ]);
-    await vault.write(
-      "Wiki/Guide.md",
-      new TextEncoder().encode("one\nTWO"),
-    );
+    await vault.write("Wiki/Guide.md", new TextEncoder().encode("one\nTWO"));
 
     const pull = await runtime.previewPull();
     expect(pull.conflicts.length).toBeGreaterThan(0);

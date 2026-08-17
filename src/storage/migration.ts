@@ -134,8 +134,7 @@ export class StorageMigration {
         // 验证内容哈希是否匹配 manifest
         if (
           page.contentHash &&
-          (await contentHash(hashContent)) !==
-            page.contentHash
+          (await contentHash(hashContent)) !== page.contentHash
         )
           throw new Error(`迁移内容哈希不匹配：${hashPath}`);
 
@@ -211,8 +210,7 @@ export class StorageMigration {
         // 验证内容哈希是否匹配 journal
         if (
           change.contentHash &&
-          (await contentHash(hashContent)) !==
-            change.contentHash
+          (await contentHash(hashContent)) !== change.contentHash
         )
           throw new Error(`迁移内容哈希不匹配：${hashPath}`);
 

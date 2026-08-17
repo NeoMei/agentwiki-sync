@@ -203,25 +203,21 @@ export default class AgentWikiSyncPlugin extends Plugin {
     const deviceId = await deviceState.getOrCreateDeviceId();
     const identity = new VaultIdentityService(shared, local);
     const vaultId = await identity.getOrCreate();
-    try {
-      const result = await new ConnectionService(
-        new RequestUrlHttp(),
-        new ObsidianSecrets(this.app),
-        local,
-      ).connect({
-        serverUrl: this.settings.serverUrl,
-        code,
-        deviceId,
-        deviceName: this.app.vault.getName(),
-        vaultId,
-        pluginVersion: this.manifest.version,
-      });
-      this.settings.serverInstanceId = result.serverInstanceId;
-      await identity.bind(vaultId);
-      await this.saveSettings();
-    } catch (error) {
-      new Notice(userErrorMessage(error));
-    }
+    const result = await new ConnectionService(
+      new RequestUrlHttp(),
+      new ObsidianSecrets(this.app),
+      local,
+    ).connect({
+      serverUrl: this.settings.serverUrl,
+      code,
+      deviceId,
+      deviceName: this.app.vault.getName(),
+      vaultId,
+      pluginVersion: this.manifest.version,
+    });
+    this.settings.serverInstanceId = result.serverInstanceId;
+    await identity.bind(vaultId);
+    await this.saveSettings();
   }
   async listAccessibleSpaces(): Promise<SyncSpaceSummary[]> {
     const local = new ObsidianLocalControlStore(this.app);
@@ -546,9 +542,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
         new Notice("已按服务器内容更新本地。");
       },
       () => {
-        void runtime
-          .discardPullPreview(preview)
-          .finally(() => flow.finish());
+        void runtime.discardPullPreview(preview).finally(() => flow.finish());
       },
     ).open();
   }
@@ -585,8 +579,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
     const needsResolution =
       preview.conflicts.some(
         (item) => !preview.conflictResolutions[item.conflictId],
-      ) ||
-      preview.initialBindings.some((item) => item.resolution === null);
+      ) || preview.initialBindings.some((item) => item.resolution === null);
     new PreviewModal(
       this.app,
       needsResolution ? "自动合并 — 处理冲突与绑定" : "自动合并 — 拉取预览",

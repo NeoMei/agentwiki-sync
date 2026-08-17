@@ -178,20 +178,25 @@ export class ConnectionService {
     const serverUrl = normalizeServerUrl(input.serverUrl);
     const existing = await this.readJournal();
     if (existing) {
-      if (
-        existing.serverUrl !== serverUrl ||
-        existing.deviceId !== input.deviceId ||
-        existing.vaultId !== input.vaultId ||
-        existing.pluginVersion !== input.pluginVersion
-      )
-        throw new Error("待处理连接身份不匹配");
-      // A fresh, different code supersedes the failed attempt: discard
-      // dead secrets instead of replaying them and getting stuck.
-      const storedCode = this.secrets.get(existing.codeSecretId);
-      if (input.code && storedCode !== input.code) {
+      const identityMatches =
+        existing.serverUrl === serverUrl &&
+        existing.deviceId === input.deviceId &&
+        existing.vaultId === input.vaultId &&
+        existing.pluginVersion === input.pluginVersion;
+      if (!identityMatches) {
+        // A journal from a different server/device/vault/plugin version can
+        // never be resumed in this context. Discard it and start fresh with
+        // the user's new code instead of blocking the connection forever.
         await this.discardPendingConnection(existing);
       } else {
-        return this.resume(existing, input.code);
+        // A fresh, different code supersedes the failed attempt: discard
+        // dead secrets instead of replaying them and getting stuck.
+        const storedCode = this.secrets.get(existing.codeSecretId);
+        if (input.code && storedCode !== input.code) {
+          await this.discardPendingConnection(existing);
+        } else {
+          return this.resume(existing, input.code);
+        }
       }
     }
     const codeSecretId = `agentwiki-sync-secret-${randomHex(16)}`;
