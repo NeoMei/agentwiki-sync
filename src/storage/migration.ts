@@ -3,6 +3,64 @@ import { isValidSyncPath } from "../core/sync-path";
 import { contentHash } from "../agentwiki/protocol";
 import type { ControlStorePort } from "../ports/control-store";
 
+interface ManifestRecord {
+  pages: Record<string, PageRecord>;
+}
+
+interface PageRecord {
+  relativePath: string;
+  contentHash?: string;
+}
+
+interface JournalRecord {
+  payload: { changes: ChangeRecord[] };
+}
+
+interface ChangeRecord {
+  operation: string;
+  pageId: string;
+  path?: string;
+  contentHash?: string;
+}
+
+function isManifestRecord(value: unknown): value is ManifestRecord {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "pages" in value &&
+    typeof (value as ManifestRecord).pages === "object" &&
+    (value as ManifestRecord).pages !== null
+  );
+}
+
+function isPageRecord(value: unknown): value is PageRecord {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as PageRecord).relativePath === "string"
+  );
+}
+
+function isJournalRecord(value: unknown): value is JournalRecord {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "payload" in value &&
+    typeof (value as JournalRecord).payload === "object" &&
+    (value as JournalRecord).payload !== null &&
+    Array.isArray((value as JournalRecord).payload.changes)
+  );
+}
+
+function isChangeRecord(value: unknown): value is ChangeRecord {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as ChangeRecord).operation === "string" &&
+    typeof (value as ChangeRecord).pageId === "string"
+  );
+}
+
 /**
  * 迁移工具：将哈希文件名迁移到可读文件名
  *
@@ -34,16 +92,20 @@ export class StorageMigration {
         return result;
       }
 
-      const manifest = JSON.parse(manifestRaw);
-      if (!manifest.pages || typeof manifest.pages !== "object") {
+      const manifest: unknown = JSON.parse(manifestRaw);
+      if (!isManifestRecord(manifest)) {
         result.errors.push(`Invalid manifest: missing pages`);
         return result;
       }
 
       // 迁移每个页面
       for (const [pageId, page] of Object.entries(manifest.pages)) {
-        const pageData = page as { pageId: string; relativePath: string };
-        const hashFileName = `p-${await opaqueFileKey(pageId)}.md`;
+        if (!isPageRecord(page)) {
+          result.skipped++;
+          continue;
+        }
+        const pageData = page;
+        const hashFileName = `${await opaqueFileKey(pageId)}.md`;
         const hashPath = `${generationRoot}/generations/${generationId}/base/${hashFileName}`;
 
         // 检查是否使用可读路径
@@ -71,9 +133,8 @@ export class StorageMigration {
 
         // 验证内容哈希是否匹配 manifest
         if (
-          (page as { contentHash?: string }).contentHash &&
-          (await contentHash(hashContent)) !==
-            (page as { contentHash: string }).contentHash
+          page.contentHash &&
+          (await contentHash(hashContent)) !== page.contentHash
         )
           throw new Error(`迁移内容哈希不匹配：${hashPath}`);
 
@@ -111,19 +172,17 @@ export class StorageMigration {
         return result;
       }
 
-      const journal = JSON.parse(journalRaw);
-      if (
-        !journal.payload?.changes ||
-        !Array.isArray(journal.payload.changes)
-      ) {
+      const journal: unknown = JSON.parse(journalRaw);
+      if (!isJournalRecord(journal)) {
         return result;
       }
 
       // 迁移每个 change
       for (const change of journal.payload.changes) {
+        if (!isChangeRecord(change)) continue;
         if (change.operation !== "upsert") continue;
 
-        const hashFileName = `p-${await opaqueFileKey(change.pageId)}.md`;
+        const hashFileName = `${await opaqueFileKey(change.pageId)}.md`;
         const hashPath = `${pushRoot}/payload/${hashFileName}`;
 
         // 检查是否使用可读路径
@@ -150,9 +209,8 @@ export class StorageMigration {
 
         // 验证内容哈希是否匹配 journal
         if (
-          (change as { contentHash?: string }).contentHash &&
-          (await contentHash(hashContent)) !==
-            (change as { contentHash: string }).contentHash
+          change.contentHash &&
+          (await contentHash(hashContent)) !== change.contentHash
         )
           throw new Error(`迁移内容哈希不匹配：${hashPath}`);
 
@@ -173,4 +231,3 @@ export class StorageMigration {
     return result;
   }
 }
-

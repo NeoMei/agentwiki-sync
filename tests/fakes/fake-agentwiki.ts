@@ -2,6 +2,7 @@ import {
   canonicalBytes,
   contentHash,
   revisionContentHash,
+  type DeltaItem,
   type PushBatch,
   type SyncCapabilities,
   type SyncPage,
@@ -37,6 +38,7 @@ export class FakeAgentWiki implements PushRemotePort {
   private revision = 0;
   private readonly pages = new Map<string, SyncPage>();
   private readonly sessions = new Map<string, Session>();
+  private readonly changeLog: Array<{ revision: number; item: DeltaItem }> = [];
   async getHead(): Promise<{ revision: string; pageCount?: string }> {
     return {
       revision: String(this.revision),
@@ -94,6 +96,27 @@ export class FakeAgentWiki implements PushRemotePort {
           });
       }
     this.revision += 1;
+    for (const batch of [...session.batches.values()].sort(
+      (a, b) => a.batchIndex - b.batchIndex,
+    ))
+      for (const change of batch.changes) {
+        if (change.operation === "archive")
+          this.changeLog.push({
+            revision: this.revision,
+            item: {
+              operation: "archive",
+              pageId: change.pageId,
+              previousPath: change.previousPath,
+            },
+          });
+        else {
+          const page = this.pages.get(change.pageId)!;
+          this.changeLog.push({
+            revision: this.revision,
+            item: { operation: "upsert", page: { ...page } },
+          });
+        }
+      }
     const manifest = {
       protocolVersion: "1" as const,
       spaceId: this.spaceId,
@@ -163,15 +186,43 @@ export class FakeAgentWiki implements PushRemotePort {
       items,
     };
   }
+  async delta(
+    fromRevision: string,
+  ): Promise<{ toRevision: string; items: DeltaItem[] }> {
+    const from = Number(fromRevision);
+    return {
+      toRevision: String(this.revision),
+      items: this.changeLog
+        .filter((entry) => entry.revision > from)
+        .map((entry) => entry.item),
+    };
+  }
   async seed(pages: SyncPage[]): Promise<void> {
     this.pages.clear();
     for (const page of pages) this.pages.set(page.pageId, { ...page });
     this.revision = pages.length > 0 ? 1 : 0;
   }
   async replace(pages: SyncPage[]): Promise<void> {
+    const previousIds = new Set(this.pages.keys());
     this.pages.clear();
     for (const page of pages) this.pages.set(page.pageId, { ...page });
     this.revision += 1;
+    for (const pageId of previousIds)
+      if (!this.pages.has(pageId)) {
+        this.changeLog.push({
+          revision: this.revision,
+          item: {
+            operation: "archive",
+            pageId,
+            previousPath: "unknown.md",
+          },
+        });
+      }
+    for (const page of this.pages.values())
+      this.changeLog.push({
+        revision: this.revision,
+        item: { operation: "upsert", page: { ...page } },
+      });
   }
   async advanceEmptyRevision(): Promise<void> {
     this.revision += 1;

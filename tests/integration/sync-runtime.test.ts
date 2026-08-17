@@ -7,6 +7,53 @@ import { contentHash } from "../../src/agentwiki/protocol";
 import { PushService } from "../../src/application/push-service";
 
 describe("SyncRuntime", () => {
+  it("reports remote delta items since the base revision", async () => {
+    const remote = new FakeAgentWiki();
+    const body = "hello";
+    await remote.seed([
+      {
+        pageId: "p1",
+        path: "Guide.md",
+        title: "Guide",
+        body,
+        contentHash: await contentHash(body),
+        updatedAt: "2026-08-14T00:00:00.000Z",
+      },
+    ]);
+    const vault = new MemoryVault({});
+    const runtime = new SyncRuntime(vault, new MemoryControlStore(), remote, {
+      spaceId: "space",
+      rootPath: "Wiki",
+      status: "pending",
+    });
+    const pullPreview = await runtime.previewPull();
+    await runtime.applyPull(pullPreview);
+
+    const clean = await runtime.remoteDelta();
+    expect(clean.ahead).toBe(false);
+    expect(clean.items).toHaveLength(0);
+
+    const nextBody = "hello v2";
+    await remote.replace([
+      {
+        pageId: "p1",
+        path: "Guide.md",
+        title: "Guide",
+        body: nextBody,
+        contentHash: await contentHash(nextBody),
+        updatedAt: "2026-08-14T00:00:00.000Z",
+      },
+    ]);
+    const ahead = await runtime.remoteDelta();
+    expect(ahead.ahead).toBe(true);
+    expect(ahead.listed).toBe(true);
+    expect(ahead.items).toHaveLength(1);
+    expect(ahead.items[0]).toMatchObject({
+      operation: "upsert",
+      page: { path: "Guide.md" },
+    });
+  });
+
   it("clones a pending remote mapping, then reports clean", async () => {
     const remote = new FakeAgentWiki();
     const seed = "hello";
