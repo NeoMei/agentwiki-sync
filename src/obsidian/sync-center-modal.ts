@@ -36,6 +36,7 @@ export class SyncCenterModal extends Modal {
     private readonly handlers: SyncCenterHandlers,
   ) {
     super(app);
+    this.modalEl.addClass("agentwiki-sync-modal");
   }
 
   override onOpen(): void {
@@ -156,7 +157,7 @@ export class SyncCenterModal extends Modal {
   }
 
   private renderActions(): void {
-    new Setting(this.contentEl)
+    const actions = new Setting(this.contentEl)
       .setDesc(
         "自动合并保留双方不冲突的修改，冲突时可在预览中逐项选择；使用本地/服务器内容会在冲突处直接采用所选一侧。",
       )
@@ -179,6 +180,7 @@ export class SyncCenterModal extends Modal {
           .setDisabled(this.running)
           .onClick(() => void this.run("server")),
       );
+    actions.controlEl?.addClass("agentwiki-sync-actions");
     new Setting(this.contentEl).addButton((button) =>
       button
         .setButtonText("刷新差异")

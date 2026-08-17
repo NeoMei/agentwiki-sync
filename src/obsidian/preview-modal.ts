@@ -29,6 +29,7 @@ export class PreviewModal extends Modal {
     private readonly pullPreview: PullPreview | null = null,
   ) {
     super(app);
+    this.modalEl.addClass("agentwiki-sync-modal");
   }
   onClose(): void {
     if (!this.released) {
