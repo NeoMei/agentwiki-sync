@@ -274,6 +274,13 @@ export class SyncRuntime {
   ): Promise<void> {
     const prefix = `${this.mapping.rootPath}/`;
     if (!fromPath.startsWith(prefix) || !toPath.startsWith(prefix)) return;
+    // Internal pull transactions rename through .agentwiki-tmp-* sidecars;
+    // those moves describe protocol mechanics, not user intent.
+    if (
+      fromPath.includes(".agentwiki-tmp-") ||
+      toPath.includes(".agentwiki-tmp-")
+    )
+      return;
     const base = await this.readBase();
     const page = Object.values(base.pages).find(
       (item) =>
@@ -1054,16 +1061,30 @@ export class SyncRuntime {
         (item) => item.field === "archive",
       );
       if (archiveConflict) {
-        if (
-          preview.conflictResolutions[archiveConflict.conflictId]!.choice !==
-            "local" &&
-          local
-        )
+        const archiveResolution =
+          preview.conflictResolutions[archiveConflict.conflictId]!;
+        if (archiveResolution.choice === "remote" && local)
           actions.push({
             kind: "trash",
             path: joinRoot(this.mapping.rootPath, local.relativePath),
           });
         else if (local) {
+          if (archiveResolution.choice === "manual") {
+            const manualBody = await this.conflictValue(
+              preview,
+              archiveConflict,
+              archiveResolution,
+            );
+            const currentBody = await this.localBody(local);
+            if (manualBody !== currentBody)
+              actions.push(
+                await this.resultAction(
+                  "write",
+                  joinRoot(this.mapping.rootPath, local.relativePath),
+                  manualBody,
+                ),
+              );
+          }
           restoreEntries[pageId] = {
             intent: "restore",
             pageId,

@@ -22,7 +22,7 @@ import {
   ObsidianVaultPort,
   RequestUrlHttp,
 } from "./obsidian/adapters";
-import { AgentWikiClient } from "./agentwiki/client";
+import { AgentWikiClient, normalizeServerUrl } from "./agentwiki/client";
 import { AgentWikiPushRemote } from "./agentwiki/push-remote";
 import { SyncRuntime } from "./application/sync-runtime";
 import {
@@ -96,11 +96,9 @@ export default class AgentWikiSyncPlugin extends Plugin {
       isConnectionState,
     ).read();
     if (connection) {
-      if (
-        this.settings.serverUrl &&
-        this.settings.serverUrl !== connection.payload.serverUrl
-      )
-        throw new Error("连接与设备设置的服务器不匹配");
+      // The connected state is authoritative. A settings URL that differs
+      // only by normalization (host case, default port) must self-heal;
+      // throwing here would brick onload before any settings UI exists.
       this.settings.serverUrl = connection.payload.serverUrl;
       this.settings.serverInstanceId = connection.payload.serverInstanceId;
       await new VaultIdentityService(
@@ -203,18 +201,20 @@ export default class AgentWikiSyncPlugin extends Plugin {
     const deviceId = await deviceState.getOrCreateDeviceId();
     const identity = new VaultIdentityService(shared, local);
     const vaultId = await identity.getOrCreate();
+    const serverUrl = normalizeServerUrl(this.settings.serverUrl);
     const result = await new ConnectionService(
       new RequestUrlHttp(),
       new ObsidianSecrets(this.app),
       local,
     ).connect({
-      serverUrl: this.settings.serverUrl,
+      serverUrl,
       code,
       deviceId,
       deviceName: this.app.vault.getName(),
       vaultId,
       pluginVersion: this.manifest.version,
     });
+    this.settings.serverUrl = serverUrl;
     this.settings.serverInstanceId = result.serverInstanceId;
     await identity.bind(vaultId);
     await this.saveSettings();
