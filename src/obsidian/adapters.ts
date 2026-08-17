@@ -56,6 +56,9 @@ export class ObsidianControlStore implements ControlStorePort {
     const safe = safeControlPath(path);
     if (await this.adapter.exists(safe)) await this.adapter.rmdir(safe, true);
   }
+  async list(path: string): Promise<{ files: string[]; folders: string[] }> {
+    return this.adapter.list(safeControlPath(path));
+  }
 }
 
 export class ObsidianLocalControlStore implements ControlStorePort {

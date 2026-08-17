@@ -426,6 +426,55 @@ describe("SyncRuntime", () => {
     ]);
   });
 
+  it("prunes stale generations after each committed baseline", async () => {
+    const remote = new FakeAgentWiki();
+    await remote.seed([
+      {
+        pageId: "p1",
+        path: "A.md",
+        title: "A",
+        body: "base",
+        contentHash: await contentHash("base"),
+        updatedAt: "2026-08-14T00:00:00.000Z",
+      },
+    ]);
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = new SyncRuntime(vault, control, remote, {
+      spaceId: "space",
+      rootPath: "Wiki",
+      status: "pending",
+    });
+    const generationsRoot =
+      ".agentwiki/devices/d-local/spaces/s-space/generations";
+    const countGenerations = async () =>
+      (await control.list(generationsRoot)).folders.length;
+
+    await runtime.applyPull(await runtime.previewPull());
+    expect(await countGenerations()).toBe(1);
+
+    await vault.write("Wiki/A.md", new TextEncoder().encode("local v2"));
+    await runtime.applyPush(await runtime.previewPush());
+    expect(await countGenerations()).toBe(2);
+
+    const nextBody = "remote v3";
+    await remote.replace([
+      {
+        pageId: "p1",
+        path: "A.md",
+        title: "A",
+        body: nextBody,
+        contentHash: await contentHash(nextBody),
+        updatedAt: "2026-08-15T00:00:00.000Z",
+      },
+    ]);
+    await runtime.applyPull(await runtime.previewPull());
+
+    // Older generations that no pointer candidate or journal references
+    // must be pruned instead of accumulating on every sync.
+    expect(await countGenerations()).toBeLessThanOrEqual(3);
+  });
+
   it("returns clean without creating an empty push session", async () => {
     const remote = new FakeAgentWiki();
     const runtime = new SyncRuntime(

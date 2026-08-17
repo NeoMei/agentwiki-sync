@@ -1,4 +1,5 @@
 import { Modal, Notice, Setting, type App } from "obsidian";
+import { userErrorMessage } from "../core/user-errors";
 import type {
   InitialBindingChoice,
   PullPreview,
@@ -103,9 +104,7 @@ export class PreviewModal extends Modal {
               await this.confirm();
               this.close();
             } catch (error) {
-              new Notice(
-                `同步失败：${error instanceof Error ? error.message : "未知错误"}`,
-              );
+              new Notice(`同步失败：${userErrorMessage(error)}`);
             } finally {
               button.setDisabled(false);
             }

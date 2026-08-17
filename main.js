@@ -16119,13 +16119,16 @@ var AgentWikiSyncSettingTab = class extends import_obsidian.PluginSettingTab {
   }
   connectionCode = "";
   availableSpaces = null;
+  spacesError = null;
   selectedSpaceId = "";
   display() {
     this.containerEl.empty();
+    this.containerEl.addClass("agentwiki-sync-settings");
+    if (this.plugin.settings.serverInstanceId === null) this.spacesError = null;
     this.renderConnectionSection();
     this.renderMappingSection();
     this.renderDisconnectSection();
-    if (this.plugin.settings.serverInstanceId !== null && !this.availableSpaces) {
+    if (this.plugin.settings.serverInstanceId !== null && !this.availableSpaces && !this.spacesError) {
       void this.loadSpaces();
     }
   }
@@ -16206,7 +16209,16 @@ var AgentWikiSyncSettingTab = class extends import_obsidian.PluginSettingTab {
       return;
     }
     if (this.availableSpaces === null) {
-      this.containerEl.createEl("p", { text: "\u6B63\u5728\u52A0\u8F7D\u7A7A\u95F4\u5217\u8868\u2026" });
+      this.containerEl.createEl("p", {
+        text: this.spacesError ?? "\u6B63\u5728\u52A0\u8F7D\u7A7A\u95F4\u5217\u8868\u2026"
+      });
+      if (this.spacesError)
+        new import_obsidian.Setting(this.containerEl).addButton(
+          (button) => button.setButtonText("\u91CD\u8BD5").onClick(() => {
+            this.spacesError = null;
+            this.display();
+          })
+        );
       return;
     }
     if (this.availableSpaces.length === 0) {
@@ -16284,8 +16296,9 @@ var AgentWikiSyncSettingTab = class extends import_obsidian.PluginSettingTab {
       const spaces = await this.plugin.listAccessibleSpaces();
       this.availableSpaces = spaces;
       this.display();
-    } catch {
-      this.availableSpaces = [];
+    } catch (error51) {
+      this.spacesError = `\u7A7A\u95F4\u5217\u8868\u52A0\u8F7D\u5931\u8D25\uFF1A${userErrorMessage(error51)}`;
+      this.availableSpaces = null;
       this.display();
     }
   }
@@ -16556,9 +16569,7 @@ var PreviewModal = class extends import_obsidian3.Modal {
           await this.confirm();
           this.close();
         } catch (error51) {
-          new import_obsidian3.Notice(
-            `\u540C\u6B65\u5931\u8D25\uFF1A${error51 instanceof Error ? error51.message : "\u672A\u77E5\u9519\u8BEF"}`
-          );
+          new import_obsidian3.Notice(`\u540C\u6B65\u5931\u8D25\uFF1A${userErrorMessage(error51)}`);
         } finally {
           button.setDisabled(false);
         }
@@ -17128,6 +17139,9 @@ var ObsidianControlStore = class {
   async removeTree(path) {
     const safe = safeControlPath(path);
     if (await this.adapter.exists(safe)) await this.adapter.rmdir(safe, true);
+  }
+  async list(path) {
+    return this.adapter.list(safeControlPath(path));
   }
 };
 var ObsidianLocalControlStore = class {
@@ -18188,6 +18202,34 @@ var BaselineRepository = class {
       manifestHash
     });
     await this.journal.write({ ...current.payload, phase: "committed" });
+    await this.pruneGenerations();
+  }
+  /**
+   * 每次同步都会写入一份完整的 generation 快照；不清理会无限累积。
+   * 仅删除不被指针候选（current/.prev/.next）与基线日志引用的 generation，
+   * 保留集天然覆盖在途事务与回滚所需的最近两代。
+   */
+  async pruneGenerations() {
+    if (!this.store.list) return;
+    const keep = /* @__PURE__ */ new Set();
+    for (const candidate of await this.pointer.candidates())
+      if (candidate.payload.active) keep.add(candidate.payload.generationId);
+    const journal = await this.journal.read();
+    if (journal) {
+      keep.add(journal.payload.newGenerationId);
+      if (journal.payload.oldGenerationId)
+        keep.add(journal.payload.oldGenerationId);
+    }
+    const generationsRoot = `${this.root}/generations`;
+    const listing = await this.store.list(generationsRoot);
+    for (const folder of listing.folders) {
+      const id = folder.slice(generationsRoot.length + 1);
+      if (keep.has(id)) continue;
+      try {
+        await this.store.removeTree?.(folder);
+      } catch {
+      }
+    }
   }
   async recover(committedTransactionId) {
     const current = await this.journal.read();
