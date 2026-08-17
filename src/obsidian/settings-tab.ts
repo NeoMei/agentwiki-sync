@@ -14,6 +14,7 @@ const roleLabels: Record<SyncSpaceSummary["role"], string> = {
 export class AgentWikiSyncSettingTab extends PluginSettingTab {
   private connectionCode = "";
   private availableSpaces: SyncSpaceSummary[] | null = null;
+  private spacesError: string | null = null;
   private selectedSpaceId = "";
 
   constructor(
@@ -25,12 +26,15 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
 
   display(): void {
     this.containerEl.empty();
+    this.containerEl.addClass("agentwiki-sync-settings");
+    if (this.plugin.settings.serverInstanceId === null) this.spacesError = null;
     this.renderConnectionSection();
     this.renderMappingSection();
     this.renderDisconnectSection();
     if (
       this.plugin.settings.serverInstanceId !== null &&
-      !this.availableSpaces
+      !this.availableSpaces &&
+      !this.spacesError
     ) {
       void this.loadSpaces();
     }
@@ -147,7 +151,16 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
     }
 
     if (this.availableSpaces === null) {
-      this.containerEl.createEl("p", { text: "正在加载空间列表…" });
+      this.containerEl.createEl("p", {
+        text: this.spacesError ?? "正在加载空间列表…",
+      });
+      if (this.spacesError)
+        new Setting(this.containerEl).addButton((button) =>
+          button.setButtonText("重试").onClick(() => {
+            this.spacesError = null;
+            this.display();
+          }),
+        );
       return;
     }
 
@@ -245,8 +258,9 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
       const spaces = await this.plugin.listAccessibleSpaces();
       this.availableSpaces = spaces;
       this.display();
-    } catch {
-      this.availableSpaces = [];
+    } catch (error) {
+      this.spacesError = `空间列表加载失败：${userErrorMessage(error)}`;
+      this.availableSpaces = null;
       this.display();
     }
   }

@@ -21,4 +21,16 @@ export class MemoryControlStore implements ControlStorePort {
     for (const key of [...this.files.keys()])
       if (key === path || key.startsWith(`${path}/`)) this.files.delete(key);
   }
+  async list(path: string): Promise<{ files: string[]; folders: string[] }> {
+    const files: string[] = [];
+    const folders = new Set<string>();
+    for (const key of this.files.keys()) {
+      if (!key.startsWith(`${path}/`)) continue;
+      const rest = key.slice(path.length + 1);
+      const head = rest.split("/")[0]!;
+      if (rest.includes("/")) folders.add(`${path}/${head}`);
+      else files.push(key);
+    }
+    return { files, folders: [...folders] };
+  }
 }

@@ -4,4 +4,5 @@ export interface ControlStorePort {
   remove(path: string): Promise<void>;
   rename(from: string, to: string): Promise<void>;
   removeTree?(path: string): Promise<void>;
+  list?(path: string): Promise<{ files: string[]; folders: string[] }>;
 }

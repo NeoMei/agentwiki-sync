@@ -255,6 +255,35 @@ export class BaselineRepository {
       manifestHash,
     });
     await this.journal.write({ ...current.payload, phase: "committed" });
+    await this.pruneGenerations();
+  }
+  /**
+   * 每次同步都会写入一份完整的 generation 快照；不清理会无限累积。
+   * 仅删除不被指针候选（current/.prev/.next）与基线日志引用的 generation，
+   * 保留集天然覆盖在途事务与回滚所需的最近两代。
+   */
+  private async pruneGenerations(): Promise<void> {
+    if (!this.store.list) return;
+    const keep = new Set<string>();
+    for (const candidate of await this.pointer.candidates())
+      if (candidate.payload.active) keep.add(candidate.payload.generationId);
+    const journal = await this.journal.read();
+    if (journal) {
+      keep.add(journal.payload.newGenerationId);
+      if (journal.payload.oldGenerationId)
+        keep.add(journal.payload.oldGenerationId);
+    }
+    const generationsRoot = `${this.root}/generations`;
+    const listing = await this.store.list(generationsRoot);
+    for (const folder of listing.folders) {
+      const id = folder.slice(generationsRoot.length + 1);
+      if (keep.has(id)) continue;
+      try {
+        await this.store.removeTree?.(folder);
+      } catch {
+        // Best-effort: stale generations are inert and retried later.
+      }
+    }
   }
   async recover(committedTransactionId: string | null): Promise<void> {
     const current = await this.journal.read();
