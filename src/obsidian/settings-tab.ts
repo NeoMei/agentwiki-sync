@@ -2,6 +2,7 @@ import { Notice, PluginSettingTab, Setting, type App } from "obsidian";
 import type AgentWikiSyncPlugin from "../main";
 import { userErrorMessage } from "../core/user-errors";
 import type { SyncSpaceSummary } from "../agentwiki/protocol";
+import { DEFAULT_SERVER_URL } from "../application/settings";
 
 const roleLabels: Record<SyncSpaceSummary["role"], string> = {
   viewer: "只读",
@@ -47,7 +48,12 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
       .addText((text) =>
         text
           .setPlaceholder("https://agentwiki.quukk.com")
-          .setValue(this.plugin.settings.serverUrl)
+          .setValue(
+            this.plugin.settings.serverUrl ||
+              (this.plugin.settings.serverInstanceId === null
+                ? DEFAULT_SERVER_URL
+                : ""),
+          )
           .setDisabled(this.plugin.settings.serverInstanceId !== null)
           .onChange(async (value) => {
             if (this.plugin.settings.serverInstanceId !== null) return;
@@ -77,8 +83,9 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
             .setCta()
             .onClick(async () => {
               if (!this.plugin.settings.serverUrl) {
-                new Notice("请先输入服务器地址。");
-                return;
+                if (this.plugin.settings.serverInstanceId !== null) return;
+                this.plugin.settings.serverUrl = DEFAULT_SERVER_URL;
+                await this.plugin.saveSettings();
               }
               if (!this.connectionCode) {
                 new Notice("请粘贴连接码。");

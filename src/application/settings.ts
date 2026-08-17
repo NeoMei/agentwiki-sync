@@ -1,5 +1,7 @@
 import { validateMappings, type SpaceMapping } from "./sync-coordinator";
 
+export const DEFAULT_SERVER_URL = "https://agentwiki.quukk.com";
+
 export interface AgentWikiSyncSettings {
   schemaVersion: 1;
   serverUrl: string;
@@ -9,7 +11,7 @@ export interface AgentWikiSyncSettings {
 
 export const DEFAULT_SETTINGS: AgentWikiSyncSettings = {
   schemaVersion: 1,
-  serverUrl: "",
+  serverUrl: DEFAULT_SERVER_URL,
   serverInstanceId: null,
   mappings: [],
 };

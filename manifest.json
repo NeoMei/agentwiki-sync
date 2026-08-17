@@ -1,9 +1,9 @@
 {
   "id": "agentwiki-sync",
   "name": "AgentWiki Sync",
-  "version": "0.1.0",
+  "version": "0.2.3",
   "minAppVersion": "1.11.5",
-  "description": "Manually synchronize mapped Obsidian folders with AgentWiki.",
+  "description": "Synchronize mapped vault folders with AgentWiki spaces.",
   "author": "NeoMei",
   "isDesktopOnly": false
 }

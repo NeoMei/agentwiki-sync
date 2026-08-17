@@ -386,8 +386,10 @@ describe("AgentWiki connection", () => {
     expect(http.calls[0]?.canonicalBody).toEqual(canonicalBytes(batch));
   });
 
-  it("rejects a pending connection journal from another Vault", async () => {
+  it("discards a stale journal from another Vault and reconnects fresh", async () => {
+    const http = new FakeHttp();
     const control = new MemoryControlStore();
+    const secrets = new MemorySecrets();
     await control.write(
       "connection-journal.json",
       JSON.stringify({
@@ -403,20 +405,59 @@ describe("AgentWiki connection", () => {
         pluginVersion: "0.1.0",
       }),
     );
-    await expect(
-      new ConnectionService(
-        new FakeHttp(),
-        new MemorySecrets(),
-        control,
-      ).connect({
-        serverUrl: "https://wiki.example.com",
-        code: "code",
-        deviceId: "33333333-3333-4333-8333-333333333333",
-        deviceName: "Phone",
-        vaultId: "99999999-9999-4999-8999-999999999999",
-        pluginVersion: "0.1.0",
-      }),
-    ).rejects.toThrow(/身份不匹配/);
+    secrets.set("code", "old-code");
+    secrets.set("credential", "dead-credential");
+    const session = {
+      protocolVersion: "1",
+      serverInstanceId: "11111111-1111-4111-8111-111111111111",
+      credentialId: "22222222-2222-4222-8222-222222222222",
+      deviceId: "33333333-3333-4333-8333-333333333333",
+      deviceName: "Phone",
+      vaultId: "99999999-9999-4999-8999-999999999999",
+      createdAt: "2026-08-14T00:00:00.000Z",
+      lastUsedAt: "2026-08-14T00:00:00.000Z",
+      credentialStatus: "active",
+      provisionalExpiresAt: null,
+      user: { id: "u", displayName: "U" },
+      capabilities: FakeHttp.capabilities,
+    };
+    http.route("POST", "/api/integrations/obsidian/exchange", {
+      status: 201,
+      json: {
+        protocolVersion: "1",
+        serverInstanceId: session.serverInstanceId,
+        credentialId: session.credentialId,
+        credentialStatus: "provisional",
+        provisionalExpiresAt: "2026-08-14T01:00:00.000Z",
+        user: session.user,
+        capabilities: FakeHttp.capabilities,
+      },
+    });
+    http.route("GET", "/api/integrations/obsidian/session", {
+      status: 200,
+      json: session,
+    });
+    http.route(
+      "POST",
+      "/api/integrations/obsidian/credentials/current/activate",
+      {
+        status: 200,
+        json: { protocolVersion: "1", credentialStatus: "active" },
+      },
+    );
+    const result = await new ConnectionService(http, secrets, control).connect({
+      serverUrl: "https://wiki.example.com",
+      code: "c".repeat(27),
+      deviceId: "33333333-3333-4333-8333-333333333333",
+      deviceName: "Phone",
+      vaultId: "99999999-9999-4999-8999-999999999999",
+      pluginVersion: "0.1.0",
+    });
+    expect(result.credentialId).toBe(session.credentialId);
+    // The stale journal's secrets must be wiped, not replayed.
+    expect(secrets.get("code")).toBe("");
+    expect(secrets.get("credential")).toBe("");
+    expect(await control.read("connection-journal.json")).toBeNull();
   });
 });
 
