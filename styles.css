@@ -1,3 +1,51 @@
 .agentwiki-sync-progress {
   width: 100%;
 }
+
+/* ---- Mobile responsiveness ----
+   Obsidian adds .is-mobile (phones + tablets) and .is-phone (phones) to
+   <body>. All rules below are scoped to plugin surfaces so desktop layout
+   stays untouched. */
+
+/* Long paths, hashes and inline previews must wrap instead of overflowing. */
+.agentwiki-sync-modal li,
+.agentwiki-sync-modal .setting-description,
+.agentwiki-sync-settings .setting-description {
+  overflow-wrap: anywhere;
+}
+
+/* Let cramped control rows wrap onto the next line instead of clipping. */
+.is-mobile .agentwiki-sync-modal .setting-item-control,
+.is-mobile .agentwiki-sync-settings .setting-item-control {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  row-gap: 0.5em;
+}
+
+.is-mobile .agentwiki-sync-modal .setting-item-control button,
+.is-mobile .agentwiki-sync-settings .setting-item-control button {
+  flex: 1 1 auto;
+}
+
+/* Text-like controls fill the wrapped line on small screens. */
+.is-mobile .agentwiki-sync-modal input[type="text"],
+.is-mobile .agentwiki-sync-modal select,
+.is-mobile .agentwiki-sync-modal textarea,
+.is-mobile .agentwiki-sync-settings input[type="text"],
+.is-mobile .agentwiki-sync-settings select,
+.is-mobile .agentwiki-sync-settings textarea {
+  width: 100%;
+  max-width: 100%;
+}
+
+/* On phones the three sync strategies stack as full-width actions. */
+.is-phone .agentwiki-sync-actions {
+  display: grid;
+  grid-template-columns: 1fr;
+  width: 100%;
+  margin-inline-start: 0;
+}
+
+.is-phone .agentwiki-sync-actions button {
+  width: 100%;
+}

@@ -16298,6 +16298,7 @@ var SyncCenterModal = class extends import_obsidian2.Modal {
   constructor(app, handlers) {
     super(app);
     this.handlers = handlers;
+    this.modalEl.addClass("agentwiki-sync-modal");
   }
   diff = null;
   loadError = null;
@@ -16399,7 +16400,7 @@ var SyncCenterModal = class extends import_obsidian2.Modal {
       list.createEl("li", { text: `\u2715 ${path}` });
   }
   renderActions() {
-    new import_obsidian2.Setting(this.contentEl).setDesc(
+    const actions = new import_obsidian2.Setting(this.contentEl).setDesc(
       "\u81EA\u52A8\u5408\u5E76\u4FDD\u7559\u53CC\u65B9\u4E0D\u51B2\u7A81\u7684\u4FEE\u6539\uFF0C\u51B2\u7A81\u65F6\u53EF\u5728\u9884\u89C8\u4E2D\u9010\u9879\u9009\u62E9\uFF1B\u4F7F\u7528\u672C\u5730/\u670D\u52A1\u5668\u5185\u5BB9\u4F1A\u5728\u51B2\u7A81\u5904\u76F4\u63A5\u91C7\u7528\u6240\u9009\u4E00\u4FA7\u3002"
     ).addButton(
       (button) => button.setButtonText(this.running ? "\u6267\u884C\u4E2D\u2026" : "\u81EA\u52A8\u5408\u5E76\uFF08\u63A8\u8350\uFF09").setCta().setDisabled(this.running).onClick(() => void this.run("auto"))
@@ -16408,6 +16409,7 @@ var SyncCenterModal = class extends import_obsidian2.Modal {
     ).addButton(
       (button) => button.setButtonText("\u4F7F\u7528\u670D\u52A1\u5668\u5185\u5BB9").setDisabled(this.running).onClick(() => void this.run("server"))
     );
+    actions.controlEl?.addClass("agentwiki-sync-actions");
     new import_obsidian2.Setting(this.contentEl).addButton(
       (button) => button.setButtonText("\u5237\u65B0\u5DEE\u5F02").setDisabled(this.running).onClick(() => void this.refresh())
     );
@@ -16496,6 +16498,7 @@ var PreviewModal = class extends import_obsidian3.Modal {
     this.release = release;
     this.bindings = bindings;
     this.pullPreview = pullPreview;
+    this.modalEl.addClass("agentwiki-sync-modal");
   }
   released = false;
   bindingPage = 0;
