@@ -18920,6 +18920,8 @@ var SyncRuntime = class {
   async recordRenameNow(fromPath, toPath) {
     const prefix = `${this.mapping.rootPath}/`;
     if (!fromPath.startsWith(prefix) || !toPath.startsWith(prefix)) return;
+    if (fromPath.includes(".agentwiki-tmp-") || toPath.includes(".agentwiki-tmp-"))
+      return;
     const base = await this.readBase();
     const page = Object.values(base.pages).find(
       (item) => portablePathKey(item.relativePath) === portablePathKey(fromPath.slice(prefix.length))
@@ -19548,12 +19550,29 @@ var SyncRuntime = class {
         (item) => item.field === "archive"
       );
       if (archiveConflict) {
-        if (preview.conflictResolutions[archiveConflict.conflictId].choice !== "local" && local)
+        const archiveResolution = preview.conflictResolutions[archiveConflict.conflictId];
+        if (archiveResolution.choice === "remote" && local)
           actions.push({
             kind: "trash",
             path: joinRoot(this.mapping.rootPath, local.relativePath)
           });
         else if (local) {
+          if (archiveResolution.choice === "manual") {
+            const manualBody = await this.conflictValue(
+              preview,
+              archiveConflict,
+              archiveResolution
+            );
+            const currentBody2 = await this.localBody(local);
+            if (manualBody !== currentBody2)
+              actions.push(
+                await this.resultAction(
+                  "write",
+                  joinRoot(this.mapping.rootPath, local.relativePath),
+                  manualBody
+                )
+              );
+          }
           restoreEntries[pageId] = {
             intent: "restore",
             pageId,
@@ -20058,8 +20077,6 @@ var AgentWikiSyncPlugin = class extends import_obsidian5.Plugin {
       isConnectionState
     ).read();
     if (connection) {
-      if (this.settings.serverUrl && this.settings.serverUrl !== connection.payload.serverUrl)
-        throw new Error("\u8FDE\u63A5\u4E0E\u8BBE\u5907\u8BBE\u7F6E\u7684\u670D\u52A1\u5668\u4E0D\u5339\u914D");
       this.settings.serverUrl = connection.payload.serverUrl;
       this.settings.serverInstanceId = connection.payload.serverInstanceId;
       await new VaultIdentityService(
@@ -20150,18 +20167,20 @@ var AgentWikiSyncPlugin = class extends import_obsidian5.Plugin {
     const deviceId = await deviceState.getOrCreateDeviceId();
     const identity = new VaultIdentityService(shared, local);
     const vaultId = await identity.getOrCreate();
+    const serverUrl = normalizeServerUrl(this.settings.serverUrl);
     const result = await new ConnectionService(
       new RequestUrlHttp(),
       new ObsidianSecrets(this.app),
       local
     ).connect({
-      serverUrl: this.settings.serverUrl,
+      serverUrl,
       code,
       deviceId,
       deviceName: this.app.vault.getName(),
       vaultId,
       pluginVersion: this.manifest.version
     });
+    this.settings.serverUrl = serverUrl;
     this.settings.serverInstanceId = result.serverInstanceId;
     await identity.bind(vaultId);
     await this.saveSettings();

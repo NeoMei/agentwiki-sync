@@ -346,6 +346,86 @@ describe("SyncRuntime", () => {
     });
   });
 
+  it("keeps the local file with manual content when Manual is chosen for an archive conflict", async () => {
+    const remote = new FakeAgentWiki();
+    await remote.seed([
+      {
+        pageId: "p1",
+        path: "A.md",
+        title: "A",
+        body: "base",
+        contentHash: await contentHash("base"),
+        updatedAt: "2026-08-14T00:00:00.000Z",
+      },
+    ]);
+    const vault = new MemoryVault({});
+    const runtime = new SyncRuntime(vault, new MemoryControlStore(), remote, {
+      spaceId: "space",
+      rootPath: "Wiki",
+      status: "pending",
+    });
+    await runtime.applyPull(await runtime.previewPull());
+    await vault.write("Wiki/A.md", new TextEncoder().encode("local"));
+    await remote.replace([]);
+    const preview = await runtime.previewPull();
+    preview.conflictResolutions[preview.conflicts[0]!.conflictId] = {
+      choice: "manual",
+      manualValue: "manual final",
+    };
+    await runtime.applyPull(preview);
+    expect(vault.text("Wiki/A.md")).toBe("manual final");
+    const push = await runtime.previewPush();
+    expect(push.changes[0]).toMatchObject({
+      operation: "upsert",
+      pageId: "p1",
+      path: "A.md",
+    });
+  });
+
+  it("ignores internal temporary renames when recording move hints", async () => {
+    const remote = new FakeAgentWiki();
+    await remote.seed([
+      {
+        pageId: "p1",
+        path: "A.md",
+        title: "A",
+        body: "base",
+        contentHash: await contentHash("base"),
+        updatedAt: "2026-08-14T00:00:00.000Z",
+      },
+    ]);
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = new SyncRuntime(vault, control, remote, {
+      spaceId: "space",
+      rootPath: "Wiki",
+      status: "pending",
+    });
+    await runtime.applyPull(await runtime.previewPull());
+    await runtime.recordRename("Wiki/A.md", "Wiki/A.md.agentwiki-tmp-0");
+    const envelope = JSON.parse(
+      (await control.read(
+        ".agentwiki/devices/d-local/spaces/s-space/move-hints.json",
+      )) ?? "null",
+    ) as { payload?: { hints?: unknown[] } } | null;
+    expect(envelope?.payload?.hints ?? []).toHaveLength(0);
+    await vault.rename("Wiki/A.md", "Wiki/B.md");
+    await runtime.recordRename("Wiki/A.md", "Wiki/B.md");
+    const updated = JSON.parse(
+      (await control.read(
+        ".agentwiki/devices/d-local/spaces/s-space/move-hints.json",
+      ))!,
+    ) as { payload: { hints: Array<{ pageId: string; toPath: string }> } };
+    expect(updated.payload.hints).toEqual([
+      {
+        pageId: "p1",
+        fromPath: "A.md",
+        toPath: "B.md",
+        observedVaultByteHash: expect.any(String),
+      },
+    ]);
+  });
+
   it("returns clean without creating an empty push session", async () => {
     const remote = new FakeAgentWiki();
     const runtime = new SyncRuntime(
