@@ -49,8 +49,10 @@ export function userErrorMessage(error: unknown): string {
     const body = error.body as
       { error?: { code?: string; message?: string } } | undefined;
     const code = body?.error?.code;
-    if (code && errorMessages[code]) return errorMessages[code]!;
-    if (httpMessages[error.status]) return httpMessages[error.status]!;
+    const codeMessage = code ? errorMessages[code] : undefined;
+    if (codeMessage) return codeMessage;
+    const httpMessage = httpMessages[error.status];
+    if (httpMessage) return httpMessage;
     return `请求失败（${error.status}）。请稍后再试。`;
   }
   if (error instanceof TypeError && error.message.includes("Server URL")) {

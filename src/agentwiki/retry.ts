@@ -38,7 +38,7 @@ export async function retryRead<T>(
   operation: () => Promise<T>,
   policy = DEFAULT_RETRY_POLICY,
   sleep: (ms: number) => Promise<void> = (ms) =>
-    new Promise((resolve) => setTimeout(resolve, ms)),
+    new Promise((resolve) => window.setTimeout(resolve, ms)),
 ): Promise<T> {
   const started = Date.now();
   let last: unknown;

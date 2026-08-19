@@ -5,6 +5,21 @@ import type {
 
 export const PREVIEW_PAGE_SIZE = 100;
 
+export function canRunSyncStrategy(
+  canPublish: boolean,
+  strategy: "auto" | "local" | "server",
+): boolean {
+  return strategy === "server" || canPublish;
+}
+
+export function preferLocalPull(preview: PullPreview): void {
+  for (const conflict of preview.conflicts)
+    preview.conflictResolutions[conflict.conflictId] = { choice: "local" };
+  for (const binding of preview.initialBindings)
+    if (binding.resolution === null)
+      binding.resolution = binding.localPath ? "local" : "remote";
+}
+
 export interface LocalCandidate {
   path: string;
   vaultByteHash: string;

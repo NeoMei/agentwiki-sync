@@ -264,6 +264,19 @@ describe("ObsidianVaultPort", () => {
     expect(manager.trashed).toEqual(["Wiki/A.md"]);
     expect(vault.files.has("Wiki/A.md")).toBe(false);
   });
+
+  it("removes files through the FileManager to respect trash preferences", async () => {
+    const vault = new FakeVault({ "Wiki/A.md": "a" });
+    const manager = new FakeFileManager(vault);
+    const port = new ObsidianVaultPort(
+      vault as unknown as Vault,
+      manager as unknown as FileManager,
+      "Wiki",
+    );
+    await port.remove("Wiki/A.md");
+    expect(manager.trashed).toEqual(["Wiki/A.md"]);
+    expect(vault.files.has("Wiki/A.md")).toBe(false);
+  });
 });
 
 describe("RequestUrlHttp", () => {

@@ -5,7 +5,7 @@
 - 产品名称：`AgentWiki Sync`
 - Obsidian 插件 ID：`agentwiki-sync`
 - 设计确认日期：2026-08-13
-- 状态：已完成第六轮可实现性复审与修订，等待用户最终确认
+- 状态：已确认并实现；当前发布状态见 `README.md` 与验证记录
 - 依赖契约：[`docs/contracts/agentwiki-obsidian-sync-api-v1.md`](../../contracts/agentwiki-obsidian-sync-api-v1.md)
 
 ## 1. 背景与目标
@@ -823,7 +823,7 @@ pending identity store 使用 `pending-identities.json.next/.prev` 做同样的�
 ### 11.1 同步入口
 
 - 功能区图标打开轻量同步中心模态框。
-- 命令 ID 固定为 `status`、`pull`、`push`，显示名称为 `Status`、`Pull`、`Push`；不在显示名称中重复插件名，因为 Obsidian 会自动显示插件来源。
+- 命令 ID 固定为 `open-sync-center`，显示名称为「打开同步中心」；Status/Pull/Push 是同步中心内部用例，不再暴露为三个独立命令。
 - 活动文件可确定 Space 时直接使用该 Space，否则显示选择器。
 - 同步中心始终允许明确选择一个 Space。
 - 首版不提供 `Push All` 或 `Pull All`。
@@ -857,7 +857,7 @@ pending identity store 使用 `pending-identities.json.next/.prev` 做同样的�
 
 - 插件加载时不发起远端请求。
 - 文件事件只使本地状态缓存失效，并记录可靠的 rename hint。
-- 只有打开同步中心或执行 Status/Pull/Push 才访问网络。
+- 只有连接、打开/刷新同步中心或在预览中确认同步时才访问网络。
 - 不注册定时轮询。
 - 不在 Obsidian 启动或获得焦点时自动检查。
 

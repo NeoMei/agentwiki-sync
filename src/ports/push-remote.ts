@@ -59,6 +59,7 @@ export interface PushRemotePort {
     confirmationHash: string,
   ): Promise<FinalizeResult>;
   getSession(sessionId: string): Promise<PushSessionStatusInfo>;
+  abort?(sessionId: string): Promise<void>;
   snapshotPages?(revision?: string): AsyncIterable<{
     metadata: Omit<SnapshotPage, "items" | "nextCursor">;
     items: SyncPage[];
