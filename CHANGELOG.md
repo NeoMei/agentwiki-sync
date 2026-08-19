@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.7
+
+- 同步中心新增明确 Space 选择，pending 映射和只读 Space 也可正确 Pull；重复 Space 映射现在会被拒绝。
+- 文件打开事件不再自动访问服务器；仅显式连接、打开/刷新同步中心和确认同步会联网。
+- “使用本地内容”现在会先展示 Pull 最终动作并取得确认，不会在 Push 预览前提前改写 Vault。
+- 扫描、下载、合并和分批上传增加进度、事件循环让步与安全取消；finalize/Pull 事务原子阶段不可中断。
+- 修复 Obsidian Community 自动审核的设置页标题错误，并将用户文件移除统一交给 FileManager 以遵循回收站偏好。
+- 接入 Obsidian 官方 ESLint 审核规则，锁定运行时依赖并提交 lockfile，保证市场构建可复现。
+- 新增 GitHub Actions 自动构建、完整验证、Release 发布和 release asset provenance attestation。
+
 ## 0.2.6
 
 - 修复基线 generation 无限累积的存储泄漏：每次同步都会写入完整快照副本且从不清理，现在提交后自动清理不再被指针、回退候选或事务日志引用的旧 generation。

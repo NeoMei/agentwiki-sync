@@ -15,6 +15,7 @@ import {
   pageSlice,
   PREVIEW_PAGE_SIZE,
 } from "../../src/obsidian/preview-logic";
+import * as previewLogic from "../../src/obsidian/preview-logic";
 
 function binding(
   overrides: Partial<InitialBindingChoice> = {},
@@ -48,6 +49,55 @@ function preview(
     artifactRoots: [],
   };
 }
+
+describe("sync strategy permissions", () => {
+  it("keeps Pull available while disabling publish strategies for viewers", () => {
+    expect(previewLogic).toHaveProperty("canRunSyncStrategy");
+    const canRunSyncStrategy = (
+      previewLogic as typeof previewLogic & {
+        canRunSyncStrategy: (
+          canPublish: boolean,
+          strategy: "auto" | "local" | "server",
+        ) => boolean;
+      }
+    ).canRunSyncStrategy;
+    expect(canRunSyncStrategy(false, "server")).toBe(true);
+    expect(canRunSyncStrategy(false, "auto")).toBe(false);
+    expect(canRunSyncStrategy(false, "local")).toBe(false);
+    expect(canRunSyncStrategy(true, "auto")).toBe(true);
+  });
+
+  it("prepares local-preference resolutions without applying the Pull", () => {
+    expect(previewLogic).toHaveProperty("preferLocalPull");
+    const preferLocalPull = (
+      previewLogic as typeof previewLogic & {
+        preferLocalPull: (preview: PullPreview) => void;
+      }
+    ).preferLocalPull;
+    const value = preview();
+    value.conflicts = [
+      {
+        conflictId: "c1",
+        pageId: "p1",
+        field: "body",
+        base: "base",
+        local: "local",
+        remote: "remote",
+        wholeDocument: true,
+      },
+    ];
+    value.initialBindings = [
+      binding({ pageId: "local", localPath: "Local.md", resolution: null }),
+      binding({ pageId: "remote", localPath: null, resolution: null }),
+    ];
+    preferLocalPull(value);
+    expect(value.conflictResolutions.c1).toEqual({ choice: "local" });
+    expect(value.initialBindings.map((item) => item.resolution)).toEqual([
+      "local",
+      "remote",
+    ]);
+  });
+});
 
 describe("preview paging", () => {
   it("always reports at least one page and clamps out-of-range pages", () => {

@@ -1,4 +1,10 @@
-import { Modal, Notice, Setting, type App } from "obsidian";
+import {
+  Modal,
+  Notice,
+  Setting,
+  type App,
+  type ButtonComponent,
+} from "obsidian";
 import { userErrorMessage } from "../core/user-errors";
 import type {
   InitialBindingChoice,
@@ -15,16 +21,23 @@ import {
   pageSlice,
   PREVIEW_PAGE_SIZE,
 } from "./preview-logic";
+import {
+  progressLabel,
+  type SyncOperationOptions,
+} from "../application/progress";
 
 export class PreviewModal extends Modal {
   private released = false;
   private bindingPage = 0;
   private conflictPage = 0;
+  private operation: AbortController | null = null;
+  private running = false;
+  private closeRequested = false;
   constructor(
     app: App,
     private readonly title: string,
     private readonly lines: string[],
-    private readonly confirm: () => Promise<void>,
+    private readonly confirm: (options: SyncOperationOptions) => Promise<void>,
     private readonly release: () => void = () => {},
     private readonly bindings: InitialBindingChoice[] = [],
     private readonly pullPreview: PullPreview | null = null,
@@ -33,6 +46,14 @@ export class PreviewModal extends Modal {
     this.modalEl.addClass("agentwiki-sync-modal");
   }
   onClose(): void {
+    this.operation?.abort();
+    if (this.running) {
+      this.closeRequested = true;
+      return;
+    }
+    this.releaseOnce();
+  }
+  private releaseOnce(): void {
     if (!this.released) {
       this.released = true;
       this.release();
@@ -89,24 +110,44 @@ export class PreviewModal extends Modal {
     this.pager(conflicts.length, this.conflictPage, (page) => {
       this.conflictPage = page;
     });
-    new Setting(this.contentEl)
-      .setDesc("确认将应用以上全部变更（包括其他分页）。")
-      .addButton((button) =>
-        button.setButtonText("取消").onClick(() => this.close()),
-      )
+    const actions = new Setting(this.contentEl).setDesc(
+      "确认将应用以上全部变更（包括其他分页）。",
+    );
+    let cancelButton: ButtonComponent | null = null;
+    actions
+      .addButton((button) => {
+        cancelButton = button;
+        button.setButtonText("取消").onClick(() => {
+          if (this.running) this.operation?.abort();
+          else this.close();
+        });
+      })
       .addButton((button) =>
         button
           .setButtonText("确认执行")
           .setWarning()
           .onClick(async () => {
+            if (this.running) return;
+            this.running = true;
+            this.operation = new AbortController();
             button.setDisabled(true);
             try {
-              await this.confirm();
+              await this.confirm({
+                signal: this.operation.signal,
+                onProgress: (progress) => {
+                  actions.setDesc(progressLabel(progress));
+                  cancelButton?.setDisabled(!progress.cancellable);
+                },
+              });
               this.close();
             } catch (error) {
               new Notice(`同步失败：${userErrorMessage(error)}`);
             } finally {
+              this.running = false;
+              this.operation = null;
               button.setDisabled(false);
+              cancelButton?.setDisabled(false);
+              if (this.closeRequested) this.releaseOnce();
             }
           }),
       );

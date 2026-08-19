@@ -8,7 +8,7 @@ const CanonicalIndexSchema = z
   .regex(/^(0|[1-9][0-9]*)$/)
   .refine((value) => Number.isSafeInteger(Number(value)));
 const CursorSchema = z.string().max(4096);
-const Rfc3339Schema = z.string().datetime({ offset: true });
+const Rfc3339Schema = z.iso.datetime({ offset: true });
 
 export const DecimalCountSchema = z
   .string()
@@ -32,7 +32,7 @@ export const SyncCapabilitiesSchema = z
     maxPageItems: z.number().int(),
     pushSessionTtlSeconds: z.number().int(),
   })
-  .passthrough();
+  .loose();
 
 export function parseCapabilities(value: unknown) {
   const parsed = SyncCapabilitiesSchema.parse(value);
@@ -59,7 +59,7 @@ export function parseCapabilities(value: unknown) {
   return parsed;
 }
 
-const UuidSchema = z.string().uuid();
+const UuidSchema = z.uuid();
 export const SpaceParamsSchema = z.object({ spaceId: PublicIdSchema }).strict();
 export const PushSessionParamsSchema = z
   .object({ spaceId: PublicIdSchema, sessionId: UuidSchema })
@@ -201,9 +201,9 @@ export const SyncApiErrorResponseSchema = z
           )
           .optional(),
       })
-      .passthrough(),
+      .loose(),
   })
-  .passthrough();
+  .loose();
 export const ExchangeResponseSchema = z
   .object({
     protocolVersion: z.literal("1"),
@@ -214,7 +214,7 @@ export const ExchangeResponseSchema = z
     user: z.object({ id: z.string(), displayName: z.string() }),
     capabilities: SyncCapabilitiesSchema,
   })
-  .passthrough();
+  .loose();
 export const SessionResponseSchema = z
   .object({
     protocolVersion: z.literal("1"),
@@ -230,7 +230,7 @@ export const SessionResponseSchema = z
     user: z.object({ id: z.string(), displayName: z.string() }),
     capabilities: SyncCapabilitiesSchema,
   })
-  .passthrough();
+  .loose();
 export const FinalizeResultSchema = z
   .object({
     protocolVersion: z.literal("1"),
@@ -244,7 +244,7 @@ export const FinalizeResultSchema = z
     revisionBodyBytes: DecimalByteCountSchema,
     changeSetId: z.string().nullable(),
   })
-  .passthrough();
+  .loose();
 export const CreatePushSessionResponseSchema = z
   .object({
     protocolVersion: z.literal("1"),
@@ -260,7 +260,7 @@ export const CreatePushSessionResponseSchema = z
     capabilities: SyncCapabilitiesSchema,
     result: FinalizeResultSchema.nullable(),
   })
-  .passthrough();
+  .loose();
 export const PushSessionStatusResponseSchema = z
   .object({
     protocolVersion: z.literal("1"),
@@ -276,10 +276,8 @@ export const PushSessionStatusResponseSchema = z
     receivedBatchIndexes: z.array(z.number().int().nonnegative()),
     result: FinalizeResultSchema.nullable(),
   })
-  .passthrough();
-export const PushReceiptSchema = z
-  .object({ receipt: z.string() })
-  .passthrough();
+  .loose();
+export const PushReceiptSchema = z.object({ receipt: z.string() }).loose();
 
 export const RevisionHeadResponseSchema = z
   .object({
@@ -293,7 +291,7 @@ export const RevisionHeadResponseSchema = z
     revisionBodyBytes: DecimalByteCountSchema,
     publishedAt: Rfc3339Schema.nullable(),
   })
-  .passthrough();
+  .loose();
 
 const PortablePathSchema = z.string().transform((value, context) => {
   try {
@@ -315,7 +313,7 @@ const SyncPageSchema = z
     contentHash: HashSchema,
     updatedAt: Rfc3339Schema,
   })
-  .passthrough();
+  .loose();
 export const SnapshotPageSchema = z
   .object({
     protocolVersion: z.literal("1"),
@@ -329,7 +327,7 @@ export const SnapshotPageSchema = z
     items: z.array(SyncPageSchema),
     nextCursor: CursorSchema.nullable(),
   })
-  .passthrough();
+  .loose();
 export const DeltaPageSchema = z
   .object({
     protocolVersion: z.literal("1"),
@@ -353,7 +351,7 @@ export const DeltaPageSchema = z
     ),
     nextCursor: CursorSchema.nullable(),
   })
-  .passthrough();
+  .loose();
 
 const SyncSpaceSummarySchema = z
   .object({
@@ -367,11 +365,11 @@ const SyncSpaceSummarySchema = z
     revisionManifestByteLength: DecimalByteCountSchema,
     revisionBodyBytes: DecimalByteCountSchema,
   })
-  .passthrough();
+  .loose();
 
 export const SyncSpaceListResponseSchema = z
   .object({
     protocolVersion: z.literal("1"),
     spaces: z.array(SyncSpaceSummarySchema),
   })
-  .passthrough();
+  .loose();

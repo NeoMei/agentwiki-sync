@@ -9,7 +9,7 @@
 - `npm run build`：browser platform 单 bundle，`obsidian` external。
 - `npm run check:bundle`：禁止 Node 文件系统/子进程、桌面 adapter 和秘密模式；检查发布版本一致性。
 
-本轮收口结果（2026-08-14）：26 个测试文件、118 项测试全部通过；Prettier 格式检查、ESLint、strict typecheck、production build 与 bundle 安全检查通过。覆盖 fixed-revision 分页、非法远端路径拒绝、connection exact replay、pageId/case-only rename、首次绑定和普通冲突、Vault CAS 与回滚故障点、不可变 generation/current pointer、设备隔离、Push 发布后指标验证、响应丢失恢复、凭据轮换 supersede 与设备本地状态 envelope 迁移；另补 UI 交互纯逻辑、Obsidian 适配器契约与协议 conformance（与已发布 `@neomei/agentwiki-sync-protocol` 的 canonical/hash/pathKey/decimal 一致性）。
+最新收口结果（2026-08-19）：29 个测试文件、147 项测试全部通过；Prettier 格式检查、Obsidian 官方 ESLint 推荐规则（0 error）、strict typecheck、production build 与 bundle/release 安全检查通过。覆盖 fixed-revision 分页、非法远端路径拒绝、connection exact replay、pageId/case-only rename、首次绑定和普通冲突、Vault CAS 与回滚故障点、不可变 generation/current pointer、设备隔离、Push 发布后指标验证、响应丢失恢复、凭据轮换 supersede 与设备本地状态 envelope 迁移；另覆盖多 Space 选择/去重、只读 Pull 权限、进度与取消边界、纯归档批量让步、取消上传时先持久化不可重放状态再 abort 远端 session、上传异常与取消竞态下仍保证 supersede 且不可恢复、取消后可安全断开且本地变更保留、UI 交互纯逻辑、Obsidian 适配器契约、协议 conformance、多代 generation 清理、市场设置标题规则、回收站偏好和近 100 MiB 有界内存验收。
 
 ## 客户端交付边界
 
@@ -23,4 +23,4 @@ AgentWiki 主项目三项交付已合并并发布：`@neomei/agentwiki-sync-prot
 
 联调发现并修复了 `revisionContentHash` 的跨边界差异：发布包的 `RevisionContentManifest` 包含 `protocolVersion` 与 `spaceId`，插件本地副本此前只有 `pages`，会导致客户端重建的 revision hash 与服务端不一致。现已补齐并统一 `revisionManifestByteLength` 的输入；默认 `maxPageItems` 也对齐到服务端公布的 `100`。
 
-协议一致性已通过 conformance 固化，API 路径、Bearer 凭据认证与 exchange 请求格式均与主项目实现核对一致。剩余工作是真实端到端联调：需要生产环境的一次性连接码，在 Obsidian 内完成 exchange→activate→head→push→finalize→snapshot，并核对数据后清理。
+协议一致性已通过 conformance 固化，API 路径、Bearer 凭据认证与 exchange 请求格式均与主项目实现核对一致。真实生产写入联调需要一次性连接码、用户数据清理和生产变更授权，因此作为独立发布验收，不属于当前仓库未完成的实现任务。

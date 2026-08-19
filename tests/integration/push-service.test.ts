@@ -190,4 +190,98 @@ describe("PushService", () => {
     await service.markVerified();
     expect(await store.read(payloadPath)).toBeNull();
   });
+
+  it("cancels between upload batches and aborts the remote session", async () => {
+    const remote = new FakePushRemote(capabilities, "r1");
+    const store = new MemoryControlStore();
+    await store.write("preview/a.md", "a");
+    await store.write("preview/b.md", "b");
+    const service = new PushService(remote, store, ".agentwiki/push/cancel");
+    let stateAtRemoteAbort: string | undefined;
+    remote.onAbort = async () => {
+      stateAtRemoteAbort = (await service.inspect())?.remoteState;
+    };
+    const controller = new AbortController();
+    const publishPrepared = service.publishPrepared.bind(service);
+    const make = (pageId: string, path: string, body: string) => ({
+      operation: "upsert" as const,
+      pageId,
+      path,
+      title: pageId,
+      contentHash:
+        body === "a"
+          ? "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+          : "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d",
+      payloadPath: `preview/${body}.md`,
+      bodyBytes: 1,
+    });
+    await expect(
+      publishPrepared(
+        {
+          spaceId: "s",
+          baseRevision: "r1",
+          capabilities,
+          changes: [make("p1", "A.md", "a"), make("p2", "B.md", "b")],
+        },
+        {
+          signal: controller.signal,
+          onProgress: (progress) => {
+            if (progress.phase === "upload" && progress.completed === 1)
+              controller.abort();
+          },
+        },
+      ),
+    ).rejects.toThrow(/取消/);
+    expect(remote.batches).toHaveLength(1);
+    expect(remote.abortCalls).toBe(1);
+    expect(stateAtRemoteAbort).toBe("superseded");
+    expect(remote.finalizeCalls).toBe(0);
+    expect((await service.inspect())?.remoteState).toBe("superseded");
+  });
+
+  it("supersedes a failed in-flight upload when cancellation races the failure", async () => {
+    const remote = new FakePushRemote(capabilities, "r1");
+    const store = new MemoryControlStore();
+    await store.write("preview/a.md", "a");
+    const service = new PushService(
+      remote,
+      store,
+      ".agentwiki/push/cancel-race",
+    );
+    const controller = new AbortController();
+    remote.loseFirstUploadOnce = true;
+    remote.onUpload = async () => {
+      controller.abort();
+    };
+
+    await expect(
+      service.publishPrepared(
+        {
+          spaceId: "s",
+          baseRevision: "r1",
+          capabilities,
+          changes: [
+            {
+              operation: "upsert",
+              pageId: "p1",
+              path: "A.md",
+              title: "A",
+              contentHash:
+                "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+              payloadPath: "preview/a.md",
+              bodyBytes: 1,
+            },
+          ],
+        },
+        { signal: controller.signal },
+      ),
+    ).rejects.toThrow(/取消/);
+    expect((await service.inspect())?.remoteState).toBe("superseded");
+    expect(remote.abortCalls).toBe(1);
+    expect(remote.finalizeCalls).toBe(0);
+
+    await expect(service.resume()).rejects.toThrow(/无法恢复/);
+    expect(remote.batches).toHaveLength(0);
+    expect(remote.finalizeCalls).toBe(0);
+  });
 });

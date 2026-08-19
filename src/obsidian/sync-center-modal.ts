@@ -1,9 +1,20 @@
 import { Modal, Notice, Setting, type App } from "obsidian";
 import { userErrorMessage } from "../core/user-errors";
+import { SyncTargetSelection } from "../application/sync-coordinator";
+import { canRunSyncStrategy } from "./preview-logic";
+import {
+  progressLabel,
+  type SyncOperationOptions,
+  type SyncProgress,
+} from "../application/progress";
 
 export type SyncStrategy = "auto" | "local" | "server";
 
 export interface SyncDiff {
+  canPublish: boolean;
+  displayName: string;
+  rootPath: string;
+  roleLabel: string;
   remoteAhead: boolean;
   localAdded: string[];
   localModified: string[];
@@ -15,9 +26,23 @@ export interface SyncDiff {
   remoteFirstBind: boolean;
 }
 
+export interface SyncTarget {
+  spaceId: string;
+  label: string;
+}
+
 export interface SyncCenterHandlers {
-  loadDiff: () => Promise<SyncDiff>;
-  runStrategy: (strategy: SyncStrategy) => Promise<void>;
+  targets: SyncTarget[];
+  initialSpaceId: string;
+  loadDiff: (
+    spaceId: string,
+    options: SyncOperationOptions,
+  ) => Promise<SyncDiff>;
+  runStrategy: (
+    spaceId: string,
+    strategy: SyncStrategy,
+    options: SyncOperationOptions,
+  ) => Promise<void>;
 }
 
 const countDiff = (diff: SyncDiff): number =>
@@ -30,12 +55,20 @@ export class SyncCenterModal extends Modal {
   private diff: SyncDiff | null = null;
   private loadError: string | null = null;
   private running: boolean = false;
+  private readonly selection: SyncTargetSelection;
+  private operation: AbortController | null = null;
+  private progress: SyncProgress | null = null;
+  private refreshGeneration = 0;
 
   constructor(
     app: App,
     private readonly handlers: SyncCenterHandlers,
   ) {
     super(app);
+    this.selection = new SyncTargetSelection(
+      handlers.targets.map((target) => target.spaceId),
+      handlers.initialSpaceId,
+    );
     this.modalEl.addClass("agentwiki-sync-modal");
   }
 
@@ -43,14 +76,32 @@ export class SyncCenterModal extends Modal {
     void this.refresh();
   }
 
+  override onClose(): void {
+    this.operation?.abort();
+  }
+
   private async refresh(): Promise<void> {
+    const generation = ++this.refreshGeneration;
     this.diff = null;
     this.loadError = null;
     this.running = false;
+    this.progress = null;
+    this.operation?.abort();
+    this.operation = new AbortController();
     this.renderLoading();
     try {
-      this.diff = await this.handlers.loadDiff();
+      const diff = await this.handlers.loadDiff(this.selection.current, {
+        signal: this.operation.signal,
+        onProgress: (progress) => {
+          if (generation !== this.refreshGeneration) return;
+          this.progress = progress;
+          this.renderLoading();
+        },
+      });
+      if (generation !== this.refreshGeneration) return;
+      this.diff = diff;
     } catch (error) {
+      if (generation !== this.refreshGeneration) return;
       this.loadError = userErrorMessage(error);
     }
     this.render();
@@ -59,7 +110,21 @@ export class SyncCenterModal extends Modal {
   private renderLoading(): void {
     this.contentEl.empty();
     this.contentEl.createEl("h2", { text: "AgentWiki 同步" });
-    this.contentEl.createEl("p", { text: "正在比较本地与服务器差异…" });
+    this.contentEl.createEl("p", {
+      text: this.progress
+        ? progressLabel(this.progress)
+        : "正在比较本地与服务器差异…",
+    });
+    new Setting(this.contentEl)
+      .addButton((button) =>
+        button
+          .setButtonText("取消")
+          .setDisabled(this.progress?.cancellable === false)
+          .onClick(() => this.operation?.abort()),
+      )
+      .addButton((button) =>
+        button.setButtonText("关闭").onClick(() => this.close()),
+      );
   }
 
   private render(): void {
@@ -71,6 +136,20 @@ export class SyncCenterModal extends Modal {
     const diff = this.diff;
     if (!diff) return;
     this.contentEl.createEl("h2", { text: "AgentWiki 同步" });
+    new Setting(this.contentEl)
+      .setName("同步空间")
+      .setDesc(`${diff.displayName} · ${diff.rootPath} · ${diff.roleLabel}`)
+      .addDropdown((dropdown) => {
+        for (const target of this.handlers.targets)
+          dropdown.addOption(target.spaceId, target.label);
+        dropdown
+          .setValue(this.selection.current)
+          .setDisabled(this.running)
+          .onChange((spaceId) => {
+            this.selection.select(spaceId);
+            void this.refresh();
+          });
+      });
     const localCount = countDiff(diff);
     const remoteCount = diff.remoteUpdated.length + diff.remoteArchived.length;
     let summary: string;
@@ -89,10 +168,12 @@ export class SyncCenterModal extends Modal {
       text: summary,
       cls: "agentwiki-sync-summary",
     });
+    if (this.progress)
+      this.contentEl.createEl("p", { text: progressLabel(this.progress) });
 
     this.renderLocalSection(diff);
     this.renderRemoteSection(diff);
-    this.renderActions();
+    this.renderActions(diff);
   }
 
   private renderError(): void {
@@ -156,7 +237,7 @@ export class SyncCenterModal extends Modal {
       list.createEl("li", { text: `✕ ${path}` });
   }
 
-  private renderActions(): void {
+  private renderActions(diff: SyncDiff): void {
     const actions = new Setting(this.contentEl)
       .setDesc(
         "自动合并保留双方不冲突的修改，冲突时可在预览中逐项选择；使用本地/服务器内容会在冲突处直接采用所选一侧。",
@@ -165,13 +246,17 @@ export class SyncCenterModal extends Modal {
         button
           .setButtonText(this.running ? "执行中…" : "自动合并（推荐）")
           .setCta()
-          .setDisabled(this.running)
+          .setDisabled(
+            this.running || !canRunSyncStrategy(diff.canPublish, "auto"),
+          )
           .onClick(() => void this.run("auto")),
       )
       .addButton((button) =>
         button
           .setButtonText("使用本地内容")
-          .setDisabled(this.running)
+          .setDisabled(
+            this.running || !canRunSyncStrategy(diff.canPublish, "local"),
+          )
           .onClick(() => void this.run("local")),
       )
       .addButton((button) =>
@@ -187,14 +272,34 @@ export class SyncCenterModal extends Modal {
         .setDisabled(this.running)
         .onClick(() => void this.refresh()),
     );
+    if (this.running)
+      new Setting(this.contentEl).addButton((button) =>
+        button
+          .setButtonText("取消当前操作")
+          .setDisabled(this.progress?.cancellable === false)
+          .onClick(() => this.operation?.abort()),
+      );
   }
 
   private async run(strategy: SyncStrategy): Promise<void> {
     if (this.running) return;
+    if (!this.diff || !canRunSyncStrategy(this.diff.canPublish, strategy)) {
+      new Notice("当前空间不允许该同步策略。");
+      return;
+    }
     this.running = true;
+    this.progress = null;
+    this.operation?.abort();
+    this.operation = new AbortController();
     this.render();
     try {
-      await this.handlers.runStrategy(strategy);
+      await this.handlers.runStrategy(this.selection.current, strategy, {
+        signal: this.operation.signal,
+        onProgress: (progress) => {
+          this.progress = progress;
+          this.render();
+        },
+      });
       this.close();
     } catch (error) {
       new Notice(`同步失败：${userErrorMessage(error)}`);

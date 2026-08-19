@@ -3,6 +3,7 @@ import type AgentWikiSyncPlugin from "../main";
 import { userErrorMessage } from "../core/user-errors";
 import type { SyncSpaceSummary } from "../agentwiki/protocol";
 import { DEFAULT_SERVER_URL } from "../application/settings";
+import { unmappedSpaces } from "../application/sync-coordinator";
 
 const roleLabels: Record<SyncSpaceSummary["role"], string> = {
   viewer: "只读",
@@ -41,7 +42,7 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
   }
 
   private renderConnectionSection(): void {
-    this.containerEl.createEl("h3", { text: "连接" });
+    new Setting(this.containerEl).setName("连接").setHeading();
     new Setting(this.containerEl)
       .setName("AgentWiki 服务器")
       .setDesc(
@@ -113,7 +114,7 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
   }
 
   private renderMappingSection(): void {
-    this.containerEl.createEl("h3", { text: "空间映射" });
+    new Setting(this.containerEl).setName("空间映射").setHeading();
 
     for (const mapping of this.plugin.settings.mappings) {
       const space = this.availableSpaces?.find(
@@ -178,7 +179,10 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
       .addDropdown((dropdown) => {
         const spaces = this.availableSpaces ?? [];
         dropdown.addOption("", "选择空间…");
-        for (const space of spaces) {
+        for (const space of unmappedSpaces(
+          spaces,
+          this.plugin.settings.mappings,
+        )) {
           const label =
             space.displayName +
             "（" +
@@ -204,14 +208,6 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
           }
           if (!rootPathInput.value) {
             new Notice("请输入本地文件夹名，如 Wiki");
-            return;
-          }
-          const selectedSpace = this.availableSpaces?.find(
-            (s) => s.spaceId === this.selectedSpaceId,
-          );
-          if (selectedSpace && !selectedSpace.canPublish) {
-            new Notice("此空间为只读，无法推送。请选择可编辑空间。");
-            button.setDisabled(false);
             return;
           }
           button.setDisabled(true);

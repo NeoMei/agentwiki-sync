@@ -415,15 +415,25 @@ describe("SyncRuntime", () => {
       (await control.read(
         ".agentwiki/devices/d-local/spaces/s-space/move-hints.json",
       ))!,
-    ) as { payload: { hints: Array<{ pageId: string; toPath: string }> } };
-    expect(updated.payload.hints).toEqual([
-      {
-        pageId: "p1",
-        fromPath: "A.md",
-        toPath: "B.md",
-        observedVaultByteHash: expect.any(String),
-      },
-    ]);
+    ) as {
+      payload: {
+        hints: Array<{
+          pageId: string;
+          fromPath: string;
+          toPath: string;
+          observedVaultByteHash: string;
+        }>;
+      };
+    };
+    expect(updated.payload.hints).toHaveLength(1);
+    expect(updated.payload.hints[0]).toMatchObject({
+      pageId: "p1",
+      fromPath: "A.md",
+      toPath: "B.md",
+    });
+    expect(updated.payload.hints[0]?.observedVaultByteHash).toEqual(
+      expect.any(String),
+    );
   });
 
   it("prunes stale generations after each committed baseline", async () => {
@@ -453,26 +463,17 @@ describe("SyncRuntime", () => {
     await runtime.applyPull(await runtime.previewPull());
     expect(await countGenerations()).toBe(1);
 
-    await vault.write("Wiki/A.md", new TextEncoder().encode("local v2"));
-    await runtime.applyPush(await runtime.previewPush());
-    expect(await countGenerations()).toBe(2);
+    for (let version = 2; version <= 7; version += 1) {
+      await vault.write(
+        "Wiki/A.md",
+        new TextEncoder().encode(`local v${version}`),
+      );
+      await runtime.applyPush(await runtime.previewPush());
 
-    const nextBody = "remote v3";
-    await remote.replace([
-      {
-        pageId: "p1",
-        path: "A.md",
-        title: "A",
-        body: nextBody,
-        contentHash: await contentHash(nextBody),
-        updatedAt: "2026-08-15T00:00:00.000Z",
-      },
-    ]);
-    await runtime.applyPull(await runtime.previewPull());
-
-    // Older generations that no pointer candidate or journal references
-    // must be pruned instead of accumulating on every sync.
-    expect(await countGenerations()).toBeLessThanOrEqual(3);
+      // Only the current and rollback generations remain after arbitrarily
+      // many commits; stale full snapshots must not accumulate over time.
+      expect(await countGenerations()).toBeLessThanOrEqual(2);
+    }
   });
 
   it("returns clean without creating an empty push session", async () => {
@@ -488,6 +489,109 @@ describe("SyncRuntime", () => {
     expect(preview.changes).toHaveLength(0);
     await runtime.applyPush(preview);
     expect(remote.sessionCount()).toBe(0);
+  });
+
+  it("yields every 50 scanned files and cancels before creating a Push", async () => {
+    const remote = new FakeAgentWiki();
+    const vault = new MemoryVault(
+      Object.fromEntries(
+        Array.from({ length: 60 }, (_, index) => [
+          `Wiki/P${index}.md`,
+          `page ${index}`,
+        ]),
+      ),
+    );
+    const runtime = new SyncRuntime(vault, new MemoryControlStore(), remote, {
+      spaceId: "space",
+      rootPath: "Wiki",
+      status: "pending",
+    });
+    const controller = new AbortController();
+    const previewPush = runtime.previewPush.bind(runtime);
+    await expect(
+      previewPush({
+        signal: controller.signal,
+        onProgress: (progress) => {
+          if (progress.phase === "scan" && progress.completed >= 50)
+            controller.abort();
+        },
+      }),
+    ).rejects.toThrow(/取消/);
+    expect(remote.sessionCount()).toBe(0);
+  });
+
+  it("yields and cancels while planning 60 local archives", async () => {
+    const remote = new FakeAgentWiki();
+    const pages = await Promise.all(
+      Array.from({ length: 60 }, async (_, index) => {
+        const body = `page ${index}`;
+        return {
+          pageId: `p${index}`,
+          path: `P${index}.md`,
+          title: `P${index}`,
+          body,
+          contentHash: await contentHash(body),
+          updatedAt: "2026-08-14T00:00:00.000Z",
+        };
+      }),
+    );
+    await remote.seed(pages);
+    const vault = new MemoryVault({});
+    const runtime = new SyncRuntime(vault, new MemoryControlStore(), remote, {
+      spaceId: "space",
+      rootPath: "Wiki",
+      status: "pending",
+    });
+    await runtime.applyPull(await runtime.previewPull());
+    for (let index = 0; index < 60; index += 1)
+      await vault.remove(`Wiki/P${index}.md`);
+    await vault.write("Wiki/.keep", new TextEncoder().encode("keep folder"));
+    const controller = new AbortController();
+    await expect(
+      runtime.previewPush({
+        signal: controller.signal,
+        onProgress: (progress) => {
+          if (progress.phase === "merge" && progress.completed >= 50)
+            controller.abort();
+        },
+      }),
+    ).rejects.toThrow(/取消/);
+  });
+
+  it("yields and cancels while planning 60 remote archives", async () => {
+    const remote = new FakeAgentWiki();
+    const pages = await Promise.all(
+      Array.from({ length: 60 }, async (_, index) => {
+        const body = `page ${index}`;
+        return {
+          pageId: `p${index}`,
+          path: `P${index}.md`,
+          title: `P${index}`,
+          body,
+          contentHash: await contentHash(body),
+          updatedAt: "2026-08-14T00:00:00.000Z",
+        };
+      }),
+    );
+    await remote.seed(pages);
+    const runtime = new SyncRuntime(
+      new MemoryVault({}),
+      new MemoryControlStore(),
+      remote,
+      { spaceId: "space", rootPath: "Wiki", status: "pending" },
+    );
+    await runtime.applyPull(await runtime.previewPull());
+    await remote.replace([]);
+    const controller = new AbortController();
+    await expect(
+      runtime.previewPull({
+        signal: controller.signal,
+        onProgress: (progress) => {
+          if (progress.phase === "merge" && progress.completed >= 50)
+            controller.abort();
+        },
+      }),
+    ).rejects.toThrow(/取消/);
   });
 
   it("rejects a truncated remote snapshot before planning destructive Pull actions", async () => {
@@ -693,6 +797,30 @@ describe("SyncRuntime", () => {
       ".agentwiki/devices/d-device/spaces/s-space/push",
     );
     expect((await push.inspect())?.remoteState).toBe("superseded");
+  });
+
+  it("does not block disconnect after a cancelled Push is superseded", async () => {
+    const remote = new FakeAgentWiki();
+    const runtime = new SyncRuntime(
+      new MemoryVault({ "Wiki/A.md": "a" }),
+      new MemoryControlStore(),
+      remote,
+      { spaceId: "space", rootPath: "Wiki", status: "pending" },
+    );
+    await runtime.establishEmptyBase();
+    const preview = await runtime.previewPush();
+    const controller = new AbortController();
+    await expect(
+      runtime.applyPush(preview, {
+        signal: controller.signal,
+        onProgress: (progress) => {
+          if (progress.phase === "upload" && progress.completed >= 1)
+            controller.abort();
+        },
+      }),
+    ).rejects.toThrow(/取消/);
+    expect(await runtime.hasUnfinishedPush()).toBe(false);
+    expect((await runtime.status()).local.added).toHaveLength(1);
   });
 
   it("clones an empty-bodied page without treating it as a missing sidecar", async () => {
