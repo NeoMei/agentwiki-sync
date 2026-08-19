@@ -36,6 +36,11 @@ import { PushService, type PreparedPushChange } from "./push-service";
 import { opaqueFileKey, validatePublicId } from "../core/identity-key";
 import { isValidSyncPath } from "../core/sync-path";
 import type { SpaceMapping } from "./sync-coordinator";
+import {
+  progressCheckpoint,
+  reportProgress,
+  type SyncOperationOptions,
+} from "./progress";
 
 export interface InitialBindingChoice {
   pageId: string;
@@ -382,8 +387,15 @@ export class SyncRuntime {
   private async validateSnapshotResult(
     value: SnapshotResult,
     revision: string,
+    options?: SyncOperationOptions,
   ): Promise<void> {
     const capabilities = await this.capabilities();
+    reportProgress(options, {
+      phase: "download",
+      completed: 0,
+      total: value.items.length,
+      cancellable: true,
+    });
     decimalWithinLimit(value.pageCount, capabilities.maxClientSpacePages);
     decimalWithinLimit(
       value.revisionBodyBytes,
@@ -396,6 +408,7 @@ export class SyncRuntime {
     const pageIds = new Set<string>();
     const pathKeys = new Set<string>();
     let bodyBytes = 0;
+    let downloaded = 0;
     for (const page of value.items) {
       const path = validatePortablePath(page.path);
       if (pageIds.has(page.pageId) || pathKeys.has(path.key))
@@ -405,7 +418,22 @@ export class SyncRuntime {
       if ((await contentHash(page.body)) !== page.contentHash)
         throw new Error("快照页面内容哈希不匹配");
       bodyBytes += new TextEncoder().encode(page.body).byteLength;
+      downloaded += 1;
+      if (downloaded % 50 === 0)
+        await progressCheckpoint(options, {
+          phase: "download",
+          completed: downloaded,
+          total: value.items.length,
+          cancellable: true,
+        });
     }
+    if (downloaded % 50 !== 0)
+      await progressCheckpoint(options, {
+        phase: "download",
+        completed: downloaded,
+        total: value.items.length,
+        cancellable: true,
+      });
     const manifest = {
       protocolVersion: "1" as const,
       spaceId: this.mapping.spaceId,
@@ -431,10 +459,11 @@ export class SyncRuntime {
   private async downloadSnapshot(
     revision: string,
     previewId = crypto.randomUUID(),
+    options?: SyncOperationOptions,
   ): Promise<SnapshotDownload> {
     if (!this.remote.snapshotPages) {
       const value = await this.remote.snapshot(revision);
-      await this.validateSnapshotResult(value, revision);
+      await this.validateSnapshotResult(value, revision, options);
       const { items: pages, ...metadata } = value;
       return { metadata, pages };
     }
@@ -479,6 +508,12 @@ export class SyncRuntime {
         await this.control.write(sidecar, item.body);
         pages.push({ ...item, body: "", bodyPath: sidecar } as SyncPage);
       }
+      await progressCheckpoint(options, {
+        phase: "download",
+        completed: pages.length,
+        total: Number(current.pageCount),
+        cancellable: true,
+      });
     }
     if (!metadata) throw new Error("快照未返回元数据");
     const manifest = {
@@ -595,7 +630,7 @@ export class SyncRuntime {
       remote: (await this.control.read(refs.remote))?.slice(0, 120) ?? "",
     };
   }
-  private async scan(): Promise<ScanResult> {
+  private async scan(options?: SyncOperationOptions): Promise<ScanResult> {
     const epoch = this.scanEpoch;
     const status = await this.vault.rootStatus(this.mapping.rootPath);
     if (status === "file") throw new Error("映射根是文件");
@@ -603,21 +638,45 @@ export class SyncRuntime {
       throw new Error("本地扫描不完整：映射根目录缺失");
     const capabilities = await this.capabilities();
     try {
-      const result = await scanMapping(
+      reportProgress(options, {
+        phase: "scan",
+        completed: 0,
+        cancellable: true,
+      });
+      const source =
         status === "missing"
-          ? []
-          : this.vault.listMarkdown(this.mapping.rootPath),
-        {
-          complete: true,
-          scanEpoch: epoch,
-          retainBodies: false,
-          capabilities: {
-            pages: capabilities.maxClientSpacePages,
-            bodyBytes: capabilities.maxClientTotalBodyBytes,
-            manifestBytes: capabilities.maxClientManifestBytes,
-          },
+          ? ([] as Array<{ relativePath: string; bytes: Uint8Array }>)
+          : this.vault.listMarkdown(this.mapping.rootPath);
+      let scanned = 0;
+      const files = async function* () {
+        for await (const file of source) {
+          scanned += 1;
+          if (scanned % 50 === 0)
+            await progressCheckpoint(options, {
+              phase: "scan",
+              completed: scanned,
+              cancellable: true,
+            });
+          yield file;
+        }
+      };
+      const result = await scanMapping(files(), {
+        complete: true,
+        scanEpoch: epoch,
+        retainBodies: false,
+        capabilities: {
+          pages: capabilities.maxClientSpacePages,
+          bodyBytes: capabilities.maxClientTotalBodyBytes,
+          manifestBytes: capabilities.maxClientManifestBytes,
         },
-      );
+      });
+      if (scanned % 50 !== 0)
+        await progressCheckpoint(options, {
+          phase: "scan",
+          completed: scanned,
+          total: scanned,
+          cancellable: true,
+        });
       if (epoch !== this.scanEpoch) throw new Error("扫描纪元已变更");
       return result;
     } catch (error) {
@@ -699,13 +758,13 @@ export class SyncRuntime {
       }
     }
   }
-  async status(): Promise<{
+  async status(options?: SyncOperationOptions): Promise<{
     baseRevision: string;
     remoteRevision: string;
     local: LocalStatus;
   }> {
     const base = await this.readBase();
-    const scan = await this.scan();
+    const scan = await this.scan(options);
     const resolved = resolvePageIdentities(
       base.pages,
       scan.files,
@@ -765,14 +824,22 @@ export class SyncRuntime {
       this.control,
       `${this.root}/push`,
     ).inspect();
-    return !!push && push.localCommitPhase !== "verified";
+    return (
+      !!push &&
+      push.remoteState !== "superseded" &&
+      push.localCommitPhase !== "verified"
+    );
   }
-  async previewPull(): Promise<PullPreview> {
+  async previewPull(options?: SyncOperationOptions): Promise<PullPreview> {
     const base = await this.readBase();
     const head = await this.remote.getHead(this.mapping.spaceId);
-    const downloaded = await this.downloadSnapshot(head.revision);
+    const downloaded = await this.downloadSnapshot(
+      head.revision,
+      crypto.randomUUID(),
+      options,
+    );
     const remote = downloaded.pages;
-    const scan = await this.scan();
+    const scan = await this.scan(options);
     const localByPath = new Map(
       scan.files.map((file) => [portablePathKey(file.relativePath), file]),
     );
@@ -794,7 +861,16 @@ export class SyncRuntime {
     };
     const initialBindings: InitialBindingChoice[] = [];
     const finalKeys = new Set<string>();
+    let merged = 0;
     for (const page of remote) {
+      merged += 1;
+      if (merged % 50 === 0)
+        await progressCheckpoint(options, {
+          phase: "merge",
+          completed: merged,
+          total: remote.length,
+          cancellable: true,
+        });
       const remotePath = validatePortablePath(page.path).path;
       if (finalKeys.has(portablePathKey(remotePath)))
         throw new Error("PATH_COLLISION");
@@ -884,7 +960,16 @@ export class SyncRuntime {
       }
     }
     const remoteIds = new Set(remote.map((page) => page.pageId));
-    for (const page of Object.values(base.pages))
+    let archived = 0;
+    for (const page of Object.values(base.pages)) {
+      archived += 1;
+      if (archived % 50 === 0)
+        await progressCheckpoint(options, {
+          phase: "merge",
+          completed: remote.length + archived,
+          total: remote.length + Object.keys(base.pages).length,
+          cancellable: true,
+        });
       if (!remoteIds.has(page.pageId)) {
         const local = localByPageId.get(page.pageId);
         if (local && local.contentHash !== page.contentHash)
@@ -905,6 +990,7 @@ export class SyncRuntime {
             path: joinRoot(this.mapping.rootPath, local.relativePath),
           });
       }
+    }
     const expectedVaultHashes: Record<string, string | null> = {};
     for (const file of scan.files)
       expectedVaultHashes[joinRoot(this.mapping.rootPath, file.relativePath)] =
@@ -983,7 +1069,15 @@ export class SyncRuntime {
       }
     }
   }
-  async applyPull(preview: PullPreview): Promise<void> {
+  async applyPull(
+    preview: PullPreview,
+    options?: SyncOperationOptions,
+  ): Promise<void> {
+    await progressCheckpoint(options, {
+      phase: "apply",
+      completed: 0,
+      cancellable: true,
+    });
     if (
       preview.conflicts.some(
         (item) => !preview.conflictResolutions[item.conflictId],
@@ -1001,7 +1095,16 @@ export class SyncRuntime {
     const actions = [...preview.actions];
     const hints: MoveHint[] = [];
     const restoreEntries: PendingIdentities["entries"] = {};
+    let planned = 0;
     for (const choice of preview.initialBindings) {
+      planned += 1;
+      if (planned % 50 === 0)
+        await progressCheckpoint(options, {
+          phase: "merge",
+          completed: planned,
+          total: preview.initialBindings.length + preview.conflicts.length,
+          cancellable: true,
+        });
       const currentBody = choice.localPath
         ? (choice.localBody ??
           (await this.localBody({ relativePath: choice.localPath })))
@@ -1044,7 +1147,7 @@ export class SyncRuntime {
         );
     }
     const base = await this.readBase();
-    const scan = await this.scan();
+    const scan = await this.scan(options);
     const moveHints = (await this.moveHints.read())?.payload.hints ?? [];
     const resolved = resolvePageIdentities(base.pages, scan.files, moveHints);
     const conflictsByPage = new Map<string, StructuredConflict[]>();
@@ -1054,6 +1157,14 @@ export class SyncRuntime {
       conflictsByPage.set(conflict.pageId, list);
     }
     for (const [pageId, pageConflicts] of conflictsByPage) {
+      planned += pageConflicts.length;
+      if (planned % 50 === 0)
+        await progressCheckpoint(options, {
+          phase: "merge",
+          completed: planned,
+          total: preview.initialBindings.length + preview.conflicts.length,
+          cancellable: true,
+        });
       const local = resolved.find((file) => file.pageId === pageId);
       const remote = preview.remotePages.find((page) => page.pageId === pageId);
       const basePage = base.pages[pageId];
@@ -1177,6 +1288,12 @@ export class SyncRuntime {
           ),
         );
     }
+    reportProgress(options, {
+      phase: "apply",
+      completed: 0,
+      total: actions.length,
+      cancellable: false,
+    });
     const baselineTx = await this.baseline.prepareStreaming(
       preview.revision,
       preview.remotePages,
@@ -1221,7 +1338,7 @@ export class SyncRuntime {
     await this.discardPullPreview(preview);
     this.mapping.status = "active";
   }
-  async previewPush(): Promise<PushPreview> {
+  async previewPush(options?: SyncOperationOptions): Promise<PushPreview> {
     const capabilities = await this.capabilities();
     const base = await this.readBase();
     const head = await this.remote.getHead(this.mapping.spaceId);
@@ -1237,7 +1354,7 @@ export class SyncRuntime {
         ? head.revision
         : base.revision;
     if (head.revision !== baseRevision) throw new Error("BASE_STALE");
-    const scan = await this.scan();
+    const scan = await this.scan(options);
     const hints = (await this.moveHints.read())?.payload.hints ?? [];
     const resolved = resolvePageIdentities(base.pages, scan.files, hints);
     const local = computeStatus(base.pages, resolved, scan);
@@ -1259,6 +1376,7 @@ export class SyncRuntime {
         file.pageId ?? `path:${portablePathKey(file.relativePath)}`,
         file,
       );
+    let prepared = 0;
     for (const file of changed.values()) {
       let identity =
         Object.values(identities.entries).find(
@@ -1300,29 +1418,57 @@ export class SyncRuntime {
         payloadPath,
         bodyBytes: new TextEncoder().encode(body).byteLength,
       });
+      prepared += 1;
+      if (prepared % 50 === 0)
+        await progressCheckpoint(options, {
+          phase: "merge",
+          completed: prepared,
+          total: changed.size,
+          cancellable: true,
+        });
     }
     await this.identities.write(identities);
-    for (const page of local.deleted)
+    for (const page of local.deleted) {
       changes.push({
         operation: "archive",
         pageId: page.pageId,
         previousPath: page.relativePath,
       });
+      prepared += 1;
+      if (prepared % 50 === 0)
+        await progressCheckpoint(options, {
+          phase: "merge",
+          completed: prepared,
+          total: changed.size + local.deleted.length,
+          cancellable: true,
+        });
+    }
     return { revision: baseRevision, changes, capabilities, previewId };
   }
-  async applyPush(preview: PushPreview): Promise<void> {
+  async applyPush(
+    preview: PushPreview,
+    options?: SyncOperationOptions,
+  ): Promise<void> {
     if (!preview.changes.length) return;
     const service = new PushService(
       this.remote,
       this.control,
       `${this.root}/push`,
     );
-    const result = await service.publishPrepared({
-      spaceId: this.mapping.spaceId,
-      baseRevision: preview.revision,
-      changes: preview.changes,
-      capabilities: preview.capabilities,
-      credentialId: this.credentialId,
+    const result = await service.publishPrepared(
+      {
+        spaceId: this.mapping.spaceId,
+        baseRevision: preview.revision,
+        changes: preview.changes,
+        capabilities: preview.capabilities,
+        credentialId: this.credentialId,
+      },
+      options,
+    );
+    reportProgress(options, {
+      phase: "apply",
+      completed: 0,
+      cancellable: false,
     });
     const downloaded = await this.downloadSnapshot(result.revision);
     const pages = downloaded.pages;

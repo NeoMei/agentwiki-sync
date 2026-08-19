@@ -102,6 +102,12 @@ export class AgentWikiPushRemote implements PushRemotePort {
       ).json,
     );
   }
+  async abort(sessionId: string): Promise<void> {
+    await this.client.raw(
+      "DELETE",
+      `/api/sync/v1/spaces/${encodeURIComponent(this.spaceId)}/push-sessions/${encodeURIComponent(sessionId)}`,
+    );
+  }
   async snapshot(revision = "current"): Promise<SnapshotResult> {
     const value = await this.client.snapshot(this.spaceId, revision);
     return { ...value.metadata, items: value.items };

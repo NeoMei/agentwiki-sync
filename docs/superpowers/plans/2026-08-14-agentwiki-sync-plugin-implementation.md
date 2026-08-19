@@ -4,14 +4,14 @@
 
 **Goal:** 交付可安装、可测试、移动端兼容的 AgentWiki Sync Obsidian 社区插件，完整实现人工连接、Status、Pull、Push、首次绑定、本地事务恢复和原生 UI。
 
-**Architecture:** 采用函数式纯核心 + 端口/适配器架构。`src/core` 只处理确定性规范化、身份、状态、合并和计划；`src/storage` 实现不可变 generation、三副本 envelope 与 journal；`src/agentwiki` 集中承载公开同步契约和 HTTP；`src/application` 编排事务；`src/obsidian` 是唯一依赖 Obsidian API 的层。上游 `@neomei/agentwiki-sync-protocol` 尚未发布，因此本仓只实现契约所需的客户端兼容层，不读取或复制 AgentWiki 主项目内部代码；包发布后由一项 adapter conformance 测试替换该边界。
+**Architecture:** 采用函数式纯核心 + 端口/适配器架构。`src/core` 只处理确定性规范化、身份、状态、合并和计划；`src/storage` 实现不可变 generation、三副本 envelope 与 journal；`src/agentwiki` 集中承载公开同步契约和 HTTP；`src/application` 编排事务；`src/obsidian` 是唯一依赖 Obsidian API 的层。当前实现依赖已发布的 `@neomei/agentwiki-sync-protocol@0.1.0` 并以 conformance 测试固定兼容边界，不读取或复制 AgentWiki 主项目内部代码。
 
 **Tech Stack:** TypeScript strict、Obsidian API 1.11.5、esbuild、Vitest、Zod、node-diff3 3.x、Web Crypto、npm lockfile、Node.js 24 LTS。
 
 ## Global Constraints
 
 - `manifest.json` 固定 `minAppVersion: "1.11.5"`、`isDesktopOnly: false`，运行时不得使用 Node 内置模块、Shell、daemon 或 `FileSystemAdapter`。
-- 插件加载、文件事件和闲置时不联网；只有用户执行 Status/Pull/Push 或连接动作才联网。
+- 插件加载、文件事件和闲置时不联网；只有用户连接、打开/刷新同步中心或确认同步时联网。
 - 原始文件、credential、安装码和未确认内容不得自动上传；所有远端写入必须先展示确认预览。
 - 每个 Space 独立串行；Push 前远端 head 必须等于 base；Pull/Push 事务可在每个持久化点崩溃恢复。
 - v1 限制：单页 1 MiB、Space 5,000 页、正文 100 MiB、revision manifest 4 MiB、confirmation 4 MiB、额外目标 heap 32 MiB。
@@ -186,7 +186,7 @@ test("manifest is mobile compatible", () => {
 - Test: `tests/integration/sync-coordinator.test.ts`, `mapping-lifecycle.test.ts`
 
 **Interfaces:**
-- Produces: commands `status(spaceId)`, `pull(spaceId)`, `push(spaceId)`; one operation per Space and no cross-Space leakage.
+- Produces: 同步中心内部用例 `status(spaceId)`, `pull(spaceId)`, `push(spaceId)`; one operation per Space and no cross-Space leakage.
 
 - [x] **Step 1: 写双 Space 隔离、并发拒绝、pending 映射隐藏、server/vault identity mismatch freeze 测试。**
 - [x] **Step 2: 写添加/取消/移除映射、断开、离线忘记和新 Vault 物理副本确认测试。**
@@ -201,7 +201,7 @@ test("manifest is mobile compatible", () => {
 - Test: `tests/unit/view-model.test.ts`, `tests/integration/plugin-lifecycle.test.ts`
 
 **Interfaces:**
-- Produces: ribbon、`status/pull/push` commands、内联连接、Space mapping、分页预览和桌面/移动冲突视图。
+- Produces: ribbon/status bar、`open-sync-center` command、内联连接、Space selector/mapping、分页预览和桌面/移动冲突视图。
 
 - [x] **Step 1: 写插件加载零网络、命令注册、活动文件选 Space 和按钮能力 view-model 测试。**
 - [x] **Step 2: 写设置页内联连接状态、无自动浏览器跳转、预览确认/取消边界测试。**
@@ -236,11 +236,11 @@ test("manifest is mobile compatible", () => {
 - [x] **Step 2: 写 bundle 扫描，拒绝 `node:`, `fs`, `child_process`, `FileSystemAdapter` 和 secret fixture。**
 - [x] **Step 3: 编写安装、连接、首次绑定、恢复、隐私、已知上游依赖文档。**
 - [x] **Step 4: 运行 `npm ci && npm run check`，随后在干净临时 Vault 执行 plugin load smoke test。**
-- [x] **Step 5: 生成验证报告，记录真实 AgentWiki API/协议包尚未发布，因此 live 联调为外部待办而非插件缺失。**
+- [x] **Step 5: 生成验证报告；上游 API/协议包发布后补充 conformance 验证，真实生产写入联调作为需要独立授权和一次性连接码的发布验收。**
 - [x] **Step 6: 提交 `release: prepare AgentWiki Sync v1`。**
 
 ## Self-Review
 
 - Spec coverage: 设计第 1–18 节分别映射到 Task 1–13；连接、三种同步命令、首次绑定、事务恢复、容量、隐私、UI、CI 和 E2E 均有实现与测试任务。
-- Placeholder scan: 计划不含 TBD/TODO/“同上”；上游 API 未发布是明确外部依赖，并由 fake public contract 与条件 live 验收处理。
+- Placeholder scan: 计划不含未决占位项或“同上”；已发布协议由 fake public contract 和 conformance 测试共同覆盖，真实生产写入保持独立授权边界。
 - Type consistency: 协议函数只从 Task 2 暴露；Vault/HTTP/Secret/Control 端口分别由 Tasks 4/6/8 定义；application 层只依赖这些稳定接口。

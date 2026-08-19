@@ -14,6 +14,12 @@ import type { FinalizeResult, PushRemotePort } from "../ports/push-remote";
 import { MutableControlRepository } from "../storage/envelope";
 import { opaqueFileKey } from "../core/identity-key";
 import { isValidSyncPath } from "../core/sync-path";
+import {
+  progressCheckpoint,
+  reportProgress,
+  SyncCancelledError,
+  type SyncOperationOptions,
+} from "./progress";
 
 interface PushInput {
   spaceId: string;
@@ -183,6 +189,7 @@ export class PushService {
     journal: PushJournal,
     capabilities: SyncCapabilities,
     received: Set<number>,
+    options?: SyncOperationOptions,
   ): Promise<void> {
     const sorted = [...journal.changes].sort(comparePushChanges);
     let batchIndex = 0;
@@ -206,6 +213,11 @@ export class PushService {
       }
       batchIndex += 1;
       current = [];
+      await progressCheckpoint(options, {
+        phase: "upload",
+        completed: batchIndex,
+        cancellable: true,
+      });
     };
     for (const metadata of sorted) {
       const change = await this.hydrateChange(metadata);
@@ -300,26 +312,46 @@ export class PushService {
     return this.commitResult(journal, result);
   }
 
-  async publishPrepared(input: PreparedPushInput): Promise<FinalizeResult> {
+  async publishPrepared(
+    input: PreparedPushInput,
+    options?: SyncOperationOptions,
+  ): Promise<FinalizeResult> {
     if (
       (await this.remote.getHead(input.spaceId)).revision !== input.baseRevision
     )
       throw new Error("BASE_STALE");
     const sorted = [...input.changes].sort(comparePushChanges);
     let totalBodyBytes = 0;
-    for (const change of sorted)
-      if (change.operation === "upsert") {
-        const body = await this.store.read(change.payloadPath);
-        if (body === null || (await contentHash(body)) !== change.contentHash)
-          throw new Error("推送预览数据损坏");
-        const bytes = new TextEncoder().encode(body).byteLength;
-        if (bytes !== change.bodyBytes) throw new Error("推送预览数据长度变化");
-        totalBodyBytes += bytes;
-        await this.store.write(
-          await this.payloadPath(change.pageId, change.path),
-          body,
-        );
+    let staged = 0;
+    try {
+      for (const change of sorted) {
+        if (change.operation === "upsert") {
+          const body = await this.store.read(change.payloadPath);
+          if (body === null || (await contentHash(body)) !== change.contentHash)
+            throw new Error("推送预览数据损坏");
+          const bytes = new TextEncoder().encode(body).byteLength;
+          if (bytes !== change.bodyBytes)
+            throw new Error("推送预览数据长度变化");
+          totalBodyBytes += bytes;
+          await this.store.write(
+            await this.payloadPath(change.pageId, change.path),
+            body,
+          );
+        }
+        staged += 1;
+        if (staged % 50 === 0)
+          await progressCheckpoint(options, {
+            phase: "upload",
+            completed: staged,
+            total: sorted.length,
+            cancellable: true,
+          });
       }
+    } catch (error) {
+      if (error instanceof SyncCancelledError)
+        await this.store.removeTree?.(`${this.root}/payload`);
+      throw error;
+    }
     const journalChanges: JournalChange[] = sorted.map((change) =>
       change.operation === "archive"
         ? change
@@ -354,22 +386,65 @@ export class PushService {
       localCommitPhase: "not_started",
     };
     await this.save(journal);
-    const session = await this.create(journal);
-    await this.validateSessionCapabilities(journal, session.capabilities);
-    journal.sessionId = session.sessionId;
-    journal.remoteState = "uploading";
-    await this.save(journal);
-    await this.uploadBatches(journal, session.capabilities, new Set());
-    journal.remoteState = "finalizing";
-    await this.save(journal);
-    return this.commitResult(
-      journal,
-      await this.remote.finalize(session.sessionId, journal.confirmationHash),
-    );
+    try {
+      await progressCheckpoint(options, {
+        phase: "upload",
+        completed: 0,
+        cancellable: true,
+      });
+      const session = await this.create(journal);
+      await this.validateSessionCapabilities(journal, session.capabilities);
+      journal.sessionId = session.sessionId;
+      journal.remoteState = "uploading";
+      await this.save(journal);
+      await this.uploadBatches(
+        journal,
+        session.capabilities,
+        new Set(),
+        options,
+      );
+      journal.remoteState = "finalizing";
+      await this.save(journal);
+      reportProgress(options, {
+        phase: "finalize",
+        completed: 0,
+        cancellable: false,
+      });
+      return this.commitResult(
+        journal,
+        await this.remote.finalize(session.sessionId, journal.confirmationHash),
+      );
+    } catch (error) {
+      const isPreFinalize =
+        journal.remoteState === "not_created" ||
+        journal.remoteState === "uploading";
+      const cancelledBeforeFinalize =
+        isPreFinalize &&
+        (error instanceof SyncCancelledError ||
+          options?.signal?.aborted === true);
+      if (cancelledBeforeFinalize) {
+        // Persist the no-replay decision before touching the remote session.
+        // A crash after this point may leave inert staging, but recovery can
+        // never upload or finalize content the user already cancelled.
+        journal.remoteState = "superseded";
+        await this.save(journal);
+        if (journal.sessionId && this.remote.abort)
+          try {
+            await this.remote.abort(journal.sessionId);
+          } catch {
+            // The server expires abandoned staging; never finalize it locally.
+          }
+        if (!(error instanceof SyncCancelledError))
+          throw new SyncCancelledError();
+      }
+      throw error;
+    }
   }
 
   async resume(): Promise<FinalizeResult | null> {
     const journal = await this.load();
+    if (journal.remoteState === "superseded")
+      throw new Error("已取消的推送无法恢复");
     let capabilities = journal.capabilities;
     let received = new Set<number>();
     if (!journal.sessionId) {
@@ -392,7 +467,7 @@ export class PushService {
     await this.save(journal);
     return this.commitResult(
       journal,
-      await this.remote.finalize(journal.sessionId!, journal.confirmationHash),
+      await this.remote.finalize(journal.sessionId, journal.confirmationHash),
     );
   }
 

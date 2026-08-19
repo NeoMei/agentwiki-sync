@@ -1,67 +1,25 @@
 # AgentWiki Sync
 
-AgentWiki Sync 是一个移动端兼容的 Obsidian 社区插件，用 Git 风格的 Status、Pull、Push 将映射目录与 AgentWiki Space 同步。
+AgentWiki Sync 是一个移动端兼容的 Obsidian 插件，通过可预览、可确认的同步中心，将 Vault 映射目录与 AgentWiki Space 双向同步。
 
-## Installation
+## 当前状态
 
-### From Obsidian Community Plugins
+插件核心、事务恢复、Obsidian 原生 UI 和公开 API 客户端已实现。AgentWiki 人类设备同步 API v1 已上线，插件依赖已发布的 `@neomei/agentwiki-sync-protocol@0.1.0` 并通过逐字节一致性测试。仓库同时使用独立 fake AgentWiki 验证端到端客户端流程，不复制 AgentWiki 主项目内部实现。
 
-1. Open Obsidian Settings → Community Plugins
-2. Disable Restricted mode if enabled
-3. Click Browse and search for "AgentWiki Sync"
-4. Click Install, then Enable
+## 安装与使用
 
-### Manual Installation
+1. 把 `main.js`、`manifest.json`、`styles.css` 放入 Vault 的 `.obsidian/plugins/agentwiki-sync/` 目录，然后在 Obsidian 中启用插件。
+2. 在 AgentWiki 网页的「集成 → Obsidian 设备」生成一次性连接码，在插件设置页完成连接。
+3. 为可访问的 Space 选择一个互不重叠的 Vault 目录。新映射首次同步时会显式展示绑定与冲突选项。
+4. 点击功能区图标、状态栏或命令面板的「打开同步中心」，选择自动合并、使用本地内容或使用服务器内容，并在预览中确认后执行。
 
-1. Download `main.js`, `manifest.json`, and `styles.css` from the [latest release](https://github.com/NeoMei/agentwiki-sync/releases/latest)
-2. Create a folder `agentwiki-sync` in your vault's `.obsidian/plugins/` directory
-3. Copy the three files into that folder
-4. Restart Obsidian and enable the plugin in Settings → Community Plugins
+同步中断后，下次打开同步中心会先恢复未完成的 Pull/Push 事务；恢复无法唯一判定时会冻结该 Space，不会静默覆盖当前文件。
 
-## Usage
+同步中心可明确切换任意已映射 Space，包括待首次同步和只读 Space。只读 Space 可查看状态并以服务器内容 Pull，不提供 Push 策略。扫描、下载、合并和分批上传会显示进度并可取消；Pull 本地事务开始后和 Push finalize 开始后进入不可中断的原子阶段。
 
-### 1. Connect to AgentWiki
+## 开发
 
-1. Open Settings → AgentWiki Sync
-2. Enter your AgentWiki server URL (e.g., `https://agentwiki.quukk.com`)
-3. Enter the connection code from your AgentWiki account settings
-4. Click Connect
-
-### 2. Map Folders to Spaces
-
-1. After connecting, select an AgentWiki Space from the dropdown
-2. Choose a vault folder to map to that Space
-3. Click Add Mapping
-
-### 3. Sync Your Notes
-
-Use the three sync commands from the ribbon or Command Palette:
-
-- **Status** — Check what changed locally and remotely since last sync
-- **Pull** — Download remote changes to your vault (merges with local edits)
-- **Push** — Upload local changes to AgentWiki (requires preview confirmation)
-
-Conflicts are resolved with Git-style three-way merge. When both sides changed the same block, the plugin keeps both versions with conflict markers for you to resolve manually.
-
-## Features
-
-- Bidirectional sync between Obsidian folders and AgentWiki Spaces
-- Git-style Status / Pull / Push workflow with three-way merge
-- Human-readable file paths (no hash filenames)
-- Conflict markers for manual resolution
-- Mobile compatible (no desktop-only APIs)
-- Credentials stored in Obsidian Secret Storage only
-
-## Security
-
-- The plugin only connects when you run Connect, Status, Pull, or Push
-- Push requires preview confirmation before uploading
-- Credentials and connection codes never enter your vault or diagnostics
-- All remote Markdown paths pass NFC/casefold portable path validation
-
-## Development
-
-Requires Node.js 24 LTS:
+要求 Node.js 24 LTS：
 
 ```bash
 npm ci
@@ -72,7 +30,7 @@ npm run check
 
 ## 安全边界
 
-- 插件只在用户执行连接、Status、Pull、Push 时联网。
+- 插件只在用户连接、打开/刷新同步中心或确认同步时联网。
 - Push 必须先确认预览，远端 head 领先时被阻止。
 - credential 与连接码只进入 Obsidian Secret Storage，不进入 Vault 或诊断。
 - `.agentwiki/` 控制状态按 device/space 隔离，通过 DataAdapter 相对路径访问；基线采用不可变 generation + current pointer，不使用 Node `fs` 或桌面专属 API。

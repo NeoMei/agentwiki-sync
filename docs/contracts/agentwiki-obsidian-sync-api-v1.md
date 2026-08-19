@@ -4,7 +4,7 @@
 
 - 契约版本：`1`
 - 设计确认日期：2026-08-13
-- 状态：插件项目已确认的上游需求；AgentWiki 主项目尚未实现
+- 状态：AgentWiki 主项目已实现并发布；插件以公开 API 和 `@neomei/agentwiki-sync-protocol@0.1.0` 集成
 - 适用客户端：AgentWiki Sync Obsidian 插件
 - 实现仓库：`/Users/neomei/项目/codexprojects/AgentWiki /agentwiki`，必须通过独立任务修改
 

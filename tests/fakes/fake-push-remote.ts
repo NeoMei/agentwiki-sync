@@ -9,6 +9,9 @@ import type {
 export class FakePushRemote implements PushRemotePort {
   readonly batches: PushBatch[] = [];
   finalizeCalls = 0;
+  abortCalls = 0;
+  onUpload: (() => Promise<void>) | null = null;
+  onAbort: (() => Promise<void>) | null = null;
   loseFinalizeResponseOnce = false;
   loseFirstUploadOnce = false;
   private session: PushSessionInfo | null = null;
@@ -34,6 +37,7 @@ export class FakePushRemote implements PushRemotePort {
     _sessionId: string,
     batch: PushBatch,
   ): Promise<{ receipt: string }> {
+    await this.onUpload?.();
     if (this.loseFirstUploadOnce) {
       this.loseFirstUploadOnce = false;
       throw new Error("upload interrupted");
@@ -76,5 +80,10 @@ export class FakePushRemote implements PushRemotePort {
       receivedBatchIndexes: this.batches.map((batch) => batch.batchIndex),
       result: this.session.result,
     };
+  }
+  async abort(): Promise<void> {
+    this.abortCalls += 1;
+    await this.onAbort?.();
+    if (this.session) this.session = { ...this.session, status: "aborted" };
   }
 }

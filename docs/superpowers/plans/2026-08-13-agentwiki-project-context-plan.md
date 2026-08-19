@@ -1,6 +1,6 @@
 # AgentWiki Project Context Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use Markdown checkboxes for tracking.
 
 **Goal:** 在 AgentWiki-Obsidian 根目录建立一套仅服务当前电脑的项目说明，让开发 Agent 能定位并正确读取 AgentWiki 主项目，同时遵守跨仓与数据安全边界。
 
@@ -17,6 +17,8 @@
 - 不复制生产凭据、令牌、部署密码或一次性发布状态。
 - 不初始化 Git，不搭建插件代码，不修改 AgentWiki 主项目。
 
+**完成记录：** 本计划已由提交 `ebba078` 完成。其中“不初始化 Git”是本历史任务的执行边界；仓库在后续插件开发阶段已正常初始化，因此对应的历史验证命令不应在当前仓库重放。
+
 ---
 
 ### Task 1: 建立插件项目的 AgentWiki 上下文入口
@@ -30,7 +32,7 @@
 - Consumes: 当前电脑上的 AgentWiki 主项目、`.codex-memory` 权威文档和 AgentWiki 公开集成边界。
 - Produces: Codex 自动读取的根级项目指令，以及供插件开发按需读取的 AgentWiki 详细上下文。
 
-- [ ] **Step 1: 创建根级 `AGENTS.md`**
+- [x] **Step 1: 创建根级 `AGENTS.md`**
 
 使用以下完整内容创建 `AGENTS.md`：
 
@@ -71,7 +73,7 @@
 - 原始本地文件、凭据和未审查内容不得被插件自动上传。
 ```
 
-- [ ] **Step 2: 创建 `docs/agentwiki-context.md`**
+- [x] **Step 2: 创建 `docs/agentwiki-context.md`**
 
 使用以下完整内容创建 `docs/agentwiki-context.md`：
 
@@ -163,7 +165,7 @@ AgentWiki 是以 Space 为知识隔离、版本和同步边界的协作式知识
 - 用户 Vault 原始内容及未经确认的本地文件
 ```
 
-- [ ] **Step 3: 验证文件内容与本机路径**
+- [x] **Step 3: 验证文件内容与本机路径**
 
 运行：
 
@@ -179,7 +181,7 @@ test -f '/Users/neomei/项目/codexprojects/AgentWiki /.codex-memory/spec/local-
 
 Expected: 命令退出码为 `0`，没有输出。
 
-- [ ] **Step 4: 检查占位符、秘密模式和跨仓误改**
+- [x] **Step 4: 检查占位符、秘密模式和跨仓误改**
 
 运行：
 
@@ -191,7 +193,7 @@ test ! -d .git
 
 Expected: 命令退出码为 `0`，没有输出；插件目录仍未初始化 Git。
 
-- [ ] **Step 5: 人工核对职责边界**
+- [x] **Step 5: 人工核对职责边界**
 
 逐项确认：
 

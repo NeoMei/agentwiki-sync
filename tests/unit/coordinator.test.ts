@@ -5,6 +5,7 @@ import {
   selectMappingForPath,
   validateMappings,
 } from "../../src/application/sync-coordinator";
+import * as coordinator from "../../src/application/sync-coordinator";
 import { parseSettings } from "../../src/application/settings";
 
 describe("sync coordinator", () => {
@@ -75,13 +76,19 @@ describe("sync coordinator", () => {
     ).toThrow(/无效的空间映射/);
   });
 
-  it("selects the active mapping for an open file and rejects overlaps", () => {
+  it("selects pending mappings for first sync and rejects duplicate spaces", () => {
     const mappings = [
       { spaceId: "s1", rootPath: "Wiki", status: "active" as const },
       { spaceId: "s2", rootPath: "Other", status: "pending" as const },
     ];
     expect(selectMappingForPath(mappings, "Wiki/A.md")?.spaceId).toBe("s1");
-    expect(selectMappingForPath(mappings, "Other/A.md")).toBeNull();
+    expect(selectMappingForPath(mappings, "Other/A.md")?.spaceId).toBe("s2");
+    expect(() =>
+      validateMappings([
+        { spaceId: "same", rootPath: "Wiki", status: "active" },
+        { spaceId: "same", rootPath: "Other", status: "pending" },
+      ]),
+    ).toThrow(/Space.*映射/);
     expect(() =>
       validateMappings([
         { spaceId: "a", rootPath: "Wiki", status: "active" },
@@ -94,5 +101,70 @@ describe("sync coordinator", () => {
         { spaceId: "b", rootPath: "Wiki/Sub", status: "pending" },
       ]),
     ).toThrow(/重叠/);
+  });
+
+  it("offers unmapped read-only spaces as pull-capable mapping candidates", () => {
+    expect(coordinator).toHaveProperty("unmappedSpaces");
+    const unmappedSpaces = (
+      coordinator as typeof coordinator & {
+        unmappedSpaces: <T extends { spaceId: string }>(
+          spaces: T[],
+          mappings: Array<{ spaceId: string }>,
+        ) => T[];
+      }
+    ).unmappedSpaces;
+    expect(
+      unmappedSpaces(
+        [
+          { spaceId: "viewer", canPublish: false },
+          { spaceId: "editor", canPublish: true },
+        ],
+        [{ spaceId: "editor" }],
+      ),
+    ).toEqual([{ spaceId: "viewer", canPublish: false }]);
+  });
+
+  it("keeps an explicitly selected sync mapping stable across the flow", () => {
+    expect(coordinator).toHaveProperty("resolveMapping");
+    const resolveMapping = (
+      coordinator as typeof coordinator & {
+        resolveMapping: (
+          mappings: Array<{
+            spaceId: string;
+            rootPath: string;
+            status: "pending" | "active";
+          }>,
+          activePath: string,
+          requestedSpaceId?: string,
+        ) => { spaceId: string } | null;
+      }
+    ).resolveMapping;
+    const mappings = [
+      { spaceId: "s1", rootPath: "Wiki", status: "active" as const },
+      { spaceId: "s2", rootPath: "Other", status: "pending" as const },
+    ];
+    expect(resolveMapping(mappings, "Other/A.md")?.spaceId).toBe("s2");
+    expect(resolveMapping(mappings, "Other/A.md", "s1")?.spaceId).toBe("s1");
+    expect(resolveMapping(mappings, "Other/A.md", "missing")).toBeNull();
+  });
+
+  it("routes diff loading and strategy execution through one selected Space", async () => {
+    expect(coordinator).toHaveProperty("SyncTargetSelection");
+    const Selection = (
+      coordinator as typeof coordinator & {
+        SyncTargetSelection: new (
+          targetIds: string[],
+          initialId: string,
+        ) => {
+          current: string;
+          select: (spaceId: string) => void;
+        };
+      }
+    ).SyncTargetSelection;
+    const selection = new Selection(["s1", "s2"], "s2");
+    expect(selection.current).toBe("s2");
+    selection.select("s1");
+    expect(selection.current).toBe("s1");
+    expect(() => selection.select("missing")).toThrow(/空间/);
   });
 });

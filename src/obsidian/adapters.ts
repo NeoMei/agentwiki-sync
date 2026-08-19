@@ -70,7 +70,7 @@ export class ObsidianLocalControlStore implements ControlStorePort {
     return `${this.namespace}:${path}`;
   }
   async read(path: string): Promise<string | null> {
-    const value = this.app.loadLocalStorage(this.key(path));
+    const value: unknown = this.app.loadLocalStorage(this.key(path));
     return typeof value === "string" ? value : null;
   }
   async write(path: string, value: string): Promise<void> {
@@ -227,7 +227,7 @@ export class ObsidianVaultPort implements VaultPort {
   }
   async remove(path: string): Promise<void> {
     const file = this.file(path);
-    if (file) await this.vault.delete(file);
+    if (file) await this.fileManager.trashFile(file);
   }
   async rename(from: string, to: string): Promise<void> {
     const file = this.file(from);
