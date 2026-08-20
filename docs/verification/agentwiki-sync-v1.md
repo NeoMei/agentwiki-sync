@@ -29,12 +29,12 @@ AgentWiki 主项目三项交付已合并并发布：`@neomei/agentwiki-sync-prot
 
 协议一致性已通过 conformance 固化，API 路径、Bearer 凭据认证与 exchange 请求格式均与主项目实现核对一致。真实生产写入联调需要一次性连接码、用户数据清理和生产变更授权，因此作为独立发布验收，不属于当前仓库未完成的实现任务。
 
-0.2.8 可读路径的服务端伴随分支为 `codex/readable-sync-paths`，验证记录 HEAD `13f9fbb`；其仓库矩阵为 1,173 pass / 40 个明确 DB skip / 0 fail，typecheck、lint、build 与 diff-check 通过。随后在本机 PostgreSQL 16 的明确命名临时库 `agentwiki_codex_readable_sync_20260820_01` 上补跑 31 个真实 DB 同步/迁移门禁，结果为 **31 pass / 0 skip / 0 fail**，包含真实 Prisma、Redis、HTTP、并发、5,000 页及 100 MiB 边界；测试库已删除并确认不存在。服务端分支仍未合并、未迁移生产数据库、未部署。
+0.2.8 可读路径的服务端伴随分支为 `codex/readable-sync-paths`，最终行为 HEAD `13f9fbb`（后续仅更新验证记录）；其仓库矩阵为 1,173 pass / 40 个明确 DB skip / 0 fail，typecheck、lint、build 与 diff-check 通过。随后在本机 PostgreSQL 16 的明确命名临时库 `agentwiki_codex_readable_sync_20260820_01` 上补跑 31 个真实 DB 同步/迁移门禁，结果为 **31 pass / 0 skip / 0 fail**，包含真实 Prisma、Redis、HTTP、并发、5,000 页及 100 MiB 边界；测试库已删除并确认不存在。服务端分支仍未合并、未迁移生产数据库、未部署。
 
 ## 0.2.8 跨仓收口与发布门
 
 - 插件分支：`codex/durable-mappings-0.2.8`，最终行为 HEAD `b87e23bbc4a4`（后续仅更新验证记录）。
-- 服务端分支：`codex/readable-sync-paths` @ `13f9fbbb6aa5c96e7a0a89e33a6a947a22acebaf`。
+- 服务端分支：`codex/readable-sync-paths`，最终行为 HEAD `13f9fbbb6aa5c96e7a0a89e33a6a947a22acebaf`（后续仅更新验证记录）。
 - 本地构建插件 manifest 版本：`0.2.8`。`main.js` 实际文件大小 `850787` bytes，SHA-256 `edcc88e798d2b1ec349b7a447317be8e2ad08485918ed657580820612d59c685`；`manifest.json` SHA-256 `6a909133ff02ab97e8aa71943f0fc08d7ac4b3c69bbc40e9d06bab6b7591e5a7`。`check-bundle.mjs` 按 JavaScript string length 记录 `850506`。
 - 需求→代码审查通过：Vault schema-v2 映射持久化、0.2.7 迁移、连接身份分离、缺失根目录保留映射、canonical rename/path conflict、正文/H1 保留和 0.2.8 元数据均有定向或全量自动证据。
 - 状态机/数据迁移/恢复二次审查找到并修正了服务端首个 migration revision 遗漏未改名页、O(n²) 路径查询与默认事务超时、以及标题本身等于 `p-<64 hex>` 时的幂等失效；最终静态审查未发现新的 Critical/Important。
