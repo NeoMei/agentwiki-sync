@@ -89,7 +89,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
     );
   }
   override async onload(): Promise<void> {
-    const stored = await this.loadData();
+    const stored: unknown = await this.loadData();
     const needsLegacy =
       stored === null ||
       stored === undefined ||

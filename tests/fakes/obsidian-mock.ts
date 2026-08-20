@@ -31,9 +31,14 @@ export class Notice {
   constructor(public readonly message: string) {}
 }
 
+interface MockPluginApp {
+  __pluginData?: unknown;
+  __savedData?: unknown[];
+}
+
 export class Plugin {
   constructor(
-    public readonly app: any,
+    public readonly app: MockPluginApp,
     public readonly manifest: { version: string } = { version: "0.0.0" },
   ) {}
   async loadData(): Promise<unknown> {
@@ -46,7 +51,7 @@ export class Plugin {
   addSettingTab(): void {}
   addRibbonIcon(): void {}
   addCommand(): void {}
-  addStatusBarItem(): any {
+  addStatusBarItem(): MockElement {
     return new MockElement();
   }
   registerEvent(): void {}
@@ -56,21 +61,21 @@ export class Plugin {
 export class PluginSettingTab {
   containerEl = new MockElement();
   constructor(
-    public readonly app: any,
-    public readonly plugin: any,
+    public readonly app: unknown,
+    public readonly plugin: unknown,
   ) {}
 }
 
 export class Modal {
   contentEl = new MockElement();
   modalEl = new MockElement();
-  constructor(public readonly app: any) {}
+  constructor(public readonly app: unknown) {}
   open(): void {}
   close(): void {}
 }
 
 export class Setting {
-  constructor(public readonly containerEl: any) {}
+  constructor(public readonly containerEl: unknown) {}
   setName(): this {
     return this;
   }
