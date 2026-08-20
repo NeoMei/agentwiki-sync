@@ -9,7 +9,9 @@
 - `npm run build`：browser platform 单 bundle，`obsidian` external。
 - `npm run check:bundle`：禁止 Node 文件系统/子进程、桌面 adapter 和秘密模式；检查发布版本一致性。
 
-最新收口结果（2026-08-19）：29 个测试文件、147 项测试全部通过；Prettier 格式检查、Obsidian 官方 ESLint 推荐规则（0 error）、strict typecheck、production build 与 bundle/release 安全检查通过。覆盖 fixed-revision 分页、非法远端路径拒绝、connection exact replay、pageId/case-only rename、首次绑定和普通冲突、Vault CAS 与回滚故障点、不可变 generation/current pointer、设备隔离、Push 发布后指标验证、响应丢失恢复、凭据轮换 supersede 与设备本地状态 envelope 迁移；另覆盖多 Space 选择/去重、只读 Pull 权限、进度与取消边界、纯归档批量让步、取消上传时先持久化不可重放状态再 abort 远端 session、上传异常与取消竞态下仍保证 supersede 且不可恢复、取消后可安全断开且本地变更保留、UI 交互纯逻辑、Obsidian 适配器契约、协议 conformance、多代 generation 清理、市场设置标题规则、回收站偏好和近 100 MiB 有界内存验收。
+最新收口结果（2026-08-20，0.2.8）：先执行 `npm ci --ignore-scripts`（新增 375 个 package，0 vulnerability），再执行 `npm run check`。结果为 **30 个测试文件、166 项测试全部通过**；Prettier 通过；Obsidian 官方 ESLint **0 error / 13 个已知 warning**；strict typecheck、production build、bundle safety 和 release metadata 全部通过。bundle safety 记录为 `850506 bytes`，release metadata 确认 `0.2.8`；`git diff --check` 通过。
+
+0.2.8 新增覆盖：库级 schema-v2 映射持久化、0.2.7 local envelope 一次性迁移、重启/禁用启用/无连接/有连接生命周期、v2 对陈旧损坏 envelope 的权威性、敏感身份不进入 `data.json`、缺失/非目录映射根阻断且不删映射、opaque → 标题路径 rename、双向改名 path conflict、`标题.md` / `标题 (2).md` 同时落地，以及正文哈希和 Markdown H1 保留。
 
 ## 客户端交付边界
 
@@ -24,3 +26,5 @@ AgentWiki 主项目三项交付已合并并发布：`@neomei/agentwiki-sync-prot
 联调发现并修复了 `revisionContentHash` 的跨边界差异：发布包的 `RevisionContentManifest` 包含 `protocolVersion` 与 `spaceId`，插件本地副本此前只有 `pages`，会导致客户端重建的 revision hash 与服务端不一致。现已补齐并统一 `revisionManifestByteLength` 的输入；默认 `maxPageItems` 也对齐到服务端公布的 `100`。
 
 协议一致性已通过 conformance 固化，API 路径、Bearer 凭据认证与 exchange 请求格式均与主项目实现核对一致。真实生产写入联调需要一次性连接码、用户数据清理和生产变更授权，因此作为独立发布验收，不属于当前仓库未完成的实现任务。
+
+0.2.8 可读路径的服务端伴随分支为 `codex/readable-sync-paths`，验证记录 HEAD `13f9fbb`；其仓库矩阵为 1,173 pass / 40 个明确 DB skip / 0 fail，typecheck、lint、build 与 diff-check 通过。由于当前没有可用的隔离 PostgreSQL `DATABASE_URL`，真实迁移事务测试未执行；服务端分支也未合并、未迁移数据库、未部署。
