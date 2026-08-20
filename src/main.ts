@@ -1,7 +1,9 @@
 import { Notice, Plugin } from "obsidian";
 import {
   DEFAULT_SETTINGS,
+  migrateVaultSettings,
   parseSettings,
+  toVaultSettings,
   type AgentWikiSyncSettings,
 } from "./application/settings";
 import { AgentWikiSyncSettingTab } from "./obsidian/settings-tab";
@@ -87,13 +89,21 @@ export default class AgentWikiSyncPlugin extends Plugin {
     );
   }
   override async onload(): Promise<void> {
-    const local = await this.settingsRepo().read();
-    if (local) this.settings = local.payload;
-    else {
-      this.settings = parseSettings(await this.loadData());
-      await this.settingsRepo().write(this.settings);
-      await this.saveData(DEFAULT_SETTINGS);
-    }
+    const stored = await this.loadData();
+    const needsLegacy =
+      stored === null ||
+      stored === undefined ||
+      (typeof stored === "object" &&
+        (stored as { schemaVersion?: unknown }).schemaVersion === 1);
+    const legacy = needsLegacy ? await this.settingsRepo().read() : null;
+    const vaultSettings = migrateVaultSettings(stored, legacy?.payload ?? null);
+    this.settings = {
+      schemaVersion: 1,
+      serverUrl: vaultSettings.serverUrl,
+      serverInstanceId: null,
+      mappings: vaultSettings.mappings,
+    };
+    await this.saveData(vaultSettings);
 
     // Run storage migration to convert hash filenames to readable paths
     await this.runStorageMigration();
@@ -107,7 +117,9 @@ export default class AgentWikiSyncPlugin extends Plugin {
       // The connected state is authoritative. A settings URL that differs
       // only by normalization (host case, default port) must self-heal;
       // throwing here would brick onload before any settings UI exists.
-      this.settings.serverUrl = connection.payload.serverUrl;
+      this.settings.serverUrl = normalizeServerUrl(
+        connection.payload.serverUrl,
+      );
       this.settings.serverInstanceId = connection.payload.serverInstanceId;
       await new VaultIdentityService(
         new ObsidianControlStore(this.app.vault.adapter),
@@ -183,7 +195,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
 
   async saveSettings(): Promise<void> {
     validateMappings(this.settings.mappings);
-    await this.settingsRepo().write(this.settings);
+    await this.saveData(toVaultSettings(this.settings));
   }
   async setServerUrl(value: string): Promise<void> {
     if (

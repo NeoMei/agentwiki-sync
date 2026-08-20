@@ -129,8 +129,12 @@ export function migrateVaultSettings(
     if (typeof stored !== "object") throw new Error("设置数据无效");
     const schemaVersion = (stored as { schemaVersion?: unknown }).schemaVersion;
     if (schemaVersion === 2) return parseVaultSettings(stored);
-    if (schemaVersion === 1)
-      return toVaultSettings(parseLegacySettings(stored));
+    if (schemaVersion === 1) {
+      const dataJsonSettings = parseLegacySettings(stored);
+      return legacy !== null
+        ? toVaultSettings(parseLegacySettings(legacy))
+        : toVaultSettings(dataJsonSettings);
+    }
     if (typeof schemaVersion === "number" && schemaVersion > 2)
       throw futureSchemaError();
     throw new Error("设置数据无效");
