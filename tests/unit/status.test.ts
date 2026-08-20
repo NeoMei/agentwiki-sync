@@ -69,4 +69,82 @@ describe("status", () => {
       }),
     ).rejects.toThrow(/SPACE_TOO_LARGE/);
   });
+
+  it("keeps the baseline title for an unchanged allocated duplicate path", async () => {
+    const body = "# 标题\n\n第二篇";
+    const files: VaultFile[] = [
+      {
+        relativePath: "pages/标题 (2).md",
+        bytes: new TextEncoder().encode(body),
+      },
+    ];
+    const scan = await scanMapping(files, {
+      complete: true,
+      scanEpoch: 1,
+      capabilities: {
+        pages: 5000,
+        bodyBytes: 100_000,
+        manifestBytes: 100_000,
+      },
+    });
+    const manifest = {
+      p2: {
+        pageId: "p2",
+        relativePath: "pages/标题 (2).md",
+        title: "标题",
+        contentHash: scan.files[0]!.contentHash,
+      },
+    };
+
+    const resolved = resolvePageIdentities(manifest, scan.files, []);
+
+    expect(resolved[0]).toMatchObject({
+      pageId: "p2",
+      relativePath: "pages/标题 (2).md",
+      title: "标题",
+      identityStatus: "resolved",
+    });
+    expect(computeStatus(manifest, resolved, scan).modified).toHaveLength(0);
+  });
+
+  it("keeps the new basename title for a genuine local rename", async () => {
+    const body = "# 标题\n\n第二篇";
+    const files: VaultFile[] = [
+      {
+        relativePath: "pages/新标题.md",
+        bytes: new TextEncoder().encode(body),
+      },
+    ];
+    const scan = await scanMapping(files, {
+      complete: true,
+      scanEpoch: 1,
+      capabilities: {
+        pages: 5000,
+        bodyBytes: 100_000,
+        manifestBytes: 100_000,
+      },
+    });
+    const manifest = {
+      p2: {
+        pageId: "p2",
+        relativePath: "pages/标题 (2).md",
+        title: "标题",
+        contentHash: scan.files[0]!.contentHash,
+      },
+    };
+    const resolved = resolvePageIdentities(manifest, scan.files, [
+      {
+        pageId: "p2",
+        fromPath: "pages/标题 (2).md",
+        toPath: "pages/新标题.md",
+        observedVaultByteHash: scan.files[0]!.vaultByteHash,
+      },
+    ]);
+
+    const status = computeStatus(manifest, resolved, scan);
+
+    expect(resolved[0]?.title).toBe("新标题");
+    expect(status.renamed).toHaveLength(1);
+    expect(status.modified).toHaveLength(1);
+  });
 });

@@ -224,5 +224,38 @@ describe("manual multi-device sync", () => {
     expect(vault.text("Wiki/pages/标题 (2).md")).toBe(secondBody);
     expect(vault.text("Wiki/pages/标题.md")).toContain("# 标题");
     expect(vault.text("Wiki/pages/标题 (2).md")).toContain("# 标题");
+
+    const clean = await runtime.status();
+    expect(clean.local).toEqual({
+      added: [],
+      modified: [],
+      renamed: [],
+      deleted: [],
+      ambiguous: [],
+    });
+    expect((await runtime.previewPush()).changes).toHaveLength(0);
+
+    await vault.rename("Wiki/pages/标题 (2).md", "Wiki/pages/真正改名.md");
+    await runtime.recordRename(
+      "Wiki/pages/标题 (2).md",
+      "Wiki/pages/真正改名.md",
+    );
+
+    const renamed = await runtime.status();
+    expect(renamed.local.renamed).toEqual([
+      expect.objectContaining({
+        pageId: "p2",
+        relativePath: "pages/真正改名.md",
+        title: "真正改名",
+      }),
+    ]);
+    expect((await runtime.previewPush()).changes).toEqual([
+      expect.objectContaining({
+        operation: "upsert",
+        pageId: "p2",
+        path: "pages/真正改名.md",
+        title: "真正改名",
+      }),
+    ]);
   });
 });

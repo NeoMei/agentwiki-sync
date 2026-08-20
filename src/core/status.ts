@@ -88,9 +88,15 @@ export function resolvePageIdentities(
   const result: ResolvedFile[] = [];
   for (const file of files) {
     const page = byPath.get(portablePathKey(file.relativePath));
+    const resolvedTitle =
+      page !== undefined &&
+      page.relativePath.normalize("NFC") === file.relativePath.normalize("NFC")
+        ? page.title
+        : file.title;
     if (page) resolvedIds.add(page.pageId);
     result.push({
       ...file,
+      title: resolvedTitle,
       pageId: page?.pageId ?? null,
       identityStatus: page ? "resolved" : "new",
     });
