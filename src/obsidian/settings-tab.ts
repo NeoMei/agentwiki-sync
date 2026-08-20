@@ -1,4 +1,4 @@
-import { Notice, PluginSettingTab, Setting, type App } from "obsidian";
+import { Notice, PluginSettingTab, Setting, TFolder, type App } from "obsidian";
 import type AgentWikiSyncPlugin from "../main";
 import { userErrorMessage } from "../core/user-errors";
 import type { SyncSpaceSummary } from "../agentwiki/protocol";
@@ -120,12 +120,20 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
       const space = this.availableSpaces?.find(
         (s) => s.spaceId === mapping.spaceId,
       );
+      const root = this.app.vault.getAbstractFileByPath(mapping.rootPath);
+      const rootProblem =
+        root instanceof TFolder
+          ? null
+          : root
+            ? "本地路径不是文件夹，请更改映射"
+            : "本地文件夹缺失，请重新创建或更改映射";
       new Setting(this.containerEl)
         .setName(space?.displayName ?? mapping.spaceId)
         .setDesc(
           mapping.rootPath +
             " · " +
-            (mapping.status === "active" ? "已激活" : "待首次拉取"),
+            (mapping.status === "active" ? "已激活" : "待首次拉取") +
+            (rootProblem ? ` · ${rootProblem}` : ""),
         )
         .addButton((button) =>
           button

@@ -59,6 +59,10 @@ export function userErrorMessage(error: unknown): string {
     return "服务器地址格式不正确。请输入完整地址，如 https://agentwiki.quukk.com";
   }
   if (error instanceof Error) {
+    if (error.message === "MAPPING_ROOT_MISSING")
+      return "映射的本地文件夹不存在。请重新创建该文件夹，或在设置中更改映射目录。";
+    if (error.message === "MAPPING_ROOT_NOT_DIRECTORY")
+      return "映射路径指向了文件而不是文件夹。请在设置中更改映射目录。";
     if (error.message.includes("Path contains"))
       return "路径格式不正确。请使用相对路径，不要包含 .. 或 / 开头。";
     if (error.message.includes("映射根路径重叠"))

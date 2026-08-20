@@ -633,9 +633,8 @@ export class SyncRuntime {
   private async scan(options?: SyncOperationOptions): Promise<ScanResult> {
     const epoch = this.scanEpoch;
     const status = await this.vault.rootStatus(this.mapping.rootPath);
-    if (status === "file") throw new Error("映射根是文件");
-    if (status === "missing" && this.mapping.status === "active")
-      throw new Error("本地扫描不完整：映射根目录缺失");
+    if (status === "missing") throw new Error("MAPPING_ROOT_MISSING");
+    if (status === "file") throw new Error("MAPPING_ROOT_NOT_DIRECTORY");
     const capabilities = await this.capabilities();
     try {
       reportProgress(options, {
@@ -643,10 +642,7 @@ export class SyncRuntime {
         completed: 0,
         cancellable: true,
       });
-      const source =
-        status === "missing"
-          ? ([] as Array<{ relativePath: string; bytes: Uint8Array }>)
-          : this.vault.listMarkdown(this.mapping.rootPath);
+      const source = this.vault.listMarkdown(this.mapping.rootPath);
       let scanned = 0;
       const files = async function* () {
         for await (const file of source) {

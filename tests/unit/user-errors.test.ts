@@ -28,4 +28,13 @@ describe("userErrorMessage", () => {
   it("falls back to raw message for unknown errors", () => {
     expect(userErrorMessage(new Error("custom"))).toBe("custom");
   });
+
+  it("explains how to repair a missing or non-directory mapping root", () => {
+    expect(userErrorMessage(new Error("MAPPING_ROOT_MISSING"))).toMatch(
+      /重新创建.*文件夹|更改.*映射/,
+    );
+    expect(userErrorMessage(new Error("MAPPING_ROOT_NOT_DIRECTORY"))).toMatch(
+      /文件夹|更改.*映射/,
+    );
+  });
 });

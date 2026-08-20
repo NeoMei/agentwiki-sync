@@ -845,4 +845,50 @@ describe("SyncRuntime", () => {
     await runtime.applyPull(preview);
     expect(vault.text("Wiki/Empty.md")).toBe("");
   });
+
+  it("blocks a missing mapping root without deleting the mapping", async () => {
+    const remote = new FakeAgentWiki();
+    const vault = new MemoryVault({});
+    vault.setRootStatus("missing");
+    const mapping = {
+      spaceId: "space",
+      rootPath: "Wiki",
+      status: "active" as const,
+    };
+    const settingsMappings = [mapping];
+    const runtime = new SyncRuntime(
+      vault,
+      new MemoryControlStore(),
+      remote,
+      mapping,
+    );
+
+    await expect(runtime.status()).rejects.toThrow("MAPPING_ROOT_MISSING");
+    expect(settingsMappings).toEqual([mapping]);
+    expect(await remote.getHead()).toMatchObject({ revision: "0" });
+  });
+
+  it("blocks a file used as the mapping root without deleting the mapping", async () => {
+    const remote = new FakeAgentWiki();
+    const vault = new MemoryVault({});
+    vault.setRootStatus("file");
+    const mapping = {
+      spaceId: "space",
+      rootPath: "Wiki",
+      status: "pending" as const,
+    };
+    const settingsMappings = [mapping];
+    const runtime = new SyncRuntime(
+      vault,
+      new MemoryControlStore(),
+      remote,
+      mapping,
+    );
+
+    await expect(runtime.previewPush()).rejects.toThrow(
+      "MAPPING_ROOT_NOT_DIRECTORY",
+    );
+    expect(settingsMappings).toEqual([mapping]);
+    expect(await remote.getHead()).toMatchObject({ revision: "0" });
+  });
 });

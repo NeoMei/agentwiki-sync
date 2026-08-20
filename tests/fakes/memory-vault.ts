@@ -5,18 +5,27 @@ export class MemoryVault implements VaultPort {
   readonly trash = new Map<string, Uint8Array>();
   operations = 0;
   failAfterOperations: number | null = null;
+  private rootStatusOverride: "folder" | "missing" | "file" | null = null;
 
   constructor(initial: Record<string, string>) {
     for (const [path, body] of Object.entries(initial))
       this.files.set(path, new TextEncoder().encode(body));
   }
+  setRootStatus(status: "folder" | "missing" | "file" | null): void {
+    this.rootStatusOverride = status;
+  }
   async rootStatus(rootPath: string): Promise<"folder" | "missing" | "file"> {
+    if (this.rootStatusOverride) return this.rootStatusOverride;
     if (this.files.has(rootPath)) return "file";
     const prefix = rootPath ? `${rootPath}/` : "";
-    return rootPath === "" ||
+    if (
+      rootPath === "" ||
       [...this.files.keys()].some((path) => path.startsWith(prefix))
-      ? "folder"
-      : "missing";
+    )
+      return "folder";
+    // Existing tests model a pre-created empty mapping directory unless they
+    // explicitly override the status with setRootStatus().
+    return "folder";
   }
   async *listMarkdown(
     rootPath: string,
