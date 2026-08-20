@@ -9,13 +9,13 @@
 - `npm run build`：browser platform 单 bundle，`obsidian` external。
 - `npm run check:bundle`：禁止 Node 文件系统/子进程、桌面 adapter 和秘密模式；检查发布版本一致性。
 
-最新收口结果（2026-08-20，0.2.8）：先执行 `npm ci --ignore-scripts`（新增 375 个 package，0 vulnerability），再执行 `npm run check`。结果为 **30 个测试文件、166 项测试全部通过**；Prettier 通过；Obsidian 官方 ESLint **0 error / 13 个已知 warning**；strict typecheck、production build、bundle safety 和 release metadata 全部通过。bundle safety 记录为 `850506 bytes`，release metadata 确认 `0.2.8`；`git diff --check` 通过。
+最新收口结果（2026-08-20，0.2.8）：先执行 `npm ci --ignore-scripts`（新增 375 个 package，0 vulnerability），再执行 `npm run check`。当前行为 HEAD 的结果为 **30 个测试文件、168 项测试全部通过**；Prettier 通过；Obsidian 官方 ESLint **0 error / 13 个已知 warning**；strict typecheck、production build、bundle safety 和 release metadata 全部通过。当前 `npm run check:bundle` 记录为 `850682 bytes`，release metadata 确认 `0.2.8`；`git diff --check` 通过。
 
 0.2.8 新增覆盖：库级 schema-v2 映射持久化、0.2.7 local envelope 一次性迁移、重启/禁用启用/无连接/有连接生命周期、v2 对陈旧损坏 envelope 的权威性、敏感身份不进入 `data.json`、缺失/非目录映射根阻断且不删映射、opaque → 标题路径 rename、双向改名 path conflict、`标题.md` / `标题 (2).md` 同时落地，以及正文哈希和 Markdown H1 保留。
 
-真实 Obsidian 桌面验收使用 Obsidian 1.13.7、独立用户数据目录和临时 Vault `/tmp/agentwiki-obsidian-acceptance.cq2VM4/vault`，安装的 `main.js`、`manifest.json`、`styles.css` 与本分支发布产物逐字节相同。插件 0.2.8 成功加载 schema-v2 映射；禁用后重新启用、完整退出后重新启动，`acceptance-space → Wiki` 映射仍保持 `active`。将 `Wiki` 临时改名后，设置页显示“本地文件夹缺失，请重新创建或更改映射”，而 `data.json` 仍保留映射；恢复目录名后提示消失。用户 Vault `/Users/neomei/Obsidian/NeoMei-Docs` 未触碰。
+真实 Obsidian 桌面验收使用 Obsidian 1.13.7、独立用户数据目录和临时 Vault `/tmp/agentwiki-obsidian-acceptance.cq2VM4/vault`，安装的 `main.js`、`manifest.json`、`styles.css` 与本分支发布产物逐字节相同。插件 0.2.8 成功加载 schema-v2 映射；禁用后重新启用、完整退出后重新启动，`acceptance-space → Wiki` 映射仍保持 `active`。将 `Wiki` 临时改名后，设置页显示“本地文件夹缺失，请重新创建或更改映射”，而 `data.json` 仍保留映射；恢复目录名后提示消失。
 
-真实 HTTPS Obsidian 验收使用受信任的临时 localhost CA 和隔离数据库完成。两篇同名页面首次 Pull 后本地状态为零变更；规范 `(2)` 后缀未产生标题 Push。真实本地改名仍产生 path/title upsert；远端改名保持正文并重命名本地文件；双端改名进入显式 path conflict；离线时映射保留，服务恢复后状态可重新加载。验收后临时 CA、数据库、监听进程和活动测试目录均已清理。
+真实 HTTPS Obsidian 验收使用受信任的临时 localhost CA 和隔离数据库完成。两篇同名页面首次 Pull 后本地状态为零变更；规范 `(2)` 后缀未产生标题 Push。真实本地改名仍产生 path/title upsert；远端改名保持正文并重命名本地文件；双端改名进入显式 path conflict；离线时映射保留，服务恢复后状态可重新加载。验收后临时 CA、数据库、监听进程和活动测试目录均已清理。本轮所有启动参数、CDP target 和文件操作都指向隔离 profile/Vault；结束前对隔离进程执行 `lsof -p 31811`，未发现 `/Users/neomei/Obsidian/NeoMei-Docs` 路径句柄。这是一项结束时的有限只读证据，不单独证明整个运行期间的全部系统活动。
 
 ## 客户端交付边界
 
@@ -35,7 +35,7 @@ AgentWiki 主项目三项交付已合并并发布：`@neomei/agentwiki-sync-prot
 
 ## 0.2.8 跨仓收口与发布门
 
-- 插件分支：`codex/durable-mappings-0.2.8`，最终行为 HEAD `83a437690e3f`（后续仅更新验证记录）。
+- 插件分支：`codex/durable-mappings-0.2.8`，最终行为 HEAD `83a437690e3fd304f6471e314f2e19b818c73e1a`（后续仅更新验证记录）。
 - 服务端分支：`codex/readable-sync-paths`，最终行为 HEAD `13f9fbbb6aa5c96e7a0a89e33a6a947a22acebaf`（后续仅更新验证记录）。
 - 本地构建插件 manifest 版本：`0.2.8`。`main.js` 实际文件大小 `850963` bytes，SHA-256 `0995a05c8420ff4bab28302343e6b81add509439d0cb475b21b06d1c764349f5`；`manifest.json` SHA-256 `6a909133ff02ab97e8aa71943f0fc08d7ac4b3c69bbc40e9d06bab6b7591e5a7`。`check-bundle.mjs` 按 JavaScript string length 记录 `850682`。
 - 需求→代码审查通过：Vault schema-v2 映射持久化、0.2.7 迁移、连接身份分离、缺失根目录保留映射、canonical rename/path conflict、正文/H1 保留和 0.2.8 元数据均有定向或全量自动证据。
