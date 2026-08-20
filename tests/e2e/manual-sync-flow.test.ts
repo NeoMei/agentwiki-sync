@@ -188,4 +188,41 @@ describe("manual multi-device sync", () => {
     await desktop.applyPull(await desktop.previewPull());
     expect(desktopVault.text("Wiki/Guide.md")).toBe("mobile edit");
   });
+
+  it("materializes duplicate readable titles at distinct paths without stripping either H1", async () => {
+    const remote = new FakeAgentWiki();
+    const firstBody = "# 标题\n\n第一篇";
+    const secondBody = "# 标题\n\n第二篇";
+    await remote.seed([
+      {
+        pageId: "p1",
+        path: "pages/标题.md",
+        title: "标题",
+        body: firstBody,
+        contentHash: await contentHash(firstBody),
+        updatedAt: "2026-08-20T00:00:00.000Z",
+      },
+      {
+        pageId: "p2",
+        path: "pages/标题 (2).md",
+        title: "标题",
+        body: secondBody,
+        contentHash: await contentHash(secondBody),
+        updatedAt: "2026-08-20T00:00:00.000Z",
+      },
+    ]);
+    const vault = new MemoryVault({});
+    const runtime = new SyncRuntime(vault, new MemoryControlStore(), remote, {
+      spaceId: "space",
+      rootPath: "Wiki",
+      status: "pending",
+    });
+
+    await runtime.applyPull(await runtime.previewPull());
+
+    expect(vault.text("Wiki/pages/标题.md")).toBe(firstBody);
+    expect(vault.text("Wiki/pages/标题 (2).md")).toBe(secondBody);
+    expect(vault.text("Wiki/pages/标题.md")).toContain("# 标题");
+    expect(vault.text("Wiki/pages/标题 (2).md")).toContain("# 标题");
+  });
 });

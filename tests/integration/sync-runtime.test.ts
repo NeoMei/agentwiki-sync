@@ -660,6 +660,107 @@ describe("SyncRuntime", () => {
     expect(vault.text("Wiki/New.md")).toBe(body);
   });
 
+  it("renames an unchanged local opaque file to the canonical title path without changing its body", async () => {
+    const remote = new FakeAgentWiki();
+    const opaque = `pages/p-${"a".repeat(64)}.md`;
+    const body = "# 吃饭\n\n正文";
+    await remote.seed([
+      {
+        pageId: "p1",
+        path: opaque,
+        title: "吃饭",
+        body,
+        contentHash: await contentHash(body),
+        updatedAt: "2026-08-20T00:00:00.000Z",
+      },
+    ]);
+    const vault = new MemoryVault({});
+    const runtime = new SyncRuntime(vault, new MemoryControlStore(), remote, {
+      spaceId: "space",
+      rootPath: "Wiki",
+      status: "pending",
+    });
+    await runtime.applyPull(await runtime.previewPull());
+    const beforeHash = await contentHash(vault.text(`Wiki/${opaque}`)!);
+
+    await remote.replace([
+      {
+        pageId: "p1",
+        path: "pages/吃饭.md",
+        title: "吃饭",
+        body,
+        contentHash: await contentHash(body),
+        updatedAt: "2026-08-20T00:01:00.000Z",
+      },
+    ]);
+    const preview = await runtime.previewPull();
+    expect(preview.conflicts).toHaveLength(0);
+    expect(preview.actions).toEqual([
+      expect.objectContaining({
+        kind: "rename",
+        fromPath: `Wiki/${opaque}`,
+        path: "Wiki/pages/吃饭.md",
+      }),
+    ]);
+
+    await runtime.applyPull(preview);
+
+    expect(vault.exists(`Wiki/${opaque}`)).toBe(false);
+    expect(vault.text("Wiki/pages/吃饭.md")).toBe(body);
+    expect(await contentHash(vault.text("Wiki/pages/吃饭.md")!)).toBe(
+      beforeHash,
+    );
+  });
+
+  it("reports a path conflict when local and remote rename the same opaque page differently", async () => {
+    const remote = new FakeAgentWiki();
+    const opaque = `pages/p-${"b".repeat(64)}.md`;
+    const body = "# 吃饭\n\n正文";
+    await remote.seed([
+      {
+        pageId: "p1",
+        path: opaque,
+        title: "吃饭",
+        body,
+        contentHash: await contentHash(body),
+        updatedAt: "2026-08-20T00:00:00.000Z",
+      },
+    ]);
+    const vault = new MemoryVault({});
+    const runtime = new SyncRuntime(vault, new MemoryControlStore(), remote, {
+      spaceId: "space",
+      rootPath: "Wiki",
+      status: "pending",
+    });
+    await runtime.applyPull(await runtime.previewPull());
+    await vault.rename(`Wiki/${opaque}`, "Wiki/Guides/吃饭.md");
+    await runtime.recordRename(`Wiki/${opaque}`, "Wiki/Guides/吃饭.md");
+    await remote.replace([
+      {
+        pageId: "p1",
+        path: "pages/吃饭.md",
+        title: "吃饭",
+        body,
+        contentHash: await contentHash(body),
+        updatedAt: "2026-08-20T00:01:00.000Z",
+      },
+    ]);
+
+    const preview = await runtime.previewPull();
+
+    const pathConflict = preview.conflicts.find(
+      (conflict) => conflict.pageId === "p1" && conflict.field === "path",
+    );
+    expect(pathConflict).toBeDefined();
+    expect(await runtime.conflictSummary(preview, pathConflict!)).toEqual({
+      base: opaque,
+      local: "Guides/吃饭.md",
+      remote: "pages/吃饭.md",
+    });
+    expect(preview.actions).toHaveLength(0);
+    expect(vault.exists("Wiki/Guides/吃饭.md")).toBe(true);
+  });
+
   it("keeps a same-path local document dirty during initial binding", async () => {
     const remote = new FakeAgentWiki();
     const vault = new MemoryVault({ "Wiki/A.md": "local" });
