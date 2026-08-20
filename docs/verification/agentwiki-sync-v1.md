@@ -15,6 +15,8 @@
 
 真实 Obsidian 桌面验收使用 Obsidian 1.13.7、独立用户数据目录和临时 Vault `/tmp/agentwiki-obsidian-acceptance.cq2VM4/vault`，安装的 `main.js`、`manifest.json`、`styles.css` 与本分支发布产物逐字节相同。插件 0.2.8 成功加载 schema-v2 映射；禁用后重新启用、完整退出后重新启动，`acceptance-space → Wiki` 映射仍保持 `active`。将 `Wiki` 临时改名后，设置页显示“本地文件夹缺失，请重新创建或更改映射”，而 `data.json` 仍保留映射；恢复目录名后提示消失。用户 Vault `/Users/neomei/Obsidian/NeoMei-Docs` 未触碰。
 
+真实 HTTPS Obsidian 验收使用受信任的临时 localhost CA 和隔离数据库完成。两篇同名页面首次 Pull 后本地状态为零变更；规范 `(2)` 后缀未产生标题 Push。真实本地改名仍产生 path/title upsert；远端改名保持正文并重命名本地文件；双端改名进入显式 path conflict；离线时映射保留，服务恢复后状态可重新加载。验收后临时 CA、数据库、监听进程和活动测试目录均已清理。
+
 ## 客户端交付边界
 
 插件客户端、Obsidian 原生安装/配置界面、人工设备凭据、Status/Pull/Push 编排及 fake AgentWiki 验收已经完成。客户端不会假装探测或兼容主项目的内部接口：服务端公开路由不存在时，连接会以结构化 HTTP 错误失败，不会上传未确认正文。
@@ -33,15 +35,14 @@ AgentWiki 主项目三项交付已合并并发布：`@neomei/agentwiki-sync-prot
 
 ## 0.2.8 跨仓收口与发布门
 
-- 插件分支：`codex/durable-mappings-0.2.8`，最终行为 HEAD `b87e23bbc4a4`（后续仅更新验证记录）。
+- 插件分支：`codex/durable-mappings-0.2.8`，最终行为 HEAD `83a437690e3f`（后续仅更新验证记录）。
 - 服务端分支：`codex/readable-sync-paths`，最终行为 HEAD `13f9fbbb6aa5c96e7a0a89e33a6a947a22acebaf`（后续仅更新验证记录）。
-- 本地构建插件 manifest 版本：`0.2.8`。`main.js` 实际文件大小 `850787` bytes，SHA-256 `edcc88e798d2b1ec349b7a447317be8e2ad08485918ed657580820612d59c685`；`manifest.json` SHA-256 `6a909133ff02ab97e8aa71943f0fc08d7ac4b3c69bbc40e9d06bab6b7591e5a7`。`check-bundle.mjs` 按 JavaScript string length 记录 `850506`。
+- 本地构建插件 manifest 版本：`0.2.8`。`main.js` 实际文件大小 `850963` bytes，SHA-256 `0995a05c8420ff4bab28302343e6b81add509439d0cb475b21b06d1c764349f5`；`manifest.json` SHA-256 `6a909133ff02ab97e8aa71943f0fc08d7ac4b3c69bbc40e9d06bab6b7591e5a7`。`check-bundle.mjs` 按 JavaScript string length 记录 `850682`。
 - 需求→代码审查通过：Vault schema-v2 映射持久化、0.2.7 迁移、连接身份分离、缺失根目录保留映射、canonical rename/path conflict、正文/H1 保留和 0.2.8 元数据均有定向或全量自动证据。
 - 状态机/数据迁移/恢复二次审查找到并修正了服务端首个 migration revision 遗漏未改名页、O(n²) 路径查询与默认事务超时、以及标题本身等于 `p-<64 hex>` 时的幂等失效；最终静态审查未发现新的 Critical/Important。
 
 以下门禁尚未完成，因此当前结论仍是 **不发布**：
 
-1. 真实 Obsidian 已完成发布产物加载、重启、禁用/启用和缺失/恢复映射根目录矩阵；尚未完成一次性连接码、双重名 Web 页 Pull、Web 改标题、双向改名冲突和离线恢复的真实 UI 联调。原因是发布包按安全契约只接受 HTTPS，而隔离服务仅有 localhost HTTP；本轮没有安装测试 CA、绕过证书校验或使用生产数据。
-2. `requesting-code-review` 独立子代理复审因账户 usage limit 失败；非原生备用模型无法解密 worker task。已完成两轮主任务差异审查，但不将其冒充为独立审查。
+1. `requesting-code-review` 独立子代理复审因账户 usage limit 失败；非原生备用模型无法解密 worker task。已完成两轮主任务差异审查，但不将其冒充为独立审查。
 
 未执行 merge/cherry-pick、生产 DB 迁移、部署、npm/GitHub Release/tag/push、用户 Vault 安装、Obsidian preview scan 或市场提交。上述每项都需独立授权。
