@@ -65,7 +65,7 @@
 
 - 迁移对象仅限于能被严格识别为 `pages/p-<64 hex>.md` 的服务端回退路径，不猜测其他用户路径。
 - 按稳定顺序（建议 `knowledgeKey` 升序）为同一 Space 分配标题路径，保证重试得到同一结果。
-- 单个 Space 的路径更新、PageVersion 审计和 Revision 推进在一个可重试的数据库事务中完成。任一碰撞或写入失败时整个 Space 回滚。
+- 单个 Space 的路径更新、PageVersion 审计和 Revision 推进在一个持有共享 Space 锁的数据库事务中完成。任一碰撞或写入失败时整个 Space 回滚；迁移批次本身幂等，失败后由操作者重新运行，不在 allocator 内重试。
 - 迁移不修改 `title`、`content`、`contentHash` 或 `knowledgeKey`，仅产生可观察的 path rename Revision。
 - 迁移后插件的普通 Pull 将远端 path 变化应用为 Vault 重命名；不设计额外专用 API。
 
@@ -104,7 +104,9 @@ Vault 插件 `data.json` 只保存可同步、非秘密的配置：
 
 ## 一致性与故障处理
 
-- 服务端的路径分配必须依赖数据库唯一约束，在并发创建/改名碰撞时重试下一个序号，不依赖事务外的“先查再写”。
+- `ReadableSyncPathService.allocate()` 只是候选路径选择器，不保留路径，也不在内部捕获唯一冲突重试。所有生产调用点必须先在同一个数据库事务内取得共享 Space advisory lock，再执行候选路径读取和 Page 写入。
+- 数据库 `UNIQUE(spaceId, syncPathKey)` 是最终不变量。Web、ChangeSet、版本恢复、Obsidian finalize、可读路径迁移和旧 `backfill:sync-v1` 必须共用同一 Space 锁键；backfill 在每 Space 的相关变更窗口全程持锁。
+- 只有明确支持的外层事务边界可以做有界重试；例如 Obsidian finalize 对精确的 PostgreSQL serialization failure 重试整个事务。不允许对普通 `P2002` 或不明确的异常扩大重试范围。
 - Revision 只能在 Page 路径变更与审计版本同一事务中成功后推进。
 - 插件持久化校验失败时保留上一份可读配置，显示可操作错误，不退回空 mappings。
 - 路径重命名继续使用现有 Pull transaction、Vault CAS 和回滚机制；双端改名继续进入显式冲突。
