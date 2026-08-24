@@ -62,4 +62,3 @@ Expected: 4 tests passed。
 Run: `npm run check`
 
 Expected: format、lint、typecheck、test、build、bundle、release metadata 全部通过。随后在 560px 和窄容器复现页检查说明宽度与按钮排列。
-
