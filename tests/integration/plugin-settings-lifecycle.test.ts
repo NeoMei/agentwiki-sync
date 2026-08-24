@@ -100,8 +100,8 @@ async function makePlugin(input: {
   const plugin = new AgentWikiSyncPlugin(app as never, {
     id: "agentwiki-sync",
     name: "AgentWiki Sync",
-    version: "0.2.8",
-    minAppVersion: "1.11.4",
+    version: "0.2.9",
+    minAppVersion: "1.11.5",
     description: "",
     author: "NeoMei",
   });
