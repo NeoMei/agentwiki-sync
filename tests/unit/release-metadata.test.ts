@@ -24,4 +24,17 @@ describe("release metadata", () => {
     const source = await readFile("src/obsidian/settings-tab.ts", "utf8");
     expect(source).not.toMatch(/\.createEl\(["']h[1-6]["']/u);
   });
+
+  it("keeps sync strategy guidance above a container-responsive action row", async () => {
+    const source = await readFile("src/obsidian/sync-center-modal.ts", "utf8");
+    const styles = await readFile("styles.css", "utf8");
+
+    expect(source).toContain('cls: "agentwiki-sync-strategy-description"');
+    expect(source).toContain('addClass("agentwiki-sync-strategy-setting")');
+    expect(styles).toContain(
+      ".agentwiki-sync-modal {\n  container-type: inline-size;",
+    );
+    expect(styles).toContain("@container (max-width: 440px)");
+    expect(styles).not.toContain(".is-phone .agentwiki-sync-actions");
+  });
 });

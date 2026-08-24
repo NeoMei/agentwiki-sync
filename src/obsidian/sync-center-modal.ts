@@ -238,10 +238,11 @@ export class SyncCenterModal extends Modal {
   }
 
   private renderActions(diff: SyncDiff): void {
+    this.contentEl.createEl("p", {
+      text: "自动合并保留双方不冲突的修改，冲突时可在预览中逐项选择；使用本地/服务器内容会在冲突处直接采用所选一侧。",
+      cls: "agentwiki-sync-strategy-description",
+    });
     const actions = new Setting(this.contentEl)
-      .setDesc(
-        "自动合并保留双方不冲突的修改，冲突时可在预览中逐项选择；使用本地/服务器内容会在冲突处直接采用所选一侧。",
-      )
       .addButton((button) =>
         button
           .setButtonText(this.running ? "执行中…" : "自动合并（推荐）")
@@ -265,6 +266,7 @@ export class SyncCenterModal extends Modal {
           .setDisabled(this.running)
           .onClick(() => void this.run("server")),
       );
+    actions.settingEl.addClass("agentwiki-sync-strategy-setting");
     actions.controlEl?.addClass("agentwiki-sync-actions");
     new Setting(this.contentEl).addButton((button) =>
       button

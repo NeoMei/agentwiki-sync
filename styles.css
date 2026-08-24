@@ -2,6 +2,31 @@
   width: 100%;
 }
 
+.agentwiki-sync-modal {
+  container-type: inline-size;
+}
+
+.agentwiki-sync-strategy-description {
+  margin-bottom: 0;
+}
+
+.agentwiki-sync-modal .agentwiki-sync-strategy-setting {
+  align-items: stretch;
+  border-top: 0;
+  padding-top: 0;
+}
+
+.agentwiki-sync-strategy-setting .setting-item-info {
+  display: none;
+}
+
+.agentwiki-sync-strategy-setting .agentwiki-sync-actions {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  margin-inline-start: 0;
+  width: 100%;
+}
+
 /* ---- Mobile responsiveness ----
    Obsidian adds .is-mobile (phones + tablets) and .is-phone (phones) to
    <body>. All rules below are scoped to plugin surfaces so desktop layout
@@ -38,14 +63,15 @@
   max-width: 100%;
 }
 
-/* On phones the three sync strategies stack as full-width actions. */
-.is-phone .agentwiki-sync-actions {
-  display: grid;
-  grid-template-columns: 1fr;
-  width: 100%;
-  margin-inline-start: 0;
-}
+/* Stack the three strategies when the modal itself becomes narrow. */
+@container (max-width: 440px) {
+  .agentwiki-sync-actions {
+    display: grid;
+    grid-template-columns: 1fr;
+    width: 100%;
+  }
 
-.is-phone .agentwiki-sync-actions button {
-  width: 100%;
+  .agentwiki-sync-actions button {
+    width: 100%;
+  }
 }
