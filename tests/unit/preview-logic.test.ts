@@ -119,6 +119,23 @@ describe("preview paging", () => {
   });
 });
 
+describe("preview inputs", () => {
+  it("shows only bindings that still require a user decision", () => {
+    expect(previewLogic).toHaveProperty("bindingsRequiringInput");
+    const bindingsRequiringInput = (
+      previewLogic as typeof previewLogic & {
+        bindingsRequiringInput: (
+          bindings: InitialBindingChoice[],
+        ) => InitialBindingChoice[];
+      }
+    ).bindingsRequiringInput;
+    const pending = binding({ pageId: "pending", resolution: null });
+    const resolved = binding({ pageId: "resolved", resolution: "remote" });
+
+    expect(bindingsRequiringInput([resolved, pending])).toEqual([pending]);
+  });
+});
+
 describe("candidate matching", () => {
   const candidates = [
     { path: "Alpha.md", vaultByteHash: "a" },

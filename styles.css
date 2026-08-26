@@ -27,6 +27,61 @@
   width: 100%;
 }
 
+.agentwiki-sync-modal .agentwiki-sync-preview-setting {
+  align-items: stretch;
+  flex-direction: column;
+  gap: 0.75em;
+}
+
+.agentwiki-sync-preview-setting .setting-item-info {
+  margin-inline-end: 0;
+  max-width: none;
+  width: 100%;
+}
+
+.agentwiki-sync-resolution-controls {
+  display: grid;
+  align-items: start;
+  gap: 0.5em;
+  margin-inline-start: 0;
+  width: 100%;
+}
+
+.agentwiki-sync-binding-setting .agentwiki-sync-resolution-controls {
+  grid-template-columns:
+    minmax(14rem, 2fr) minmax(10rem, 1fr) minmax(9rem, 1fr);
+}
+
+.agentwiki-sync-conflict-setting .agentwiki-sync-resolution-controls {
+  grid-template-columns: minmax(9rem, 1fr) minmax(16rem, 3fr);
+}
+
+.agentwiki-sync-resolution-controls > * {
+  box-sizing: border-box;
+  max-width: 100%;
+  min-width: 0;
+  width: 100%;
+}
+
+.agentwiki-sync-binding-setting textarea {
+  grid-column: 1 / -1;
+  height: 6rem;
+  min-height: 6rem;
+  resize: vertical;
+}
+
+.agentwiki-sync-preview-actions {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--background-primary);
+  box-shadow: 0 1px 0 var(--background-modifier-border);
+}
+
+.agentwiki-sync-preview-actions .setting-item-control {
+  flex-wrap: wrap;
+}
+
 /* ---- Mobile responsiveness ----
    Obsidian adds .is-mobile (phones + tablets) and .is-phone (phones) to
    <body>. All rules below are scoped to plugin surfaces so desktop layout
@@ -72,6 +127,25 @@
   }
 
   .agentwiki-sync-actions button {
+    width: 100%;
+  }
+}
+
+@container (max-width: 700px) {
+  .agentwiki-sync-binding-setting .agentwiki-sync-resolution-controls,
+  .agentwiki-sync-conflict-setting .agentwiki-sync-resolution-controls {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .agentwiki-sync-preview-actions {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 0.75em;
+  }
+
+  .agentwiki-sync-preview-actions .setting-item-control {
+    justify-content: flex-end;
+    margin-inline-start: 0;
     width: 100%;
   }
 }

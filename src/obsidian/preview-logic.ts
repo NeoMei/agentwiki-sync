@@ -47,6 +47,12 @@ export function pageSlice<T>(
   return items.slice(start, start + pageSize);
 }
 
+export function bindingsRequiringInput(
+  bindings: readonly InitialBindingChoice[],
+): InitialBindingChoice[] {
+  return bindings.filter((binding) => binding.resolution === null);
+}
+
 export function matchCandidates(
   candidates: readonly LocalCandidate[],
   query: string,

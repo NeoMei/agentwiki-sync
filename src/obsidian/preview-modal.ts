@@ -16,6 +16,8 @@ import {
   applyBindingPath,
   applyBindingSearch,
   applyConflictResolution,
+  bindingsRequiringInput,
+  clampPage,
   conflictManualValue,
   pageCount,
   pageSlice,
@@ -99,20 +101,10 @@ export class PreviewModal extends Modal {
       this.contentEl.createEl("p", {
         text: `${this.lines.length - PREVIEW_PAGE_SIZE} 其余变更已在下方分页中列出.`,
       });
-    for (const binding of pageSlice(this.bindings, this.bindingPage))
-      this.renderBinding(binding);
-    this.pager(this.bindings.length, this.bindingPage, (page) => {
-      this.bindingPage = page;
-    });
-    const conflicts = this.pullPreview?.conflicts ?? [];
-    for (const conflict of pageSlice(conflicts, this.conflictPage))
-      this.renderConflict(conflict);
-    this.pager(conflicts.length, this.conflictPage, (page) => {
-      this.conflictPage = page;
-    });
     const actions = new Setting(this.contentEl).setDesc(
-      "确认将应用以上全部变更（包括其他分页）。",
+      "完成下方待处理项后，确认将应用全部变更（包括其他分页）。",
     );
+    actions.settingEl.addClass("agentwiki-sync-preview-actions");
     let cancelButton: ButtonComponent | null = null;
     actions
       .addButton((button) => {
@@ -151,11 +143,27 @@ export class PreviewModal extends Modal {
             }
           }),
       );
+    const pendingBindings = bindingsRequiringInput(this.bindings);
+    this.bindingPage = clampPage(this.bindingPage, pendingBindings.length);
+    for (const binding of pageSlice(pendingBindings, this.bindingPage))
+      this.renderBinding(binding);
+    this.pager(pendingBindings.length, this.bindingPage, (page) => {
+      this.bindingPage = page;
+    });
+    const conflicts = this.pullPreview?.conflicts ?? [];
+    for (const conflict of pageSlice(conflicts, this.conflictPage))
+      this.renderConflict(conflict);
+    this.pager(conflicts.length, this.conflictPage, (page) => {
+      this.conflictPage = page;
+    });
   }
   private renderBinding(binding: InitialBindingChoice): void {
     const setting = new Setting(this.contentEl)
       .setName(`${binding.localPath ?? "新文件"} ↔ ${binding.remotePath}`)
       .setDesc("选择本地文件对应关系，或使用远端版本。");
+    setting.settingEl.addClass("agentwiki-sync-preview-setting");
+    setting.settingEl.addClass("agentwiki-sync-binding-setting");
+    setting.controlEl?.addClass("agentwiki-sync-resolution-controls");
     let searchTouched = false;
     if (binding.remoteBodyPath)
       void this.app.vault.adapter
@@ -226,6 +234,9 @@ export class PreviewModal extends Modal {
     const setting = new Setting(this.contentEl)
       .setName(`${conflict.field}: ${conflict.pageId}`)
       .setDesc("正在加载预览…");
+    setting.settingEl.addClass("agentwiki-sync-preview-setting");
+    setting.settingEl.addClass("agentwiki-sync-conflict-setting");
+    setting.controlEl?.addClass("agentwiki-sync-resolution-controls");
     const refs = this.pullPreview?.conflictValuePaths[conflict.conflictId];
     if (refs)
       void Promise.all(
