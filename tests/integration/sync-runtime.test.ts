@@ -237,6 +237,11 @@ describe("SyncRuntime", () => {
     ]);
     const preview = await runtime.previewPull();
     expect(preview.conflicts).toHaveLength(1);
+    expect(preview.conflicts[0]).toMatchObject({
+      base: "same",
+      local: "local",
+      remote: "remote",
+    });
     await expect(runtime.applyPull(preview)).rejects.toThrow(/冲突/);
     preview.conflictResolutions[preview.conflicts[0]!.conflictId] = {
       choice: "remote",

@@ -209,6 +209,7 @@ const DEFAULT_CAPABILITIES: SyncCapabilities = {
   pushSessionTtlSeconds: 900,
 };
 const safeKey = (value: string) => value.replace(/[^A-Za-z0-9_-]/gu, "_");
+const CONFLICT_PREVIEW_CHARS = 120;
 const joinRoot = (root: string, relative: string) =>
   `${root}/${validatePortablePath(relative).path}`;
 const localFileName = async (
@@ -574,6 +575,11 @@ export class SyncRuntime {
     refs: Record<string, { base: string; local: string; remote: string }>,
   ): Promise<void> {
     for (const conflict of conflicts) {
+      const preview = {
+        base: conflict.base.slice(0, CONFLICT_PREVIEW_CHARS),
+        local: conflict.local.slice(0, CONFLICT_PREVIEW_CHARS),
+        remote: conflict.remote.slice(0, CONFLICT_PREVIEW_CHARS),
+      };
       const root = `${this.root}/pull-conflicts/${safeKey(conflict.conflictId)}`;
       refs[conflict.conflictId] = {
         base: `${root}/base.md`,
@@ -589,9 +595,9 @@ export class SyncRuntime {
         refs[conflict.conflictId]!.remote,
         conflict.remote,
       );
-      conflict.base = "";
-      conflict.local = "";
-      conflict.remote = "";
+      conflict.base = preview.base;
+      conflict.local = preview.local;
+      conflict.remote = preview.remote;
     }
   }
   private async conflictValue(

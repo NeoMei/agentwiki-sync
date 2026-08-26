@@ -27,6 +27,7 @@ import {
   progressLabel,
   type SyncOperationOptions,
 } from "../application/progress";
+import { completeModalAction, type ModalTransition } from "./modal-handoff";
 
 export class PreviewModal extends Modal {
   private released = false;
@@ -39,7 +40,9 @@ export class PreviewModal extends Modal {
     app: App,
     private readonly title: string,
     private readonly lines: string[],
-    private readonly confirm: (options: SyncOperationOptions) => Promise<void>,
+    private readonly confirm: (
+      options: SyncOperationOptions,
+    ) => Promise<ModalTransition | void>,
     private readonly release: () => void = () => {},
     private readonly bindings: InitialBindingChoice[] = [],
     private readonly pullPreview: PullPreview | null = null,
@@ -124,14 +127,20 @@ export class PreviewModal extends Modal {
             this.operation = new AbortController();
             button.setDisabled(true);
             try {
-              await this.confirm({
-                signal: this.operation.signal,
-                onProgress: (progress) => {
-                  actions.setDesc(progressLabel(progress));
-                  cancelButton?.setDisabled(!progress.cancellable);
+              await completeModalAction(
+                () =>
+                  this.confirm({
+                    signal: this.operation!.signal,
+                    onProgress: (progress) => {
+                      actions.setDesc(progressLabel(progress));
+                      cancelButton?.setDisabled(!progress.cancellable);
+                    },
+                  }),
+                () => {
+                  this.operation = null;
+                  this.close();
                 },
-              });
-              this.close();
+              );
             } catch (error) {
               new Notice(`同步失败：${userErrorMessage(error)}`);
             } finally {
@@ -233,29 +242,12 @@ export class PreviewModal extends Modal {
   private renderConflict(conflict: StructuredConflict): void {
     const setting = new Setting(this.contentEl)
       .setName(`${conflict.field}: ${conflict.pageId}`)
-      .setDesc("正在加载预览…");
+      .setDesc(
+        `原版：${conflict.base} · 本地：${conflict.local} · 远端：${conflict.remote}`,
+      );
     setting.settingEl.addClass("agentwiki-sync-preview-setting");
     setting.settingEl.addClass("agentwiki-sync-conflict-setting");
     setting.controlEl?.addClass("agentwiki-sync-resolution-controls");
-    const refs = this.pullPreview?.conflictValuePaths[conflict.conflictId];
-    if (refs)
-      void Promise.all(
-        [refs.base, refs.local, refs.remote].map((path) =>
-          this.app.vault.adapter.read(path),
-        ),
-      )
-        .then(([base, local, remote]) =>
-          setting.setDesc(
-            `原版：${(base ?? "").slice(0, 120)} · 本地：${(local ?? "").slice(0, 120)} · 远端：${(remote ?? "").slice(0, 120)}`,
-          ),
-        )
-        .catch(() =>
-          setting.setDesc("无法加载冲突预览。请直接选择一方或手动输入。"),
-        );
-    else
-      setting.setDesc(
-        `原版：${conflict.base.slice(0, 120)} · 本地：${conflict.local.slice(0, 120)} · 远端：${conflict.remote.slice(0, 120)}`,
-      );
     setting.addDropdown((dropdown) =>
       dropdown
         .addOption("", "请选择…")

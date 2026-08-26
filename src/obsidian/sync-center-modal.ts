@@ -7,6 +7,7 @@ import {
   type SyncOperationOptions,
   type SyncProgress,
 } from "../application/progress";
+import { completeModalAction, type ModalTransition } from "./modal-handoff";
 
 export type SyncStrategy = "auto" | "local" | "server";
 
@@ -42,7 +43,7 @@ export interface SyncCenterHandlers {
     spaceId: string,
     strategy: SyncStrategy,
     options: SyncOperationOptions,
-  ) => Promise<void>;
+  ) => Promise<ModalTransition | void>;
 }
 
 const countDiff = (diff: SyncDiff): number =>
@@ -295,14 +296,20 @@ export class SyncCenterModal extends Modal {
     this.operation = new AbortController();
     this.render();
     try {
-      await this.handlers.runStrategy(this.selection.current, strategy, {
-        signal: this.operation.signal,
-        onProgress: (progress) => {
-          this.progress = progress;
-          this.render();
+      await completeModalAction(
+        () =>
+          this.handlers.runStrategy(this.selection.current, strategy, {
+            signal: this.operation!.signal,
+            onProgress: (progress) => {
+              this.progress = progress;
+              this.render();
+            },
+          }),
+        () => {
+          this.operation = null;
+          this.close();
         },
-      });
-      this.close();
+      );
     } catch (error) {
       new Notice(`同步失败：${userErrorMessage(error)}`);
       this.running = false;

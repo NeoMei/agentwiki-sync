@@ -43,6 +43,7 @@ import { DeviceStateRepository } from "./storage/device-state";
 import { StorageMigration } from "./storage/migration";
 import { preferLocalPull } from "./obsidian/preview-logic";
 import type { SyncOperationOptions } from "./application/progress";
+import type { ModalTransition } from "./obsidian/modal-handoff";
 
 const actionLabel = (kind: string): string => {
   const labels: Record<string, string> = {
@@ -489,7 +490,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
     spaceId: string,
     strategy: SyncStrategy,
     options: SyncOperationOptions,
-  ): Promise<void> {
+  ): Promise<ModalTransition | void> {
     const mapping = this.selectedMapping(spaceId);
     if (!mapping) throw new Error("请先连接并在设置中添加空间映射。");
     const flow = new SyncFlowLock(this.locks.acquire(mapping.spaceId));
@@ -498,14 +499,12 @@ export default class AgentWikiSyncPlugin extends Plugin {
       if (!runtime) throw new Error("请先连接并在设置中添加空间映射。");
       await runtime.recover();
       if (strategy === "server") {
-        await this.syncUseServer(runtime, flow, options);
-        return;
+        return await this.syncUseServer(runtime, flow, options);
       }
       if (strategy === "local") {
-        await this.syncUseLocal(runtime, flow, options);
-        return;
+        return await this.syncUseLocal(runtime, flow, options);
       }
-      await this.syncAutoMerge(runtime, flow, options);
+      return await this.syncAutoMerge(runtime, flow, options);
     } catch (error) {
       flow.finish();
       throw error;
@@ -516,7 +515,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
     runtime: SyncRuntime,
     flow: SyncFlowLock,
     options: SyncOperationOptions,
-  ): Promise<void> {
+  ): Promise<ModalTransition | void> {
     const delta = await runtime.remoteDelta();
     if (!delta.ahead) {
       new Notice("服务器没有新的变更可应用。");
@@ -530,132 +529,133 @@ export default class AgentWikiSyncPlugin extends Plugin {
       };
     for (const binding of preview.initialBindings)
       if (binding.resolution === null) binding.resolution = "remote";
-    new PreviewModal(
-      this.app,
-      "以服务器内容为准",
-      [
-        ...preview.actions.map(
-          (item) => `${actionLabel(item.kind)}: ${item.path}`,
-        ),
-        ...preview.conflicts.map(
-          (item) => `冲突以服务器为准: ${item.field} ${item.pageId}`,
-        ),
-        ...preview.initialBindings.map(
-          (item) => `新页面写入服务器内容: ${item.remotePath}`,
-        ),
-      ],
-      async (applyOptions) => {
-        await runtime.applyPull(preview, applyOptions);
-        await this.saveSettings();
-        new Notice("已按服务器内容更新本地。");
-      },
-      () => {
-        void runtime.discardPullPreview(preview).finally(() => flow.finish());
-      },
-    ).open();
+    return () =>
+      new PreviewModal(
+        this.app,
+        "以服务器内容为准",
+        [
+          ...preview.actions.map(
+            (item) => `${actionLabel(item.kind)}: ${item.path}`,
+          ),
+          ...preview.conflicts.map(
+            (item) => `冲突以服务器为准: ${item.field} ${item.pageId}`,
+          ),
+          ...preview.initialBindings.map(
+            (item) => `新页面写入服务器内容: ${item.remotePath}`,
+          ),
+        ],
+        async (applyOptions) => {
+          await runtime.applyPull(preview, applyOptions);
+          await this.saveSettings();
+          new Notice("已按服务器内容更新本地。");
+        },
+        () => {
+          void runtime.discardPullPreview(preview).finally(() => flow.finish());
+        },
+      ).open();
   }
 
   private async syncUseLocal(
     runtime: SyncRuntime,
     flow: SyncFlowLock,
     options: SyncOperationOptions,
-  ): Promise<void> {
+  ): Promise<ModalTransition | void> {
     const delta = await runtime.remoteDelta();
     if (!delta.ahead) {
-      await this.openPushPreview(
+      return await this.openPushPreview(
         runtime,
         flow,
         "推送预览（以本地内容为准）",
         options,
       );
-      return;
     }
     const preview = await runtime.previewPull(options);
     preferLocalPull(preview);
-    new PreviewModal(
-      this.app,
-      "以本地内容为准 — 先合并服务器更新",
-      [
-        ...preview.actions.map(
-          (item) => `${actionLabel(item.kind)}: ${item.path}`,
-        ),
-        ...preview.conflicts.map(
-          (item) => `冲突以本地为准: ${item.field} ${item.pageId}`,
-        ),
-        ...preview.initialBindings.map(
-          (item) =>
-            `${item.localPath ? "保留本地" : "写入远端"}: ${item.remotePath}`,
-        ),
-      ],
-      async (applyOptions) => {
-        await runtime.applyPull(preview, applyOptions);
-        await this.saveSettings();
-        flow.advance();
-        await this.openPushPreview(
-          runtime,
-          flow,
-          "推送预览（以本地内容为准）",
-          applyOptions,
-        );
-      },
-      () => {
-        void runtime
-          .discardPullPreview(preview)
-          .finally(() => flow.phaseRelease()());
-      },
-      preview.initialBindings,
-      preview,
-    ).open();
+    return () =>
+      new PreviewModal(
+        this.app,
+        "以本地内容为准 — 先合并服务器更新",
+        [
+          ...preview.actions.map(
+            (item) => `${actionLabel(item.kind)}: ${item.path}`,
+          ),
+          ...preview.conflicts.map(
+            (item) => `冲突以本地为准: ${item.field} ${item.pageId}`,
+          ),
+          ...preview.initialBindings.map(
+            (item) =>
+              `${item.localPath ? "保留本地" : "写入远端"}: ${item.remotePath}`,
+          ),
+        ],
+        async (applyOptions) => {
+          await runtime.applyPull(preview, applyOptions);
+          await this.saveSettings();
+          flow.advance();
+          return await this.openPushPreview(
+            runtime,
+            flow,
+            "推送预览（以本地内容为准）",
+            applyOptions,
+          );
+        },
+        () => {
+          void runtime
+            .discardPullPreview(preview)
+            .finally(() => flow.phaseRelease()());
+        },
+        preview.initialBindings,
+        preview,
+      ).open();
   }
 
   private async syncAutoMerge(
     runtime: SyncRuntime,
     flow: SyncFlowLock,
     options: SyncOperationOptions,
-  ): Promise<void> {
+  ): Promise<ModalTransition | void> {
     const delta = await runtime.remoteDelta();
     if (!delta.ahead) {
-      await this.openPushPreview(runtime, flow, "推送预览", options);
-      return;
+      return await this.openPushPreview(runtime, flow, "推送预览", options);
     }
     const preview = await runtime.previewPull(options);
     const needsResolution =
       preview.conflicts.some(
         (item) => !preview.conflictResolutions[item.conflictId],
       ) || preview.initialBindings.some((item) => item.resolution === null);
-    new PreviewModal(
-      this.app,
-      needsResolution ? "自动合并 — 处理冲突与绑定" : "自动合并 — 拉取预览",
-      [
-        ...preview.actions.map(
-          (item) => `${actionLabel(item.kind)}: ${item.path}`,
-        ),
-        ...preview.initialBindings
-          .filter((item) => item.resolution === null)
-          .map((item) => `远端新页面待绑定: ${item.remotePath}`),
-        ...preview.conflicts.map(
-          (item) => `冲突待处理: ${item.field} ${item.pageId}`,
-        ),
-      ],
-      async (applyOptions) => {
-        await runtime.applyPull(preview, applyOptions);
-        await this.saveSettings();
-        flow.advance();
-        await this.openPushPreview(
-          runtime,
-          flow,
-          "自动合并 — 推送本地变更",
-          applyOptions,
-        );
-      },
-      () => {
-        void runtime
-          .discardPullPreview(preview)
-          .finally(() => flow.phaseRelease()());
-      },
-      preview.initialBindings,
-      preview,
-    ).open();
+    return () =>
+      new PreviewModal(
+        this.app,
+        needsResolution ? "自动合并 — 处理冲突与绑定" : "自动合并 — 拉取预览",
+        [
+          ...preview.actions.map(
+            (item) => `${actionLabel(item.kind)}: ${item.path}`,
+          ),
+          ...preview.initialBindings
+            .filter((item) => item.resolution === null)
+            .map((item) => `远端新页面待绑定: ${item.remotePath}`),
+          ...preview.conflicts.map(
+            (item) => `冲突待处理: ${item.field} ${item.pageId}`,
+          ),
+        ],
+        async (applyOptions) => {
+          await runtime.applyPull(preview, applyOptions);
+          await this.saveSettings();
+          flow.advance();
+          return await this.openPushPreview(
+            runtime,
+            flow,
+            "自动合并 — 推送本地变更",
+            applyOptions,
+          );
+        },
+        () => {
+          void runtime
+            .discardPullPreview(preview)
+            .finally(() => flow.phaseRelease()());
+        },
+        preview.initialBindings,
+        preview,
+      ).open();
   }
 
   private async openPushPreview(
@@ -663,7 +663,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
     flow: SyncFlowLock,
     title: string,
     options?: SyncOperationOptions,
-  ): Promise<void> {
+  ): Promise<ModalTransition | void> {
     try {
       const preview = await runtime.previewPush(options);
       if (!preview.changes.length) {
@@ -671,22 +671,25 @@ export default class AgentWikiSyncPlugin extends Plugin {
         flow.finish();
         return;
       }
-      new PreviewModal(
-        this.app,
-        title,
-        preview.changes.map(
-          (item) =>
-            `${actionLabel(item.operation)}: ${item.operation === "upsert" ? item.path : item.previousPath}`,
-        ),
-        async (applyOptions) => {
-          await runtime.applyPush(preview, applyOptions);
-          await this.saveSettings();
-          new Notice("推送完成。");
-        },
-        () => {
-          void runtime.discardPushPreview(preview).finally(() => flow.finish());
-        },
-      ).open();
+      return () =>
+        new PreviewModal(
+          this.app,
+          title,
+          preview.changes.map(
+            (item) =>
+              `${actionLabel(item.operation)}: ${item.operation === "upsert" ? item.path : item.previousPath}`,
+          ),
+          async (applyOptions) => {
+            await runtime.applyPush(preview, applyOptions);
+            await this.saveSettings();
+            new Notice("推送完成。");
+          },
+          () => {
+            void runtime
+              .discardPushPreview(preview)
+              .finally(() => flow.finish());
+          },
+        ).open();
     } catch (error) {
       new Notice(userErrorMessage(error));
       flow.finish();
