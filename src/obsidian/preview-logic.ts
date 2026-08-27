@@ -53,6 +53,17 @@ export function bindingsRequiringInput(
   return bindings.filter((binding) => binding.resolution === null);
 }
 
+export function pendingPreviewDecisionCount(
+  bindings: readonly InitialBindingChoice[],
+  preview: PullPreview | null,
+): number {
+  const pendingConflicts =
+    preview?.conflicts.filter(
+      (conflict) => !preview.conflictResolutions[conflict.conflictId],
+    ).length ?? 0;
+  return bindingsRequiringInput(bindings).length + pendingConflicts;
+}
+
 export function matchCandidates(
   candidates: readonly LocalCandidate[],
   query: string,

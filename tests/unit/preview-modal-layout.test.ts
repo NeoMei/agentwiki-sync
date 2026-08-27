@@ -26,4 +26,14 @@ describe("preview modal layout", () => {
       ".agentwiki-sync-preview-actions {\n  position: sticky;\n  top: 0;",
     );
   });
+
+  it("keeps confirmation disabled until every conflict and binding is resolved", async () => {
+    const source = await readFile("src/obsidian/preview-modal.ts", "utf8");
+
+    expect(source).toContain("pendingPreviewDecisionCount(");
+    expect(source).toContain(
+      "setDisabled(this.running || pendingDecisionCount() > 0)",
+    );
+    expect(source).toContain("项待处理，完成选择后才能执行");
+  });
 });

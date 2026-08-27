@@ -19,6 +19,7 @@ import {
   bindingsRequiringInput,
   clampPage,
   conflictManualValue,
+  pendingPreviewDecisionCount,
   pageCount,
   pageSlice,
   PREVIEW_PAGE_SIZE,
@@ -104,11 +105,22 @@ export class PreviewModal extends Modal {
       this.contentEl.createEl("p", {
         text: `${this.lines.length - PREVIEW_PAGE_SIZE} 其余变更已在下方分页中列出.`,
       });
-    const actions = new Setting(this.contentEl).setDesc(
-      "完成下方待处理项后，确认将应用全部变更（包括其他分页）。",
-    );
+    const pendingDecisionCount = () =>
+      pendingPreviewDecisionCount(this.bindings, this.pullPreview);
+    const actionDescription = () => {
+      const pending = pendingDecisionCount();
+      return pending > 0
+        ? `还有 ${pending} 项待处理，完成选择后才能执行。`
+        : "确认将应用全部变更（包括其他分页）。";
+    };
+    const actions = new Setting(this.contentEl).setDesc(actionDescription());
     actions.settingEl.addClass("agentwiki-sync-preview-actions");
     let cancelButton: ButtonComponent | null = null;
+    let confirmButton: ButtonComponent | null = null;
+    const refreshActionState = () => {
+      actions.setDesc(actionDescription());
+      confirmButton?.setDisabled(this.running || pendingDecisionCount() > 0);
+    };
     actions
       .addButton((button) => {
         cancelButton = button;
@@ -117,12 +129,20 @@ export class PreviewModal extends Modal {
           else this.close();
         });
       })
-      .addButton((button) =>
+      .addButton((button) => {
+        confirmButton = button;
         button
           .setButtonText("确认执行")
           .setWarning()
+          .setDisabled(this.running || pendingDecisionCount() > 0)
           .onClick(async () => {
             if (this.running) return;
+            const pending = pendingDecisionCount();
+            if (pending > 0) {
+              new Notice(`还有 ${pending} 项待处理，请先完成选择。`);
+              refreshActionState();
+              return;
+            }
             this.running = true;
             this.operation = new AbortController();
             button.setDisabled(true);
@@ -146,27 +166,30 @@ export class PreviewModal extends Modal {
             } finally {
               this.running = false;
               this.operation = null;
-              button.setDisabled(false);
+              refreshActionState();
               cancelButton?.setDisabled(false);
               if (this.closeRequested) this.releaseOnce();
             }
-          }),
-      );
+          });
+      });
     const pendingBindings = bindingsRequiringInput(this.bindings);
     this.bindingPage = clampPage(this.bindingPage, pendingBindings.length);
     for (const binding of pageSlice(pendingBindings, this.bindingPage))
-      this.renderBinding(binding);
+      this.renderBinding(binding, refreshActionState);
     this.pager(pendingBindings.length, this.bindingPage, (page) => {
       this.bindingPage = page;
     });
     const conflicts = this.pullPreview?.conflicts ?? [];
     for (const conflict of pageSlice(conflicts, this.conflictPage))
-      this.renderConflict(conflict);
+      this.renderConflict(conflict, refreshActionState);
     this.pager(conflicts.length, this.conflictPage, (page) => {
       this.conflictPage = page;
     });
   }
-  private renderBinding(binding: InitialBindingChoice): void {
+  private renderBinding(
+    binding: InitialBindingChoice,
+    refreshActionState: () => void,
+  ): void {
     const setting = new Setting(this.contentEl)
       .setName(`${binding.localPath ?? "新文件"} ↔ ${binding.remotePath}`)
       .setDesc("选择本地文件对应关系，或使用远端版本。");
@@ -189,6 +212,7 @@ export class PreviewModal extends Modal {
         searchTouched = true;
         const candidates = this.pullPreview?.localCandidates ?? [];
         const matches = applyBindingSearch(binding, candidates, value);
+        refreshActionState();
         setting.setDesc(
           matches.length
             ? `匹配：${matches.join(" · ")}`
@@ -217,6 +241,7 @@ export class PreviewModal extends Modal {
           this.pullPreview?.localCandidates ?? [],
           value,
         );
+        refreshActionState();
       });
     });
     setting.addDropdown((dropdown) =>
@@ -228,6 +253,7 @@ export class PreviewModal extends Modal {
         .setValue(binding.resolution ?? "")
         .onChange((value) => {
           applyBindingMode(binding, value);
+          refreshActionState();
         }),
     );
     setting.addTextArea((text) =>
@@ -239,7 +265,10 @@ export class PreviewModal extends Modal {
         }),
     );
   }
-  private renderConflict(conflict: StructuredConflict): void {
+  private renderConflict(
+    conflict: StructuredConflict,
+    refreshActionState: () => void,
+  ): void {
     const setting = new Setting(this.contentEl)
       .setName(`${conflict.field}: ${conflict.pageId}`)
       .setDesc(
@@ -266,6 +295,7 @@ export class PreviewModal extends Modal {
             value,
             conflictManualValue(this.pullPreview, conflict.conflictId),
           );
+          refreshActionState();
         }),
     );
     setting.addTextArea((text) =>
@@ -277,13 +307,15 @@ export class PreviewModal extends Modal {
             : "",
         )
         .onChange((value) => {
-          if (this.pullPreview)
+          if (this.pullPreview) {
             applyConflictResolution(
               this.pullPreview,
               conflict.conflictId,
               "manual",
               value,
             );
+            refreshActionState();
+          }
         }),
     );
   }

@@ -58,6 +58,10 @@ export async function mergeBody(
 ): Promise<{ body: string; conflicts: StructuredConflict[] }> {
   const direct = mergeField(base, local, remote);
   if (!direct.conflict) return { body: direct.value, conflicts: [] };
+  if (local.startsWith(remote) && remote.startsWith(base))
+    return { body: local, conflicts: [] };
+  if (remote.startsWith(local) && local.startsWith(base))
+    return { body: remote, conflicts: [] };
   if ([base, local, remote].some((text) => lineCount(text) > 10_000))
     return {
       body: local,
@@ -85,6 +89,10 @@ export async function mergeBody(
   const localBody = localOutput.join("\n");
   if (!hasConflict) return { body: localBody, conflicts: [] };
   const remoteBody = remoteOutput.join("\n");
+  if (localBody.startsWith(remoteBody) && remoteBody.startsWith(base))
+    return { body: localBody, conflicts: [] };
+  if (remoteBody.startsWith(localBody) && localBody.startsWith(base))
+    return { body: remoteBody, conflicts: [] };
   return {
     body: localBody,
     conflicts: [await conflict(pageId, base, localBody, remoteBody, true)],

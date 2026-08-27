@@ -11,6 +11,7 @@ import {
   clampPage,
   conflictManualValue,
   matchCandidates,
+  pendingPreviewDecisionCount,
   pageCount,
   pageSlice,
   PREVIEW_PAGE_SIZE,
@@ -133,6 +134,40 @@ describe("preview inputs", () => {
     const resolved = binding({ pageId: "resolved", resolution: "remote" });
 
     expect(bindingsRequiringInput([resolved, pending])).toEqual([pending]);
+  });
+
+  it("counts unresolved conflicts and bindings before confirmation", () => {
+    const value = preview({ resolved: { choice: "remote" } });
+    value.conflicts = [
+      {
+        conflictId: "resolved",
+        pageId: "p1",
+        field: "body",
+        base: "base",
+        local: "local",
+        remote: "remote",
+        wholeDocument: true,
+      },
+      {
+        conflictId: "pending",
+        pageId: "p2",
+        field: "body",
+        base: "base",
+        local: "local",
+        remote: "remote",
+        wholeDocument: true,
+      },
+    ];
+    value.initialBindings = [
+      binding({ pageId: "pending-binding", resolution: null }),
+      binding({ pageId: "resolved-binding", resolution: "remote" }),
+    ];
+
+    expect(pendingPreviewDecisionCount(value.initialBindings, value)).toBe(2);
+
+    value.conflictResolutions.pending = { choice: "local" };
+    value.initialBindings[0]!.resolution = "local";
+    expect(pendingPreviewDecisionCount(value.initialBindings, value)).toBe(0);
   });
 });
 
