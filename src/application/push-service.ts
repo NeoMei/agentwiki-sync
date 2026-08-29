@@ -101,6 +101,10 @@ export class PushService {
     await this.journal.write(journal);
   }
   private async load(): Promise<PushJournal> {
+    const raw = await this.store.read(`${this.root}/journal.json`);
+    const version = readPushJournalSchemaVersion(raw);
+    if (version !== null && version > 1)
+      throw new Error("不支持的推送日志版本");
     const value = await this.journal.read();
     if (!value) throw new Error("推送日志缺失或已损坏");
     return value.payload;
@@ -500,5 +504,16 @@ export class PushService {
       throw new Error("已发布的推送无法被替代");
     journal.remoteState = "superseded";
     await this.save(journal);
+  }
+}
+
+function readPushJournalSchemaVersion(raw: string | null): number | null {
+  if (raw === null) return null;
+  try {
+    const parsed = JSON.parse(raw) as { payload?: { schemaVersion?: unknown } };
+    const version = parsed.payload?.schemaVersion;
+    return typeof version === "number" ? version : null;
+  } catch {
+    return null;
   }
 }
