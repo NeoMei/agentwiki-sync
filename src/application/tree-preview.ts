@@ -78,41 +78,139 @@ function compareTrashDirectories(
   return compareIds(actionId(left), actionId(right));
 }
 
-function orderDirectoryUpserts(actions: TreePullAction[]): TreePullAction[] {
-  const byTarget = new Map<string, TreePullAction>();
-  for (const action of actions) byTarget.set(pathKey(action.path), action);
+function seedRank(action: TreePullAction): number {
+  switch (action.kind) {
+    case "trash_page":
+      return 0;
+    case "trash_directory":
+      return 1;
+    case "create_directory":
+    case "move_directory":
+      return 2;
+    case "move_page":
+      return 3;
+    case "write_page":
+      return 4;
+    case "create_page":
+      return 5;
+  }
+}
 
-  const visited = new Set<TreePullAction>();
-  const visiting = new Set<TreePullAction>();
-  const ordered: TreePullAction[] = [];
+function compareSeed(left: TreePullAction, right: TreePullAction): number {
+  const leftRank = seedRank(left);
+  const rightRank = seedRank(right);
+  if (leftRank !== rightRank) return leftRank - rightRank;
+  if (left.kind === "trash_page" && right.kind === "trash_page")
+    return compareTrashPages(left, right);
+  if (left.kind === "trash_directory" && right.kind === "trash_directory")
+    return compareTrashDirectories(left, right);
+  if (
+    (left.kind === "move_page" ||
+      left.kind === "write_page" ||
+      left.kind === "create_page") &&
+    (right.kind === "move_page" ||
+      right.kind === "write_page" ||
+      right.kind === "create_page")
+  )
+    return comparePageUpserts(left, right);
+  return comparePathKeys(left.path, right.path);
+}
 
-  const visit = (action: TreePullAction): void => {
-    if (visited.has(action) || visiting.has(action)) return;
-    visiting.add(action);
-
-    const parent = parentPathOf(action.path);
-    if (parent !== null) {
-      const creator = byTarget.get(pathKey(parent));
-      if (creator && creator !== action) visit(creator);
+function dependenciesOf(
+  action: TreePullAction,
+  actions: TreePullAction[],
+  byTarget: Map<string, TreePullAction>,
+  trashDirectories: TreePullAction[],
+): TreePullAction[] {
+  const dependencies: TreePullAction[] = [];
+  switch (action.kind) {
+    case "trash_directory": {
+      for (const other of trashDirectories) {
+        if (
+          other !== action &&
+          isInsideSubtree(other.path, action.path) &&
+          pathDepth(other.path) > pathDepth(action.path)
+        )
+          dependencies.push(other);
+      }
+      for (const other of actions) {
+        if (
+          (other.kind === "move_page" || other.kind === "move_directory") &&
+          isInsideSubtree(other.fromPath, action.path)
+        )
+          dependencies.push(other);
+      }
+      break;
     }
-
-    if (action.kind === "create_directory") {
+    case "create_directory": {
+      const parent = parentPathOf(action.path);
+      if (parent !== null) {
+        const creator = byTarget.get(pathKey(parent));
+        if (creator && creator !== action) dependencies.push(creator);
+      }
       const vacator = actions.find(
         (item) =>
           item.kind === "move_directory" &&
           pathKey(item.fromPath) === pathKey(action.path),
       );
-      if (vacator && vacator !== action) visit(vacator);
+      if (vacator && vacator !== action) dependencies.push(vacator);
+      break;
     }
+    case "move_directory": {
+      const parent = parentPathOf(action.path);
+      if (parent !== null) {
+        const creator = byTarget.get(pathKey(parent));
+        if (creator && creator !== action) dependencies.push(creator);
+      }
+      const vacated = trashDirectories.find(
+        (item) => pathKey(item.path) === pathKey(action.path),
+      );
+      if (vacated) dependencies.push(vacated);
+      break;
+    }
+    case "move_page":
+    case "create_page": {
+      const parent = parentPathOf(action.path);
+      if (parent !== null) {
+        const creator = byTarget.get(pathKey(parent));
+        if (creator && creator !== action) dependencies.push(creator);
+      }
+      break;
+    }
+    // trash_page and write_page have no ordering dependencies.
+  }
+  return dependencies;
+}
 
+function topologicalSort(actions: TreePullAction[]): TreePullAction[] {
+  const byTarget = new Map<string, TreePullAction>();
+  for (const action of actions)
+    if (action.kind === "create_directory" || action.kind === "move_directory")
+      byTarget.set(pathKey(action.path), action);
+  const trashDirectories = actions.filter(
+    (action) => action.kind === "trash_directory",
+  );
+
+  const dependencies = new Map<TreePullAction, TreePullAction[]>();
+  for (const action of actions)
+    dependencies.set(
+      action,
+      dependenciesOf(action, actions, byTarget, trashDirectories),
+    );
+
+  const visited = new Set<TreePullAction>();
+  const visiting = new Set<TreePullAction>();
+  const ordered: TreePullAction[] = [];
+  const visit = (action: TreePullAction): void => {
+    if (visited.has(action) || visiting.has(action)) return;
+    visiting.add(action);
+    for (const dependency of dependencies.get(action) ?? []) visit(dependency);
     visiting.delete(action);
     visited.add(action);
     ordered.push(action);
   };
 
-  const sorted = [...actions].sort((left, right) =>
-    comparePathKeys(left.path, right.path),
-  );
+  const sorted = [...actions].sort(compareSeed);
   for (const action of sorted) visit(action);
   return ordered;
 }
@@ -143,34 +241,16 @@ function comparePageUpserts(
   return compareIds(actionId(left), actionId(right));
 }
 
+function isInsideSubtree(path: string, directory: string): boolean {
+  const key = pathKey(path);
+  const dir = pathKey(directory);
+  return key === dir || key.startsWith(`${dir}/`);
+}
+
 export function sortTreePullActions(
   actions: TreePullAction[],
 ): TreePullAction[] {
-  const trashPages = actions.filter((action) => action.kind === "trash_page");
-  const trashDirectories = actions.filter(
-    (action) => action.kind === "trash_directory",
-  );
-  const directoryUpserts = actions.filter(
-    (action) =>
-      action.kind === "create_directory" || action.kind === "move_directory",
-  );
-  const pageUpserts = actions.filter(
-    (action) =>
-      action.kind === "move_page" ||
-      action.kind === "write_page" ||
-      action.kind === "create_page",
-  );
-
-  trashPages.sort(compareTrashPages);
-  trashDirectories.sort(compareTrashDirectories);
-  pageUpserts.sort(comparePageUpserts);
-
-  return [
-    ...trashPages,
-    ...trashDirectories,
-    ...orderDirectoryUpserts(directoryUpserts),
-    ...pageUpserts,
-  ];
+  return topologicalSort(actions);
 }
 
 export function orderPreviewActions(

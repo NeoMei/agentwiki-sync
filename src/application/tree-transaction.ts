@@ -1,3 +1,5 @@
+import { pathKey } from "@neomei/agentwiki-sync-protocol";
+
 import { sha256Hex } from "../agentwiki/protocol";
 import type { TreePullAction } from "../core/merge";
 import type { ControlStorePort } from "../ports/control-store";
@@ -142,6 +144,12 @@ function isPageUpsert(
   );
 }
 
+function isInsideSubtree(path: string, root: string): boolean {
+  const key = pathKey(path);
+  const rootKey = pathKey(root);
+  return key === rootKey || key.startsWith(`${rootKey}/`);
+}
+
 export class TreeTransaction {
   private readonly journal: MutableControlRepository<TreeTransactionJournal>;
 
@@ -174,10 +182,29 @@ export class TreeTransaction {
     input: TreeTransactionInput,
     transactionId: string = crypto.randomUUID(),
   ): Promise<void> {
+    const existing = await this.journal.read();
+    if (
+      existing &&
+      existing.payload.state !== "committed" &&
+      existing.payload.state !== "rolled_back"
+    )
+      throw new Error("存在未终结的事务，请先执行恢复（recover）");
+
+    const evacuatedRoots = input.actions
+      .filter(
+        (action) =>
+          action.kind === "move_page" || action.kind === "move_directory",
+      )
+      .map((action) => action.fromPath);
+
     const operations: JournalOperation[] = [];
     for (let index = 0; index < input.actions.length; index += 1) {
       operations.push(
-        await this.materializeOperation(index, input.actions[index]!),
+        await this.materializeOperation(
+          index,
+          input.actions[index]!,
+          evacuatedRoots,
+        ),
       );
     }
     await this.journal.write({
@@ -291,6 +318,7 @@ export class TreeTransaction {
   private async materializeOperation(
     index: number,
     action: TreePullAction,
+    evacuatedRoots: string[],
   ): Promise<JournalOperation> {
     let paths: OperationPath[];
     switch (action.kind) {
@@ -304,7 +332,7 @@ export class TreeTransaction {
         ];
         break;
       case "trash_directory":
-        paths = await this.directoryTrashPaths(action.path);
+        paths = await this.directoryTrashPaths(action.path, evacuatedRoots);
         break;
       case "move_directory":
         paths = await this.directoryMovePaths(action.fromPath, action.path);
@@ -438,7 +466,10 @@ export class TreeTransaction {
     return paths;
   }
 
-  private async directoryTrashPaths(path: string): Promise<OperationPath[]> {
+  private async directoryTrashPaths(
+    path: string,
+    evacuatedRoots: string[],
+  ): Promise<OperationPath[]> {
     const paths: OperationPath[] = [
       {
         path,
@@ -448,6 +479,7 @@ export class TreeTransaction {
     ];
     for await (const entry of this.vault.listTree(path)) {
       const child = `${path}/${entry.relativePath}`;
+      if (evacuatedRoots.some((root) => isInsideSubtree(child, root))) continue;
       if (entry.kind === "directory") {
         paths.push({
           path: child,
@@ -538,15 +570,22 @@ export class TreeTransaction {
     const last = Math.min(journal.nextOperation, journal.operations.length - 1);
     for (let index = last; index >= 0; index -= 1) {
       const operation = journal.operations[index]!;
-      const state = await this.classifyOperation(operation);
-      if (state === "before") continue;
-      if (state === "after") {
-        await this.revertOperation(index, operation);
-        continue;
+      if (operation.action.kind === "move_directory") {
+        // A directory move is one atomic rename; classify and revert whole.
+        const state = await this.classifyOperation(operation);
+        if (state === "before") continue;
+        if (state === "after") {
+          await this.vault.rename(
+            operation.action.path,
+            operation.action.fromPath,
+          );
+          continue;
+        }
+        journal.state = "ambiguous";
+        await this.save(journal);
+        throw new Error("TREE_TRANSACTION_AMBIGUOUS: 回滚时发现未记录的变更");
       }
-      journal.state = "ambiguous";
-      await this.save(journal);
-      throw new Error("TREE_TRANSACTION_AMBIGUOUS: 回滚时发现未记录的变更");
+      await this.rollbackOperationPaths(index, operation, journal);
     }
     journal.state = "rolled_back";
     journal.nextOperation = 0;
@@ -554,57 +593,74 @@ export class TreeTransaction {
     await this.discardSidecars();
   }
 
-  private async revertOperation(
+  /**
+   * Reverts one operation path by path so an interruption can resume safely:
+   * each path is reclassified independently (before = already restored,
+   * after = restore now) instead of treating the whole operation as a unit.
+   */
+  private async rollbackOperationPaths(
     index: number,
     operation: JournalOperation,
+    journal: TreeTransactionJournal,
   ): Promise<void> {
-    const action = operation.action;
-    switch (action.kind) {
-      case "create_directory":
-        await this.vault.trashDirectory(action.path);
-        break;
-      case "move_directory":
-        await this.vault.rename(action.path, action.fromPath);
-        break;
-      case "trash_directory": {
-        const directories = operation.paths
-          .filter((item) => item.before.kind === "directory")
-          .map((item) => item.path)
-          .sort((left, right) => pathDepth(left) - pathDepth(right));
-        for (const dir of directories) await this.vault.createDirectory(dir);
-        for (const item of operation.paths) {
-          if (item.before.kind === "file")
-            await this.vault.write(
-              item.path,
-              await this.beforeBytes(index, operation, item.path),
-            );
-        }
-        break;
+    for (const { item } of this.rollbackPathOrder(operation)) {
+      const current = await this.readPathState(item.path);
+      if (sameState(current, item.before)) continue;
+      if (sameState(current, item.after)) {
+        await this.revertPath(index, operation, item);
+        continue;
       }
-      case "create_page":
-        await this.vault.trashFile(action.path);
-        break;
-      case "write_page":
-        await this.vault.write(
-          action.path,
-          await this.beforeBytes(index, operation, action.path),
-        );
-        break;
-      case "move_page": {
-        await this.vault.rename(action.path, action.fromPath);
-        await this.vault.write(
-          action.fromPath,
-          await this.beforeBytes(index, operation, action.fromPath),
-        );
-        break;
-      }
-      case "trash_page":
-        await this.vault.write(
-          action.path,
-          await this.beforeBytes(index, operation, action.path),
-        );
-        break;
+      journal.state = "ambiguous";
+      await this.save(journal);
+      throw new Error("TREE_TRANSACTION_AMBIGUOUS: 回滚时发现未记录的变更");
     }
+  }
+
+  private rollbackPathOrder(
+    operation: JournalOperation,
+  ): Array<{ pathIndex: number; item: OperationPath }> {
+    const entries = operation.paths.map((item, pathIndex) => ({
+      pathIndex,
+      item,
+    }));
+    entries.sort((left, right) => {
+      const leftDir = left.item.before.kind === "directory";
+      const rightDir = right.item.before.kind === "directory";
+      if (leftDir !== rightDir) return leftDir ? -1 : 1;
+      if (leftDir)
+        return pathDepth(left.item.path) - pathDepth(right.item.path);
+      return left.pathIndex - right.pathIndex;
+    });
+    return entries;
+  }
+
+  private async revertPath(
+    index: number,
+    operation: JournalOperation,
+    item: OperationPath,
+  ): Promise<void> {
+    const { before, after } = item;
+    if (after.kind === "missing") {
+      if (before.kind === "file")
+        await this.vault.write(
+          item.path,
+          await this.beforeBytes(index, operation, item.path),
+        );
+      else if (before.kind === "directory")
+        await this.vault.createDirectory(item.path);
+      return;
+    }
+    if (after.kind === "file") {
+      if (before.kind === "missing") await this.vault.trashFile(item.path);
+      else if (before.kind === "file")
+        await this.vault.write(
+          item.path,
+          await this.beforeBytes(index, operation, item.path),
+        );
+      return;
+    }
+    // after.kind === "directory" (a created directory)
+    await this.vault.trashDirectory(item.path);
   }
 
   private async beforeBytes(

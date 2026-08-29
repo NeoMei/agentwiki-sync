@@ -66,8 +66,9 @@ export class MemoryVault implements VaultPort {
       if (!path.startsWith(prefix)) continue;
       const relativePath = path.slice(prefix.length);
       if (relativePath.split("/").includes(".agentwiki")) continue;
-      if (!relativePath.toLowerCase().endsWith(".md")) continue;
-      entries.push({ kind: "markdown", relativePath, bytes: bytes.slice() });
+      if (relativePath.toLowerCase().endsWith(".md"))
+        entries.push({ kind: "markdown", relativePath, bytes: bytes.slice() });
+      else entries.push({ kind: "file", relativePath, bytes: bytes.slice() });
     }
     entries.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
     yield* entries;

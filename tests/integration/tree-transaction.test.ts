@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { TreeTransaction } from "../../src/application/tree-transaction";
+import { sortTreePullActions } from "../../src/application/tree-preview";
 import type { TreePullAction } from "../../src/core/merge";
 import { MemoryControlStore } from "../fakes/memory-control-store";
 import { MemoryVault } from "../fakes/memory-vault";
@@ -182,5 +183,162 @@ describe("TreeTransaction", () => {
     expect(vault.text("pages/Doomed/Inner.md")).toBe("inner");
     expect(vault.folders.has("pages/Extra")).toBe(false);
     expect(vault.hasUnexpectedTemporaryPaths()).toBe(false);
+  });
+
+  it("refuses to prepare a new plan over an unfinished transaction", async () => {
+    const vault = initialVault();
+    const control = seededControl();
+    const tx = new TreeTransaction(vault, control, ".agentwiki/tx/reprepare");
+    await tx.prepare({
+      baseRevision: "base",
+      targetRevision: "target",
+      targetTreeHash: "0".repeat(64),
+      actions: folderPlan(),
+    });
+
+    vault.failAfterOperations = 1;
+    await expect(tx.apply()).rejects.toThrow();
+    vault.failAfterOperations = null;
+
+    await expect(
+      tx.prepare({
+        baseRevision: "base2",
+        targetRevision: "target2",
+        targetTreeHash: "0".repeat(64),
+        actions: folderPlan(),
+      }),
+    ).rejects.toThrow(/未终结|恢复|recover/);
+  });
+
+  it("restores non-markdown files inside a trashed directory", async () => {
+    const vault = new MemoryVault({
+      "pages/Doomed/Inner.md": "inner",
+      "pages/Doomed/image.png": "imagedata",
+    });
+    const control = new MemoryControlStore();
+    const tx = new TreeTransaction(vault, control, ".agentwiki/tx/non-md");
+    await tx.prepare({
+      baseRevision: "base",
+      targetRevision: "target",
+      targetTreeHash: "0".repeat(64),
+      actions: [
+        { kind: "trash_directory", folderId: "f-doomed", path: "pages/Doomed" },
+        { kind: "create_directory", folderId: "f-extra", path: "pages/Extra" },
+      ],
+    });
+
+    vault.failAfterOperations = 2;
+    await expect(tx.apply()).rejects.toThrow();
+    vault.failAfterOperations = null;
+    await tx.recover();
+
+    expect(vault.text("pages/Doomed/Inner.md")).toBe("inner");
+    expect(vault.text("pages/Doomed/image.png")).toBe("imagedata");
+    expect(vault.folders.has("pages/Doomed")).toBe(true);
+    expect(vault.folders.has("pages/Extra")).toBe(false);
+  });
+
+  it("orders page evacuation before directory trash", () => {
+    const sorted = sortTreePullActions([
+      { kind: "trash_directory", folderId: "f", path: "pages/F" },
+      {
+        kind: "move_page",
+        pageId: "p",
+        fromPath: "pages/F/P.md",
+        path: "pages/G/P.md",
+        bodyPath: "tree-preview-body/p.md",
+      },
+      { kind: "create_directory", folderId: "g", path: "pages/G" },
+    ]);
+    const kinds = sorted.map((action) => action.kind);
+    expect(kinds.indexOf("create_directory")).toBeLessThan(
+      kinds.indexOf("move_page"),
+    );
+    expect(kinds.indexOf("move_page")).toBeLessThan(
+      kinds.indexOf("trash_directory"),
+    );
+  });
+
+  it("orders a directory trash before moving another directory into its path", () => {
+    const sorted = sortTreePullActions([
+      {
+        kind: "move_directory",
+        folderId: "a",
+        fromPath: "pages/A",
+        path: "pages/B",
+      },
+      { kind: "trash_directory", folderId: "b", path: "pages/B" },
+    ]);
+    const kinds = sorted.map((action) => action.kind);
+    expect(kinds.indexOf("trash_directory")).toBeLessThan(
+      kinds.indexOf("move_directory"),
+    );
+  });
+
+  it("applies and commits a folder-trash-with-page-evacuation plan", async () => {
+    const vault = new MemoryVault({ "pages/F/P.md": "p" });
+    const control = new MemoryControlStore();
+    control.files.set("tree-preview-body/p.md", "p-moved");
+    const tx = new TreeTransaction(vault, control, ".agentwiki/tx/evac");
+    await tx.prepare({
+      baseRevision: "base",
+      targetRevision: "target",
+      targetTreeHash: "0".repeat(64),
+      actions: sortTreePullActions([
+        { kind: "trash_directory", folderId: "f", path: "pages/F" },
+        {
+          kind: "move_page",
+          pageId: "p",
+          fromPath: "pages/F/P.md",
+          path: "pages/G/P.md",
+          bodyPath: "tree-preview-body/p.md",
+        },
+        { kind: "create_directory", folderId: "g", path: "pages/G" },
+      ]),
+    });
+
+    await tx.apply();
+    expect(vault.text("pages/G/P.md")).toBe("p-moved");
+    expect(vault.folders.has("pages/F")).toBe(false);
+    expect((await tx.inspect())?.state).toBe("committed");
+  });
+
+  it("resumes a multi-step rollback after interruption", async () => {
+    const vault = new MemoryVault({
+      "pages/Doomed/Inner.md": "inner",
+      "pages/Doomed/Sub/X.md": "x",
+    });
+    const control = new MemoryControlStore();
+    const tx = new TreeTransaction(
+      vault,
+      control,
+      ".agentwiki/tx/rollback-resume",
+    );
+    await tx.prepare({
+      baseRevision: "base",
+      targetRevision: "target",
+      targetTreeHash: "0".repeat(64),
+      actions: [
+        { kind: "trash_directory", folderId: "f-doomed", path: "pages/Doomed" },
+        { kind: "create_directory", folderId: "f-extra", path: "pages/A" },
+      ],
+    });
+
+    vault.failAfterOperations = 2;
+    await expect(tx.apply()).rejects.toThrow();
+
+    // Interrupt rollback after recreating the directories but before writing
+    // the first file back, then resume without the fault.
+    vault.failAfterOperations = 5;
+    await expect(tx.recover()).rejects.toThrow();
+    vault.failAfterOperations = null;
+
+    await tx.recover();
+    expect((await tx.inspect())?.state).toBe("rolled_back");
+    expect(vault.text("pages/Doomed/Inner.md")).toBe("inner");
+    expect(vault.text("pages/Doomed/Sub/X.md")).toBe("x");
+    expect(vault.folders.has("pages/Doomed")).toBe(true);
+    expect(vault.folders.has("pages/Doomed/Sub")).toBe(true);
+    expect(vault.folders.has("pages/A")).toBe(false);
   });
 });

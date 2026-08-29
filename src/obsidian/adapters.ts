@@ -191,15 +191,11 @@ export class ObsidianVaultPort implements VaultPort {
         if (child instanceof TFolder) {
           yield { kind: "directory", relativePath };
           yield* visit(child);
-        } else if (
-          child instanceof TFile &&
-          child.extension.toLowerCase() === "md"
-        ) {
-          yield {
-            kind: "markdown",
-            relativePath,
-            bytes: new Uint8Array(await vault.readBinary(child)),
-          };
+        } else if (child instanceof TFile) {
+          const bytes = new Uint8Array(await vault.readBinary(child));
+          if (child.extension.toLowerCase() === "md")
+            yield { kind: "markdown", relativePath, bytes };
+          else yield { kind: "file", relativePath, bytes };
         }
       }
     };

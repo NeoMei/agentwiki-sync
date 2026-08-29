@@ -1,6 +1,6 @@
 export interface VaultTreeEntry {
   relativePath: string;
-  kind: "directory" | "markdown";
+  kind: "directory" | "markdown" | "file";
   bytes?: Uint8Array;
 }
 
