@@ -103,6 +103,12 @@ export class MemoryVault implements VaultPort {
   exists(path: string): boolean {
     return this.files.has(path);
   }
+  hasUnexpectedTemporaryPaths(): boolean {
+    const marker = ".agentwiki-tmp-";
+    for (const key of [...this.files.keys(), ...this.folders])
+      if (key.includes(marker)) return true;
+    return false;
+  }
   text(path: string): string | null {
     const value = this.files.get(path);
     return value ? new TextDecoder().decode(value) : null;
@@ -120,10 +126,34 @@ export class MemoryVault implements VaultPort {
   }
   async rename(from: string, to: string): Promise<void> {
     this.fail();
+    if (this.folders.has(from)) {
+      if (this.folders.has(to) || this.files.has(to))
+        throw new Error("rename conflict");
+      const prefix = `${from}/`;
+      for (const dir of [...this.folders]) {
+        if (dir === from || dir.startsWith(prefix)) {
+          const relative = dir.slice(from.length);
+          this.folders.delete(dir);
+          this.folders.add(`${to}${relative}`);
+        }
+      }
+      for (const file of [...this.files.keys()]) {
+        if (file.startsWith(prefix)) {
+          const value = this.files.get(file);
+          if (value === undefined) continue;
+          const relative = file.slice(from.length);
+          this.files.delete(file);
+          this.files.set(`${to}${relative}`, value);
+        }
+      }
+      this.deriveParents(to);
+      return;
+    }
     const value = this.files.get(from);
     if (!value || this.files.has(to)) throw new Error("rename conflict");
     this.files.delete(from);
     this.files.set(to, value);
+    this.deriveParents(to);
   }
   async trashFile(path: string): Promise<void> {
     this.fail();

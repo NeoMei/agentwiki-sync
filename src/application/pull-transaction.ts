@@ -34,7 +34,12 @@ interface SnapshotEntry {
   snapshotPath: string | null;
   hash: string | null;
 }
-interface PullJournal {
+/**
+ * Legacy schema-1 Pull journal. Kept only so unfinished v1 journals can still
+ * be recovered through `PullTransaction.recover()`. New previews always create
+ * a `TreeTransactionJournal` (schema 2); see `tree-transaction.ts`.
+ */
+export interface PullJournal {
   schemaVersion: 1;
   transactionId: string;
   state:

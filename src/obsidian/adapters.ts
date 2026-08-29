@@ -281,10 +281,10 @@ export class ObsidianVaultPort implements VaultPort {
     if (file) await this.fileManager.trashFile(file);
   }
   async rename(from: string, to: string): Promise<void> {
-    const file = this.file(from);
-    if (!file) throw new Error("重命名源缺失");
+    const entry = this.vault.getAbstractFileByPath(this.safe(from));
+    if (!entry) throw new Error("重命名源缺失");
     await this.ensureParentDirectories(to);
-    await this.vault.rename(file, this.safe(to));
+    await this.vault.rename(entry, this.safe(to));
   }
   async trashFile(path: string): Promise<void> {
     const file = this.file(path);
