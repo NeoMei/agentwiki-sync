@@ -2,11 +2,50 @@ import { describe, expect, it } from "vitest";
 import * as local from "../../src/agentwiki/protocol";
 import * as published from "@neomei/agentwiki-sync-protocol";
 import {
+  SYNC_PROTOCOL_V2,
+  TreeCapabilitiesResponseV2Schema,
+  treeRevisionContentHashV2,
+} from "@neomei/agentwiki-sync-protocol";
+import {
   portablePathKey,
   validatePortablePath as localValidatePortablePath,
 } from "../../src/core/portable-path";
 
 describe("protocol conformance against the published package", () => {
+  it("loads the published v2 tree contract", async () => {
+    expect(SYNC_PROTOCOL_V2).toBe("2");
+    expect(
+      TreeCapabilitiesResponseV2Schema.parse({
+        protocolVersion: "2",
+        capabilities: {
+          maxPageBytes: 1,
+          maxBatchBytes: 1,
+          maxBatchItems: 1,
+          maxChangeCount: 1,
+          maxConfirmationBytes: 1,
+          maxClientSpacePages: 1,
+          maxClientSpaceFolders: 1,
+          maxSnapshotObjects: 2,
+          maxClientManifestBytes: 1,
+          maxClientTotalBodyBytes: 1,
+          maxDeltaItems: 1,
+          maxResponseBytes: 1,
+          maxPageItems: 1,
+          pushSessionTtlSeconds: 1,
+        },
+        capabilitiesHash: "0".repeat(64),
+      }).protocolVersion,
+    ).toBe("2");
+    expect(
+      await treeRevisionContentHashV2({
+        protocolVersion: "2",
+        spaceId: "space",
+        folders: [],
+        pages: [],
+      }),
+    ).toMatch(/^[0-9a-f]{64}$/);
+  });
+
   it("produces identical canonical bytes for representative values", () => {
     for (const value of [
       { z: 1, a: "雪", nested: { list: [1, 2, 3], flag: true } },

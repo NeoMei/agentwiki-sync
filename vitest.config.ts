@@ -12,5 +12,6 @@ export default defineConfig({
   test: {
     environment: "node",
     setupFiles: ["./tests/setup.ts"],
+    exclude: ["**/node_modules/**", "**/.git/**", "**/.worktrees/**"],
   },
 });
