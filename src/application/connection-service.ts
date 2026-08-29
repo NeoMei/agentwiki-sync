@@ -240,7 +240,7 @@ export class ConnectionService {
         deviceName: input.deviceName,
         vaultId: input.vaultId,
         pluginVersion: input.pluginVersion,
-        supportedProtocolVersions: ["1"],
+        supportedProtocolVersions: ["2", "1"],
       });
       try {
         const value = ExchangeResponseSchema.parse(
@@ -420,7 +420,7 @@ export class ConnectionService {
           deviceName: prepared.deviceName,
           vaultId: prepared.vaultId,
           pluginVersion: prepared.pluginVersion,
-          supportedProtocolVersions: ["1"],
+          supportedProtocolVersions: ["2", "1"],
         });
         try {
           const value = ExchangeResponseSchema.parse(

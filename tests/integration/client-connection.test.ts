@@ -150,6 +150,9 @@ describe("AgentWiki connection", () => {
       "/api/integrations/obsidian/credentials/current/activate",
       "/api/integrations/obsidian/session",
     ]);
+    expect(http.calls[0]?.body).toMatchObject({
+      supportedProtocolVersions: ["2", "1"],
+    });
     expect(await control.read("connection-journal.json")).toBeNull();
     expect(await control.read("connection-state.json")).toContain(
       result.credentialId,
