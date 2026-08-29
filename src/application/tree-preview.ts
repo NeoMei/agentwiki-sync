@@ -10,6 +10,7 @@ import type {
 import type { LocalTreeScan } from "../core/tree-scan";
 import type { TreeSnapshot } from "../core/tree-model";
 import type { ResolvedTree, TreePullPreview } from "./tree-diff";
+import type { PageConflictResolution } from "./tree-diff";
 
 export interface PreviewCandidate {
   base: TreeSnapshot;
@@ -20,6 +21,7 @@ export interface PreviewCandidate {
   folderConflicts: FolderConflict[];
   pageConflicts: StructuredConflict[];
   folderConflictResolutions: Record<string, FolderConflictResolution>;
+  pageConflictResolutions: Record<string, PageConflictResolution>;
   pagePlan: PageMergePlan;
 }
 
@@ -274,6 +276,7 @@ export function orderPreviewActions(
     folderConflicts: candidate.folderConflicts,
     folderConflictResolutions: candidate.folderConflictResolutions,
     pageConflicts: candidate.pageConflicts,
+    pageConflictResolutions: candidate.pageConflictResolutions,
     base: candidate.base,
     local: candidate.local,
     remote: candidate.remote,

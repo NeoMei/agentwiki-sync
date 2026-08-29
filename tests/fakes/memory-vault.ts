@@ -104,6 +104,9 @@ export class MemoryVault implements VaultPort {
   exists(path: string): boolean {
     return this.files.has(path);
   }
+  hasDirectory(path: string): boolean {
+    return this.folders.has(path);
+  }
   hasUnexpectedTemporaryPaths(): boolean {
     const marker = ".agentwiki-tmp-";
     for (const key of [...this.files.keys(), ...this.folders])

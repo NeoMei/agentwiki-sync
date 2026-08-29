@@ -36,10 +36,28 @@ function binding(
 function preview(
   resolutions: PullPreview["conflictResolutions"] = {},
 ): PullPreview {
+  const emptySnapshot = {
+    protocolVersion: "2" as const,
+    spaceId: "space",
+    revision: "0",
+    revisionContentHash: "",
+    folders: [],
+    pages: [],
+  };
   return {
-    scanEpoch: 1,
     revision: "r1",
     actions: [],
+    folderConflicts: [],
+    folderConflictResolutions: {},
+    pageConflicts: [],
+    pageConflictResolutions: {},
+    resolvedFolders: [],
+    resolvedPages: [],
+    base: emptySnapshot,
+    local: { rootPath: "Wiki", folders: [], pages: [] },
+    remote: emptySnapshot,
+    pagePlan: { resolved: [], conflicts: [] },
+    scanEpoch: 1,
     remotePages: [],
     conflicts: [],
     conflictResolutions: resolutions,

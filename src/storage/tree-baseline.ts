@@ -98,6 +98,25 @@ export class TreeBaselineRepository {
     return manifest;
   }
 
+  /**
+   * 还原当前 v2 基线的完整 TreeSnapshot（含每页正文），供三方比较使用。
+   */
+  async readSnapshot(): Promise<TreeSnapshot> {
+    const manifest = await this.read();
+    const { bodies } = await this.generations.read(manifest.generationId);
+    return {
+      protocolVersion: "2",
+      spaceId: manifest.spaceId,
+      revision: manifest.baseRevision,
+      revisionContentHash: manifest.baseRevisionContentHash,
+      folders: Object.values(manifest.folders),
+      pages: Object.values(manifest.pages).map((page) => ({
+        ...page,
+        body: bodies[page.pageId]!,
+      })),
+    };
+  }
+
   async prepare(
     snapshot: TreeSnapshot,
     kind: TreeBaselineKind,

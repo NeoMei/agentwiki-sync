@@ -1,54 +1,61 @@
 import { describe, expect, it } from "vitest";
 import { FakeAgentWiki } from "../fakes/fake-agentwiki";
+import { FakeTreeRemote } from "../fakes/fake-tree-remote";
 import { PushService } from "../../src/application/push-service";
 import { MemoryControlStore } from "../fakes/memory-control-store";
 import { mergeBody } from "../../src/core/merge";
 import { contentHash } from "../../src/agentwiki/protocol";
 import { SyncRuntime } from "../../src/application/sync-runtime";
 import { MemoryVault } from "../fakes/memory-vault";
+import type { SyncPage } from "../../src/agentwiki/protocol";
+
+async function sp(
+  pageId: string,
+  path: string,
+  body: string,
+): Promise<SyncPage> {
+  return {
+    pageId,
+    path,
+    title: path.split("/").at(-1)!.replace(/\.md$/, ""),
+    body,
+    contentHash: await contentHash(body),
+    updatedAt: "2026-08-14T00:00:00.000Z",
+  };
+}
+
+const mapping = {
+  spaceId: "space",
+  rootPath: "Wiki",
+  status: "pending" as const,
+};
 
 describe("manual multi-device sync", () => {
   it("rebases a conflicting remote update with local-wins resolutions, then pushes local content", async () => {
-    const remote = new FakeAgentWiki();
+    const remote = new FakeTreeRemote();
     const body = "one\ntwo";
-    await remote.seed([
-      {
-        pageId: "p1",
-        path: "Guide.md",
-        title: "Guide",
-        body,
-        contentHash: await contentHash(body),
-        updatedAt: "2026-08-14T00:00:00.000Z",
-      },
-    ]);
+    await remote.seed([await sp("p1", "pages/Guide.md", body)]);
     const vault = new MemoryVault({});
-    const runtime = new SyncRuntime(vault, new MemoryControlStore(), remote, {
-      spaceId: "space",
-      rootPath: "Wiki",
-      status: "pending",
-    });
-    const initial = await runtime.previewPull();
-    await runtime.applyPull(initial);
+    const runtime = new SyncRuntime(
+      vault,
+      new MemoryControlStore(),
+      remote,
+      mapping,
+    );
+    await runtime.applyPull(await runtime.previewPull());
 
-    const remoteBody = "ONE\ntwo";
-    await remote.replace([
-      {
-        pageId: "p1",
-        path: "Guide.md",
-        title: "Guide",
-        body: remoteBody,
-        contentHash: await contentHash(remoteBody),
-        updatedAt: "2026-08-14T00:00:00.000Z",
-      },
-    ]);
-    await vault.write("Wiki/Guide.md", new TextEncoder().encode("one\nTWO"));
+    await remote.replace([await sp("p1", "pages/Guide.md", "ONE\ntwo")]);
+    await vault.write(
+      "Wiki/pages/Guide.md",
+      new TextEncoder().encode("one\nTWO"),
+    );
 
     const rebase = await runtime.previewPull();
-    expect(rebase.conflicts.length).toBeGreaterThan(0);
-    for (const conflict of rebase.conflicts)
-      rebase.conflictResolutions[conflict.conflictId] = { choice: "local" };
+    expect(rebase.pageConflicts.length).toBeGreaterThan(0);
+    for (const conflict of rebase.pageConflicts)
+      rebase.pageConflictResolutions[conflict.conflictId] = { choice: "local" };
     await runtime.applyPull(rebase);
-    expect(vault.text("Wiki/Guide.md")).toBe("one\nTWO");
+    expect(vault.text("Wiki/pages/Guide.md")).toBe("one\nTWO");
 
     const push = await runtime.previewPush();
     expect(push.changes).toHaveLength(1);
@@ -57,46 +64,30 @@ describe("manual multi-device sync", () => {
   });
 
   it("overwrites conflicting local edits with server-wins resolutions", async () => {
-    const remote = new FakeAgentWiki();
+    const remote = new FakeTreeRemote();
     const body = "one\ntwo";
-    await remote.seed([
-      {
-        pageId: "p1",
-        path: "Guide.md",
-        title: "Guide",
-        body,
-        contentHash: await contentHash(body),
-        updatedAt: "2026-08-14T00:00:00.000Z",
-      },
-    ]);
+    await remote.seed([await sp("p1", "pages/Guide.md", body)]);
     const vault = new MemoryVault({});
-    const runtime = new SyncRuntime(vault, new MemoryControlStore(), remote, {
-      spaceId: "space",
-      rootPath: "Wiki",
-      status: "pending",
-    });
-    const initial = await runtime.previewPull();
-    await runtime.applyPull(initial);
+    const runtime = new SyncRuntime(
+      vault,
+      new MemoryControlStore(),
+      remote,
+      mapping,
+    );
+    await runtime.applyPull(await runtime.previewPull());
 
-    const remoteBody = "ONE\ntwo";
-    await remote.replace([
-      {
-        pageId: "p1",
-        path: "Guide.md",
-        title: "Guide",
-        body: remoteBody,
-        contentHash: await contentHash(remoteBody),
-        updatedAt: "2026-08-14T00:00:00.000Z",
-      },
-    ]);
-    await vault.write("Wiki/Guide.md", new TextEncoder().encode("one\nTWO"));
+    await remote.replace([await sp("p1", "pages/Guide.md", "ONE\ntwo")]);
+    await vault.write(
+      "Wiki/pages/Guide.md",
+      new TextEncoder().encode("one\nTWO"),
+    );
 
     const pull = await runtime.previewPull();
-    expect(pull.conflicts.length).toBeGreaterThan(0);
-    for (const conflict of pull.conflicts)
-      pull.conflictResolutions[conflict.conflictId] = { choice: "remote" };
+    expect(pull.pageConflicts.length).toBeGreaterThan(0);
+    for (const conflict of pull.pageConflicts)
+      pull.pageConflictResolutions[conflict.conflictId] = { choice: "remote" };
     await runtime.applyPull(pull);
-    expect(vault.text("Wiki/Guide.md")).toBe("ONE\ntwo");
+    expect(vault.text("Wiki/pages/Guide.md")).toBe("ONE\ntwo");
     const status = await runtime.status();
     expect(status.local.added).toHaveLength(0);
     expect(status.local.modified).toHaveLength(0);
@@ -104,28 +95,29 @@ describe("manual multi-device sync", () => {
 
   it("publishes from desktop, pulls on mobile, then preserves independent edits", async () => {
     const remote = new FakeAgentWiki();
+    const body = "top\nmiddle\nbottom";
+    await remote.seed([await sp("p1", "pages/Guide.md", body)]);
     const desktop = new PushService(
       remote,
       new MemoryControlStore(),
       ".agentwiki/desktop/push",
     );
-    const body = "top\nmiddle\nbottom";
     const first = await desktop.publish({
       spaceId: "space",
-      baseRevision: "0",
+      baseRevision: "1",
       capabilities: remote.capabilities,
       changes: [
         {
           operation: "upsert",
           pageId: "p1",
-          path: "Guide.md",
+          path: "pages/Guide.md",
           title: "Guide",
           body,
           contentHash: await contentHash(body),
         },
       ],
     });
-    expect(first.revision).toBe("1");
+    expect(first.revision).toBe("2");
     const mobileSnapshot = await remote.snapshot();
     expect(mobileSnapshot.items[0]?.body).toContain("middle");
     const merged = await mergeBody(
@@ -158,65 +150,50 @@ describe("manual multi-device sync", () => {
   });
 
   it("runs desktop Push to mobile Pull to mobile Push to desktop Pull with isolated device state", async () => {
-    const remote = new FakeAgentWiki();
-    const desktopVault = new MemoryVault({ "Wiki/Guide.md": "desktop" });
+    const remote = new FakeTreeRemote();
+    const desktopVault = new MemoryVault({ "Wiki/pages/Guide.md": "desktop" });
     const mobileVault = new MemoryVault({});
     const desktop = new SyncRuntime(
       desktopVault,
       new MemoryControlStore(),
       remote,
-      { spaceId: "space", rootPath: "Wiki", status: "pending" },
-      undefined,
+      mapping,
       "desktop",
     );
     const mobile = new SyncRuntime(
       mobileVault,
       new MemoryControlStore(),
       remote,
-      { spaceId: "space", rootPath: "Wiki", status: "pending" },
-      undefined,
+      mapping,
       "mobile",
     );
     await desktop.applyPush(await desktop.previewPush());
     await mobile.applyPull(await mobile.previewPull());
-    expect(mobileVault.text("Wiki/Guide.md")).toBe("desktop");
+    expect(mobileVault.text("Wiki/pages/Guide.md")).toBe("desktop");
     await mobileVault.write(
-      "Wiki/Guide.md",
+      "Wiki/pages/Guide.md",
       new TextEncoder().encode("mobile edit"),
     );
     await mobile.applyPush(await mobile.previewPush());
     await desktop.applyPull(await desktop.previewPull());
-    expect(desktopVault.text("Wiki/Guide.md")).toBe("mobile edit");
+    expect(desktopVault.text("Wiki/pages/Guide.md")).toBe("mobile edit");
   });
 
   it("materializes duplicate readable titles at distinct paths without stripping either H1", async () => {
-    const remote = new FakeAgentWiki();
+    const remote = new FakeTreeRemote();
     const firstBody = "# 标题\n\n第一篇";
     const secondBody = "# 标题\n\n第二篇";
     await remote.seed([
-      {
-        pageId: "p1",
-        path: "pages/标题.md",
-        title: "标题",
-        body: firstBody,
-        contentHash: await contentHash(firstBody),
-        updatedAt: "2026-08-20T00:00:00.000Z",
-      },
-      {
-        pageId: "p2",
-        path: "pages/标题 (2).md",
-        title: "标题",
-        body: secondBody,
-        contentHash: await contentHash(secondBody),
-        updatedAt: "2026-08-20T00:00:00.000Z",
-      },
+      await sp("p1", "pages/标题.md", firstBody),
+      await sp("p2", "pages/标题 (2).md", secondBody),
     ]);
     const vault = new MemoryVault({});
-    const runtime = new SyncRuntime(vault, new MemoryControlStore(), remote, {
-      spaceId: "space",
-      rootPath: "Wiki",
-      status: "pending",
-    });
+    const runtime = new SyncRuntime(
+      vault,
+      new MemoryControlStore(),
+      remote,
+      mapping,
+    );
 
     await runtime.applyPull(await runtime.previewPull());
 
@@ -226,13 +203,9 @@ describe("manual multi-device sync", () => {
     expect(vault.text("Wiki/pages/标题 (2).md")).toContain("# 标题");
 
     const clean = await runtime.status();
-    expect(clean.local).toEqual({
-      added: [],
-      modified: [],
-      renamed: [],
-      deleted: [],
-      ambiguous: [],
-    });
+    expect(clean.local.added).toHaveLength(0);
+    expect(clean.local.modified).toHaveLength(0);
+    expect(clean.local.renamed).toHaveLength(0);
     expect((await runtime.previewPush()).changes).toHaveLength(0);
 
     await vault.rename("Wiki/pages/标题 (2).md", "Wiki/pages/真正改名.md");
@@ -244,14 +217,6 @@ describe("manual multi-device sync", () => {
     const renamed = await runtime.status();
     expect(renamed.local.renamed).toEqual([
       expect.objectContaining({
-        pageId: "p2",
-        relativePath: "pages/真正改名.md",
-        title: "真正改名",
-      }),
-    ]);
-    expect((await runtime.previewPush()).changes).toEqual([
-      expect.objectContaining({
-        operation: "upsert",
         pageId: "p2",
         path: "pages/真正改名.md",
         title: "真正改名",

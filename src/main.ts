@@ -25,8 +25,14 @@ import {
   RequestUrlHttp,
 } from "./obsidian/adapters";
 import { AgentWikiClient, normalizeServerUrl } from "./agentwiki/client";
-import { AgentWikiPushRemote } from "./agentwiki/push-remote";
+import { V1TreeRemote } from "./agentwiki/v1-tree-remote";
+import { V2TreeRemote } from "./agentwiki/v2-tree-remote";
 import { SyncRuntime } from "./application/sync-runtime";
+import {
+  ProtocolNegotiator,
+  type SyncProtocolSelection,
+} from "./application/protocol-negotiator";
+import { ProtocolSelectionRepository } from "./storage/protocol-selection";
 import {
   OperationLock,
   removeMapping,
@@ -35,9 +41,13 @@ import {
 } from "./application/sync-coordinator";
 import { VaultIdentityService } from "./storage/vault-identity";
 import { idFileKey } from "./core/identity-key";
-import { SessionResponseSchema } from "./agentwiki/protocol";
+import {
+  SessionResponseSchema,
+  type SyncCapabilities,
+} from "./agentwiki/protocol";
 import { userErrorMessage } from "./core/user-errors";
 import type { SyncSpaceSummary } from "./agentwiki/protocol";
+import type { TreeRemotePort } from "./ports/tree-remote";
 import { MutableControlRepository } from "./storage/envelope";
 import { DeviceStateRepository } from "./storage/device-state";
 import { StorageMigration } from "./storage/migration";
@@ -48,11 +58,22 @@ import type { ModalTransition } from "./obsidian/modal-handoff";
 const actionLabel = (kind: string): string => {
   const labels: Record<string, string> = {
     write: "写入",
+    write_page: "写入",
     create: "创建",
+    create_page: "创建",
+    create_directory: "创建目录",
     rename: "重命名",
+    move_page: "移动",
+    move_directory: "移动目录",
     trash: "删除",
+    trash_page: "删除",
+    trash_directory: "删除目录",
     upsert: "更新",
+    upsert_page: "更新",
+    upsert_folder: "更新目录",
     archive: "归档",
+    archive_page: "归档",
+    archive_folder: "归档目录",
   };
   return labels[kind] || kind;
 };
@@ -62,6 +83,20 @@ const roleLabel: Record<SyncSpaceSummary["role"], string> = {
   editor: "可编辑",
   admin: "管理员",
   owner: "所有者",
+};
+
+const DEFAULT_V1_CAPABILITIES: SyncCapabilities = {
+  maxPageBytes: 1048576,
+  maxBatchBytes: 4194304,
+  maxBatchItems: 100,
+  maxChangeCount: 5000,
+  maxConfirmationBytes: 4194304,
+  maxClientSpacePages: 5000,
+  maxClientManifestBytes: 4194304,
+  maxClientTotalBodyBytes: 104857600,
+  maxResponseBytes: 4194304,
+  maxPageItems: 100,
+  pushSessionTtlSeconds: 900,
 };
 
 const isDeviceSettings = (value: unknown): value is AgentWikiSyncSettings => {
@@ -255,8 +290,30 @@ export default class AgentWikiSyncPlugin extends Plugin {
       new RequestUrlHttp(),
       () => secrets.get(secretId),
     );
-    const response = await client.spaces();
-    return response.spaces;
+    const selection = await this.negotiate(
+      client,
+      state!.payload.serverInstanceId,
+    );
+    const remote: TreeRemotePort =
+      selection.version === "2"
+        ? new V2TreeRemote(client, "", selection)
+        : new V1TreeRemote(client, "", DEFAULT_V1_CAPABILITIES);
+    return remote.spaces();
+  }
+
+  private async negotiate(
+    client: AgentWikiClient,
+    serverInstanceId: string,
+  ): Promise<SyncProtocolSelection> {
+    const local = new ObsidianLocalControlStore(this.app);
+    return new ProtocolNegotiator(
+      client,
+      new ProtocolSelectionRepository(local),
+    ).select({
+      serverOrigin: this.settings.serverUrl,
+      serverInstanceId,
+      pluginVersion: this.manifest.version,
+    });
   }
 
   async addMapping(spaceId: string, rootPath: string): Promise<void> {
@@ -349,9 +406,6 @@ export default class AgentWikiSyncPlugin extends Plugin {
   private async runtime(
     mapping: NonNullable<ReturnType<AgentWikiSyncPlugin["selectedMapping"]>>,
   ): Promise<SyncRuntime | null> {
-    const runtimeKey = `${this.settings.serverInstanceId ?? "pending"}\0${mapping.spaceId}\0${mapping.rootPath}`;
-    const existing = this.liveRuntimes.get(runtimeKey);
-    if (existing) return existing;
     const local = new ObsidianLocalControlStore(this.app);
     await new VaultIdentityService(
       new ObsidianControlStore(this.app.vault.adapter),
@@ -393,6 +447,23 @@ export default class AgentWikiSyncPlugin extends Plugin {
       session.credentialStatus !== "active"
     )
       throw new Error("认证会话身份不匹配");
+    const selection = await this.negotiate(client, state.serverInstanceId);
+    const protocolSuffix =
+      selection.version === "2" ? "2\0" + selection.capabilitiesHash : "1";
+    const runtimeKey =
+      (this.settings.serverInstanceId ?? "pending") +
+      "\0" +
+      mapping.spaceId +
+      "\0" +
+      mapping.rootPath +
+      "\0" +
+      protocolSuffix;
+    const existing = this.liveRuntimes.get(runtimeKey);
+    if (existing) return existing;
+    const remote: TreeRemotePort =
+      selection.version === "2"
+        ? new V2TreeRemote(client, mapping.spaceId, selection)
+        : new V1TreeRemote(client, mapping.spaceId, session.capabilities);
     const runtime = new SyncRuntime(
       new ObsidianVaultPort(
         this.app.vault,
@@ -400,9 +471,8 @@ export default class AgentWikiSyncPlugin extends Plugin {
         mapping.rootPath,
       ),
       new ObsidianControlStore(this.app.vault.adapter),
-      new AgentWikiPushRemote(client, mapping.spaceId),
+      remote,
       mapping,
-      undefined,
       await idFileKey(deviceId),
       await idFileKey(mapping.spaceId),
       state.credentialId,
@@ -471,15 +541,25 @@ export default class AgentWikiSyncPlugin extends Plugin {
       rootPath: mapping.rootPath,
       roleLabel: roleLabel[space.role],
       remoteAhead: delta.ahead,
-      localAdded: status.local.added.map((file) => file.relativePath),
-      localModified: status.local.modified.map((file) => file.relativePath),
-      localRenamed: status.local.renamed.map((file) => file.relativePath),
-      localDeleted: status.local.deleted.map((page) => page.relativePath),
+      localAdded: status.local.added.map((file) => file.path),
+      localModified: status.local.modified.map((file) => file.path),
+      localRenamed: status.local.renamed.map((file) => file.path),
+      localDeleted: status.local.deleted.map((page) => page.path),
       remoteUpdated: delta.items
-        .filter((item) => item.operation === "upsert")
-        .map((item) => item.page.path),
+        .filter(
+          (item) =>
+            item.operation === "upsert_page" ||
+            item.operation === "upsert_folder",
+        )
+        .map((item) =>
+          item.operation === "upsert_page" ? item.page.path : item.folder.path,
+        ),
       remoteArchived: delta.items
-        .filter((item) => item.operation === "archive")
+        .filter(
+          (item) =>
+            item.operation === "archive_page" ||
+            item.operation === "archive_folder",
+        )
         .map((item) => item.previousPath),
       remoteListed: delta.listed,
       remoteFirstBind: delta.ahead && delta.baseRevision === "0",
@@ -675,10 +755,15 @@ export default class AgentWikiSyncPlugin extends Plugin {
         new PreviewModal(
           this.app,
           title,
-          preview.changes.map(
-            (item) =>
-              `${actionLabel(item.operation)}: ${item.operation === "upsert" ? item.path : item.previousPath}`,
-          ),
+          preview.changes.map((item) => {
+            const path =
+              item.operation === "upsert_page"
+                ? item.page.path
+                : item.operation === "upsert_folder"
+                  ? item.folder.path
+                  : item.previousPath;
+            return actionLabel(item.operation) + ": " + path;
+          }),
           async (applyOptions) => {
             await runtime.applyPush(preview, applyOptions);
             await this.saveSettings();
