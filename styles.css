@@ -48,12 +48,15 @@
 }
 
 .agentwiki-sync-binding-setting .agentwiki-sync-resolution-controls {
-  grid-template-columns:
-    minmax(14rem, 2fr) minmax(10rem, 1fr) minmax(9rem, 1fr);
+  grid-template-columns: minmax(14rem, 2fr) minmax(10rem, 1fr) minmax(9rem, 1fr);
 }
 
 .agentwiki-sync-conflict-setting .agentwiki-sync-resolution-controls {
   grid-template-columns: minmax(9rem, 1fr) minmax(16rem, 3fr);
+}
+
+.agentwiki-sync-folder-setting .agentwiki-sync-resolution-controls {
+  grid-template-columns: minmax(10rem, 1fr) minmax(16rem, 3fr);
 }
 
 .agentwiki-sync-resolution-controls > * {
@@ -67,6 +70,13 @@
   grid-column: 1 / -1;
   height: 6rem;
   min-height: 6rem;
+  resize: vertical;
+}
+
+.agentwiki-sync-folder-setting textarea {
+  grid-column: 1 / -1;
+  height: 4rem;
+  min-height: 4rem;
   resize: vertical;
 }
 
@@ -89,6 +99,7 @@
 
 /* Long paths, hashes and inline previews must wrap instead of overflowing. */
 .agentwiki-sync-modal li,
+.agentwiki-sync-modal .setting-item-name,
 .agentwiki-sync-modal .setting-description,
 .agentwiki-sync-settings .setting-description {
   overflow-wrap: anywhere;
@@ -133,7 +144,8 @@
 
 @container (max-width: 700px) {
   .agentwiki-sync-binding-setting .agentwiki-sync-resolution-controls,
-  .agentwiki-sync-conflict-setting .agentwiki-sync-resolution-controls {
+  .agentwiki-sync-conflict-setting .agentwiki-sync-resolution-controls,
+  .agentwiki-sync-folder-setting .agentwiki-sync-resolution-controls {
     grid-template-columns: minmax(0, 1fr);
   }
 

@@ -31,6 +31,21 @@ const errorMessages: Record<string, string> = {
   INITIAL_PULL_REQUIRED: "远端已有内容。请先拉取（Pull）建立基线。",
   IDENTITY_REQUIRED: "无法唯一确定页面身份。请重命名其中一个文件后重试。",
   PATH_COLLISION: "目标路径已被占用。请选择其他路径。",
+  SYNC_PROTOCOL_UPGRADE_REQUIRED: "需要升级同步协议。请更新插件后重试。",
+  FOLDER_ID_CONFLICT: "目录标识冲突。请重新预览后重试。",
+};
+
+const localErrorMessages: Record<string, string> = {
+  TREE_TRANSACTION_AMBIGUOUS: "同步事务状态不明确。请按恢复指引处理。",
+  FOLDER_CYCLE: "目录层级存在循环。请选择其他目标路径。",
+  MANUAL_PATH_REQUIRED: "请填写目标路径。",
+  MANAGED_ROOT: "目录必须位于 pages/ 下。",
+  UNKNOWN_PARENT: "目录缺少父目录。请选择已有目录作为父级。",
+  PATH_COLLISION: "目标路径已被占用。请选择其他路径。",
+  PAGE_CONFLICT_NOT_FOUND: "页面冲突不存在。请重新预览。",
+  FOLDER_CONFLICT_NOT_FOUND: "目录冲突不存在。请重新预览。",
+  DUPLICATE_FOLDER_ID: "目录标识重复。",
+  DUPLICATE_PAGE_ID: "页面标识重复。",
 };
 
 const httpMessages: Record<number, string> = {
@@ -42,6 +57,37 @@ const httpMessages: Record<number, string> = {
   502: "服务器暂时不可用。请稍后再试。",
   503: "服务器维护中。请稍后再试。",
 };
+
+const protocolValidationMessages: Array<[string, string]> = [
+  [
+    "Path must be relative and use slash separators",
+    "路径必须是相对路径并使用 / 分隔。",
+  ],
+  [
+    "Path contains an empty or relative segment",
+    "路径包含空段或相对段。请使用相对路径，不要包含 .. 或 / 开头。",
+  ],
+  ["Path contains a forbidden character", "路径包含非法字符。"],
+  [
+    "Path segment has a forbidden trailing character",
+    "路径段末尾包含非法字符。",
+  ],
+  [
+    "Path segment is longer than 255 UTF-8 bytes",
+    "路径段过长（超过 255 字节）。",
+  ],
+  [
+    "Path uses a reserved Windows device name",
+    "路径使用了 Windows 保留设备名。",
+  ],
+  ["Path is longer than 1024 UTF-8 bytes", "路径过长（超过 1024 字节）。"],
+  ["Path must end with .md", "路径必须以 .md 结尾。"],
+  ["Invalid Markdown title", "标题格式不正确。"],
+  [
+    "Sync v2 capability hash mismatch",
+    "同步协议能力哈希不匹配。请更新插件后重试。",
+  ],
+];
 
 /** Convert any error into a user-friendly Chinese message. */
 export function userErrorMessage(error: unknown): string {
@@ -59,6 +105,11 @@ export function userErrorMessage(error: unknown): string {
     return "服务器地址格式不正确。请输入完整地址，如 https://agentwiki.quukk.com";
   }
   if (error instanceof Error) {
+    const localCode = error.message.match(/^([A-Z][A-Z0-9_]*):/)?.[1];
+    if (localCode && localErrorMessages[localCode])
+      return localErrorMessages[localCode];
+    for (const [needle, message] of protocolValidationMessages)
+      if (error.message.includes(needle)) return message;
     if (error.message === "MAPPING_ROOT_MISSING")
       return "映射的本地文件夹不存在。请重新创建该文件夹，或在设置中更改映射目录。";
     if (error.message === "MAPPING_ROOT_NOT_DIRECTORY")

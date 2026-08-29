@@ -52,7 +52,7 @@ import type { TreeRemotePort } from "./ports/tree-remote";
 import { MutableControlRepository } from "./storage/envelope";
 import { DeviceStateRepository } from "./storage/device-state";
 import { StorageMigration } from "./storage/migration";
-import { preferLocalPull } from "./obsidian/preview-logic";
+import { preferLocalPull, protocolLabel } from "./obsidian/preview-logic";
 import type { SyncOperationOptions } from "./application/progress";
 import type { ModalTransition } from "./obsidian/modal-handoff";
 
@@ -537,32 +537,64 @@ export default class AgentWikiSyncPlugin extends Plugin {
     ]);
     const space = spaces.find((item) => item.spaceId === mapping.spaceId);
     if (!space) throw new Error("当前凭据无权访问该空间。");
+    const localFoldersAdded = status.local.foldersAdded.map(
+      (folder) => folder.path,
+    );
+    const localFoldersMoved = status.local.foldersMoved.map(
+      (folder) => folder.path,
+    );
+    const localFoldersDeleted = status.local.foldersDeleted.map(
+      (folder) => folder.path,
+    );
+    const localAdded = status.local.added.map((file) => file.path);
+    const localModified = status.local.modified.map((file) => file.path);
+    const localRenamed = status.local.renamed.map((file) => file.path);
+    const localDeleted = status.local.deleted.map((page) => page.path);
+    const remoteUpdated = delta.items
+      .filter((item) => item.operation === "upsert_page")
+      .map((item) => item.page.path);
+    const remoteArchived = delta.items
+      .filter((item) => item.operation === "archive_page")
+      .map((item) => item.previousPath);
+    const remoteFoldersUpdated = delta.items
+      .filter((item) => item.operation === "upsert_folder")
+      .map((item) => item.folder.path);
+    const remoteFoldersArchived = delta.items
+      .filter((item) => item.operation === "archive_folder")
+      .map((item) => item.previousPath);
+    const folderCount =
+      localFoldersAdded.length +
+      localFoldersMoved.length +
+      localFoldersDeleted.length +
+      remoteFoldersUpdated.length +
+      remoteFoldersArchived.length;
+    const pageCount =
+      localAdded.length +
+      localModified.length +
+      localRenamed.length +
+      localDeleted.length +
+      remoteUpdated.length +
+      remoteArchived.length;
     return {
       canPublish: space.canPublish,
       displayName: space.displayName,
       rootPath: mapping.rootPath,
       roleLabel: roleLabel[space.role],
       remoteAhead: delta.ahead,
-      localAdded: status.local.added.map((file) => file.path),
-      localModified: status.local.modified.map((file) => file.path),
-      localRenamed: status.local.renamed.map((file) => file.path),
-      localDeleted: status.local.deleted.map((page) => page.path),
-      remoteUpdated: delta.items
-        .filter(
-          (item) =>
-            item.operation === "upsert_page" ||
-            item.operation === "upsert_folder",
-        )
-        .map((item) =>
-          item.operation === "upsert_page" ? item.page.path : item.folder.path,
-        ),
-      remoteArchived: delta.items
-        .filter(
-          (item) =>
-            item.operation === "archive_page" ||
-            item.operation === "archive_folder",
-        )
-        .map((item) => item.previousPath),
+      protocolLabel: protocolLabel(status.protocolVersion),
+      localFoldersAdded,
+      localFoldersMoved,
+      localFoldersDeleted,
+      remoteFoldersUpdated,
+      remoteFoldersArchived,
+      folderCount,
+      pageCount,
+      localAdded,
+      localModified,
+      localRenamed,
+      localDeleted,
+      remoteUpdated,
+      remoteArchived,
       remoteListed: delta.listed,
       remoteFirstBind: delta.ahead && delta.baseRevision === "0",
     };
@@ -707,7 +739,11 @@ export default class AgentWikiSyncPlugin extends Plugin {
     const needsResolution =
       preview.conflicts.some(
         (item) => !preview.conflictResolutions[item.conflictId],
-      ) || preview.initialBindings.some((item) => item.resolution === null);
+      ) ||
+      preview.folderConflicts.some(
+        (item) => !preview.folderConflictResolutions[item.conflictId],
+      ) ||
+      preview.initialBindings.some((item) => item.resolution === null);
     return () =>
       new PreviewModal(
         this.app,
@@ -721,6 +757,9 @@ export default class AgentWikiSyncPlugin extends Plugin {
             .map((item) => `远端新页面待绑定: ${item.remotePath}`),
           ...preview.conflicts.map(
             (item) => `冲突待处理: ${item.field} ${item.pageId}`,
+          ),
+          ...preview.folderConflicts.map(
+            (item) => `目录冲突待处理: ${item.folderId}`,
           ),
         ],
         async (applyOptions) => {

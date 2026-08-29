@@ -3,18 +3,23 @@ import type {
   InitialBindingChoice,
   PullPreview,
 } from "../../src/application/sync-runtime";
+import type { FolderConflict } from "../../src/core/merge";
 import {
   applyBindingMode,
   applyBindingPath,
   applyBindingSearch,
   applyConflictResolution,
+  applyFolderConflictResolution,
   clampPage,
   conflictManualValue,
+  folderConflictManualValue,
+  folderConflictValidationError,
   matchCandidates,
   pendingPreviewDecisionCount,
   pageCount,
   pageSlice,
   PREVIEW_PAGE_SIZE,
+  protocolLabel,
 } from "../../src/obsidian/preview-logic";
 import * as previewLogic from "../../src/obsidian/preview-logic";
 
@@ -67,6 +72,47 @@ function preview(
     localCandidates: [],
     artifactRoots: [],
   };
+}
+
+function folderConflict(
+  overrides: Partial<FolderConflict> = {},
+): FolderConflict {
+  return {
+    conflictId: "folder:f1",
+    objectType: "folder",
+    folderId: "f1",
+    baseParentPath: null,
+    localParentPath: null,
+    remoteParentPath: null,
+    basePath: "pages/A",
+    localPath: "pages/A",
+    remotePath: "pages/B",
+    ...overrides,
+  };
+}
+
+function previewWithFolderConflict(): PullPreview {
+  const value = preview();
+  value.folderConflicts = [folderConflict()];
+  value.resolvedFolders = [
+    {
+      folderId: "f1",
+      parentFolderId: null,
+      name: "A",
+      path: "pages/A",
+      sortOrder: 0,
+      updatedAt: "",
+    },
+    {
+      folderId: "f2",
+      parentFolderId: null,
+      name: "Other",
+      path: "pages/Other",
+      sortOrder: 0,
+      updatedAt: "",
+    },
+  ];
+  return value;
 }
 
 describe("sync strategy permissions", () => {
@@ -267,5 +313,85 @@ describe("conflict resolution", () => {
     const local = preview({ c1: { choice: "local" } });
     expect(conflictManualValue(local, "c1")).toBe("");
     expect(conflictManualValue(preview(), "missing")).toBe("");
+  });
+});
+
+describe("folder conflict resolution", () => {
+  it("counts unresolved Folder and Page conflicts together", () => {
+    const value = preview();
+    value.conflicts = [
+      {
+        conflictId: "page:c1",
+        pageId: "p1",
+        field: "body",
+        base: "base",
+        local: "local",
+        remote: "remote",
+        wholeDocument: true,
+      },
+    ];
+    value.folderConflicts = [folderConflict()];
+    expect(pendingPreviewDecisionCount(value.initialBindings, value)).toBe(2);
+  });
+
+  it("sets local/remote resolutions and removes on empty selection", () => {
+    const state = previewWithFolderConflict();
+    applyFolderConflictResolution(state, "folder:f1", "local");
+    expect(state.folderConflictResolutions["folder:f1"]).toEqual({
+      choice: "local",
+    });
+    applyFolderConflictResolution(state, "folder:f1", "remote");
+    expect(state.folderConflictResolutions["folder:f1"]).toEqual({
+      choice: "remote",
+    });
+    applyFolderConflictResolution(state, "folder:f1", "");
+    expect(state.folderConflictResolutions["folder:f1"]).toBeUndefined();
+  });
+
+  it("stores a valid manual path and refuses an invalid one", () => {
+    const state = previewWithFolderConflict();
+    expect(
+      folderConflictValidationError(state, "folder:f1", "pages/New"),
+    ).toBeNull();
+    applyFolderConflictResolution(state, "folder:f1", "manual", "pages/New");
+    expect(state.folderConflictResolutions["folder:f1"]).toEqual({
+      choice: "manual",
+      manualPath: "pages/New",
+    });
+
+    applyFolderConflictResolution(state, "folder:f1", "manual", "not-pages");
+    expect(state.folderConflictResolutions["folder:f1"]).toBeUndefined();
+    expect(
+      folderConflictValidationError(state, "folder:f1", "not-pages"),
+    ).toContain("pages/");
+  });
+
+  it("reports collisions, missing parents, and empty manual paths", () => {
+    const state = previewWithFolderConflict();
+    expect(
+      folderConflictValidationError(state, "folder:f1", "pages/Other"),
+    ).toContain("占用");
+    expect(
+      folderConflictValidationError(state, "folder:f1", "pages/Missing/New"),
+    ).toContain("父目录");
+    expect(folderConflictValidationError(state, "folder:f1", "  ")).toContain(
+      "请填写",
+    );
+  });
+
+  it("returns the manual path only for manual folder resolutions", () => {
+    const state = previewWithFolderConflict();
+    applyFolderConflictResolution(state, "folder:f1", "manual", "pages/X");
+    expect(folderConflictManualValue(state, "folder:f1")).toBe("pages/X");
+    expect(
+      folderConflictManualValue(previewWithFolderConflict(), "folder:f1"),
+    ).toBe("");
+  });
+});
+
+describe("protocol labeling", () => {
+  it("labels protocols as diagnostic-only text", () => {
+    expect(protocolLabel("2")).toBe("Sync v2");
+    expect(protocolLabel("1")).toBe("Legacy v1");
   });
 });

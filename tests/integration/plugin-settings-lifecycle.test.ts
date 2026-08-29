@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { readFile } from "node:fs/promises";
 import AgentWikiSyncPlugin from "../../src/main";
 import {
   DEFAULT_SETTINGS,
@@ -221,5 +222,18 @@ describe("plugin settings lifecycle", () => {
       mappings: harness.plugin.settings.mappings,
     });
     expect(harness.local).toEqual(before);
+  });
+
+  it("collects a read-only protocol label and folder-aware diff fields", async () => {
+    const source = await readFile("src/main.ts", "utf8");
+
+    expect(source).toContain("protocolLabel");
+    expect(source).toContain("localFoldersAdded");
+    expect(source).toContain("localFoldersMoved");
+    expect(source).toContain("localFoldersDeleted");
+    expect(source).toContain("remoteFoldersUpdated");
+    expect(source).toContain("remoteFoldersArchived");
+    expect(source).toContain("folderCount");
+    expect(source).toContain("pageCount");
   });
 });

@@ -4,14 +4,16 @@ import {
   Setting,
   type App,
   type ButtonComponent,
+  type TextAreaComponent,
 } from "obsidian";
 import { userErrorMessage } from "../core/user-errors";
 import type {
   InitialBindingChoice,
   PullPreview,
 } from "../application/sync-runtime";
-import type { StructuredConflict } from "../core/merge";
+import type { FolderConflict, StructuredConflict } from "../core/merge";
 import {
+  applyFolderConflictResolution,
   applyBindingMode,
   applyBindingPath,
   applyBindingSearch,
@@ -19,6 +21,8 @@ import {
   bindingsRequiringInput,
   clampPage,
   conflictManualValue,
+  folderConflictManualValue,
+  folderConflictValidationError,
   pendingPreviewDecisionCount,
   pageCount,
   pageSlice,
@@ -34,6 +38,8 @@ export class PreviewModal extends Modal {
   private released = false;
   private bindingPage = 0;
   private conflictPage = 0;
+  private folderConflictPage = 0;
+  private readonly folderManualDrafts = new Map<string, string>();
   private operation: AbortController | null = null;
   private running = false;
   private closeRequested = false;
@@ -185,6 +191,16 @@ export class PreviewModal extends Modal {
     this.pager(conflicts.length, this.conflictPage, (page) => {
       this.conflictPage = page;
     });
+    const folderConflicts = this.pullPreview?.folderConflicts ?? [];
+    this.folderConflictPage = clampPage(
+      this.folderConflictPage,
+      folderConflicts.length,
+    );
+    for (const conflict of pageSlice(folderConflicts, this.folderConflictPage))
+      this.renderFolderConflict(conflict, refreshActionState);
+    this.pager(folderConflicts.length, this.folderConflictPage, (page) => {
+      this.folderConflictPage = page;
+    });
   }
   private renderBinding(
     binding: InitialBindingChoice,
@@ -318,5 +334,87 @@ export class PreviewModal extends Modal {
           }
         }),
     );
+  }
+
+  private renderFolderConflict(
+    conflict: FolderConflict,
+    refreshActionState: () => void,
+  ): void {
+    const preview = this.pullPreview;
+    if (!preview) return;
+    const baseDescription = `原位置：${conflict.basePath ?? "无"} · 本地：${conflict.localPath ?? "无"} · 服务器：${conflict.remotePath ?? "无"}`;
+    const setting = new Setting(this.contentEl)
+      .setName(`目录：${conflict.folderId}`)
+      .setDesc(baseDescription);
+    setting.settingEl.addClass("agentwiki-sync-preview-setting");
+    setting.settingEl.addClass("agentwiki-sync-folder-setting");
+    setting.controlEl?.addClass("agentwiki-sync-resolution-controls");
+
+    const draftValue = () =>
+      this.folderManualDrafts.get(conflict.conflictId) ??
+      folderConflictManualValue(preview, conflict.conflictId);
+    const showValidation = (value: string) => {
+      const error = folderConflictValidationError(
+        preview,
+        conflict.conflictId,
+        value,
+      );
+      setting.setDesc(
+        error ? `${baseDescription}（错误：${error}）` : baseDescription,
+      );
+    };
+    let textArea: TextAreaComponent | null = null;
+
+    setting.addDropdown((dropdown) =>
+      dropdown
+        .addOption("", "请选择…")
+        .addOption("local", "保留本地位置")
+        .addOption("remote", "使用服务器位置")
+        .addOption("manual", "手动输入最终路径")
+        .setValue(
+          preview.folderConflictResolutions[conflict.conflictId]?.choice ?? "",
+        )
+        .onChange((value) => {
+          if (value === "manual") {
+            const current = draftValue();
+            this.folderManualDrafts.set(conflict.conflictId, current);
+            applyFolderConflictResolution(
+              preview,
+              conflict.conflictId,
+              "manual",
+              current,
+            );
+            showValidation(current);
+            textArea?.setDisabled(false);
+          } else {
+            this.folderManualDrafts.delete(conflict.conflictId);
+            applyFolderConflictResolution(preview, conflict.conflictId, value);
+            setting.setDesc(baseDescription);
+            textArea?.setDisabled(true);
+          }
+          refreshActionState();
+        }),
+    );
+    setting.addTextArea((text) => {
+      textArea = text;
+      text
+        .setPlaceholder("手动输入最终目录路径（例如 pages/新目录）")
+        .setValue(draftValue())
+        .setDisabled(
+          preview.folderConflictResolutions[conflict.conflictId]?.choice !==
+            "manual",
+        )
+        .onChange((value) => {
+          this.folderManualDrafts.set(conflict.conflictId, value);
+          applyFolderConflictResolution(
+            preview,
+            conflict.conflictId,
+            "manual",
+            value,
+          );
+          showValidation(value);
+          refreshActionState();
+        });
+    });
   }
 }

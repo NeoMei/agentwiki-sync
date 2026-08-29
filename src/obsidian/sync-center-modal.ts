@@ -17,6 +17,14 @@ export interface SyncDiff {
   rootPath: string;
   roleLabel: string;
   remoteAhead: boolean;
+  protocolLabel: "Sync v2" | "Legacy v1";
+  localFoldersAdded: string[];
+  localFoldersMoved: string[];
+  localFoldersDeleted: string[];
+  remoteFoldersUpdated: string[];
+  remoteFoldersArchived: string[];
+  folderCount: number;
+  pageCount: number;
   localAdded: string[];
   localModified: string[];
   localRenamed: string[];
@@ -51,6 +59,11 @@ const countDiff = (diff: SyncDiff): number =>
   diff.localModified.length +
   diff.localRenamed.length +
   diff.localDeleted.length;
+
+const countFolderDiff = (diff: SyncDiff): number =>
+  diff.localFoldersAdded.length +
+  diff.localFoldersMoved.length +
+  diff.localFoldersDeleted.length;
 
 export class SyncCenterModal extends Modal {
   private diff: SyncDiff | null = null;
@@ -151,18 +164,27 @@ export class SyncCenterModal extends Modal {
             void this.refresh();
           });
       });
+    this.contentEl.createEl("p", {
+      text: `协议：${diff.protocolLabel}`,
+      cls: "agentwiki-sync-protocol-label",
+    });
     const localCount = countDiff(diff);
+    const localFolderCount = countFolderDiff(diff);
     const remoteCount = diff.remoteUpdated.length + diff.remoteArchived.length;
+    const remoteFolderCount =
+      diff.remoteFoldersUpdated.length + diff.remoteFoldersArchived.length;
+    const localTotal = localCount + localFolderCount;
+    const remoteTotal = remoteCount + remoteFolderCount;
     let summary: string;
     if (diff.remoteAhead) {
       summary =
-        remoteCount > 0 && diff.remoteListed
-          ? `本地 ${localCount} 处变更 · 服务器 ${remoteCount} 处更新`
+        remoteTotal > 0 && diff.remoteListed
+          ? `本地 ${localTotal} 处变更（目录 ${localFolderCount} · 页面 ${localCount}）· 服务器 ${remoteTotal} 处更新（目录 ${remoteFolderCount} · 页面 ${remoteCount}）`
           : "服务器有更新";
     } else {
       summary =
-        localCount > 0
-          ? `本地 ${localCount} 处变更 · 服务器已是基线版本`
+        localTotal > 0
+          ? `本地 ${localTotal} 处变更（目录 ${localFolderCount} · 页面 ${localCount}）· 服务器已是基线版本`
           : "本地与服务器已同步，无需操作。";
     }
     this.contentEl.createEl("p", {
@@ -193,11 +215,17 @@ export class SyncCenterModal extends Modal {
 
   private renderLocalSection(diff: SyncDiff): void {
     new Setting(this.contentEl).setName("本地变更").setHeading();
-    if (countDiff(diff) === 0) {
+    if (countDiff(diff) === 0 && countFolderDiff(diff) === 0) {
       this.contentEl.createEl("p", { text: "本地没有未推送的变更。" });
       return;
     }
     const list = this.contentEl.createEl("ul");
+    for (const path of diff.localFoldersAdded)
+      list.createEl("li", { text: `+ 目录 ${path}` });
+    for (const path of diff.localFoldersMoved)
+      list.createEl("li", { text: `→ 目录 ${path}` });
+    for (const path of diff.localFoldersDeleted)
+      list.createEl("li", { text: `- 目录 ${path}` });
     for (const path of diff.localAdded)
       list.createEl("li", { text: `+ ${path}` });
     for (const path of diff.localModified)
@@ -222,7 +250,11 @@ export class SyncCenterModal extends Modal {
     }
     if (
       !diff.remoteListed ||
-      diff.remoteUpdated.length + diff.remoteArchived.length === 0
+      diff.remoteUpdated.length +
+        diff.remoteArchived.length +
+        diff.remoteFoldersUpdated.length +
+        diff.remoteFoldersArchived.length ===
+        0
     ) {
       this.contentEl.createEl("p", {
         text: diff.remoteListed
@@ -232,6 +264,10 @@ export class SyncCenterModal extends Modal {
       return;
     }
     const list = this.contentEl.createEl("ul");
+    for (const path of diff.remoteFoldersUpdated)
+      list.createEl("li", { text: `↑ 目录 ${path}` });
+    for (const path of diff.remoteFoldersArchived)
+      list.createEl("li", { text: `✕ 目录 ${path}` });
     for (const path of diff.remoteUpdated)
       list.createEl("li", { text: `↑ ${path}` });
     for (const path of diff.remoteArchived)
