@@ -166,6 +166,18 @@ function dependenciesOf(
         (item) => pathKey(item.path) === pathKey(action.path),
       );
       if (vacated) dependencies.push(vacated);
+      // A move whose source sits under an ancestor move's source must run
+      // after that ancestor move (the ancestor renames the subtree first).
+      const ownBase = action.beforePath ?? action.fromPath;
+      for (const other of actions) {
+        if (other.kind !== "move_directory" || other === action) continue;
+        const otherBase = other.beforePath ?? other.fromPath;
+        if (
+          isInsideSubtree(ownBase, otherBase) &&
+          pathDepth(ownBase) > pathDepth(otherBase)
+        )
+          dependencies.push(other);
+      }
       break;
     }
     case "move_page":

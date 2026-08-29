@@ -507,4 +507,42 @@ describe("TreeTransaction", () => {
     expect(vault.exists("pages/D/S/P.md")).toBe(false);
     expect((await tx.inspect())?.state).toBe("committed");
   });
+
+  it("applies a nested folder re-parented out from under a moved ancestor", async () => {
+    const base = snapshot({
+      folders: [folder("d", null, "pages/D"), folder("c", "d", "pages/D/C")],
+      pages: [],
+    });
+    const remote = snapshot({
+      folders: [folder("d", null, "pages/Z"), folder("c", null, "pages/C")],
+      pages: [],
+    });
+    const preview = await buildTreePullPreview(
+      base,
+      localScan(base.folders, base.pages),
+      remote,
+    );
+
+    const vault = new MemoryVault({ "pages/D/C/Keep.md": "keep" });
+    const control = new MemoryControlStore();
+    const tx = new TreeTransaction(
+      vault,
+      control,
+      ".agentwiki/tx/reparent-out",
+    );
+    await tx.prepare({
+      baseRevision: "base",
+      targetRevision: "target",
+      targetTreeHash: "0".repeat(64),
+      actions: preview.actions,
+    });
+    await tx.apply();
+
+    expect(vault.folders.has("pages/Z")).toBe(true);
+    expect(vault.folders.has("pages/C")).toBe(true);
+    expect(vault.folders.has("pages/D")).toBe(false);
+    expect(vault.folders.has("pages/D/C")).toBe(false);
+    expect(vault.text("pages/C/Keep.md")).toBe("keep");
+    expect((await tx.inspect())?.state).toBe("committed");
+  });
 });
