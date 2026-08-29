@@ -65,6 +65,32 @@ function localScan(folders: TreeFolder[], pages: TreePage[]): LocalTreeScan {
   return { rootPath: "Wiki", folders, pages };
 }
 
+function moveConflictPreview(): Promise<TreePullPreview> {
+  const base = snapshot({
+    folders: [
+      folder("pa", null, "pages/A"),
+      folder("pb", null, "pages/B"),
+      folder("f1", null, "pages/X"),
+    ],
+  });
+  const local = localScan(
+    [
+      folder("pa", null, "pages/A"),
+      folder("pb", null, "pages/B"),
+      folder("f1", "pa", "pages/A/X"),
+    ],
+    [],
+  );
+  const remote = snapshot({
+    folders: [
+      folder("pa", null, "pages/A"),
+      folder("pb", null, "pages/B"),
+      folder("f1", "pb", "pages/B/X"),
+    ],
+  });
+  return buildTreePullPreview(base, local, remote);
+}
+
 describe("buildTreePullPreview", () => {
   it("keeps one folder identity when local and remote agree on a move", async () => {
     const base = snapshot({
@@ -380,5 +406,225 @@ describe("resolveFolderConflict", () => {
         manualPath: "pages/A",
       }),
     ).toThrow(/冲突|占用|collision/i);
+  });
+});
+
+describe("fix round 1 regressions", () => {
+  it("creates a new parent folder before moving a folder into it", async () => {
+    const base = snapshot({ folders: [folder("f", null, "pages/F")] });
+    const local = localScan([folder("f", null, "pages/F")], []);
+    const remote = snapshot({
+      folders: [folder("n", null, "pages/N"), folder("f", "n", "pages/N/F")],
+    });
+
+    const preview = await buildTreePullPreview(base, local, remote);
+    const create = preview.actions.findIndex(
+      (action) => action.kind === "create_directory" && action.folderId === "n",
+    );
+    const move = preview.actions.findIndex(
+      (action) => action.kind === "move_directory" && action.folderId === "f",
+    );
+    expect(create).toBeGreaterThanOrEqual(0);
+    expect(create).toBeLessThan(move);
+  });
+
+  it("moves a folder out before creating into its vacated path", async () => {
+    const base = snapshot({ folders: [folder("f", null, "pages/F")] });
+    const local = localScan([folder("f", null, "pages/F")], []);
+    const remote = snapshot({
+      folders: [
+        folder("n", null, "pages/N"),
+        folder("f", "n", "pages/N/F"),
+        folder("g", null, "pages/F"),
+      ],
+    });
+
+    const preview = await buildTreePullPreview(base, local, remote);
+    const move = preview.actions.findIndex(
+      (action) => action.kind === "move_directory" && action.folderId === "f",
+    );
+    const createG = preview.actions.findIndex(
+      (action) => action.kind === "create_directory" && action.folderId === "g",
+    );
+    expect(move).toBeGreaterThanOrEqual(0);
+    expect(move).toBeLessThan(createG);
+  });
+
+  it("conflicts when local deletes a folder that remote moved", async () => {
+    const base = snapshot({ folders: [folder("f", null, "pages/F")] });
+    const local = localScan([], []);
+    const remote = snapshot({ folders: [folder("f", null, "pages/G")] });
+
+    const preview = await buildTreePullPreview(base, local, remote);
+
+    expect(preview.folderConflicts).toHaveLength(1);
+    expect(preview.folderConflicts[0]).toMatchObject({
+      folderId: "f",
+      basePath: "pages/F",
+      localPath: null,
+      remotePath: "pages/G",
+    });
+    expect(preview.actions).not.toContainEqual(
+      expect.objectContaining({ kind: "trash_directory", folderId: "f" }),
+    );
+  });
+
+  it("conflicts when local moves a folder that remote deleted", async () => {
+    const base = snapshot({ folders: [folder("f", null, "pages/F")] });
+    const local = localScan([folder("f", null, "pages/G")], []);
+    const remote = snapshot({ folders: [] });
+
+    const preview = await buildTreePullPreview(base, local, remote);
+
+    expect(preview.folderConflicts).toHaveLength(1);
+    expect(preview.folderConflicts[0]).toMatchObject({
+      folderId: "f",
+      basePath: "pages/F",
+      localPath: "pages/G",
+      remotePath: null,
+    });
+  });
+
+  it("conflicts when both sides add the same folder id at different locations", async () => {
+    const base = snapshot({ folders: [] });
+    const local = localScan([folder("f", null, "pages/A")], []);
+    const remote = snapshot({ folders: [folder("f", null, "pages/B")] });
+
+    const preview = await buildTreePullPreview(base, local, remote);
+
+    expect(preview.folderConflicts).toHaveLength(1);
+    expect(preview.folderConflicts[0]).toMatchObject({
+      folderId: "f",
+      basePath: null,
+      localPath: "pages/A",
+      remotePath: "pages/B",
+    });
+  });
+
+  it("promotes a deleted folder to a conflict when a page still depends on it", async () => {
+    const base = snapshot({ folders: [folder("f", null, "pages/F")] });
+    const local = localScan(
+      [folder("f", null, "pages/F")],
+      [page("p", "f", "pages/F/P.md")],
+    );
+    const remote = snapshot({ folders: [] });
+
+    const preview = await buildTreePullPreview(base, local, remote);
+
+    expect(preview.folderConflicts).toHaveLength(1);
+    expect(preview.folderConflicts[0]?.folderId).toBe("f");
+    expect(pendingTreeDecisionCount(preview)).toBe(1);
+  });
+
+  it("recomputes descendant actions after resolving a folder to remote", async () => {
+    const base = snapshot({
+      folders: [folder("f", null, "pages/X"), folder("c", "f", "pages/X/C")],
+      pages: [page("p", "c", "pages/X/C/P.md")],
+    });
+    const local = localScan(
+      [folder("f", null, "pages/A"), folder("c", "f", "pages/A/C")],
+      [page("p", "c", "pages/A/C/P.md")],
+    );
+    const remote = snapshot({
+      folders: [folder("f", null, "pages/B"), folder("c", "f", "pages/B/C")],
+      pages: [page("p", "c", "pages/B/C/P.md")],
+    });
+
+    const preview = await buildTreePullPreview(base, local, remote);
+    const conflictId = preview.folderConflicts.find(
+      (conflict) => conflict.folderId === "f",
+    )!.conflictId;
+
+    resolveFolderConflict(preview, conflictId, { choice: "remote" });
+
+    expect(preview.actions).toContainEqual(
+      expect.objectContaining({
+        kind: "move_directory",
+        folderId: "f",
+        path: "pages/B",
+      }),
+    );
+    expect(preview.actions).toContainEqual(
+      expect.objectContaining({
+        kind: "move_directory",
+        folderId: "c",
+        path: "pages/B/C",
+      }),
+    );
+    expect(preview.actions).toContainEqual(
+      expect.objectContaining({
+        kind: "move_page",
+        pageId: "p",
+        path: "pages/B/C/P.md",
+      }),
+    );
+    expect(pendingTreeDecisionCount(preview)).toBe(0);
+  });
+
+  it("rejects a manual path outside the managed pages/ root", async () => {
+    const preview = await moveConflictPreview();
+    const conflictId = preview.folderConflicts[0]!.conflictId;
+
+    expect(() =>
+      resolveFolderConflict(preview, conflictId, {
+        choice: "manual",
+        manualPath: "OutsideRoot",
+      }),
+    ).toThrow(/pages/);
+    expect(pendingTreeDecisionCount(preview)).toBe(1);
+  });
+
+  it("detects a case-folded manual path cycle", async () => {
+    const base = snapshot({ folders: [folder("f1", null, "pages/X")] });
+    const local = localScan([folder("f1", null, "pages/A")], []);
+    const remote = snapshot({ folders: [folder("f1", null, "pages/B")] });
+    const preview = await buildTreePullPreview(base, local, remote);
+    const conflictId = preview.folderConflicts[0]!.conflictId;
+
+    expect(() =>
+      resolveFolderConflict(preview, conflictId, {
+        choice: "manual",
+        manualPath: "pages/a/X",
+      }),
+    ).toThrow(/FOLDER_CYCLE|循环/);
+  });
+
+  it("surfaces a title conflict when local and remote diverge on a title", async () => {
+    const base = snapshot({
+      pages: [page("p", null, "pages/P.md", { title: "Base", body: "x" })],
+    });
+    const local = localScan(
+      [],
+      [page("p", null, "pages/P.md", { title: "Local", body: "x" })],
+    );
+    const remote = snapshot({
+      pages: [page("p", null, "pages/P.md", { title: "Remote", body: "x" })],
+    });
+
+    const preview = await buildTreePullPreview(base, local, remote);
+
+    expect(preview.pageConflicts).toContainEqual(
+      expect.objectContaining({ field: "title", pageId: "p" }),
+    );
+  });
+
+  it("conflicts when local changes a title and remote deleted the page", async () => {
+    const base = snapshot({
+      pages: [page("p", null, "pages/P.md", { title: "Base", body: "x" })],
+    });
+    const local = localScan(
+      [],
+      [page("p", null, "pages/P.md", { title: "Local", body: "x" })],
+    );
+    const remote = snapshot({ pages: [] });
+
+    const preview = await buildTreePullPreview(base, local, remote);
+
+    expect(preview.pageConflicts).toContainEqual(
+      expect.objectContaining({ field: "archive", pageId: "p" }),
+    );
+    expect(preview.actions).not.toContainEqual(
+      expect.objectContaining({ kind: "trash_page", pageId: "p" }),
+    );
   });
 });

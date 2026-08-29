@@ -101,9 +101,13 @@ export async function mergeBody(
   };
 }
 
-/** A structured conflict for a single Folder whose location diverged in
- *  local and remote. `*Path` fields carry the folder's absolute path while
- *  `*ParentPath` carry its parent folder path (null when top-level). */
+/**
+ * A structured conflict for a single Folder. `*Path` fields carry the folder's
+ * absolute path (null when the folder is absent in that side) while
+ * `*ParentPath` carry its parent folder path (null when top-level or absent).
+ * Presence divergences (delete-vs-modify, modify-vs-delete, create-vs-create)
+ * are represented by a null path on the absent side.
+ */
 export interface FolderConflict {
   conflictId: string;
   objectType: "folder";
@@ -111,9 +115,14 @@ export interface FolderConflict {
   baseParentPath: string | null;
   localParentPath: string | null;
   remoteParentPath: string | null;
-  basePath: string;
-  localPath: string;
-  remotePath: string;
+  basePath: string | null;
+  localPath: string | null;
+  remotePath: string | null;
+}
+
+export interface FolderConflictResolution {
+  choice: "local" | "remote" | "manual";
+  manualPath?: string;
 }
 
 /** The pull-side operation surface consumed by the tree transaction layer. */
@@ -142,6 +151,8 @@ export interface ResolvedFolderLocation {
   name: string;
   sortOrder: number;
   updatedAt: string;
+  /** When set, the folder's final path is fixed by a manual resolution. */
+  manualPath?: string;
 }
 
 export interface ResolvedPageLocation {
@@ -154,8 +165,20 @@ export interface ResolvedPageLocation {
   updatedAt: string;
 }
 
+export interface DeletedFolderInfo {
+  folderId: string;
+  basePath: string | null;
+  localPath: string | null;
+  remotePath: string | null;
+  baseParentPath: string | null;
+  localParentPath: string | null;
+  remoteParentPath: string | null;
+  local: ResolvedFolderLocation | null;
+}
+
 export interface FolderMergePlan {
   resolved: ResolvedFolderLocation[];
+  deleted: DeletedFolderInfo[];
   conflicts: FolderConflict[];
 }
 
@@ -217,6 +240,33 @@ function folderParentPath(folder: TreeFolder): string | null {
   return slash > 0 ? folder.path.slice(0, slash) : null;
 }
 
+function localFolderLocation(
+  id: string,
+  folder: TreeFolder,
+): ResolvedFolderLocation {
+  return {
+    folderId: id,
+    parentFolderId: folder.parentFolderId,
+    name: folder.name,
+    sortOrder: folder.sortOrder,
+    updatedAt: folder.updatedAt,
+  };
+}
+
+function applyFolderResolution(
+  localFolder: TreeFolder | undefined,
+  remoteFolder: TreeFolder | undefined,
+  resolution: FolderConflictResolution,
+): { location: FolderLocation | null; manualPath?: string } {
+  if (resolution.choice === "local")
+    return { location: localFolder ? folderLocation(localFolder) : null };
+  if (resolution.choice === "remote")
+    return { location: remoteFolder ? folderLocation(remoteFolder) : null };
+  const path = resolution.manualPath ?? "";
+  const name = path.split("/").at(-1) ?? "";
+  return { location: { parentFolderId: null, name }, manualPath: path };
+}
+
 /**
  * ID-first three-way comparison of folders. Each folder's stable identity is
  * its `folderId`; its location is `(parentFolderId, name)`. Comparing the
@@ -227,6 +277,7 @@ export function mergeFoldersById(
   base: TreeFolder[],
   local: TreeFolder[],
   remote: TreeFolder[],
+  resolutions?: ReadonlyMap<string, FolderConflictResolution>,
 ): FolderMergePlan {
   const byBase = new Map(base.map((item) => [item.folderId, item]));
   const byLocal = new Map(local.map((item) => [item.folderId, item]));
@@ -238,6 +289,7 @@ export function mergeFoldersById(
   ]);
 
   const resolved: ResolvedFolderLocation[] = [];
+  const deleted: DeletedFolderInfo[] = [];
   const conflicts: FolderConflict[] = [];
 
   for (const id of ids) {
@@ -251,32 +303,64 @@ export function mergeFoldersById(
       folderLocationEquals,
     );
 
-    if (merged.value === null) continue;
-    const source = localFolder ?? remoteFolder ?? baseFolder;
-    resolved.push({
-      folderId: id,
-      parentFolderId: merged.value.parentFolderId,
-      name: merged.value.name,
-      sortOrder: source?.sortOrder ?? 0,
-      updatedAt: source?.updatedAt ?? "",
-    });
+    let location = merged.value;
+    let conflict = merged.conflict;
+    let manualPath: string | undefined;
+    if (merged.conflict && resolutions?.has(id)) {
+      const applied = applyFolderResolution(
+        localFolder,
+        remoteFolder,
+        resolutions.get(id)!,
+      );
+      location = applied.location;
+      manualPath = applied.manualPath;
+      conflict = false;
+    }
 
-    if (merged.conflict && baseFolder && localFolder && remoteFolder) {
+    if (conflict) {
       conflicts.push({
         conflictId: `folder:${id}`,
         objectType: "folder",
         folderId: id,
-        baseParentPath: folderParentPath(baseFolder),
-        localParentPath: folderParentPath(localFolder),
-        remoteParentPath: folderParentPath(remoteFolder),
-        basePath: baseFolder.path,
-        localPath: localFolder.path,
-        remotePath: remoteFolder.path,
+        baseParentPath: baseFolder ? folderParentPath(baseFolder) : null,
+        localParentPath: localFolder ? folderParentPath(localFolder) : null,
+        remoteParentPath: remoteFolder ? folderParentPath(remoteFolder) : null,
+        basePath: baseFolder?.path ?? null,
+        localPath: localFolder?.path ?? null,
+        remotePath: remoteFolder?.path ?? null,
       });
     }
+
+    if (location === null) {
+      if (localFolder)
+        deleted.push({
+          folderId: id,
+          basePath: baseFolder?.path ?? null,
+          localPath: localFolder.path,
+          remotePath: remoteFolder?.path ?? null,
+          baseParentPath: baseFolder ? folderParentPath(baseFolder) : null,
+          localParentPath: folderParentPath(localFolder),
+          remoteParentPath: remoteFolder
+            ? folderParentPath(remoteFolder)
+            : null,
+          local: localFolderLocation(id, localFolder),
+        });
+      continue;
+    }
+
+    const source = localFolder ?? remoteFolder ?? baseFolder;
+    const item: ResolvedFolderLocation = {
+      folderId: id,
+      parentFolderId: location.parentFolderId,
+      name: location.name,
+      sortOrder: source?.sortOrder ?? 0,
+      updatedAt: source?.updatedAt ?? "",
+    };
+    if (manualPath !== undefined) item.manualPath = manualPath;
+    resolved.push(item);
   }
 
-  return { resolved, conflicts };
+  return { resolved, deleted, conflicts };
 }
 
 /**
@@ -325,6 +409,21 @@ export async function mergePagesById(
     }
 
     if (basePage && localPage && remotePage) {
+      const titleMerge = mergeField(
+        basePage.title,
+        localPage.title,
+        remotePage.title,
+      );
+      if (titleMerge.conflict)
+        conflicts.push({
+          conflictId: `title:${id}`,
+          pageId: id,
+          field: "title",
+          base: basePage.title,
+          local: localPage.title,
+          remote: remotePage.title,
+          wholeDocument: false,
+        });
       const bodyMerge = await mergeBody(
         basePage.body,
         localPage.body,
@@ -335,6 +434,7 @@ export async function mergePagesById(
     } else if (basePage && localPage && !remotePage) {
       const localChanged =
         localPage.body !== basePage.body ||
+        localPage.title !== basePage.title ||
         !pageLocationEquals(pageLocation(localPage), pageLocation(basePage));
       if (localChanged)
         conflicts.push({
@@ -349,6 +449,7 @@ export async function mergePagesById(
     } else if (basePage && remotePage && !localPage) {
       const remoteChanged =
         remotePage.body !== basePage.body ||
+        remotePage.title !== basePage.title ||
         !pageLocationEquals(pageLocation(remotePage), pageLocation(basePage));
       if (remoteChanged)
         conflicts.push({
