@@ -115,7 +115,7 @@ export class FakeTreeRemote implements TreeRemotePort {
         folderCount: String(this.folders.size),
         pageCount: String(this.pages.size),
         revisionManifestByteLength: "0",
-        revisionBodyBytes: "0",
+        revisionBodyBytes: this.bodyBytes(),
       },
     ];
   }
@@ -131,7 +131,7 @@ export class FakeTreeRemote implements TreeRemotePort {
       folderCount: String(this.folders.size),
       pageCount: String(this.pages.size),
       revisionManifestByteLength: "0",
-      revisionBodyBytes: "0",
+      revisionBodyBytes: this.bodyBytes(),
       publishedAt: "2026-08-14T00:00:00.000Z",
     };
   }
@@ -167,6 +167,13 @@ export class FakeTreeRemote implements TreeRemotePort {
     });
   }
 
+  private bodyBytes(): string {
+    let total = 0;
+    for (const page of this.pages.values())
+      total += new TextEncoder().encode(page.body).byteLength;
+    return String(total);
+  }
+
   async *snapshotPages(
     revision = "current",
   ): AsyncIterable<TreeSnapshotSegment> {
@@ -188,7 +195,7 @@ export class FakeTreeRemote implements TreeRemotePort {
       folderCount: String(folders.length),
       pageCount: String(pages.length),
       revisionManifestByteLength: "0",
-      revisionBodyBytes: "0",
+      revisionBodyBytes: this.bodyBytes(),
       folders,
       pages,
     };
@@ -311,7 +318,7 @@ export class FakeTreeRemote implements TreeRemotePort {
       folderCount: String(this.folders.size),
       pageCount: String(this.pages.size),
       revisionManifestByteLength: "0",
-      revisionBodyBytes: "0",
+      revisionBodyBytes: this.bodyBytes(),
       changeSetId: "c-" + this.revision,
     };
     session.status = "published";

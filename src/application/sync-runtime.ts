@@ -4,6 +4,7 @@ import {
 } from "@neomei/agentwiki-sync-protocol";
 
 import {
+  canonicalBytes,
   contentHash,
   decimalWithinLimit,
   revisionContentHash,
@@ -144,6 +145,65 @@ const isMoveHints = (value: unknown): value is MoveHintsState =>
   (value as Partial<MoveHintsState>).schemaVersion === 1 &&
   Array.isArray((value as Partial<MoveHintsState>).hints);
 
+interface PendingIdentities {
+  schemaVersion: 1;
+  entries: Record<
+    string,
+    | { intent: "create"; pageId: string; path: string; contentHash: string }
+    | {
+        intent: "restore";
+        pageId: string;
+        path: string;
+        contentHash: string;
+        archivedBasePath: string;
+        archivedBaseTitle: string;
+        archivedBaseContentHash: string;
+      }
+  >;
+}
+const isPendingIdentities = (value: unknown): value is PendingIdentities => {
+  if (!value || typeof value !== "object") return false;
+  const state = value as Partial<PendingIdentities>;
+  if (
+    state.schemaVersion !== 1 ||
+    !state.entries ||
+    typeof state.entries !== "object"
+  )
+    return false;
+  for (const entry of Object.values(state.entries)) {
+    if (!entry || typeof entry !== "object") return false;
+    const intent = (entry as { intent?: unknown }).intent;
+    if (
+      typeof (entry as { pageId?: unknown }).pageId !== "string" ||
+      typeof (entry as { path?: unknown }).path !== "string" ||
+      typeof (entry as { contentHash?: unknown }).contentHash !== "string" ||
+      (intent !== "create" && intent !== "restore")
+    )
+      return false;
+  }
+  return true;
+};
+interface PullControlAfterState {
+  schemaVersion: 1;
+  transactionId: string;
+  phase: "pending" | "applied";
+  identities: PendingIdentities;
+  moveHints: MoveHintsState;
+}
+const isPullControlAfterState = (
+  value: unknown,
+): value is PullControlAfterState => {
+  if (!value || typeof value !== "object") return false;
+  const state = value as Partial<PullControlAfterState>;
+  return (
+    state.schemaVersion === 1 &&
+    typeof state.transactionId === "string" &&
+    ["pending", "applied"].includes(state.phase ?? "") &&
+    isPendingIdentities(state.identities) &&
+    isMoveHints(state.moveHints)
+  );
+};
+
 const isTreeIdentityState = (value: unknown): value is TreeIdentityState => {
   try {
     validateTreeIdentityState(value);
@@ -174,6 +234,7 @@ export class SyncRuntime {
   private readonly legacyBaseline: BaselineRepository;
   private readonly identities: MutableControlRepository<TreeIdentityState>;
   private readonly moveHints: MutableControlRepository<MoveHintsState>;
+  private readonly pullControlAfter: MutableControlRepository<PullControlAfterState>;
   private renameQueue: Promise<void> = Promise.resolve();
 
   constructor(
@@ -212,6 +273,11 @@ export class SyncRuntime {
       control,
       this.root + "/move-hints.json",
       isMoveHints,
+    );
+    this.pullControlAfter = new MutableControlRepository(
+      control,
+      this.root + "/pull-control-after.json",
+      isPullControlAfterState,
     );
   }
 
@@ -347,6 +413,7 @@ export class SyncRuntime {
   ): Promise<TreeSnapshot> {
     const folders: TreeFolder[] = [];
     const pages: TreePage[] = [];
+    let totalBodyBytes = 0;
     let pinned: {
       protocolVersion: "1" | "2";
       spaceId: string;
@@ -354,6 +421,8 @@ export class SyncRuntime {
       revisionContentHash: string;
       folderCount: string;
       pageCount: string;
+      revisionManifestByteLength: string;
+      revisionBodyBytes: string;
     } | null = null;
     const capabilities = await this.remote.capabilities();
     for await (const segment of this.remote.snapshotPages(revision)) {
@@ -364,14 +433,21 @@ export class SyncRuntime {
         revisionContentHash: segment.revisionContentHash,
         folderCount: segment.folderCount,
         pageCount: segment.pageCount,
+        revisionManifestByteLength: segment.revisionManifestByteLength,
+        revisionBodyBytes: segment.revisionBodyBytes,
       };
       if (pinned && JSON.stringify(pinned) !== JSON.stringify(current))
         throw new Error("快照分页元数据已变更");
       pinned = current;
       folders.push(...segment.folders);
-      for (const page of segment.pages)
+      for (const page of segment.pages) {
         if ((await contentHash(page.body)) !== page.contentHash)
           throw new Error("快照页面内容哈希不匹配");
+        const bodyBytes = new TextEncoder().encode(page.body).byteLength;
+        if (bodyBytes > capabilities.maxPageBytes)
+          throw new Error("PAGE_TOO_LARGE");
+        totalBodyBytes += bodyBytes;
+      }
       pages.push(...segment.pages);
       await progressCheckpoint(options, {
         phase: "download",
@@ -393,6 +469,24 @@ export class SyncRuntime {
       String(pages.length) !== pinned.pageCount
     )
       throw new Error("快照对象数量不匹配");
+    decimalWithinLimit(
+      pinned.revisionBodyBytes,
+      capabilities.maxClientTotalBodyBytes,
+    );
+    if (totalBodyBytes !== Number(pinned.revisionBodyBytes))
+      throw new Error("快照字节数不匹配");
+    const manifestBytes = this.computeManifestBytes(
+      pinned.protocolVersion,
+      pinned.spaceId,
+      folders,
+      pages,
+    );
+    decimalWithinLimit(
+      pinned.revisionManifestByteLength,
+      capabilities.maxClientManifestBytes,
+    );
+    if (manifestBytes > capabilities.maxClientManifestBytes)
+      throw new Error("SPACE_TOO_LARGE");
     const contentHashValue =
       pinned.protocolVersion === "2"
         ? await treeRevisionContentHashV2({
@@ -423,6 +517,38 @@ export class SyncRuntime {
     };
   }
 
+  private computeManifestBytes(
+    protocolVersion: "1" | "2",
+    spaceId: string,
+    folders: TreeFolder[],
+    pages: TreePage[],
+  ): number {
+    if (protocolVersion === "1")
+      return canonicalBytes({
+        protocolVersion: "1",
+        spaceId,
+        pages: pages.map((page) => ({
+          pageId: page.pageId,
+          path: page.path,
+          title: page.title,
+          contentHash: page.contentHash,
+        })),
+      }).byteLength;
+    return canonicalBytes({
+      protocolVersion: "2",
+      spaceId,
+      folders,
+      pages: pages.map((page) => ({
+        pageId: page.pageId,
+        folderId: page.folderId,
+        path: page.path,
+        title: page.title,
+        contentHash: page.contentHash,
+        updatedAt: page.updatedAt,
+      })),
+    }).byteLength;
+  }
+
   private async discardOrphanPreviews(): Promise<void> {
     for (const dir of ["push-preview"]) {
       try {
@@ -434,11 +560,13 @@ export class SyncRuntime {
   }
 
   private async readJournalSchemaVersion(path: string): Promise<number | null> {
+    let best: { writeGeneration: number; version: number } | null = null;
     for (const candidate of [path, path + ".prev", path + ".next"]) {
       const raw = await this.control.read(candidate);
       if (raw === null) continue;
       let parsed: {
         envelopeSchemaVersion?: unknown;
+        writeGeneration?: unknown;
         payload?: { schemaVersion?: unknown };
       };
       try {
@@ -453,9 +581,13 @@ export class SyncRuntime {
         throw new Error("不支持的控制存储版本");
       if (parsed.envelopeSchemaVersion !== 1) throw new Error("控制存储已损坏");
       const version = parsed.payload?.schemaVersion;
-      if (typeof version === "number") return version;
+      if (typeof version !== "number") continue;
+      const writeGeneration =
+        typeof parsed.writeGeneration === "number" ? parsed.writeGeneration : 0;
+      if (!best || writeGeneration > best.writeGeneration)
+        best = { writeGeneration, version };
     }
-    return null;
+    return best ? best.version : null;
   }
 
   private prefixAction(action: TreePullAction): TreePullAction {
@@ -544,6 +676,36 @@ export class SyncRuntime {
         recovered?.state === "committed" ? recovered.transactionId : null;
     }
     await this.legacyBaseline.recover(committedTransactionId);
+    if (committedTransactionId)
+      await this.applyPullControlAfter(committedTransactionId);
+  }
+
+  private async applyPullControlAfter(transactionId: string): Promise<void> {
+    const after = await this.pullControlAfter.read();
+    if (
+      !after ||
+      after.payload.transactionId !== transactionId ||
+      after.payload.phase === "applied"
+    )
+      return;
+    const identities = await this.readIdentities();
+    for (const entry of Object.values(after.payload.identities.entries))
+      identities.pendingPages[entry.pageId] = {
+        pageId: entry.pageId,
+        path: entry.path,
+        contentHash: entry.contentHash,
+      };
+    await this.identities.write(identities);
+    const current = (await this.moveHints.read())?.payload.hints ?? [];
+    const merged = new Map(
+      after.payload.moveHints.hints.map((hint) => [hint.pageId, hint]),
+    );
+    for (const hint of current) merged.set(hint.pageId, hint);
+    await this.moveHints.write({
+      schemaVersion: 1,
+      hints: [...merged.values()],
+    });
+    await this.pullControlAfter.write({ ...after.payload, phase: "applied" });
   }
 
   private async recoverTreePull(): Promise<void> {
@@ -682,6 +844,23 @@ export class SyncRuntime {
   }
 
   async hasUnfinishedPush(): Promise<boolean> {
+    const version = await this.readJournalSchemaVersion(
+      this.root + "/push/journal.json",
+    );
+    if (version === 1) {
+      if (!this.legacyRemote) return true;
+      const push = await new PushService(
+        this.legacyRemote,
+        this.control,
+        this.root + "/push",
+      ).inspect();
+      return (
+        !!push &&
+        push.remoteState !== "superseded" &&
+        push.localCommitPhase !== "verified"
+      );
+    }
+    if (version === null) return false;
     const push = await new TreePushService(
       this.remote,
       this.control,
@@ -825,6 +1004,7 @@ export class SyncRuntime {
     local: LocalTreeScan,
     options?: SyncOperationOptions,
   ): Promise<PreparedTreePushChange[]> {
+    const isV1 = this.remote.protocolVersion === "1";
     const baseFolders = new Map(base.folders.map((f) => [f.folderId, f]));
     const localFolders = new Map(local.folders.map((f) => [f.folderId, f]));
     const basePages = new Map(base.pages.map((p) => [p.pageId, p]));
@@ -840,10 +1020,11 @@ export class SyncRuntime {
     for (const folder of local.folders) {
       const before = baseFolders.get(folder.folderId);
       if (
-        !before ||
-        before.path !== folder.path ||
-        before.parentFolderId !== folder.parentFolderId ||
-        before.name !== folder.name
+        !isV1 &&
+        (!before ||
+          before.path !== folder.path ||
+          before.parentFolderId !== folder.parentFolderId ||
+          before.name !== folder.name)
       )
         changes.push({ operation: "upsert_folder", folder });
       prepared += 1;
@@ -856,7 +1037,7 @@ export class SyncRuntime {
         });
     }
     for (const folder of base.folders) {
-      if (!localFolders.has(folder.folderId))
+      if (!isV1 && !localFolders.has(folder.folderId))
         changes.push({
           operation: "archive_folder",
           folderId: folder.folderId,
@@ -889,6 +1070,7 @@ export class SyncRuntime {
           ".md";
         await this.control.write(payloadPath, page.body);
         const { body: _body, ...metadata } = page;
+        if (isV1) metadata.folderId = null;
         changes.push({
           operation: "upsert_page",
           page: {

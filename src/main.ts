@@ -27,6 +27,7 @@ import {
 import { AgentWikiClient, normalizeServerUrl } from "./agentwiki/client";
 import { V1TreeRemote } from "./agentwiki/v1-tree-remote";
 import { V2TreeRemote } from "./agentwiki/v2-tree-remote";
+import { AgentWikiPushRemote } from "./agentwiki/push-remote";
 import { SyncRuntime } from "./application/sync-runtime";
 import {
   ProtocolNegotiator,
@@ -476,6 +477,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       await idFileKey(deviceId),
       await idFileKey(mapping.spaceId),
       state.credentialId,
+      new AgentWikiPushRemote(client, mapping.spaceId),
     );
     this.liveRuntimes.set(runtimeKey, runtime);
     return runtime;

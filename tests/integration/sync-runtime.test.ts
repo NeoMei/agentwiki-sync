@@ -1,11 +1,18 @@
 import { describe, expect, it } from "vitest";
 import { SyncRuntime } from "../../src/application/sync-runtime";
-import { confirmationHash, contentHash } from "../../src/agentwiki/protocol";
+import {
+  canonicalBytes,
+  confirmationHash,
+  contentHash,
+  sha256Hex,
+} from "../../src/agentwiki/protocol";
 import { FakeTreeRemote } from "../fakes/fake-tree-remote";
+import { FakeAgentWiki } from "../fakes/fake-agentwiki";
 import { MemoryControlStore } from "../fakes/memory-control-store";
 import { MemoryVault } from "../fakes/memory-vault";
 import { BaselineRepository } from "../../src/storage/baseline";
 import { TreeBaselineRepository } from "../../src/storage/tree-baseline";
+import { PushService } from "../../src/application/push-service";
 import type { TreeFolder, TreePage } from "../../src/core/tree-model";
 
 function folder(
@@ -392,7 +399,9 @@ describe("SyncRuntime", () => {
     );
     await runtime.applyPull(await runtime.previewPull());
     remote.truncateNextSnapshot = true;
-    await expect(runtime.previewPull()).rejects.toThrow(/快照完整性/);
+    await expect(runtime.previewPull()).rejects.toThrow(
+      /快照(完整性|字节数|对象数量)/,
+    );
     expect(vault.text("Wiki/pages/A.md")).toBe("base");
   });
 
@@ -667,5 +676,204 @@ describe("SyncRuntime", () => {
         },
       }),
     ).rejects.toThrow(/取消/);
+  });
+
+  it("routes a schema-1 push journal through the legacy push service", async () => {
+    const legacyRemote = new FakeAgentWiki();
+    const control = new MemoryControlStore();
+    const root = ".agentwiki/devices/d-device/spaces/s-space";
+    const v1 = new PushService(legacyRemote, control, root + "/push");
+    legacyRemote.canPublish = false;
+    await expect(
+      v1.publish({
+        spaceId: "space",
+        baseRevision: "0",
+        capabilities: legacyRemote.capabilities,
+        changes: [
+          {
+            operation: "upsert",
+            pageId: "p1",
+            path: "pages/A.md",
+            title: "A",
+            body: "a",
+            contentHash: await contentHash("a"),
+          },
+        ],
+      }),
+    ).rejects.toThrow(/SPACE_READ_ONLY/);
+    legacyRemote.canPublish = true;
+    const runtime = new SyncRuntime(
+      new MemoryVault({}),
+      control,
+      new FakeTreeRemote(),
+      mapping(),
+      "device",
+      "space",
+      "cred",
+      legacyRemote,
+    );
+    expect(await runtime.hasUnfinishedPush()).toBe(true);
+    await runtime.recover();
+    expect(await runtime.hasUnfinishedPush()).toBe(false);
+  });
+
+  it("picks the highest writeGeneration journal candidate for routing", async () => {
+    const remote = new FakeTreeRemote();
+    const control = new MemoryControlStore();
+    const runtime = new SyncRuntime(
+      new MemoryVault({}),
+      control,
+      remote,
+      mapping(),
+    );
+    const base = ".agentwiki/devices/d-local/spaces/s-space/push";
+    await control.write(
+      base + "/journal.json",
+      JSON.stringify({
+        envelopeSchemaVersion: 1,
+        writeGeneration: 1,
+        payloadHash: "x".repeat(64),
+        payload: { schemaVersion: 1 },
+      }),
+    );
+    await control.write(
+      base + "/journal.json.next",
+      JSON.stringify({
+        envelopeSchemaVersion: 1,
+        writeGeneration: 2,
+        payloadHash: "x".repeat(64),
+        payload: { schemaVersion: 3 },
+      }),
+    );
+    await expect(runtime.recover()).rejects.toThrow(/不支持的推送日志版本/);
+  });
+
+  it("applies a legacy pull-control-after state during recovery", async () => {
+    const control = new MemoryControlStore();
+    const root = ".agentwiki/devices/d-local/spaces/s-space";
+    const runtime = new SyncRuntime(
+      new MemoryVault({}),
+      control,
+      new FakeTreeRemote(),
+      mapping(),
+    );
+    const writeEnvelope = async (path: string, payload: unknown) => {
+      await control.write(
+        path,
+        JSON.stringify({
+          envelopeSchemaVersion: 1,
+          writeGeneration: 1,
+          payloadHash: await sha256Hex(canonicalBytes(payload)),
+          payload,
+        }),
+      );
+    };
+    await writeEnvelope(root + "/pull/journal.json", {
+      schemaVersion: 1,
+      transactionId: "tx1",
+      state: "committed",
+      scanEpoch: 0,
+      actions: [],
+      snapshots: [],
+      temporaryPaths: [],
+      materialized: [],
+    });
+    await writeEnvelope(root + "/pull-control-after.json", {
+      schemaVersion: 1,
+      transactionId: "tx1",
+      phase: "pending",
+      identities: {
+        schemaVersion: 1,
+        entries: {
+          p1: {
+            intent: "restore",
+            pageId: "p1",
+            path: "pages/A.md",
+            contentHash: "h".repeat(64),
+            archivedBasePath: "pages/A.md",
+            archivedBaseTitle: "A",
+            archivedBaseContentHash: "h".repeat(64),
+          },
+        },
+      },
+      moveHints: {
+        schemaVersion: 1,
+        hints: [
+          {
+            pageId: "p1",
+            fromPath: "pages/A.md",
+            toPath: "pages/B.md",
+            observedVaultByteHash: "h".repeat(64),
+          },
+        ],
+      },
+    });
+    await runtime.recover();
+    const identities = JSON.parse(
+      (await control.read(root + "/tree-identities.json"))!,
+    ) as {
+      payload: {
+        pendingPages: Record<string, { pageId: string; path: string }>;
+      };
+    };
+    expect(identities.payload.pendingPages.p1).toMatchObject({
+      pageId: "p1",
+      path: "pages/A.md",
+    });
+    const moveHints = JSON.parse(
+      (await control.read(root + "/move-hints.json"))!,
+    ) as { payload: { hints: Array<{ pageId: string; toPath: string }> } };
+    expect(moveHints.payload.hints[0]).toMatchObject({
+      pageId: "p1",
+      toPath: "pages/B.md",
+    });
+  });
+
+  it("pushes a v1 nested page path without folder changes", async () => {
+    const remote = new FakeTreeRemote();
+    remote.setProtocol("1");
+    const vault = new MemoryVault({ "Wiki/pages/A/P.md": "# p" });
+    const runtime = new SyncRuntime(
+      vault,
+      new MemoryControlStore(),
+      remote,
+      mapping(),
+    );
+    await runtime.establishEmptyBase();
+    const preview = await runtime.previewPush();
+    expect(
+      preview.changes.filter((change) => change.operation === "upsert_folder"),
+    ).toHaveLength(0);
+    expect(
+      preview.changes.some(
+        (change) =>
+          change.operation === "upsert_page" &&
+          change.page.path === "pages/A/P.md",
+      ),
+    ).toBe(true);
+    await runtime.applyPush(preview);
+    expect((await remote.snapshot()).items[0]?.path).toBe("pages/A/P.md");
+  });
+
+  it("rejects a snapshot whose page exceeds the body byte limit", async () => {
+    const remote = new FakeTreeRemote();
+    const huge = "x".repeat(2 * 1024 * 1024);
+    await remote.seed([
+      {
+        pageId: "p1",
+        path: "pages/A.md",
+        title: "A",
+        body: huge,
+        contentHash: await contentHash(huge),
+        updatedAt: "2026-08-14T00:00:00.000Z",
+      },
+    ]);
+    const runtime = new SyncRuntime(
+      new MemoryVault({}),
+      new MemoryControlStore(),
+      remote,
+      mapping(),
+    );
+    await expect(runtime.previewPull()).rejects.toThrow(/PAGE_TOO_LARGE/);
   });
 });
