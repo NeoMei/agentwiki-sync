@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- 新增 Sync v2 树同步：服务端支持时自动选择 Sync v2，否则回退 Legacy v1；同步中心显示当前协议（`Sync v2` / `Legacy v1`），不提供手动协议选择器。
+- v2 支持文件夹映射与空文件夹：嵌套目录、空目录和页面可跨设备双向同步，文件夹 ID 与路径保持一致；Legacy v1 保留原页面语义。
+- 补齐 v2 端到端与资源上限回归：混合目录/页面跨桌面与移动端往返、空文件夹保留，以及 maxClientSpaceFolders / maxSnapshotObjects / maxDeltaItems / maxResponseBytes / maxDocumentTreeBytes / maxPushChanges 边界校验。
+
 ## 0.2.12
 
 - 自动合并现在能识别双方在文末追加内容、且 `diff3` 已生成完整包含双方的安全候选，不再误报为必须人工处理的结构化冲突。

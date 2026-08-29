@@ -223,4 +223,58 @@ describe("manual multi-device sync", () => {
       }),
     ]);
   });
+
+  it("syncs a mixed folder/page tree across desktop and mobile", async () => {
+    const remote = new FakeTreeRemote();
+    const desktopVault = new MemoryVault({});
+    const mobileVault = new MemoryVault({});
+    const desktop = new SyncRuntime(
+      desktopVault,
+      new MemoryControlStore(),
+      remote,
+      mapping,
+      "desktop",
+    );
+    const mobile = new SyncRuntime(
+      mobileVault,
+      new MemoryControlStore(),
+      remote,
+      mapping,
+      "mobile",
+    );
+
+    await desktopVault.createDirectory("Wiki/pages/Empty");
+    await desktopVault.createDirectory("Wiki/pages/Guides");
+    await desktopVault.write(
+      "Wiki/pages/Guides/A.md",
+      new TextEncoder().encode("desktop"),
+    );
+    await desktop.applyPush(await desktop.previewPush());
+
+    await mobile.applyPull(await mobile.previewPull());
+    expect(mobileVault.text("Wiki/pages/Guides/A.md")).toBe("desktop");
+    expect(mobileVault.hasDirectory("Wiki/pages/Empty")).toBe(true);
+
+    await mobileVault.rename("Wiki/pages/Guides", "Wiki/pages/Manuals");
+    await mobileVault.write(
+      "Wiki/pages/Manuals/A.md",
+      new TextEncoder().encode("mobile"),
+    );
+    await mobile.applyPush(await mobile.previewPush());
+
+    await desktop.applyPull(await desktop.previewPull());
+    expect(desktopVault.text("Wiki/pages/Manuals/A.md")).toBe("mobile");
+    expect(desktopVault.hasDirectory("Wiki/pages/Empty")).toBe(true);
+    expect([...desktopVault.folders].sort()).toEqual(
+      [...mobileVault.folders].sort(),
+    );
+
+    const tree = remote.tree();
+    expect(tree.folders.map((folder) => folder.path).sort()).toEqual([
+      "pages/Empty",
+      "pages/Manuals",
+    ]);
+    expect(tree.pages.map((page) => page.path)).toEqual(["pages/Manuals/A.md"]);
+    expect(tree.pages[0]?.body).toBe("mobile");
+  });
 });

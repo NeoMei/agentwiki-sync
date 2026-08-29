@@ -1,10 +1,23 @@
 import { describe, expect, it } from "vitest";
 import { memoryUsage } from "node:process";
 import {
+  TREE_SYNC_V2_LIMITS,
+  TreeCapabilitiesResponseV2Schema,
+  partitionTreePushChangesV2,
+  type TreeSyncCapabilitiesV2,
+} from "@neomei/agentwiki-sync-protocol";
+import { AgentWikiClient } from "../../src/agentwiki/client";
+import { V2TreeRemote } from "../../src/agentwiki/v2-tree-remote";
+import {
   partitionPushChanges,
   type PushChange,
 } from "../../src/agentwiki/protocol";
+import type { TreeSnapshot } from "../../src/core/tree-model";
+import { scanLocalTree, type TreeScanLimits } from "../../src/core/tree-scan";
 import { scanMapping } from "../../src/core/status";
+import { emptyTreeIdentityState } from "../../src/storage/tree-identities";
+import { FakeHttp } from "../fakes/fake-http";
+import { MemoryVault } from "../fakes/memory-vault";
 
 describe("bounded v1 space", () => {
   it("streams 5,000 metadata entries and deterministically partitions 5,000 changes", async () => {
@@ -69,4 +82,175 @@ describe("bounded v1 space", () => {
     expect(scan.bodyBytes).toBe(100_000_000);
     if (globalThis.gc) expect(delta).toBeLessThan(32 * 1024 * 1024);
   }, 60_000);
+});
+
+const v2Capabilities: TreeSyncCapabilitiesV2 = {
+  maxPageBytes: 1_048_576,
+  maxBatchBytes: 4_194_304,
+  maxBatchItems: 100,
+  maxChangeCount: 100,
+  maxConfirmationBytes: 4_194_304,
+  maxClientSpacePages: 5_000,
+  maxClientSpaceFolders: 10_000,
+  maxSnapshotObjects: 15_000,
+  maxClientManifestBytes: 4_194_304,
+  maxClientTotalBodyBytes: 2_097_152,
+  maxDeltaItems: 15_000,
+  maxResponseBytes: 4_194_304,
+  maxPageItems: 200,
+  pushSessionTtlSeconds: 900,
+};
+
+function client(http: FakeHttp): AgentWikiClient {
+  return new AgentWikiClient("https://wiki.example.com", http, () => "secret");
+}
+
+function v2Remote(http: FakeHttp): V2TreeRemote {
+  return new V2TreeRemote(client(http), "space", {
+    version: "2",
+    capabilities: v2Capabilities,
+    capabilitiesHash: "c".repeat(64),
+  });
+}
+
+function v2SnapshotPage(overrides: Record<string, unknown> = {}) {
+  return {
+    protocolVersion: "2",
+    spaceId: "space",
+    revision: "r1",
+    sequence: 1,
+    revisionContentHash: "e".repeat(64),
+    folderCount: "0",
+    pageCount: "0",
+    revisionManifestByteLength: "10",
+    revisionBodyBytes: "0",
+    folders: [],
+    pages: [],
+    nextCursor: null,
+    ...overrides,
+  };
+}
+
+describe("bounded v2 tree", () => {
+  it("rejects a scan that would retain more folders than maxClientSpaceFolders", async () => {
+    const vault = new MemoryVault({});
+    for (
+      let index = 0;
+      index <= TREE_SYNC_V2_LIMITS.maxClientSpaceFolders;
+      index += 1
+    )
+      await vault.createDirectory(
+        `Wiki/pages/f${String(index).padStart(5, "0")}`,
+      );
+    const limits: TreeScanLimits = {
+      maxFolders: TREE_SYNC_V2_LIMITS.maxClientSpaceFolders,
+      maxPages: 100_000,
+      maxPageBytes: 100_000_000,
+    };
+    await expect(
+      scanLocalTree(
+        vault,
+        "Wiki",
+        {
+          protocolVersion: "2",
+          spaceId: "space",
+          revision: "0",
+          revisionContentHash: "",
+          folders: [],
+          pages: [],
+        } satisfies TreeSnapshot,
+        emptyTreeIdentityState(),
+        limits,
+      ),
+    ).rejects.toThrow(/SPACE_TOO_LARGE/);
+  }, 60_000);
+
+  it("rejects a snapshot that exceeds maxSnapshotObjects", async () => {
+    const http = new FakeHttp();
+    http.responses.push({
+      status: 200,
+      json: v2SnapshotPage({
+        folderCount: String(TREE_SYNC_V2_LIMITS.maxSnapshotObjects + 1),
+        pageCount: "0",
+      }),
+    });
+    await expect(
+      v2Remote(http).snapshotPages()[Symbol.asyncIterator]().next(),
+    ).rejects.toThrow(/快照对象数量超过限制/);
+  });
+
+  it("rejects a snapshot that exceeds maxDocumentTreeBytes", async () => {
+    const http = new FakeHttp();
+    http.responses.push({
+      status: 200,
+      json: v2SnapshotPage({
+        revisionManifestByteLength: String(
+          TREE_SYNC_V2_LIMITS.maxDocumentTreeBytes + 1,
+        ),
+        revisionBodyBytes: "0",
+      }),
+    });
+    await expect(
+      v2Remote(http).snapshotPages()[Symbol.asyncIterator]().next(),
+    ).rejects.toThrow(/快照字节数超过限制/);
+  });
+
+  it("rejects a delta that exceeds maxDeltaItems", async () => {
+    const http = new FakeHttp();
+    const items = Array.from(
+      { length: TREE_SYNC_V2_LIMITS.maxDeltaItems + 1 },
+      (_, index) => ({
+        operation: "archive_page",
+        pageId: `p${index}`,
+        previousPath: "pages/Old.md",
+      }),
+    );
+    http.responses.push({
+      status: 200,
+      json: {
+        protocolVersion: "2",
+        spaceId: "space",
+        fromRevision: "r0",
+        toRevision: "r1",
+        toSequence: 1,
+        toRevisionContentHash: "a".repeat(64),
+        toFolderCount: "0",
+        toPageCount: "0",
+        toRevisionManifestByteLength: "10",
+        toRevisionBodyBytes: "0",
+        items,
+        nextCursor: null,
+      },
+    });
+    await expect(v2Remote(http).delta("r0")).rejects.toThrow(
+      /增量条目数量超过限制/,
+    );
+  });
+
+  it("rejects more than maxPushChanges in a v2 push partition", async () => {
+    const changes = Array.from(
+      { length: TREE_SYNC_V2_LIMITS.maxPushChanges + 1 },
+      (_, index) => ({
+        operation: "archive_page" as const,
+        pageId: `p${index}`,
+        previousPath: "pages/Old.md",
+      }),
+    );
+    await expect(
+      partitionTreePushChangesV2(changes, v2Capabilities),
+    ).rejects.toThrow(/BATCH_TOO_LARGE/);
+  });
+
+  it("rejects v2 capabilities advertising maxResponseBytes above the protocol bound", () => {
+    expect(() =>
+      TreeCapabilitiesResponseV2Schema.parse({
+        protocolVersion: "2",
+        capabilities: {
+          ...v2Capabilities,
+          maxResponseBytes: TREE_SYNC_V2_LIMITS.maxResponseBytes + 1,
+        },
+        capabilitiesHash: "c".repeat(64),
+      }),
+    ).toThrow();
+  });
 });

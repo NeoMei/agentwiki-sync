@@ -4,7 +4,13 @@ AgentWiki Sync 是一个移动端兼容的 Obsidian 插件，通过可预览、�
 
 ## 当前状态
 
-插件核心、事务恢复、Obsidian 原生 UI 和公开 API 客户端已实现。AgentWiki 人类设备同步 API v1 已上线，插件依赖已发布的 `@neomei/agentwiki-sync-protocol@0.1.0` 并通过逐字节一致性测试。仓库同时使用独立 fake AgentWiki 验证端到端客户端流程，不复制 AgentWiki 主项目内部实现。
+插件核心、事务恢复、Obsidian 原生 UI 和公开 API 客户端已实现，同时支持 Sync v2 树同步与 Legacy v1。服务端支持 v2 时自动选择 Sync v2，否则回退 Legacy v1；同步中心只显示当前协议（`Sync v2` / `Legacy v1`），不提供手动协议选择器。插件依赖已发布的 `@neomei/agentwiki-sync-protocol@0.4.0` 并通过逐字节一致性测试。仓库同时使用独立 fake AgentWiki 验证端到端客户端流程，不复制 AgentWiki 主项目内部实现。
+
+## 协议选择与文件夹
+
+- Sync v2 自动启用：连接时先探测 `/api/sync/v2/capabilities`，校验能力哈希后选择 v2；404 或协议不支持时回退 v1，结果按服务器实例缓存。
+- 文件夹映射：v2 下映射目录内的嵌套文件夹与页面作为统一树同步，文件夹 ID、父级、排序与路径保持一致；空文件夹也会被同步保留。Legacy v1 不包含文件夹语义。
+- 确认与恢复：Pull/Push 仍需在预览中确认；冲突、首次绑定、只读 Space 与崩溃恢复行为在两种协议下一致。中断的 Pull/Push 在下次打开同步中心时先恢复，无法唯一判定时冻结该 Space，不会静默覆盖当前文件。
 
 ## 安装与使用
 
