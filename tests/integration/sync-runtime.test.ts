@@ -876,4 +876,52 @@ describe("SyncRuntime", () => {
     );
     await expect(runtime.previewPull()).rejects.toThrow(/PAGE_TOO_LARGE/);
   });
+
+  it("keeps v1 nested pages folder-less across the full sync cycle", async () => {
+    const remote = new FakeTreeRemote();
+    remote.setProtocol("1");
+    const vault = new MemoryVault({ "Wiki/pages/A/P.md": "# p" });
+    const runtime = new SyncRuntime(
+      vault,
+      new MemoryControlStore(),
+      remote,
+      mapping(),
+    );
+    await runtime.establishEmptyBase();
+    const initial = await runtime.previewPush();
+    const upsert = initial.changes.find(
+      (change) => change.operation === "upsert_page",
+    )!;
+    const pageId = upsert.page.pageId;
+    await runtime.applyPush(initial);
+
+    await runtime.applyPull(await runtime.previewPull());
+    const status = await runtime.status();
+    expect(status.local.added).toHaveLength(0);
+    expect(status.local.modified).toHaveLength(0);
+    expect(status.local.renamed).toHaveLength(0);
+    expect((await runtime.previewPush()).changes).toHaveLength(0);
+
+    await remote.replace([
+      {
+        pageId,
+        path: "pages/A/P.md",
+        title: "P",
+        body: "remote v2",
+        contentHash: await contentHash("remote v2"),
+        updatedAt: "2026-08-14T00:00:00.000Z",
+      },
+    ]);
+    const preview = await runtime.previewPull();
+    expect(
+      preview.actions.some(
+        (action) => action.kind === "trash_page" || action.kind === "move_page",
+      ),
+    ).toBe(false);
+    expect(
+      preview.actions.some(
+        (action) => action.kind === "write_page" && action.pageId === pageId,
+      ),
+    ).toBe(true);
+  });
 });

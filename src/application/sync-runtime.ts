@@ -402,6 +402,11 @@ export class SyncRuntime {
         });
       },
     );
+    if (this.remote.protocolVersion === "1") {
+      local.folders = [];
+      for (const page of local.pages) page.folderId = null;
+      identities.pendingFolders = {};
+    }
     if (epoch !== this.scanEpoch) throw new Error("扫描纪元已变更");
     await this.identities.write(identities);
     return local;
@@ -1070,7 +1075,6 @@ export class SyncRuntime {
           ".md";
         await this.control.write(payloadPath, page.body);
         const { body: _body, ...metadata } = page;
-        if (isV1) metadata.folderId = null;
         changes.push({
           operation: "upsert_page",
           page: {
