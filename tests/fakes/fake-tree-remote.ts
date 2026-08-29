@@ -1,6 +1,7 @@
 import {
   capabilitiesHash,
   contentHash,
+  revisionContentHash,
   type SyncPage,
 } from "../../src/agentwiki/protocol";
 import {
@@ -70,8 +71,9 @@ function toSyncPage(page: TreePage): SyncPage {
 }
 
 export class FakeTreeRemote implements TreeRemotePort {
-  readonly protocolVersion = "2" as const;
+  private protocolVersionValue: "1" | "2" = "2";
   readonly capabilitiesHash: Promise<string>;
+  lastCreateInput: TreeCreatePushSession | null = null;
   canPublish = true;
   truncateNextSnapshot = false;
   private revision = 0;
@@ -83,6 +85,14 @@ export class FakeTreeRemote implements TreeRemotePort {
 
   constructor() {
     this.capabilitiesHash = capabilitiesHash(CAPABILITIES);
+  }
+
+  get protocolVersion(): "1" | "2" {
+    return this.protocolVersionValue;
+  }
+
+  setProtocol(protocol: "1" | "2"): void {
+    this.protocolVersionValue = protocol;
   }
 
   async capabilities(): Promise<TreeSyncLimits> {
@@ -113,7 +123,7 @@ export class FakeTreeRemote implements TreeRemotePort {
   async head(): Promise<TreeHead> {
     const snapshot = await this.buildSnapshot();
     return {
-      protocolVersion: "2",
+      protocolVersion: this.protocolVersionValue,
       spaceId: "space",
       revision: String(this.revision),
       sequence: this.revision,
@@ -128,7 +138,7 @@ export class FakeTreeRemote implements TreeRemotePort {
 
   private async buildSnapshot(): Promise<TreeSnapshot> {
     return {
-      protocolVersion: "2",
+      protocolVersion: this.protocolVersionValue,
       spaceId: "space",
       revision: String(this.revision),
       revisionContentHash: "",
@@ -138,6 +148,17 @@ export class FakeTreeRemote implements TreeRemotePort {
   }
 
   private async treeHash(snapshot: TreeSnapshot): Promise<string> {
+    if (this.protocolVersionValue === "1")
+      return revisionContentHash({
+        protocolVersion: "1",
+        spaceId: "space",
+        pages: snapshot.pages.map((page) => ({
+          pageId: page.pageId,
+          path: page.path,
+          title: page.title,
+          contentHash: page.contentHash,
+        })),
+      });
     return treeRevisionContentHashV2({
       protocolVersion: "2",
       spaceId: "space",
@@ -159,7 +180,7 @@ export class FakeTreeRemote implements TreeRemotePort {
       : all.pages;
     this.truncateNextSnapshot = false;
     yield {
-      protocolVersion: "2",
+      protocolVersion: this.protocolVersionValue,
       spaceId: "space",
       revision: String(this.revision),
       sequence: this.revision,
@@ -186,6 +207,7 @@ export class FakeTreeRemote implements TreeRemotePort {
   async createPushSession(
     input: TreeCreatePushSession,
   ): Promise<TreePushSession> {
+    this.lastCreateInput = input;
     if (input.baseRevision !== String(this.revision))
       throw new Error("BASE_STALE");
     const sessionId = "session-" + (this.sessions.size + 1);
@@ -280,7 +302,7 @@ export class FakeTreeRemote implements TreeRemotePort {
       }
     const snapshot = await this.buildSnapshot();
     const result: TreeFinalizeResult = {
-      protocolVersion: "2",
+      protocolVersion: this.protocolVersionValue,
       status: "published",
       revision: String(this.revision),
       sequence: this.revision,

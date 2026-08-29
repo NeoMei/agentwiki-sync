@@ -7,9 +7,15 @@ import {
 } from "@neomei/agentwiki-sync-protocol";
 
 import {
+  batchHash,
   capabilitiesHash,
   canonicalBytes,
+  comparePushChanges,
+  confirmationHash,
   contentHash,
+  type PushChange,
+  type PushConfirmationManifest,
+  type PushManifestChange,
 } from "../agentwiki/protocol";
 import { AgentWikiHttpError } from "../agentwiki/client";
 import { opaqueFileKey } from "../core/identity-key";
@@ -18,6 +24,7 @@ import type { ControlStorePort } from "../ports/control-store";
 import type {
   TreeCreatePushSession,
   TreeFinalizeResult,
+  TreePushBatch,
   TreePushSession,
   TreeRemotePort,
   TreeSyncLimits,
@@ -200,6 +207,51 @@ function buildManifest(
   };
 }
 
+function toV1ManifestChange(
+  change: PreparedTreePushChange,
+): PushManifestChange {
+  if (change.operation === "upsert_page")
+    return {
+      operation: "upsert",
+      pageId: change.page.pageId,
+      path: change.page.path,
+      title: change.page.title,
+      contentHash: change.page.contentHash,
+    };
+  if (change.operation === "archive_page")
+    return {
+      operation: "archive",
+      pageId: change.pageId,
+      previousPath: change.previousPath,
+    };
+  throw new Error("v1 适配器不支持目录变更");
+}
+
+function toV1PushChange(change: TreePushChange): PushChange {
+  if (change.operation === "upsert_page")
+    return {
+      operation: "upsert",
+      pageId: change.page.pageId,
+      path: change.page.path,
+      title: change.page.title,
+      body: change.page.body,
+      contentHash: change.page.contentHash,
+    };
+  if (change.operation === "archive_page")
+    return {
+      operation: "archive",
+      pageId: change.pageId,
+      previousPath: change.previousPath,
+    };
+  throw new Error("v1 适配器不支持目录变更");
+}
+
+function v1ManifestChanges(
+  changes: PreparedTreePushChange[],
+): PushManifestChange[] {
+  return changes.map(toV1ManifestChange).sort(comparePushChanges);
+}
+
 export class TreePushService {
   private readonly journal: MutableControlRepository<TreePushJournal>;
 
@@ -296,6 +348,23 @@ export class TreePushService {
   }
 
   private createInput(journal: TreePushJournal): TreeCreatePushSession {
+    if (this.remote.protocolVersion === "1") {
+      const manifest: PushConfirmationManifest = {
+        protocolVersion: "1",
+        spaceId: journal.spaceId,
+        baseRevision: journal.baseRevision,
+        changes: v1ManifestChanges(journal.changes),
+      };
+      return {
+        baseRevision: journal.baseRevision,
+        idempotencyKey: journal.idempotencyKey,
+        capabilitiesHash: journal.capabilitiesHash,
+        confirmationHash: journal.confirmationHash,
+        confirmationByteLength: canonicalBytes(manifest).byteLength,
+        changeCount: manifest.changes.length,
+        totalBodyBytes: journal.totalBodyBytes,
+      };
+    }
     const manifest = buildManifest(journal);
     return {
       baseRevision: journal.baseRevision,
@@ -343,6 +412,8 @@ export class TreePushService {
     received: Set<number>,
     options?: SyncOperationOptions,
   ): Promise<void> {
+    if (this.remote.protocolVersion === "1")
+      return this.uploadBatchesV1(journal, received, options);
     const hydrated = await this.hydrate(journal.changes);
     const batches = await partitionTreePushChangesV2(
       hydrated,
@@ -374,10 +445,84 @@ export class TreePushService {
     }
   }
 
+  private async uploadBatchesV1(
+    journal: TreePushJournal,
+    received: Set<number>,
+    options?: SyncOperationOptions,
+  ): Promise<void> {
+    const hydrated = await this.hydrate(journal.changes);
+    const ordered = hydrated
+      .map((tree) => ({ tree, v1: toV1PushChange(tree) }))
+      .sort((left, right) => comparePushChanges(left.v1, right.v1));
+    let batchIndex = 0;
+    let current: Array<{ tree: TreePushChange; v1: PushChange }> = [];
+    let completed = 0;
+    const flush = async () => {
+      if (current.length === 0) return;
+      const batch: TreePushBatch = {
+        protocolVersion: "1",
+        batchIndex,
+        changes: current.map((item) => item.tree),
+        batchHash: await batchHash({
+          protocolVersion: "1",
+          batchIndex,
+          changes: current.map((item) => item.v1),
+        }),
+      };
+      if (!received.has(batchIndex)) {
+        const receipt = await this.remote.uploadBatch(
+          journal.sessionId!,
+          batch,
+        );
+        await this.store.write(
+          this.root + "/receipts/" + batchIndex + ".json",
+          JSON.stringify({
+            batchIndex,
+            batchHash: batch.batchHash,
+            receipt: receipt.receipt,
+          }),
+        );
+      }
+      batchIndex += 1;
+      current = [];
+      completed += 1;
+      await progressCheckpoint(options, {
+        phase: "upload",
+        completed,
+        total: undefined,
+        cancellable: true,
+      });
+    };
+    for (const item of ordered) {
+      const proposed = [...current, item];
+      const bytes = canonicalBytes({
+        protocolVersion: "1",
+        batchIndex,
+        changes: proposed.map((entry) => entry.v1),
+      }).byteLength;
+      if (
+        proposed.length > journal.capabilities.maxBatchItems ||
+        bytes > journal.capabilities.maxBatchBytes
+      ) {
+        if (current.length === 0) throw new RangeError("BATCH_TOO_LARGE");
+        await flush();
+        current = [item];
+      } else current = proposed;
+    }
+    await flush();
+  }
+
   async publishPrepared(
     input: TreePushPreview,
     options?: SyncOperationOptions,
   ): Promise<TreeFinalizeResult> {
+    const existing = await this.journal.read();
+    if (
+      existing &&
+      existing.payload.localCommitPhase !== "verified" &&
+      existing.payload.remoteState !== "superseded"
+    )
+      throw new Error("存在未终结的推送，请先执行恢复（recover）");
     if ((await this.remote.head()).revision !== input.baseRevision)
       throw new Error("BASE_STALE");
     const capabilities = input.capabilities;
@@ -416,17 +561,26 @@ export class TreePushService {
       throw error;
     }
 
+    const confirmationHashValue =
+      this.remote.protocolVersion === "1"
+        ? await confirmationHash({
+            protocolVersion: "1",
+            spaceId: input.spaceId,
+            baseRevision: input.baseRevision,
+            changes: v1ManifestChanges(staged),
+          })
+        : await treeConfirmationHashV2({
+            protocolVersion: "2",
+            spaceId: input.spaceId,
+            baseRevision: input.baseRevision,
+            changes: staged.map(toManifestChange),
+          });
     const journal: TreePushJournal = {
       schemaVersion: 2,
       spaceId: input.spaceId,
       baseRevision: input.baseRevision,
       idempotencyKey: crypto.randomUUID(),
-      confirmationHash: await treeConfirmationHashV2({
-        protocolVersion: "2",
-        spaceId: input.spaceId,
-        baseRevision: input.baseRevision,
-        changes: staged.map(toManifestChange),
-      }),
+      confirmationHash: confirmationHashValue,
       capabilitiesHash: capabilitiesHashValue,
       capabilities,
       changes: staged,

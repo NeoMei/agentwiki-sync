@@ -307,6 +307,18 @@ describe("TreePushService", () => {
     expect(remote.receivedOperations()).toEqual(["upsert_page"]);
   });
 
+  it("refuses to overwrite an unfinished push journal", async () => {
+    const remote = new FakeTreeRemote();
+    remote.changeCapabilitiesOnCreate = 2;
+    store = new MemoryControlStore();
+    const service = new TreePushService(remote, store, ".agentwiki/tree/guard");
+    const input = await prepared([upsertPage("p1", null, "pages/A.md")]);
+    await expect(service.publishPrepared(input)).rejects.toThrow(
+      /CAPABILITIES_CHANGED/,
+    );
+    await expect(service.publishPrepared(input)).rejects.toThrow(/未终结/);
+  });
+
   it("rejects stale caller capabilities that do not match the remote", async () => {
     const remote = new FakeTreeRemote();
     store = new MemoryControlStore();

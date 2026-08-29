@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { SyncRuntime } from "../../src/application/sync-runtime";
-import { contentHash } from "../../src/agentwiki/protocol";
+import { confirmationHash, contentHash } from "../../src/agentwiki/protocol";
 import { FakeTreeRemote } from "../fakes/fake-tree-remote";
 import { MemoryControlStore } from "../fakes/memory-control-store";
 import { MemoryVault } from "../fakes/memory-vault";
@@ -378,5 +378,294 @@ describe("SyncRuntime", () => {
       rootPath: "Wiki",
       status: "pending",
     });
+  });
+
+  it("rejects a truncated remote snapshot before planning destructive Pull actions", async () => {
+    const remote = new FakeTreeRemote();
+    await remote.seed([await page("p1", "pages/A.md", "base")]);
+    const vault = new MemoryVault({});
+    const runtime = new SyncRuntime(
+      vault,
+      new MemoryControlStore(),
+      remote,
+      mapping(),
+    );
+    await runtime.applyPull(await runtime.previewPull());
+    remote.truncateNextSnapshot = true;
+    await expect(runtime.previewPull()).rejects.toThrow(/快照完整性/);
+    expect(vault.text("Wiki/pages/A.md")).toBe("base");
+  });
+
+  it("rejects a remote page whose body does not match its content hash", async () => {
+    const remote = new FakeTreeRemote();
+    const body = "base";
+    await remote.seed([
+      {
+        pageId: "p1",
+        path: "pages/A.md",
+        title: "A",
+        body: "tampered",
+        contentHash: await contentHash(body),
+        updatedAt: "2026-08-14T00:00:00.000Z",
+      },
+    ]);
+    const runtime = new SyncRuntime(
+      new MemoryVault({}),
+      new MemoryControlStore(),
+      remote,
+      mapping(),
+    );
+    await expect(runtime.previewPull()).rejects.toThrow(/内容哈希不匹配/);
+  });
+
+  it("preserves the archived page identity across a local-wins archive", async () => {
+    const remote = new FakeTreeRemote();
+    await remote.seed([await page("p1", "pages/A.md", "base")]);
+    const vault = new MemoryVault({});
+    const runtime = new SyncRuntime(
+      vault,
+      new MemoryControlStore(),
+      remote,
+      mapping(),
+    );
+    await runtime.applyPull(await runtime.previewPull());
+    await vault.write("Wiki/pages/A.md", new TextEncoder().encode("local"));
+    await remote.replace([]);
+    const preview = await runtime.previewPull();
+    preview.pageConflictResolutions[preview.pageConflicts[0]!.conflictId] = {
+      choice: "local",
+    };
+    await runtime.applyPull(preview);
+    const push = await runtime.previewPush();
+    expect(push.changes[0]).toMatchObject({
+      operation: "upsert_page",
+      page: { pageId: "p1", path: "pages/A.md" },
+    });
+  });
+
+  it("binds a same-path local document during initial pull and keeps it dirty", async () => {
+    const remote = new FakeTreeRemote();
+    await remote.seed([await page("p1", "pages/A.md", "remote")]);
+    const vault = new MemoryVault({ "Wiki/pages/A.md": "local" });
+    const runtime = new SyncRuntime(
+      vault,
+      new MemoryControlStore(),
+      remote,
+      mapping(),
+    );
+    const preview = await runtime.previewPull();
+    expect(preview.pageConflicts).toHaveLength(1);
+    await expect(runtime.applyPull(preview)).rejects.toThrow(/冲突/);
+    preview.pageConflictResolutions[preview.pageConflicts[0]!.conflictId] = {
+      choice: "local",
+    };
+    await runtime.applyPull(preview);
+    expect(vault.text("Wiki/pages/A.md")).toBe("local");
+    expect((await runtime.status()).local.modified).toHaveLength(1);
+  });
+
+  it("uses a v1 confirmation hash for the v1 tree adapter", async () => {
+    const remote = new FakeTreeRemote();
+    remote.setProtocol("1");
+    const vault = new MemoryVault({ "Wiki/pages/New.md": "new" });
+    const runtime = new SyncRuntime(
+      vault,
+      new MemoryControlStore(),
+      remote,
+      mapping(),
+    );
+    await runtime.establishEmptyBase();
+    const preview = await runtime.previewPush();
+    const upsert = preview.changes.find(
+      (change) => change.operation === "upsert_page",
+    )!;
+    await runtime.applyPush(preview);
+    expect((await remote.snapshot()).items[0]?.body).toBe("new");
+    const manifest = {
+      protocolVersion: "1" as const,
+      spaceId: "space",
+      baseRevision: "0",
+      changes: [
+        {
+          operation: "upsert" as const,
+          pageId: upsert.page.pageId,
+          path: "pages/New.md",
+          title: "New",
+          contentHash: upsert.page.contentHash,
+        },
+      ],
+    };
+    expect(remote.lastCreateInput?.confirmationHash).toBe(
+      await confirmationHash(manifest),
+    );
+  });
+
+  it("does not delete unfinished journals before recovering", async () => {
+    const remote = new FakeTreeRemote();
+    const vault = new MemoryVault({ "Wiki/pages/A.md": "a" });
+    const control = new MemoryControlStore();
+    const runtime = new SyncRuntime(vault, control, remote, mapping());
+    await runtime.establishEmptyBase();
+    remote.canPublish = false;
+    const preview = await runtime.previewPush();
+    await expect(runtime.applyPush(preview)).rejects.toThrow(/SPACE_READ_ONLY/);
+    const journalPath =
+      ".agentwiki/devices/d-local/spaces/s-space/push/journal.json";
+    expect(await control.read(journalPath)).not.toBeNull();
+    remote.canPublish = true;
+    await runtime.recover();
+    expect(await control.read(journalPath)).not.toBeNull();
+  });
+
+  it("fails closed on an unknown future push journal version", async () => {
+    const remote = new FakeTreeRemote();
+    const control = new MemoryControlStore();
+    const runtime = new SyncRuntime(
+      new MemoryVault({}),
+      control,
+      remote,
+      mapping(),
+    );
+    await control.write(
+      ".agentwiki/devices/d-local/spaces/s-space/push/journal.json",
+      JSON.stringify({
+        envelopeSchemaVersion: 1,
+        writeGeneration: 1,
+        payloadHash: "x".repeat(64),
+        payload: { schemaVersion: 3, spaceId: "space" },
+      }),
+    );
+    await expect(runtime.recover()).rejects.toThrow(/不支持的推送日志版本/);
+  });
+
+  it("clones an empty-bodied page without treating it as a missing sidecar", async () => {
+    const remote = new FakeTreeRemote();
+    await remote.seed([await page("empty", "pages/Empty.md", "")]);
+    const vault = new MemoryVault({});
+    const runtime = new SyncRuntime(
+      vault,
+      new MemoryControlStore(),
+      remote,
+      mapping(),
+    );
+    await runtime.applyPull(await runtime.previewPull());
+    expect(vault.text("Wiki/pages/Empty.md")).toBe("");
+  });
+
+  it("supersedes an unfinished Push after credential rotation instead of replaying it", async () => {
+    const remote = new FakeTreeRemote();
+    const vault = new MemoryVault({ "Wiki/pages/A.md": "a" });
+    const control = new MemoryControlStore();
+    const m = mapping();
+    const runtimeA = new SyncRuntime(
+      vault,
+      control,
+      remote,
+      m,
+      "device",
+      "space",
+      "cred-a",
+    );
+    await runtimeA.establishEmptyBase();
+    remote.canPublish = false;
+    const preview = await runtimeA.previewPush();
+    await expect(runtimeA.applyPush(preview)).rejects.toThrow(
+      /SPACE_READ_ONLY/,
+    );
+    remote.canPublish = true;
+    const runtimeB = new SyncRuntime(
+      vault,
+      control,
+      remote,
+      m,
+      "device",
+      "space",
+      "cred-b",
+    );
+    await runtimeB.recover();
+    expect(await runtimeB.hasUnfinishedPush()).toBe(false);
+  });
+
+  it("does not block disconnect after a cancelled Push is superseded", async () => {
+    const remote = new FakeTreeRemote();
+    const runtime = new SyncRuntime(
+      new MemoryVault({ "Wiki/pages/A.md": "a" }),
+      new MemoryControlStore(),
+      remote,
+      mapping(),
+    );
+    await runtime.establishEmptyBase();
+    const preview = await runtime.previewPush();
+    const controller = new AbortController();
+    await expect(
+      runtime.applyPush(preview, {
+        signal: controller.signal,
+        onProgress: (progress) => {
+          if (progress.phase === "upload" && progress.completed >= 1)
+            controller.abort();
+        },
+      }),
+    ).rejects.toThrow(/取消/);
+    expect(await runtime.hasUnfinishedPush()).toBe(false);
+    expect((await runtime.status()).local.added).toHaveLength(1);
+  });
+
+  it("yields and cancels while scanning local files before creating a Push", async () => {
+    const remote = new FakeTreeRemote();
+    const vault = new MemoryVault(
+      Object.fromEntries(
+        Array.from({ length: 60 }, (_, index) => [
+          "Wiki/pages/P" + index + ".md",
+          "page " + index,
+        ]),
+      ),
+    );
+    const runtime = new SyncRuntime(
+      vault,
+      new MemoryControlStore(),
+      remote,
+      mapping(),
+    );
+    const controller = new AbortController();
+    await expect(
+      runtime.previewPush({
+        signal: controller.signal,
+        onProgress: (progress) => {
+          if (progress.phase === "scan" && progress.completed >= 50)
+            controller.abort();
+        },
+      }),
+    ).rejects.toThrow(/取消/);
+    expect(remote.sessionCount()).toBe(0);
+  });
+
+  it("yields and cancels while planning local archives", async () => {
+    const remote = new FakeTreeRemote();
+    const pages = await Promise.all(
+      Array.from({ length: 60 }, async (_, index) =>
+        page("p" + index, "pages/P" + index + ".md", "page " + index),
+      ),
+    );
+    await remote.seed(pages);
+    const vault = new MemoryVault({});
+    const runtime = new SyncRuntime(
+      vault,
+      new MemoryControlStore(),
+      remote,
+      mapping(),
+    );
+    await runtime.applyPull(await runtime.previewPull());
+    for (let index = 0; index < 60; index += 1)
+      await vault.remove("Wiki/pages/P" + index + ".md");
+    const controller = new AbortController();
+    await expect(
+      runtime.previewPush({
+        signal: controller.signal,
+        onProgress: (progress) => {
+          if (progress.phase === "merge" && progress.completed >= 50)
+            controller.abort();
+        },
+      }),
+    ).rejects.toThrow(/取消/);
   });
 });

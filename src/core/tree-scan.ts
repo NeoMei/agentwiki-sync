@@ -40,12 +40,16 @@ export async function scanLocalTree(
   base: TreeSnapshot,
   identities: TreeIdentityState,
   limits: TreeScanLimits,
+  onProgress?: (completed: number) => Promise<void>,
 ): Promise<LocalTreeScan> {
   const directories: string[] = [];
   const markdown = new Map<string, Uint8Array>();
+  let scanned = 0;
   for await (const entry of vault.listTree(rootPath)) {
     if (entry.relativePath === MANAGED_ROOT) continue;
     if (!entry.relativePath.startsWith(MANAGED_PREFIX)) continue;
+    scanned += 1;
+    if (scanned % 50 === 0) await onProgress?.(scanned);
     if (entry.kind === "directory") directories.push(entry.relativePath);
     else if (entry.kind === "markdown")
       markdown.set(entry.relativePath, entry.bytes ?? new Uint8Array());

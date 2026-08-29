@@ -607,6 +607,10 @@ export default class AgentWikiSyncPlugin extends Plugin {
       preview.conflictResolutions[conflict.conflictId] = {
         choice: "remote",
       };
+    for (const conflict of preview.folderConflicts)
+      preview.folderConflictResolutions[conflict.conflictId] = {
+        choice: "remote",
+      };
     for (const binding of preview.initialBindings)
       if (binding.resolution === null) binding.resolution = "remote";
     return () =>

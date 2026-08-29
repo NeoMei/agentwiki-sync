@@ -3,7 +3,12 @@ import {
   pathKey,
 } from "@neomei/agentwiki-sync-protocol";
 
-import { contentHash, sha256Hex } from "../agentwiki/protocol";
+import {
+  contentHash,
+  decimalWithinLimit,
+  revisionContentHash,
+  sha256Hex,
+} from "../agentwiki/protocol";
 import { decodeVaultMarkdown } from "../core/markdown";
 import type {
   FolderConflict,
@@ -21,6 +26,7 @@ import type {
   TreeSnapshot,
 } from "../core/tree-model";
 import type { ControlStorePort } from "../ports/control-store";
+import type { PushRemotePort } from "../ports/push-remote";
 import type { TreeRemotePort, TreeSyncLimits } from "../ports/tree-remote";
 import type { VaultPort } from "../ports/vault";
 import { BaselineRepository } from "../storage/baseline";
@@ -40,6 +46,8 @@ import {
   type TreePullPreview,
 } from "./tree-diff";
 import { TreeTransaction } from "./tree-transaction";
+import { PullTransaction } from "./pull-transaction";
+import { PushService } from "./push-service";
 import {
   TreePushService,
   type PreparedTreePushChange,
@@ -176,6 +184,7 @@ export class SyncRuntime {
     deviceKey = "local",
     spaceKey = safeKey(mapping.spaceId),
     private readonly credentialId: string | null = null,
+    private readonly legacyRemote: PushRemotePort | null = null,
   ) {
     this.root =
       ".agentwiki/devices/d-" +
@@ -267,7 +276,10 @@ export class SyncRuntime {
     return this.treeBaseline.readLegacyEvidence(this.legacyBaseline);
   }
 
-  private async scan(options?: SyncOperationOptions): Promise<LocalTreeScan> {
+  private async scan(
+    options?: SyncOperationOptions,
+    preBindPages?: TreePage[],
+  ): Promise<LocalTreeScan> {
     const epoch = this.scanEpoch;
     const status = await this.vault.rootStatus(this.mapping.rootPath);
     if (status === "missing") throw new Error("MAPPING_ROOT_MISSING");
@@ -288,6 +300,17 @@ export class SyncRuntime {
         contentHash: await contentHash(body),
       };
     }
+    if (preBindPages) {
+      const baseIds = new Set((base?.pages ?? []).map((page) => page.pageId));
+      for (const page of preBindPages) {
+        if (!baseIds.has(page.pageId) && !identities.pendingPages[page.pageId])
+          identities.pendingPages[page.pageId] = {
+            pageId: page.pageId,
+            path: page.path,
+            contentHash: page.contentHash,
+          };
+      }
+    }
     reportProgress(options, {
       phase: "scan",
       completed: 0,
@@ -304,6 +327,14 @@ export class SyncRuntime {
       base ?? emptySnapshot(this.remote.protocolVersion, this.mapping.spaceId),
       identities,
       limits,
+      async (completed) => {
+        await progressCheckpoint(options, {
+          phase: "scan",
+          completed,
+          total: undefined,
+          cancellable: true,
+        });
+      },
     );
     if (epoch !== this.scanEpoch) throw new Error("扫描纪元已变更");
     await this.identities.write(identities);
@@ -316,29 +347,31 @@ export class SyncRuntime {
   ): Promise<TreeSnapshot> {
     const folders: TreeFolder[] = [];
     const pages: TreePage[] = [];
-    let head: {
+    let pinned: {
       protocolVersion: "1" | "2";
       spaceId: string;
       revision: string;
       revisionContentHash: string;
+      folderCount: string;
+      pageCount: string;
     } | null = null;
+    const capabilities = await this.remote.capabilities();
     for await (const segment of this.remote.snapshotPages(revision)) {
-      if (head) {
-        if (
-          head.revision !== segment.revision ||
-          head.revisionContentHash !== segment.revisionContentHash ||
-          head.spaceId !== segment.spaceId
-        )
-          throw new Error("快照分页元数据已变更");
-      } else {
-        head = {
-          protocolVersion: segment.protocolVersion,
-          spaceId: segment.spaceId,
-          revision: segment.revision,
-          revisionContentHash: segment.revisionContentHash,
-        };
-      }
+      const current = {
+        protocolVersion: segment.protocolVersion,
+        spaceId: segment.spaceId,
+        revision: segment.revision,
+        revisionContentHash: segment.revisionContentHash,
+        folderCount: segment.folderCount,
+        pageCount: segment.pageCount,
+      };
+      if (pinned && JSON.stringify(pinned) !== JSON.stringify(current))
+        throw new Error("快照分页元数据已变更");
+      pinned = current;
       folders.push(...segment.folders);
+      for (const page of segment.pages)
+        if ((await contentHash(page.body)) !== page.contentHash)
+          throw new Error("快照页面内容哈希不匹配");
       pages.push(...segment.pages);
       await progressCheckpoint(options, {
         phase: "download",
@@ -347,25 +380,82 @@ export class SyncRuntime {
         cancellable: true,
       });
     }
-    if (!head) throw new Error("快照未返回元数据");
+    if (!pinned) throw new Error("快照未返回元数据");
+    if (revision !== "current" && pinned.revision !== revision)
+      throw new Error("快照修订不匹配");
+    decimalWithinLimit(pinned.pageCount, capabilities.maxClientSpacePages);
+    decimalWithinLimit(
+      pinned.folderCount,
+      capabilities.maxClientSpaceFolders ?? 10000,
+    );
+    if (
+      String(folders.length) !== pinned.folderCount ||
+      String(pages.length) !== pinned.pageCount
+    )
+      throw new Error("快照对象数量不匹配");
+    const contentHashValue =
+      pinned.protocolVersion === "2"
+        ? await treeRevisionContentHashV2({
+            protocolVersion: "2",
+            spaceId: pinned.spaceId,
+            folders,
+            pages,
+          })
+        : await revisionContentHash({
+            protocolVersion: "1",
+            spaceId: pinned.spaceId,
+            pages: pages.map((page) => ({
+              pageId: page.pageId,
+              path: page.path,
+              title: page.title,
+              contentHash: page.contentHash,
+            })),
+          });
+    if (contentHashValue !== pinned.revisionContentHash)
+      throw new Error("快照完整性不匹配");
     return {
-      protocolVersion: head.protocolVersion,
-      spaceId: head.spaceId,
-      revision: head.revision,
-      revisionContentHash: head.revisionContentHash,
+      protocolVersion: pinned.protocolVersion,
+      spaceId: pinned.spaceId,
+      revision: pinned.revision,
+      revisionContentHash: pinned.revisionContentHash,
       folders,
       pages,
     };
   }
 
   private async discardOrphanPreviews(): Promise<void> {
-    for (const dir of ["pull", "push"]) {
+    for (const dir of ["push-preview"]) {
       try {
         await this.control.removeTree?.(this.root + "/" + dir);
       } catch {
         // Best-effort: orphaned preview artifacts are inert.
       }
     }
+  }
+
+  private async readJournalSchemaVersion(path: string): Promise<number | null> {
+    for (const candidate of [path, path + ".prev", path + ".next"]) {
+      const raw = await this.control.read(candidate);
+      if (raw === null) continue;
+      let parsed: {
+        envelopeSchemaVersion?: unknown;
+        payload?: { schemaVersion?: unknown };
+      };
+      try {
+        parsed = JSON.parse(raw) as typeof parsed;
+      } catch {
+        throw new Error("控制存储已损坏");
+      }
+      if (
+        typeof parsed.envelopeSchemaVersion === "number" &&
+        parsed.envelopeSchemaVersion > 1
+      )
+        throw new Error("不支持的控制存储版本");
+      if (parsed.envelopeSchemaVersion !== 1) throw new Error("控制存储已损坏");
+      const version = parsed.payload?.schemaVersion;
+      if (typeof version === "number") return version;
+    }
+    return null;
   }
 
   private prefixAction(action: TreePullAction): TreePullAction {
@@ -423,6 +513,40 @@ export class SyncRuntime {
 
   async recover(): Promise<void> {
     await this.discardOrphanPreviews();
+    const pullVersion = await this.readJournalSchemaVersion(
+      this.root + "/pull/journal.json",
+    );
+    if (pullVersion === 1) await this.recoverLegacyPull();
+    else if (pullVersion === 2) await this.recoverTreePull();
+    else if (pullVersion !== null) throw new Error("不支持的拉取日志版本");
+
+    const pushVersion = await this.readJournalSchemaVersion(
+      this.root + "/push/journal.json",
+    );
+    if (pushVersion === 1) await this.recoverLegacyPush();
+    else if (pushVersion === 2) await this.recoverTreePush();
+    else if (pushVersion !== null) throw new Error("不支持的推送日志版本");
+  }
+
+  private async recoverLegacyPull(): Promise<void> {
+    const pullTx = new PullTransaction(
+      this.vault,
+      this.control,
+      this.root + "/pull",
+    );
+    const pull = await pullTx.inspect();
+    let committedTransactionId: string | null =
+      pull?.state === "committed" ? pull.transactionId : null;
+    if (pull && !committedTransactionId) {
+      await pullTx.recover();
+      const recovered = await pullTx.inspect();
+      committedTransactionId =
+        recovered?.state === "committed" ? recovered.transactionId : null;
+    }
+    await this.legacyBaseline.recover(committedTransactionId);
+  }
+
+  private async recoverTreePull(): Promise<void> {
     const treeTx = new TreeTransaction(
       this.vault,
       this.control,
@@ -438,41 +562,73 @@ export class SyncRuntime {
         recovered?.state === "committed" ? recovered.transactionId : null;
     }
     await this.treeBaseline.recover(committedTransactionId);
+  }
 
+  private async recoverLegacyPush(): Promise<void> {
+    if (!this.legacyRemote) throw new Error("缺少旧版推送恢复所需的连接");
+    const pushService = new PushService(
+      this.legacyRemote,
+      this.control,
+      this.root + "/push",
+    );
+    const push = await pushService.inspect();
+    if (!push || push.localCommitPhase === "verified") return;
+    const credentialRotated =
+      this.credentialId !== null &&
+      push.credentialIdAtCreation !== null &&
+      this.credentialId !== push.credentialIdAtCreation;
+    if (
+      credentialRotated &&
+      push.remoteState !== "published" &&
+      push.remoteState !== "superseded"
+    ) {
+      await pushService.supersede();
+      return;
+    }
+    if (push.remoteState === "superseded") return;
+    const result =
+      push.remoteState === "published" && push.result
+        ? push.result
+        : await pushService.resume();
+    if (!result) throw new Error("PUSH_RECOVERY_REQUIRED");
+    await pushService.markVerified();
+  }
+
+  private async recoverTreePush(): Promise<void> {
     const pushService = new TreePushService(
       this.remote,
       this.control,
       this.root + "/push",
     );
     const push = await pushService.inspect();
-    if (push && push.localCommitPhase !== "verified") {
-      const credentialRotated =
-        this.credentialId !== null &&
-        push.credentialIdAtCreation !== null &&
-        this.credentialId !== push.credentialIdAtCreation;
-      if (
-        credentialRotated &&
-        push.remoteState !== "published" &&
-        push.remoteState !== "superseded"
-      ) {
-        await pushService.supersede();
-      } else if (push.remoteState !== "superseded") {
-        const result =
-          push.remoteState === "published" && push.result
-            ? push.result
-            : await pushService.resume();
-        if (!result) throw new Error("PUSH_RECOVERY_REQUIRED");
-        const base = await this.readBaseSnapshot();
-        if (!base || base.revision !== result.revision) {
-          await this.commitBaseline(
-            await this.downloadRemoteSnapshot(result.revision),
-            "push",
-          );
-        }
-        await this.clearIdentities();
-        await pushService.markVerified();
-      }
+    if (!push || push.localCommitPhase === "verified") return;
+    const credentialRotated =
+      this.credentialId !== null &&
+      push.credentialIdAtCreation !== null &&
+      this.credentialId !== push.credentialIdAtCreation;
+    if (
+      credentialRotated &&
+      push.remoteState !== "published" &&
+      push.remoteState !== "superseded"
+    ) {
+      await pushService.supersede();
+      return;
     }
+    if (push.remoteState === "superseded") return;
+    const result =
+      push.remoteState === "published" && push.result
+        ? push.result
+        : await pushService.resume();
+    if (!result) throw new Error("PUSH_RECOVERY_REQUIRED");
+    const base = await this.readBaseSnapshot();
+    if (!base || base.revision !== result.revision) {
+      await this.commitBaseline(
+        await this.downloadRemoteSnapshot(result.revision),
+        "push",
+      );
+    }
+    await this.clearIdentities();
+    await pushService.markVerified();
   }
 
   async status(options?: SyncOperationOptions): Promise<RuntimeStatus> {
@@ -542,7 +698,7 @@ export class SyncRuntime {
     const base = await this.readBaseSnapshot();
     const head = await this.remote.head();
     const remote = await this.downloadRemoteSnapshot(head.revision, options);
-    const local = await this.scan(options);
+    const local = await this.scan(options, base ? undefined : remote.pages);
     const tree = await buildTreePullPreview(
       base ?? emptySnapshot(remote.protocolVersion, remote.spaceId),
       local,
@@ -623,7 +779,11 @@ export class SyncRuntime {
     );
     await tx.apply();
     await this.treeBaseline.commit();
-    await this.commitIdentities(preview.resolvedFolders);
+    await this.commitIdentities(
+      preview.resolvedFolders,
+      preview.resolvedPages,
+      preview.remote.pages,
+    );
     await this.moveHints.clear();
     await this.discardPullPreview(preview);
     this.mapping.status = "active";
@@ -702,6 +862,14 @@ export class SyncRuntime {
           folderId: folder.folderId,
           previousPath: folder.path,
         });
+      prepared += 1;
+      if (prepared % 50 === 0)
+        await progressCheckpoint(options, {
+          phase: "merge",
+          completed: prepared,
+          total,
+          cancellable: true,
+        });
     }
     for (const page of local.pages) {
       const before = basePages.get(page.pageId);
@@ -746,6 +914,14 @@ export class SyncRuntime {
           pageId: page.pageId,
           previousPath: page.path,
         });
+      prepared += 1;
+      if (prepared % 50 === 0)
+        await progressCheckpoint(options, {
+          phase: "merge",
+          completed: prepared,
+          total,
+          cancellable: true,
+        });
     }
     return changes;
   }
@@ -789,7 +965,24 @@ export class SyncRuntime {
     await this.treeBaseline.commit();
   }
 
-  private async commitIdentities(folders: TreeFolder[]): Promise<void> {
+  private async commitIdentities(
+    folders: TreeFolder[],
+    resolvedPages: TreePage[],
+    remotePages: TreePage[],
+  ): Promise<void> {
+    const remoteIds = new Set(remotePages.map((page) => page.pageId));
+    const pendingPages = Object.fromEntries(
+      resolvedPages
+        .filter((page) => !remoteIds.has(page.pageId))
+        .map((page) => [
+          page.pageId,
+          {
+            pageId: page.pageId,
+            path: page.path,
+            contentHash: page.contentHash,
+          },
+        ]),
+    );
     await this.identities.write({
       schemaVersion: 1,
       folders: Object.fromEntries(
@@ -803,7 +996,7 @@ export class SyncRuntime {
         ]),
       ),
       pendingFolders: {},
-      pendingPages: {},
+      pendingPages,
     });
   }
 

@@ -240,6 +240,7 @@ function bodyPathFor(pageId: string): string {
 
 function computeActions(
   base: TreeSnapshot,
+  local: LocalTreeScan,
   resolved: ResolvedTree,
   folderConflicts: FolderConflict[],
   pageConflicts: StructuredConflict[],
@@ -248,6 +249,7 @@ function computeActions(
 
   const conflictedFolders = new Set(folderConflicts.map((c) => c.folderId));
   const baseFolders = new Map(base.folders.map((f) => [f.folderId, f]));
+  const localFolders = new Map(local.folders.map((f) => [f.folderId, f]));
   const resolvedFolders = new Map(resolved.folders.map((f) => [f.folderId, f]));
 
   const resolvedFolderPath = (folderId: string | null): string | null => {
@@ -259,7 +261,8 @@ function computeActions(
 
   for (const folder of resolved.folders) {
     if (conflictedFolders.has(folder.folderId)) continue;
-    const before = baseFolders.get(folder.folderId);
+    const before =
+      baseFolders.get(folder.folderId) ?? localFolders.get(folder.folderId);
     if (!before)
       actions.push({
         kind: "create_directory",
@@ -298,11 +301,12 @@ function computeActions(
 
   const conflictedPages = new Set(pageConflicts.map((c) => c.pageId));
   const basePages = new Map(base.pages.map((p) => [p.pageId, p]));
+  const localPages = new Map(local.pages.map((p) => [p.pageId, p]));
   const resolvedPages = new Map(resolved.pages.map((p) => [p.pageId, p]));
 
   for (const page of resolved.pages) {
     if (conflictedPages.has(page.pageId)) continue;
-    const before = basePages.get(page.pageId);
+    const before = basePages.get(page.pageId) ?? localPages.get(page.pageId);
     if (!before)
       actions.push({
         kind: "create_page",
@@ -383,6 +387,7 @@ function computePreview(
   );
   const actions = computeActions(
     base,
+    local,
     resolved,
     folderConflicts,
     pageConflicts,
