@@ -240,6 +240,13 @@ function computeActions(
   const baseFolders = new Map(base.folders.map((f) => [f.folderId, f]));
   const resolvedFolders = new Map(resolved.folders.map((f) => [f.folderId, f]));
 
+  const resolvedFolderPath = (folderId: string | null): string | null => {
+    if (folderId === null) return null;
+    return resolvedFolders.get(folderId)?.path ?? null;
+  };
+
+  const filenameOf = (path: string): string => path.split("/").at(-1) ?? "";
+
   for (const folder of resolved.folders) {
     if (conflictedFolders.has(folder.folderId)) continue;
     const before = baseFolders.get(folder.folderId);
@@ -249,13 +256,25 @@ function computeActions(
         folderId: folder.folderId,
         path: folder.path,
       });
-    else if (pathKey(before.path) !== pathKey(folder.path))
+    else if (
+      before.parentFolderId !== folder.parentFolderId ||
+      before.name !== folder.name
+    ) {
+      const parentPath = resolvedFolderPath(before.parentFolderId);
+      const fromPath =
+        before.parentFolderId === null || parentPath === null
+          ? before.path
+          : `${parentPath}/${before.name}`;
       actions.push({
         kind: "move_directory",
         folderId: folder.folderId,
-        fromPath: before.path,
+        fromPath,
         path: folder.path,
+        ...(pathKey(fromPath) === pathKey(before.path)
+          ? {}
+          : { beforePath: before.path }),
       });
+    }
   }
   for (const before of base.folders) {
     if (conflictedFolders.has(before.folderId)) continue;
@@ -281,21 +300,39 @@ function computeActions(
         path: page.path,
         bodyPath: bodyPathFor(page.pageId),
       });
-    else if (pathKey(before.path) !== pathKey(page.path))
-      actions.push({
-        kind: "move_page",
-        pageId: page.pageId,
-        fromPath: before.path,
-        path: page.path,
-        bodyPath: bodyPathFor(page.pageId),
-      });
-    else if (before.contentHash !== page.contentHash)
-      actions.push({
-        kind: "write_page",
-        pageId: page.pageId,
-        path: page.path,
-        bodyPath: bodyPathFor(page.pageId),
-      });
+    else {
+      const beforeFilename = filenameOf(before.path);
+      const locationChanged =
+        before.folderId !== page.folderId ||
+        beforeFilename !== filenameOf(page.path);
+      if (locationChanged) {
+        const parentPath = resolvedFolderPath(before.folderId);
+        const fromPath =
+          before.folderId === null || parentPath === null
+            ? before.path
+            : `${parentPath}/${beforeFilename}`;
+        actions.push({
+          kind: "move_page",
+          pageId: page.pageId,
+          fromPath,
+          path: page.path,
+          bodyPath: bodyPathFor(page.pageId),
+          ...(pathKey(fromPath) === pathKey(before.path)
+            ? {}
+            : { beforePath: before.path }),
+        });
+      } else if (before.contentHash !== page.contentHash) {
+        actions.push({
+          kind: "write_page",
+          pageId: page.pageId,
+          path: page.path,
+          bodyPath: bodyPathFor(page.pageId),
+          ...(pathKey(before.path) === pathKey(page.path)
+            ? {}
+            : { beforePath: before.path }),
+        });
+      }
+    }
   }
   for (const before of base.pages) {
     if (conflictedPages.has(before.pageId)) continue;

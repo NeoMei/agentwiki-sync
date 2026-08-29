@@ -144,6 +144,22 @@ function isPageUpsert(
   );
 }
 
+function beforeSourcePath(action: TreePullAction, journalPath: string): string {
+  if (
+    action.kind === "move_page" &&
+    action.beforePath &&
+    journalPath === action.fromPath
+  )
+    return action.beforePath;
+  if (
+    action.kind === "write_page" &&
+    action.beforePath &&
+    journalPath === action.path
+  )
+    return action.beforePath;
+  return journalPath;
+}
+
 function isInsideSubtree(path: string, root: string): boolean {
   const key = pathKey(path);
   const rootKey = pathKey(root);
@@ -190,12 +206,20 @@ export class TreeTransaction {
     )
       throw new Error("存在未终结的事务，请先执行恢复（recover）");
 
-    const evacuatedRoots = input.actions
-      .filter(
-        (action) =>
-          action.kind === "move_page" || action.kind === "move_directory",
-      )
-      .map((action) => action.fromPath);
+    const ownedRoots = input.actions.flatMap((action) => {
+      switch (action.kind) {
+        case "trash_page":
+        case "trash_directory":
+          return [action.path];
+        case "move_page":
+        case "move_directory":
+          return [action.beforePath ?? action.fromPath];
+        case "create_page":
+        case "write_page":
+        case "create_directory":
+          return [];
+      }
+    });
 
     const operations: JournalOperation[] = [];
     for (let index = 0; index < input.actions.length; index += 1) {
@@ -203,7 +227,7 @@ export class TreeTransaction {
         await this.materializeOperation(
           index,
           input.actions[index]!,
-          evacuatedRoots,
+          ownedRoots,
         ),
       );
     }
@@ -318,7 +342,7 @@ export class TreeTransaction {
   private async materializeOperation(
     index: number,
     action: TreePullAction,
-    evacuatedRoots: string[],
+    ownedRoots: string[],
   ): Promise<JournalOperation> {
     let paths: OperationPath[];
     switch (action.kind) {
@@ -332,10 +356,14 @@ export class TreeTransaction {
         ];
         break;
       case "trash_directory":
-        paths = await this.directoryTrashPaths(action.path, evacuatedRoots);
+        paths = await this.directoryTrashPaths(action.path, ownedRoots);
         break;
       case "move_directory":
-        paths = await this.directoryMovePaths(action.fromPath, action.path);
+        paths = await this.directoryMovePaths(
+          action.fromPath,
+          action.path,
+          ownedRoots,
+        );
         break;
       case "create_page":
         paths = [
@@ -350,7 +378,7 @@ export class TreeTransaction {
         paths = [
           {
             path: action.path,
-            before: await this.readPathState(action.path),
+            before: await this.readPathState(action.beforePath ?? action.path),
             after: { kind: "file", hash: await this.resultHash(action) },
           },
         ];
@@ -359,7 +387,9 @@ export class TreeTransaction {
         paths = [
           {
             path: action.fromPath,
-            before: await this.readPathState(action.fromPath),
+            before: await this.readPathState(
+              action.beforePath ?? action.fromPath,
+            ),
             after: { kind: "missing", hash: null },
           },
           {
@@ -383,7 +413,7 @@ export class TreeTransaction {
     for (let pathIndex = 0; pathIndex < paths.length; pathIndex += 1) {
       const item = paths[pathIndex]!;
       if (item.before.kind === "file") {
-        const bytes = await this.fileBytes(item.path);
+        const bytes = await this.fileBytes(beforeSourcePath(action, item.path));
         if ((await sha256Hex(bytes)) !== item.before.hash)
           throw new Error("前置快照读取失败");
         await this.control.write(
@@ -421,7 +451,11 @@ export class TreeTransaction {
   private async directoryMovePaths(
     fromPath: string,
     toPath: string,
+    ownedRoots: string[],
   ): Promise<OperationPath[]> {
+    const others = ownedRoots.filter(
+      (root) => pathKey(root) !== pathKey(fromPath),
+    );
     const paths: OperationPath[] = [
       {
         path: fromPath,
@@ -436,6 +470,7 @@ export class TreeTransaction {
     ];
     for await (const entry of this.vault.listTree(fromPath)) {
       const source = `${fromPath}/${entry.relativePath}`;
+      if (others.some((root) => isInsideSubtree(source, root))) continue;
       const target = `${toPath}/${entry.relativePath}`;
       if (entry.kind === "directory") {
         paths.push({
@@ -468,8 +503,9 @@ export class TreeTransaction {
 
   private async directoryTrashPaths(
     path: string,
-    evacuatedRoots: string[],
+    ownedRoots: string[],
   ): Promise<OperationPath[]> {
+    const others = ownedRoots.filter((root) => pathKey(root) !== pathKey(path));
     const paths: OperationPath[] = [
       {
         path,
@@ -479,7 +515,7 @@ export class TreeTransaction {
     ];
     for await (const entry of this.vault.listTree(path)) {
       const child = `${path}/${entry.relativePath}`;
-      if (evacuatedRoots.some((root) => isInsideSubtree(child, root))) continue;
+      if (others.some((root) => isInsideSubtree(child, root))) continue;
       if (entry.kind === "directory") {
         paths.push({
           path: child,

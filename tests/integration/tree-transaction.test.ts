@@ -1,10 +1,71 @@
 import { describe, expect, it } from "vitest";
 
+import { contentHash } from "../../src/agentwiki/protocol";
+import { buildTreePullPreview } from "../../src/application/tree-diff";
 import { TreeTransaction } from "../../src/application/tree-transaction";
 import { sortTreePullActions } from "../../src/application/tree-preview";
 import type { TreePullAction } from "../../src/core/merge";
+import type {
+  TreeFolder,
+  TreePage,
+  TreeSnapshot,
+} from "../../src/core/tree-model";
+import type { LocalTreeScan } from "../../src/core/tree-scan";
 import { MemoryControlStore } from "../fakes/memory-control-store";
 import { MemoryVault } from "../fakes/memory-vault";
+
+function folder(
+  folderId: string,
+  parentFolderId: string | null,
+  path: string,
+): TreeFolder {
+  return {
+    folderId,
+    parentFolderId,
+    name: path.split("/").at(-1) ?? "Folder",
+    path,
+    sortOrder: 0,
+    updatedAt: "2026-08-29T00:00:00Z",
+  };
+}
+
+async function treePage(
+  pageId: string,
+  folderId: string | null,
+  path: string,
+  body: string,
+): Promise<TreePage> {
+  return {
+    pageId,
+    folderId,
+    path,
+    title: path.split("/").at(-1)?.replace(/\.md$/, "") ?? "Page",
+    body,
+    contentHash: await contentHash(body),
+    updatedAt: "2026-08-29T00:00:00Z",
+  };
+}
+
+function snapshot(overrides: Partial<TreeSnapshot> = {}): TreeSnapshot {
+  return {
+    protocolVersion: "2",
+    spaceId: "space-1",
+    revision: "rev-1",
+    revisionContentHash: "0".repeat(64),
+    folders: [],
+    pages: [],
+    ...overrides,
+  };
+}
+
+function localScan(folders: TreeFolder[], pages: TreePage[]): LocalTreeScan {
+  return { rootPath: "Wiki", folders, pages };
+}
+
+function seedBodies(control: MemoryControlStore, pages: TreePage[]): void {
+  for (const page of pages)
+    control.files.set(`tree-preview-body/${page.pageId}.md`, page.body);
+}
 
 function folderPlan(): TreePullAction[] {
   return [
@@ -340,5 +401,110 @@ describe("TreeTransaction", () => {
     expect(vault.folders.has("pages/Doomed")).toBe(true);
     expect(vault.folders.has("pages/Doomed/Sub")).toBe(true);
     expect(vault.folders.has("pages/A")).toBe(false);
+  });
+
+  it("applies and commits a standard directory delete with pages", async () => {
+    const base = snapshot({
+      folders: [folder("d", null, "pages/D")],
+      pages: [
+        await treePage("p1", "d", "pages/D/P1.md", "p1"),
+        await treePage("p2", "d", "pages/D/P2.md", "p2"),
+      ],
+    });
+    const preview = await buildTreePullPreview(
+      base,
+      localScan(base.folders, base.pages),
+      snapshot(),
+    );
+
+    const vault = new MemoryVault({
+      "pages/D/P1.md": "p1",
+      "pages/D/P2.md": "p2",
+    });
+    const control = new MemoryControlStore();
+    const tx = new TreeTransaction(vault, control, ".agentwiki/tx/delete-dir");
+    await tx.prepare({
+      baseRevision: "base",
+      targetRevision: "target",
+      targetTreeHash: "0".repeat(64),
+      actions: preview.actions,
+    });
+    await tx.apply();
+
+    expect(vault.folders.has("pages/D")).toBe(false);
+    expect(vault.exists("pages/D/P1.md")).toBe(false);
+    expect(vault.exists("pages/D/P2.md")).toBe(false);
+    expect((await tx.inspect())?.state).toBe("committed");
+  });
+
+  it("applies a page move and content change under a moved directory", async () => {
+    const base = snapshot({
+      folders: [folder("d", null, "pages/D")],
+      pages: [await treePage("p", "d", "pages/D/P.md", "old")],
+    });
+    const remote = snapshot({
+      folders: [folder("d", null, "pages/E")],
+      pages: [await treePage("p", "d", "pages/E/Q.md", "new")],
+    });
+    const preview = await buildTreePullPreview(
+      base,
+      localScan(base.folders, base.pages),
+      remote,
+    );
+
+    const vault = new MemoryVault({ "pages/D/P.md": "old" });
+    const control = new MemoryControlStore();
+    seedBodies(control, preview.resolvedPages);
+    const tx = new TreeTransaction(vault, control, ".agentwiki/tx/nested-move");
+    await tx.prepare({
+      baseRevision: "base",
+      targetRevision: "target",
+      targetTreeHash: "0".repeat(64),
+      actions: preview.actions,
+    });
+    await tx.apply();
+
+    expect(vault.text("pages/E/Q.md")).toBe("new");
+    expect(vault.exists("pages/E/P.md")).toBe(false);
+    expect(vault.exists("pages/D/P.md")).toBe(false);
+    expect(vault.folders.has("pages/D")).toBe(false);
+    expect((await tx.inspect())?.state).toBe("committed");
+  });
+
+  it("applies a moved directory containing a trashed subdirectory", async () => {
+    const base = snapshot({
+      folders: [folder("d", null, "pages/D"), folder("s", "d", "pages/D/S")],
+      pages: [await treePage("p", "s", "pages/D/S/P.md", "p")],
+    });
+    const remote = snapshot({
+      folders: [folder("d", null, "pages/E")],
+      pages: [],
+    });
+    const preview = await buildTreePullPreview(
+      base,
+      localScan(base.folders, base.pages),
+      remote,
+    );
+
+    const vault = new MemoryVault({ "pages/D/S/P.md": "p" });
+    const control = new MemoryControlStore();
+    const tx = new TreeTransaction(
+      vault,
+      control,
+      ".agentwiki/tx/moved-with-trash",
+    );
+    await tx.prepare({
+      baseRevision: "base",
+      targetRevision: "target",
+      targetTreeHash: "0".repeat(64),
+      actions: preview.actions,
+    });
+    await tx.apply();
+
+    expect(vault.folders.has("pages/E")).toBe(true);
+    expect(vault.folders.has("pages/D")).toBe(false);
+    expect(vault.folders.has("pages/E/S")).toBe(false);
+    expect(vault.exists("pages/D/S/P.md")).toBe(false);
+    expect((await tx.inspect())?.state).toBe("committed");
   });
 });

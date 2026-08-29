@@ -128,13 +128,26 @@ export interface FolderConflictResolution {
 /** The pull-side operation surface consumed by the tree transaction layer. */
 export type TreePullAction =
   | { kind: "create_directory"; folderId: string; path: string }
-  | { kind: "move_directory"; folderId: string; fromPath: string; path: string }
+  | {
+      kind: "move_directory";
+      folderId: string;
+      fromPath: string;
+      path: string;
+      beforePath?: string;
+    }
   | { kind: "trash_directory"; folderId: string; path: string }
   | {
-      kind: "create_page" | "write_page";
+      kind: "create_page";
       pageId: string;
       path: string;
       bodyPath: string;
+    }
+  | {
+      kind: "write_page";
+      pageId: string;
+      path: string;
+      bodyPath: string;
+      beforePath?: string;
     }
   | {
       kind: "move_page";
@@ -142,6 +155,7 @@ export type TreePullAction =
       fromPath: string;
       path: string;
       bodyPath: string;
+      beforePath?: string;
     }
   | { kind: "trash_page"; pageId: string; path: string };
 

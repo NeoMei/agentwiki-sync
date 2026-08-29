@@ -43,7 +43,9 @@ function page(
     path,
     title: name.slice(0, name.lastIndexOf(".")),
     body: "",
-    contentHash: "0".repeat(64),
+    // SHA-256 of the empty body, matching contentHash("").
+    contentHash:
+      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     updatedAt: "2026-08-29T00:00:00Z",
     ...overrides,
   };
@@ -276,10 +278,10 @@ describe("buildTreePullPreview", () => {
 
     expect(preview.actions).toContainEqual(
       expect.objectContaining({
-        kind: "move_page",
+        kind: "write_page",
         pageId: "p1",
-        fromPath: "pages/A/P.md",
         path: "pages/B/P.md",
+        beforePath: "pages/A/P.md",
       }),
     );
   });
@@ -544,19 +546,11 @@ describe("fix round 1 regressions", () => {
         path: "pages/B",
       }),
     );
-    expect(preview.actions).toContainEqual(
-      expect.objectContaining({
-        kind: "move_directory",
-        folderId: "c",
-        path: "pages/B/C",
-      }),
+    expect(preview.actions).not.toContainEqual(
+      expect.objectContaining({ kind: "move_directory", folderId: "c" }),
     );
-    expect(preview.actions).toContainEqual(
-      expect.objectContaining({
-        kind: "move_page",
-        pageId: "p",
-        path: "pages/B/C/P.md",
-      }),
+    expect(preview.actions).not.toContainEqual(
+      expect.objectContaining({ kind: "move_page", pageId: "p" }),
     );
     expect(pendingTreeDecisionCount(preview)).toBe(0);
   });
