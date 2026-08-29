@@ -126,6 +126,10 @@ export class V1TreeRemote implements TreeRemotePort {
     return toTreeLimits(this.capabilitiesValue);
   }
 
+  async refreshCapabilities(): Promise<TreeSyncLimits> {
+    return toTreeLimits(this.capabilitiesValue);
+  }
+
   async spaces(): Promise<TreeSpaceSummary[]> {
     const value = await this.client.spaces();
     return value.spaces.map((space) => ({ ...space, folderCount: "0" }));

@@ -120,6 +120,7 @@ export interface TreeRemotePort {
   readonly protocolVersion: "1" | "2";
   readonly capabilitiesHash: Promise<string>;
   capabilities(): Promise<TreeSyncLimits>;
+  refreshCapabilities(): Promise<TreeSyncLimits>;
   spaces(): Promise<TreeSpaceSummary[]>;
   head(): Promise<TreeHead>;
   snapshotPages(revision?: string): AsyncIterable<TreeSnapshotSegment>;

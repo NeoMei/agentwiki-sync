@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { AgentWikiHttpError } from "../../src/agentwiki/client";
 import { capabilitiesHash } from "../../src/agentwiki/protocol";
 import type { SyncCapabilities } from "../../src/agentwiki/protocol";
 import { PushService } from "../../src/application/push-service";
@@ -67,16 +68,28 @@ class FakeTreeRemote implements TreeRemotePort {
   abortCalls = 0;
   revision = "r1";
   readonly batches: TreePushBatch[] = [];
-  private caps: TreeSyncLimits = { ...v2Capabilities };
+  private serverCaps: TreeSyncLimits = { ...v2Capabilities };
+  private clientCaps: TreeSyncLimits = { ...v2Capabilities };
+  private clientHash: Promise<string>;
   private readonly receivedOps: string[] = [];
   private readonly sessions = new Map<string, TreePushSession>();
 
+  constructor() {
+    this.clientHash = capabilitiesHash(this.clientCaps);
+  }
+
   get capabilitiesHash(): Promise<string> {
-    return capabilitiesHash(this.caps);
+    return this.clientHash;
   }
 
   async capabilities(): Promise<TreeSyncLimits> {
-    return { ...this.caps };
+    return { ...this.clientCaps };
+  }
+
+  async refreshCapabilities(): Promise<TreeSyncLimits> {
+    this.clientCaps = { ...this.serverCaps };
+    this.clientHash = capabilitiesHash(this.clientCaps);
+    return { ...this.clientCaps };
   }
 
   async spaces(): Promise<TreeSpaceSummary[]> {
@@ -112,7 +125,17 @@ class FakeTreeRemote implements TreeRemotePort {
     this.createCount += 1;
     if (this.changeCapabilitiesOnCreate > 0) {
       this.changeCapabilitiesOnCreate -= 1;
-      this.caps = { ...this.caps, maxBatchItems: this.caps.maxBatchItems + 1 };
+      this.serverCaps = {
+        ...this.serverCaps,
+        maxBatchItems: this.serverCaps.maxBatchItems + 1,
+      };
+      throw new AgentWikiHttpError(409, {
+        error: {
+          code: "CAPABILITIES_CHANGED",
+          message: "capabilities changed",
+          retryable: true,
+        },
+      });
     }
     const session: TreePushSession = {
       sessionId: `session-${this.createCount}`,
@@ -228,6 +251,7 @@ function upsertFolder(
 
 async function prepared(
   changes: PreparedTreePushChange[],
+  capabilities: TreeSyncLimits = v2Capabilities,
 ): Promise<TreePushPreview> {
   for (const change of changes)
     if (change.operation === "upsert_page")
@@ -236,7 +260,7 @@ async function prepared(
     spaceId: "space",
     baseRevision: "r1",
     changes,
-    capabilities: v2Capabilities,
+    capabilities,
   };
 }
 
@@ -268,6 +292,33 @@ describe("TreePushService", () => {
       /CAPABILITIES_CHANGED/,
     );
     expect(remote.createCount).toBe(2);
+  });
+
+  it("rebuilds once after a single CAPABILITIES_CHANGED and publishes", async () => {
+    const remote = new FakeTreeRemote();
+    remote.changeCapabilitiesOnCreate = 1;
+    store = new MemoryControlStore();
+    const service = new TreePushService(remote, store, ".agentwiki/tree/p2b");
+    const result = await service.publishPrepared(
+      await prepared([upsertPage("p1", null, "pages/A.md")]),
+    );
+    expect(remote.createCount).toBe(2);
+    expect(result.status).toBe("published");
+    expect(remote.receivedOperations()).toEqual(["upsert_page"]);
+  });
+
+  it("rejects stale caller capabilities that do not match the remote", async () => {
+    const remote = new FakeTreeRemote();
+    store = new MemoryControlStore();
+    const service = new TreePushService(remote, store, ".agentwiki/tree/stale");
+    await expect(
+      service.publishPrepared(
+        await prepared([upsertPage("p1", null, "pages/A.md")], {
+          ...v2Capabilities,
+          maxBatchItems: 1,
+        }),
+      ),
+    ).rejects.toThrow(/能力集与服务器不一致/);
   });
 
   it("keeps page bodies in sidecars instead of the JSON journal", async () => {

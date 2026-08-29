@@ -476,6 +476,23 @@ describe("V2TreeRemote", () => {
       new V2TreeRemote(client(http), "space", v2Selection()).delta("r0"),
     ).rejects.toThrow(/增量条目数量超过限制/);
   });
+
+  it("refreshes v2 capabilities with a live fetch and hash check", async () => {
+    const http = new FakeHttp();
+    const fresh = { ...v2Capabilities, maxBatchItems: 25 };
+    http.responses.push({
+      status: 200,
+      json: {
+        protocolVersion: "2",
+        capabilities: fresh,
+        capabilitiesHash: await capabilitiesHash(fresh),
+      },
+    });
+    const remote = new V2TreeRemote(client(http), "space", v2Selection());
+    const limits = await remote.refreshCapabilities();
+    expect(limits.maxBatchItems).toBe(25);
+    expect(http.calls[0]?.path).toBe("/api/sync/v2/capabilities");
+  });
 });
 
 describe("FakeAgentWiki v2 capability", () => {

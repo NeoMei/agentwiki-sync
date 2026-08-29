@@ -6,7 +6,12 @@ import {
   type TreePushManifestChangeV2,
 } from "@neomei/agentwiki-sync-protocol";
 
-import { canonicalBytes, contentHash } from "../agentwiki/protocol";
+import {
+  capabilitiesHash,
+  canonicalBytes,
+  contentHash,
+} from "../agentwiki/protocol";
+import { AgentWikiHttpError } from "../agentwiki/client";
 import { opaqueFileKey } from "../core/identity-key";
 import type { TreeFolder, TreePage, TreePushChange } from "../core/tree-model";
 import type { ControlStorePort } from "../ports/control-store";
@@ -306,28 +311,31 @@ export class TreePushService {
   private async createWithRebuild(
     journal: TreePushJournal,
   ): Promise<TreePushSession> {
-    const created = await this.remote.createPushSession(
-      this.createInput(journal),
-    );
-    if ((await this.remote.capabilitiesHash) === journal.capabilitiesHash)
-      return created;
-    if (created.sessionId && this.remote.abort)
+    return this.createSession(journal, true);
+  }
+
+  private async createSession(
+    journal: TreePushJournal,
+    allowRebuild: boolean,
+  ): Promise<TreePushSession> {
+    try {
+      return await this.remote.createPushSession(this.createInput(journal));
+    } catch (error) {
+      if (!allowRebuild || syncErrorCode(error) !== "CAPABILITIES_CHANGED")
+        throw error;
+      journal.capabilities = await this.remote.refreshCapabilities();
+      journal.capabilitiesHash = await capabilitiesHash(journal.capabilities);
+      journal.sessionId = null;
+      journal.remoteState = "not_created";
+      await this.save(journal);
       try {
-        await this.remote.abort(created.sessionId);
-      } catch {
-        // 被替换的会话由服务端过期清理；这里只尽力回收。
+        return await this.remote.createPushSession(this.createInput(journal));
+      } catch (retryError) {
+        if (syncErrorCode(retryError) === "CAPABILITIES_CHANGED")
+          throw new Error("CAPABILITIES_CHANGED");
+        throw retryError;
       }
-    journal.capabilities = await this.remote.capabilities();
-    journal.capabilitiesHash = await this.remote.capabilitiesHash;
-    journal.sessionId = null;
-    journal.remoteState = "not_created";
-    await this.save(journal);
-    const retry = await this.remote.createPushSession(
-      this.createInput(journal),
-    );
-    if ((await this.remote.capabilitiesHash) !== journal.capabilitiesHash)
-      throw new Error("CAPABILITIES_CHANGED");
-    return retry;
+    }
   }
 
   private async uploadBatches(
@@ -372,6 +380,10 @@ export class TreePushService {
   ): Promise<TreeFinalizeResult> {
     if ((await this.remote.head()).revision !== input.baseRevision)
       throw new Error("BASE_STALE");
+    const capabilities = input.capabilities;
+    const capabilitiesHashValue = await capabilitiesHash(capabilities);
+    if (capabilitiesHashValue !== (await this.remote.capabilitiesHash))
+      throw new Error("能力集与服务器不一致");
 
     const staged: PreparedTreePushChange[] = [];
     let totalBodyBytes = 0;
@@ -415,8 +427,8 @@ export class TreePushService {
         baseRevision: input.baseRevision,
         changes: staged.map(toManifestChange),
       }),
-      capabilitiesHash: await this.remote.capabilitiesHash,
-      capabilities: input.capabilities,
+      capabilitiesHash: capabilitiesHashValue,
+      capabilities,
       changes: staged,
       totalBodyBytes,
       sessionId: null,
@@ -545,4 +557,12 @@ function readJournalSchemaVersion(raw: string | null): number | null {
   } catch {
     return null;
   }
+}
+
+function syncErrorCode(error: unknown): string | null {
+  if (!(error instanceof AgentWikiHttpError)) return null;
+  const body = error.body;
+  if (typeof body !== "object" || body === null) return null;
+  const code = (body as { error?: { code?: unknown } }).error?.code;
+  return typeof code === "string" ? code : null;
 }

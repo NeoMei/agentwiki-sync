@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   TREE_SYNC_V2_LIMITS,
+  TreeCapabilitiesResponseV2Schema,
   CreateTreePushSessionRequestV2Schema,
   CreateTreePushSessionResponseV2Schema,
   TreeDeltaPageV2Schema,
@@ -29,7 +30,11 @@ import type {
   TreeSyncLimits,
 } from "../ports/tree-remote";
 import type { AgentWikiClient } from "./client";
-import { DecimalByteCountSchema, DecimalCountSchema } from "./protocol";
+import {
+  capabilitiesHash,
+  DecimalByteCountSchema,
+  DecimalCountSchema,
+} from "./protocol";
 import { retryRead } from "./retry";
 
 const TreeSpaceSummaryV2Schema = z
@@ -106,6 +111,21 @@ export class V2TreeRemote implements TreeRemotePort {
 
   async capabilities(): Promise<TreeSyncLimits> {
     return toTreeLimits(this.selection.capabilities);
+  }
+
+  async refreshCapabilities(): Promise<TreeSyncLimits> {
+    const parsed = TreeCapabilitiesResponseV2Schema.parse(
+      (
+        await retryRead(async () =>
+          this.client.raw("GET", "/api/sync/v2/capabilities"),
+        )
+      ).json,
+    );
+    if (
+      (await capabilitiesHash(parsed.capabilities)) !== parsed.capabilitiesHash
+    )
+      throw new Error("Sync v2 capability hash mismatch");
+    return toTreeLimits(parsed.capabilities);
   }
 
   async spaces(): Promise<TreeSpaceSummary[]> {
