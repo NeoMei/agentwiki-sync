@@ -37,4 +37,21 @@ describe("userErrorMessage", () => {
       /文件夹|更改.*映射/,
     );
   });
+
+  it("maps bare protocol codes without a colon to Chinese", () => {
+    expect(userErrorMessage(new Error("PATH_COLLISION"))).toContain("占用");
+    expect(userErrorMessage(new Error("PATH_COLLISION"))).not.toBe(
+      "PATH_COLLISION",
+    );
+    expect(userErrorMessage(new Error("BASE_STALE"))).toContain("拉取");
+    expect(userErrorMessage(new Error("BASE_STALE"))).not.toBe("BASE_STALE");
+    expect(userErrorMessage(new Error("PAGE_TOO_LARGE"))).toContain("大小");
+  });
+
+  it("keeps colon-prefixed codes and unknown fallback unchanged", () => {
+    expect(
+      userErrorMessage(new TypeError("FOLDER_CYCLE: 目录层级存在循环")),
+    ).toContain("循环");
+    expect(userErrorMessage(new Error("UNKNOWN_CODE"))).toBe("UNKNOWN_CODE");
+  });
 });

@@ -105,9 +105,13 @@ export function userErrorMessage(error: unknown): string {
     return "服务器地址格式不正确。请输入完整地址，如 https://agentwiki.quukk.com";
   }
   if (error instanceof Error) {
-    const localCode = error.message.match(/^([A-Z][A-Z0-9_]*):/)?.[1];
-    if (localCode && localErrorMessages[localCode])
-      return localErrorMessages[localCode];
+    const localCode = error.message.match(/^([A-Z][A-Z0-9_]*)(?::|$)/)?.[1];
+    if (localCode) {
+      const localMessage = localErrorMessages[localCode];
+      if (localMessage) return localMessage;
+      const protocolMessage = errorMessages[localCode];
+      if (protocolMessage) return protocolMessage;
+    }
     for (const [needle, message] of protocolValidationMessages)
       if (error.message.includes(needle)) return message;
     if (error.message === "MAPPING_ROOT_MISSING")
