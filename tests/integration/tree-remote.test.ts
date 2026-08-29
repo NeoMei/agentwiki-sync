@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { treeRevisionContentHashV2 } from "@neomei/agentwiki-sync-protocol";
+import {
+  TREE_SYNC_V2_LIMITS,
+  treeRevisionContentHashV2,
+} from "@neomei/agentwiki-sync-protocol";
 import type { SyncFolderV2, SyncPageV2 } from "@neomei/agentwiki-sync-protocol";
 import { AgentWikiClient } from "../../src/agentwiki/client";
+import { capabilitiesHash } from "../../src/agentwiki/protocol";
 import { V1TreeRemote } from "../../src/agentwiki/v1-tree-remote";
 import { V2TreeRemote } from "../../src/agentwiki/v2-tree-remote";
 import type {
@@ -14,6 +18,20 @@ import { FakeAgentWiki } from "../fakes/fake-agentwiki";
 import { FakeHttp } from "../fakes/fake-http";
 
 const UID = "11111111-1111-4111-8111-111111111111";
+
+const v1Capabilities = {
+  maxPageBytes: 1048576,
+  maxBatchBytes: 4194304,
+  maxBatchItems: 100,
+  maxChangeCount: 5000,
+  maxConfirmationBytes: 4194304,
+  maxClientSpacePages: 5000,
+  maxClientManifestBytes: 4194304,
+  maxClientTotalBodyBytes: 104857600,
+  maxResponseBytes: 4194304,
+  maxPageItems: 200,
+  pushSessionTtlSeconds: 900,
+};
 
 const v2Capabilities = {
   maxPageBytes: 1048576,
@@ -144,7 +162,7 @@ describe("V1TreeRemote", () => {
       },
     });
     const snapshot = await collectSnapshot(
-      new V1TreeRemote(client(http), "space"),
+      new V1TreeRemote(client(http), "space", v1Capabilities),
     );
     expect(snapshot.folders).toEqual([]);
     expect(snapshot.pages[0]).toMatchObject({
@@ -174,13 +192,17 @@ describe("V1TreeRemote", () => {
         ],
       },
     });
-    const spaces = await new V1TreeRemote(client(http), "space").spaces();
+    const spaces = await new V1TreeRemote(
+      client(http),
+      "space",
+      v1Capabilities,
+    ).spaces();
     expect(spaces[0]).toMatchObject({ spaceId: "space", folderCount: "0" });
   });
 
   it("rejects folder changes before contacting the v1 server", async () => {
     const http = new FakeHttp();
-    const remote = new V1TreeRemote(client(http), "space");
+    const remote = new V1TreeRemote(client(http), "space", v1Capabilities);
     await expect(
       remote.uploadBatch(UID, {
         protocolVersion: "1",
@@ -195,6 +217,71 @@ describe("V1TreeRemote", () => {
       }),
     ).rejects.toThrow(/目录|文件夹|folder/i);
     expect(http.calls).toHaveLength(0);
+  });
+
+  it("rejects a replayed v1 pagination cursor", async () => {
+    const http = new FakeHttp();
+    const page = {
+      protocolVersion: "1",
+      spaceId: "space",
+      revision: "r1",
+      sequence: 1,
+      revisionContentHash: "a".repeat(64),
+      pageCount: "1",
+      revisionManifestByteLength: "10",
+      revisionBodyBytes: "4",
+      items: [
+        {
+          pageId: "p1",
+          path: "pages/A.md",
+          title: "A",
+          body: "body",
+          contentHash: "b".repeat(64),
+          updatedAt: "2026-08-29T00:00:00.000Z",
+        },
+      ],
+      nextCursor: "next",
+    };
+    http.responses.push(
+      { status: 200, json: page },
+      { status: 200, json: { ...page, nextCursor: "next" } },
+    );
+    await expect(
+      collectSnapshot(new V1TreeRemote(client(http), "space", v1Capabilities)),
+    ).rejects.toThrow(/游标重放/);
+  });
+
+  it("rejects a replayed v1 delta cursor", async () => {
+    const http = new FakeHttp();
+    const page = {
+      protocolVersion: "1",
+      spaceId: "space",
+      fromRevision: "r0",
+      toRevision: "r1",
+      toSequence: 1,
+      toRevisionContentHash: "a".repeat(64),
+      toPageCount: "1",
+      toRevisionManifestByteLength: "10",
+      toRevisionBodyBytes: "4",
+      items: [],
+      nextCursor: "next",
+    };
+    http.responses.push(
+      { status: 200, json: page },
+      { status: 200, json: { ...page, nextCursor: "next" } },
+    );
+    await expect(
+      new V1TreeRemote(client(http), "space", v1Capabilities).delta("r0"),
+    ).rejects.toThrow(/游标重放/);
+  });
+
+  it("exposes a non-empty v1 capabilities hash without a timing trap", async () => {
+    const http = new FakeHttp();
+    const remote = new V1TreeRemote(client(http), "space", v1Capabilities);
+    await expect(remote.capabilitiesHash).resolves.toMatch(/^[0-9a-f]{64}$/);
+    expect(await remote.capabilitiesHash).toBe(
+      await capabilitiesHash(v1Capabilities),
+    );
   });
 });
 
@@ -356,6 +443,38 @@ describe("V2TreeRemote", () => {
     const result = await remote.finalize(UID, "d".repeat(64));
     expect(result.protocolVersion).toBe("2");
     expect(result.status).toBe("published");
+  });
+
+  it("rejects a v2 delta that exceeds maxDeltaItems", async () => {
+    const http = new FakeHttp();
+    const items = Array.from(
+      { length: TREE_SYNC_V2_LIMITS.maxDeltaItems + 1 },
+      (_, index) => ({
+        operation: "archive_page",
+        pageId: `p${index}`,
+        previousPath: "pages/Old.md",
+      }),
+    );
+    http.responses.push({
+      status: 200,
+      json: {
+        protocolVersion: "2",
+        spaceId: "space",
+        fromRevision: "r0",
+        toRevision: "r1",
+        toSequence: 1,
+        toRevisionContentHash: "a".repeat(64),
+        toFolderCount: "0",
+        toPageCount: "0",
+        toRevisionManifestByteLength: "10",
+        toRevisionBodyBytes: "0",
+        items,
+        nextCursor: null,
+      },
+    });
+    await expect(
+      new V2TreeRemote(client(http), "space", v2Selection()).delta("r0"),
+    ).rejects.toThrow(/增量条目数量超过限制/);
   });
 });
 

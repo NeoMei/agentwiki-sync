@@ -24,11 +24,9 @@ import {
   FinalizeResultSchema,
   PushReceiptSchema,
   PushSessionStatusResponseSchema,
-  SessionResponseSchema,
   UploadPushBatchRequestSchema,
   batchHash,
   capabilitiesHash,
-  parseCapabilities,
   type DeltaItem,
   type PushChange,
   type SyncCapabilities,
@@ -112,37 +110,20 @@ function toV1PushChange(change: TreePageChange): PushChange {
 
 export class V1TreeRemote implements TreeRemotePort {
   readonly protocolVersion = "1" as const;
-  private capabilitiesValue: SyncCapabilities | null = null;
-  private capabilitiesHashValue = "";
+  readonly capabilitiesHash: Promise<string>;
+  private readonly capabilitiesValue: SyncCapabilities;
 
   constructor(
     private readonly client: AgentWikiClient,
     private readonly spaceId: string,
-    private readonly suppliedCapabilities?: SyncCapabilities,
-  ) {}
-
-  get capabilitiesHash(): string {
-    return this.capabilitiesHashValue;
-  }
-
-  private async resolveCapabilities(): Promise<SyncCapabilities> {
-    if (this.capabilitiesValue) return this.capabilitiesValue;
-    if (this.suppliedCapabilities) {
-      this.capabilitiesValue = this.suppliedCapabilities;
-    } else {
-      this.capabilitiesValue = parseCapabilities(
-        SessionResponseSchema.parse(
-          (await this.client.raw("GET", "/api/integrations/obsidian/session"))
-            .json,
-        ).capabilities,
-      );
-    }
-    this.capabilitiesHashValue = await capabilitiesHash(this.capabilitiesValue);
-    return this.capabilitiesValue;
+    capabilities: SyncCapabilities,
+  ) {
+    this.capabilitiesValue = capabilities;
+    this.capabilitiesHash = capabilitiesHash(capabilities);
   }
 
   async capabilities(): Promise<TreeSyncLimits> {
-    return toTreeLimits(await this.resolveCapabilities());
+    return toTreeLimits(this.capabilitiesValue);
   }
 
   async spaces(): Promise<TreeSpaceSummary[]> {

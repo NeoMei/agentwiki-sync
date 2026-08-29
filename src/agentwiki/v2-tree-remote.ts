@@ -94,14 +94,14 @@ function assertSnapshotLimits(page: {
 
 export class V2TreeRemote implements TreeRemotePort {
   readonly protocolVersion = "2" as const;
-  readonly capabilitiesHash: string;
+  readonly capabilitiesHash: Promise<string>;
 
   constructor(
     private readonly client: AgentWikiClient,
     private readonly spaceId: string,
     private readonly selection: V2Selection,
   ) {
-    this.capabilitiesHash = this.selection.capabilitiesHash;
+    this.capabilitiesHash = Promise.resolve(this.selection.capabilitiesHash);
   }
 
   async capabilities(): Promise<TreeSyncLimits> {
@@ -234,6 +234,8 @@ export class V2TreeRemote implements TreeRemotePort {
       fixed = signature;
       toRevision = page.toRevision;
       items.push(...page.items);
+      if (items.length > TREE_SYNC_V2_LIMITS.maxDeltaItems)
+        throw new Error("增量条目数量超过限制");
       const next = page.nextCursor;
       if (next !== null) {
         if (seenCursors.has(next)) throw new Error("分页游标重放");

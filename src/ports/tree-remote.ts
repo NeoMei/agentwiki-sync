@@ -118,7 +118,7 @@ export interface TreePushSessionStatus {
 
 export interface TreeRemotePort {
   readonly protocolVersion: "1" | "2";
-  readonly capabilitiesHash: string;
+  readonly capabilitiesHash: Promise<string>;
   capabilities(): Promise<TreeSyncLimits>;
   spaces(): Promise<TreeSpaceSummary[]>;
   head(): Promise<TreeHead>;

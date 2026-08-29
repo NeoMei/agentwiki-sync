@@ -144,6 +144,7 @@ export class AgentWikiClient {
     let cursor: string | null = null;
     let requestRevision = revision;
     let fixed: Omit<SnapshotPage, "items" | "nextCursor"> | null = null;
+    const seenCursors = new Set<string>();
     do {
       const query = new URLSearchParams({ revision: requestRevision });
       if (cursor) query.set("cursor", cursor);
@@ -172,8 +173,13 @@ export class AgentWikiClient {
       fixed ??= metadata;
       requestRevision = page.revision;
       yield { metadata, items: page.items };
-      cursor = page.nextCursor;
-    } while (cursor);
+      const next = page.nextCursor;
+      if (next !== null) {
+        if (seenCursors.has(next)) throw new Error("快照分页游标重放");
+        seenCursors.add(next);
+      }
+      cursor = next;
+    } while (cursor !== null);
     if (!fixed) throw new Error("快照未返回元数据");
   }
 
@@ -185,6 +191,7 @@ export class AgentWikiClient {
     let fixed: string | null = null;
     let fixedRevision: string | null = null;
     const items: DeltaItem[] = [];
+    const seenCursors = new Set<string>();
     do {
       const query = new URLSearchParams({ from });
       if (cursor) query.set("cursor", cursor);
@@ -211,8 +218,13 @@ export class AgentWikiClient {
       fixed ??= signature;
       fixedRevision ??= page.toRevision;
       items.push(...page.items);
-      cursor = page.nextCursor;
-    } while (cursor);
+      const next = page.nextCursor;
+      if (next !== null) {
+        if (seenCursors.has(next)) throw new Error("增量分页游标重放");
+        seenCursors.add(next);
+      }
+      cursor = next;
+    } while (cursor !== null);
     return {
       toRevision: fixedRevision ?? from,
       items,
