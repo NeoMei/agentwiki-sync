@@ -9,10 +9,18 @@ export function normalizePath(path: string): string {
 
 export class TFile {
   constructor(public readonly path: string) {}
+  get extension(): string {
+    const name = this.path.slice(this.path.lastIndexOf("/") + 1);
+    const dot = name.lastIndexOf(".");
+    return dot >= 0 ? name.slice(dot + 1) : "";
+  }
 }
 
 export class TFolder {
-  constructor(public readonly path: string) {}
+  constructor(
+    public readonly path: string,
+    public readonly children: Array<TFile | TFolder> = [],
+  ) {}
 }
 
 class MockElement {

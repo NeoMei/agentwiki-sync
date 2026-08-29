@@ -1,15 +1,28 @@
-import type { VaultPort } from "../../src/ports/vault";
+import type { VaultPort, VaultTreeEntry } from "../../src/ports/vault";
 
 export class MemoryVault implements VaultPort {
   private readonly files = new Map<string, Uint8Array>();
+  readonly folders = new Set<string>();
   readonly trash = new Map<string, Uint8Array>();
+  readonly trashedDirectories = new Set<string>();
   operations = 0;
   failAfterOperations: number | null = null;
   private rootStatusOverride: "folder" | "missing" | "file" | null = null;
 
   constructor(initial: Record<string, string>) {
-    for (const [path, body] of Object.entries(initial))
+    for (const [path, body] of Object.entries(initial)) {
       this.files.set(path, new TextEncoder().encode(body));
+      this.deriveParents(path);
+    }
+  }
+  private deriveParents(path: string): void {
+    const segments = path.split("/");
+    segments.pop();
+    let parent = "";
+    for (const segment of segments) {
+      parent = parent ? `${parent}/${segment}` : segment;
+      this.folders.add(parent);
+    }
   }
   setRootStatus(status: "folder" | "missing" | "file" | null): void {
     this.rootStatusOverride = status;
@@ -38,6 +51,54 @@ export class MemoryVault implements VaultPort {
         !path.startsWith(".agentwiki/")
       )
         yield { relativePath: path.slice(prefix.length), bytes: bytes.slice() };
+  }
+  async *listTree(rootPath: string): AsyncIterable<VaultTreeEntry> {
+    const prefix = rootPath.length > 0 ? `${rootPath}/` : "";
+    const entries: VaultTreeEntry[] = [];
+    for (const dir of this.folders) {
+      if (dir === rootPath) continue;
+      if (!dir.startsWith(prefix)) continue;
+      const relativePath = dir.slice(prefix.length);
+      if (
+        relativePath === ".agentwiki" ||
+        relativePath.startsWith(".agentwiki/")
+      )
+        continue;
+      entries.push({ kind: "directory", relativePath });
+    }
+    for (const [path, bytes] of this.files) {
+      if (!path.startsWith(prefix)) continue;
+      const relativePath = path.slice(prefix.length);
+      if (
+        relativePath === ".agentwiki" ||
+        relativePath.startsWith(".agentwiki/")
+      )
+        continue;
+      if (!relativePath.toLowerCase().endsWith(".md")) continue;
+      entries.push({ kind: "markdown", relativePath, bytes: bytes.slice() });
+    }
+    entries.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+    yield* entries;
+  }
+  async pathStatus(path: string): Promise<"directory" | "file" | "missing"> {
+    if (this.files.has(path)) return "file";
+    if (this.folders.has(path)) return "directory";
+    return "missing";
+  }
+  async createDirectory(path: string): Promise<void> {
+    this.fail();
+    this.folders.add(path);
+    this.deriveParents(path);
+  }
+  async trashDirectory(path: string): Promise<void> {
+    this.fail();
+    if (!this.folders.has(path)) throw new Error("missing directory source");
+    const prefix = `${path}/`;
+    for (const dir of [...this.folders])
+      if (dir === path || dir.startsWith(prefix)) this.folders.delete(dir);
+    for (const file of [...this.files.keys()])
+      if (file.startsWith(prefix)) this.files.delete(file);
+    this.trashedDirectories.add(path);
   }
   private fail(): void {
     this.operations += 1;

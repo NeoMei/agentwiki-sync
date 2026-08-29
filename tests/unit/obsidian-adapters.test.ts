@@ -74,10 +74,39 @@ class FakeVault {
   getFileByPath(path: string): TFile | null {
     return this.files.has(path) ? new TFile(path) : null;
   }
+  private allFolders(): Set<string> {
+    const result = new Set<string>(this.folders);
+    for (const path of [...this.files.keys(), ...this.folders]) {
+      const segments = path.split("/");
+      segments.pop();
+      let parent = "";
+      for (const segment of segments) {
+        parent = parent ? `${parent}/${segment}` : segment;
+        result.add(parent);
+      }
+    }
+    return result;
+  }
+  private folderNode(path: string, folders: Set<string>): TFolder {
+    const prefix = path ? `${path}/` : "";
+    const direct = (candidate: string): string | null => {
+      if (!candidate.startsWith(prefix)) return null;
+      const rest = candidate.slice(prefix.length);
+      return rest && !rest.includes("/") ? rest : null;
+    };
+    const children: Array<TFile | TFolder> = [];
+    for (const folder of folders) {
+      if (folder !== path && direct(folder) !== null)
+        children.push(this.folderNode(folder, folders));
+    }
+    for (const file of this.files.keys())
+      if (direct(file) !== null) children.push(new TFile(file));
+    return new TFolder(path, children);
+  }
   getAbstractFileByPath(path: string): TFile | TFolder | null {
     if (this.files.has(path)) return new TFile(path);
-    if (this.folders.has(path)) return new TFolder(path);
-    return null;
+    const folders = this.allFolders();
+    return folders.has(path) ? this.folderNode(path, folders) : null;
   }
   getMarkdownFiles(): TFile[] {
     return [...this.files.keys()]
@@ -116,13 +145,29 @@ class FakeVault {
 class FakeFileManager {
   readonly trashed: string[] = [];
   constructor(private readonly vault: FakeVault) {}
-  async trashFile(file: TFile): Promise<void> {
+  async trashFile(file: TFile | TFolder): Promise<void> {
     this.trashed.push(file.path);
-    await this.vault.delete(file);
+    if (file instanceof TFolder) {
+      const prefix = `${file.path}/`;
+      for (const folder of [...this.vault.folders])
+        if (folder === file.path || folder.startsWith(prefix))
+          this.vault.folders.delete(folder);
+      for (const path of [...this.vault.files.keys()])
+        if (path.startsWith(prefix)) this.vault.files.delete(path);
+      this.vault.folders.delete(file.path);
+    } else {
+      await this.vault.delete(file);
+    }
   }
 }
 
 const encoder = new TextEncoder();
+
+async function collect<T>(iterable: AsyncIterable<T>): Promise<T[]> {
+  const result: T[] = [];
+  for await (const item of iterable) result.push(item);
+  return result;
+}
 
 describe("ObsidianControlStore", () => {
   it("rejects paths that escape the .agentwiki control root", async () => {
@@ -276,6 +321,63 @@ describe("ObsidianVaultPort", () => {
     await port.remove("Wiki/A.md");
     expect(manager.trashed).toEqual(["Wiki/A.md"]);
     expect(vault.files.has("Wiki/A.md")).toBe(false);
+  });
+
+  it("enumerates empty directories and markdown files under the mapping root", async () => {
+    const vault = new FakeVault();
+    const port = new ObsidianVaultPort(
+      vault as unknown as Vault,
+      {} as unknown as FileManager,
+      "Wiki",
+    );
+    vault.folders.add("Wiki/pages/Empty");
+    vault.files.set("Wiki/pages/A.md", "a");
+    expect(await collect(port.listTree("Wiki"))).toEqual([
+      { kind: "directory", relativePath: "pages" },
+      {
+        kind: "markdown",
+        relativePath: "pages/A.md",
+        bytes: encoder.encode("a"),
+      },
+      { kind: "directory", relativePath: "pages/Empty" },
+    ]);
+  });
+
+  it("trashes a directory through FileManager", async () => {
+    const vault = new FakeVault({ "Wiki/pages/Empty/X.md": "x" });
+    const manager = new FakeFileManager(vault);
+    const port = new ObsidianVaultPort(
+      vault as unknown as Vault,
+      manager as unknown as FileManager,
+      "Wiki",
+    );
+    await port.trashDirectory("Wiki/pages/Empty");
+    expect(manager.trashed).toEqual(["Wiki/pages/Empty"]);
+  });
+
+  it("classifies path status for files, directories, and missing paths", async () => {
+    const vault = new FakeVault({ "Wiki/pages/A.md": "a" });
+    const port = new ObsidianVaultPort(
+      vault as unknown as Vault,
+      {} as unknown as FileManager,
+      "Wiki",
+    );
+    expect(await port.pathStatus("Wiki/pages")).toBe("directory");
+    expect(await port.pathStatus("Wiki/pages/A.md")).toBe("file");
+    expect(await port.pathStatus("Wiki/pages/Missing")).toBe("missing");
+  });
+
+  it("creates a directory and its parents", async () => {
+    const vault = new FakeVault();
+    const port = new ObsidianVaultPort(
+      vault as unknown as Vault,
+      {} as unknown as FileManager,
+      "Wiki",
+    );
+    await port.createDirectory("Wiki/pages/New");
+    expect(vault.folders.has("Wiki/pages/New")).toBe(true);
+    expect(vault.folders.has("Wiki/pages")).toBe(true);
+    expect(vault.folders.has("Wiki")).toBe(true);
   });
 });
 

@@ -11,7 +11,7 @@ import {
 import type { ControlStorePort } from "../ports/control-store";
 import type { HttpPort, HttpResponse } from "../ports/http";
 import type { SecretPort } from "../ports/secrets";
-import type { VaultPort } from "../ports/vault";
+import type { VaultPort, VaultTreeEntry } from "../ports/vault";
 
 function safeControlPath(path: string): string {
   const normalized = normalizePath(path);
@@ -168,6 +168,61 @@ export class ObsidianVaultPort implements VaultPort {
         bytes: new Uint8Array(await this.vault.readBinary(file)),
       };
   }
+  async pathStatus(path: string): Promise<"directory" | "file" | "missing"> {
+    const entry = this.vault.getAbstractFileByPath(this.safe(path));
+    if (entry instanceof TFolder) return "directory";
+    if (entry instanceof TFile) return "file";
+    return "missing";
+  }
+  async *listTree(rootPath: string): AsyncIterable<VaultTreeEntry> {
+    const root = this.vault.getAbstractFileByPath(this.safe(rootPath));
+    if (!(root instanceof TFolder)) return;
+    const vault = this.vault;
+    const prefix = `${normalizePath(rootPath)}/`;
+    const relative = (path: string): string => path.slice(prefix.length);
+    const visit = async function* (
+      folder: TFolder,
+    ): AsyncIterable<VaultTreeEntry> {
+      for (const child of [...folder.children].sort((a, b) =>
+        a.path.localeCompare(b.path),
+      )) {
+        const relativePath = relative(child.path);
+        if (
+          relativePath === ".agentwiki" ||
+          relativePath.startsWith(".agentwiki/")
+        )
+          continue;
+        if (child instanceof TFolder) {
+          yield { kind: "directory", relativePath };
+          yield* visit(child);
+        } else if (
+          child instanceof TFile &&
+          child.extension.toLowerCase() === "md"
+        ) {
+          yield {
+            kind: "markdown",
+            relativePath,
+            bytes: new Uint8Array(await vault.readBinary(child)),
+          };
+        }
+      }
+    };
+    yield* visit(root);
+  }
+  async createDirectory(path: string): Promise<void> {
+    const safe = this.safe(path);
+    const entry = this.vault.getAbstractFileByPath(safe);
+    if (entry instanceof TFile) throw new Error("目录路径被文件占用");
+    if (entry instanceof TFolder) return;
+    const parts = safe.split("/");
+    let current = "";
+    for (const part of parts) {
+      current = current ? `${current}/${part}` : part;
+      const node = this.vault.getAbstractFileByPath(current);
+      if (node instanceof TFile) throw new Error("父路径是文件");
+      if (!node) await this.vault.createFolder(current);
+    }
+  }
   async read(path: string): Promise<Uint8Array | null> {
     const file = this.file(path);
     return file ? new Uint8Array(await this.vault.readBinary(file)) : null;
@@ -239,5 +294,10 @@ export class ObsidianVaultPort implements VaultPort {
     const file = this.file(path);
     if (!file) throw new Error("删除源缺失");
     await this.fileManager.trashFile(file);
+  }
+  async trashDirectory(path: string): Promise<void> {
+    const entry = this.vault.getAbstractFileByPath(this.safe(path));
+    if (!(entry instanceof TFolder)) throw new Error("删除目录源缺失");
+    await this.fileManager.trashFile(entry);
   }
 }
