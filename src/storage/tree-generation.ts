@@ -168,19 +168,33 @@ export class TreeGenerationRepository {
     generationId: string,
   ): Promise<TreePage[]> {
     const hydrated: TreePage[] = [];
-    for (const page of Object.values(pages)) {
-      const fileName = await this.localFileName(page.pageId, page.path);
-      let body = await this.store.read(this.bodyPath(generationId, fileName));
-      if (body === null && isValidSyncPath(page.path)) {
-        body = await this.store.read(
-          this.bodyPath(generationId, `${await opaqueFileKey(page.pageId)}.md`),
-        );
-      }
-      if (body === null || (await contentHash(body)) !== page.contentHash)
-        throw new Error("基线损坏: 页面内容哈希不匹配");
-      hydrated.push({ ...page, body });
-    }
+    for (const page of Object.values(pages))
+      hydrated.push({
+        ...page,
+        body: await this.readBodyForPage(generationId, page, page.contentHash),
+      });
     return hydrated;
+  }
+
+  /**
+   * 读取单个页面的正文 sidecar 并校验内容哈希。调用方必须传入已验证清单里的
+   * page metadata，避免每读一页都重新走一次 verify()（否则读 N 页会变成 O(N²)）。
+   */
+  private async readBodyForPage(
+    generationId: string,
+    page: PageMetadata,
+    expectedHash: string,
+  ): Promise<string> {
+    const fileName = await this.localFileName(page.pageId, page.path);
+    let body = await this.store.read(this.bodyPath(generationId, fileName));
+    if (body === null && isValidSyncPath(page.path)) {
+      body = await this.store.read(
+        this.bodyPath(generationId, `${await opaqueFileKey(page.pageId)}.md`),
+      );
+    }
+    if (body === null || (await contentHash(body)) !== expectedHash)
+      throw new Error("基线损坏: 页面内容哈希不匹配");
+    return body;
   }
 
   async read(generationId: string): Promise<{
@@ -190,9 +204,9 @@ export class TreeGenerationRepository {
     const manifest = await this.verify(generationId);
     const bodies: Record<string, string> = {};
     for (const page of Object.values(manifest.pages))
-      bodies[page.pageId] = await this.readBody(
+      bodies[page.pageId] = await this.readBodyForPage(
         generationId,
-        page.pageId,
+        page,
         page.contentHash,
       );
     return { manifest, bodies };
@@ -210,15 +224,6 @@ export class TreeGenerationRepository {
     const manifest = await this.readManifest(generationId);
     const page = manifest.pages[pageId];
     if (!page) throw new Error("基线损坏: 页面缺失");
-    const fileName = await this.localFileName(page.pageId, page.path);
-    let body = await this.store.read(this.bodyPath(generationId, fileName));
-    if (body === null && isValidSyncPath(page.path)) {
-      body = await this.store.read(
-        this.bodyPath(generationId, `${await opaqueFileKey(pageId)}.md`),
-      );
-    }
-    if (body === null || (await contentHash(body)) !== expectedHash)
-      throw new Error("基线损坏: 页面内容哈希不匹配");
-    return body;
+    return this.readBodyForPage(generationId, page, expectedHash);
   }
 }
