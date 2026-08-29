@@ -79,6 +79,10 @@ export class BaselineRepository {
       isJournal,
     );
   }
+  /**
+   * 只读地读取当前 v1 基线。v2 升级路径只把它作为零 Folder 的历史证据使用，
+   * 从不据此激活 v2 指针；只有确认成功的远端 v2 tree 事务才能写入 v2 基线。
+   */
   async read(): Promise<BaselineState> {
     const current = await this.pointer.read();
     if (!current?.payload.active) return { revision: "0", pages: {} };
@@ -101,6 +105,9 @@ export class BaselineRepository {
       pages,
     };
   }
+  /**
+   * 只读地读取某代 v1 页面正文；与 read() 一样是 v2 升级的只读证据来源。
+   */
   async readBody(
     pageId: string,
     generationId?: string,
