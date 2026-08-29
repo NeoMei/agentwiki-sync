@@ -343,6 +343,23 @@ describe("ObsidianVaultPort", () => {
     ]);
   });
 
+  it("skips .agentwiki directories and files anywhere under the root", async () => {
+    const vault = new FakeVault({
+      "Wiki/pages/.agentwiki/secret.md": "s",
+      "Wiki/pages/Keep.md": "k",
+    });
+    const port = new ObsidianVaultPort(
+      vault as unknown as Vault,
+      {} as unknown as FileManager,
+      "Wiki",
+    );
+    const entries = await collect(port.listTree("Wiki"));
+    expect(entries.map((entry) => entry.relativePath)).toEqual([
+      "pages",
+      "pages/Keep.md",
+    ]);
+  });
+
   it("trashes a directory through FileManager", async () => {
     const vault = new FakeVault({ "Wiki/pages/Empty/X.md": "x" });
     const manager = new FakeFileManager(vault);

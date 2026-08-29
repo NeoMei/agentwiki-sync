@@ -187,11 +187,7 @@ export class ObsidianVaultPort implements VaultPort {
         a.path.localeCompare(b.path),
       )) {
         const relativePath = relative(child.path);
-        if (
-          relativePath === ".agentwiki" ||
-          relativePath.startsWith(".agentwiki/")
-        )
-          continue;
+        if (relativePath.split("/").includes(".agentwiki")) continue;
         if (child instanceof TFolder) {
           yield { kind: "directory", relativePath };
           yield* visit(child);

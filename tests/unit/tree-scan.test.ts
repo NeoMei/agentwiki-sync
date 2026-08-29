@@ -103,6 +103,7 @@ describe("scanLocalTree", () => {
     expect(scan.pages.map((item) => item.path)).toEqual(["pages/Guide/B.md"]);
     expect(scan.pages[0]?.body).toBe("# B");
     expect(scan.pages[0]?.title).toBe("B");
+    expect(scan.pages[0]?.folderId).toBe(scan.folders[1]?.folderId);
   });
 
   it("keeps a known folder ID through the local identity state after a move", async () => {
@@ -178,6 +179,24 @@ describe("scanLocalTree", () => {
   it("skips the pages root itself and content outside pages/", async () => {
     const vault = new MemoryVault({ "Wiki/pages/Keep.md": "# keep" });
     await vault.createDirectory("Wiki/other");
+
+    const scan = await scanLocalTree(
+      vault,
+      "Wiki",
+      snapshot(),
+      identityState(),
+      limits,
+    );
+
+    expect(scan.folders).toEqual([]);
+    expect(scan.pages.map((item) => item.path)).toEqual(["pages/Keep.md"]);
+  });
+
+  it("excludes .agentwiki content nested under the managed pages root", async () => {
+    const vault = new MemoryVault({
+      "Wiki/pages/Keep.md": "# keep",
+      "Wiki/pages/.agentwiki/secret.md": "# secret",
+    });
 
     const scan = await scanLocalTree(
       vault,

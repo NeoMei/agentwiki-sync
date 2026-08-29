@@ -59,21 +59,13 @@ export class MemoryVault implements VaultPort {
       if (dir === rootPath) continue;
       if (!dir.startsWith(prefix)) continue;
       const relativePath = dir.slice(prefix.length);
-      if (
-        relativePath === ".agentwiki" ||
-        relativePath.startsWith(".agentwiki/")
-      )
-        continue;
+      if (relativePath.split("/").includes(".agentwiki")) continue;
       entries.push({ kind: "directory", relativePath });
     }
     for (const [path, bytes] of this.files) {
       if (!path.startsWith(prefix)) continue;
       const relativePath = path.slice(prefix.length);
-      if (
-        relativePath === ".agentwiki" ||
-        relativePath.startsWith(".agentwiki/")
-      )
-        continue;
+      if (relativePath.split("/").includes(".agentwiki")) continue;
       if (!relativePath.toLowerCase().endsWith(".md")) continue;
       entries.push({ kind: "markdown", relativePath, bytes: bytes.slice() });
     }
