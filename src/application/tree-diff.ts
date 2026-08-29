@@ -413,14 +413,18 @@ export function resolveFolderConflict(
     resolution = { choice: "manual", manualPath: validated.path };
   }
 
-  preview.folderConflictResolutions[conflictId] = resolution;
+  const nextResolutions = {
+    ...preview.folderConflictResolutions,
+    [conflictId]: resolution,
+  };
   const next = computePreview(
     preview.base,
     preview.local,
     preview.remote,
     preview.pagePlan,
-    preview.folderConflictResolutions,
+    nextResolutions,
   );
+  preview.folderConflictResolutions = nextResolutions;
   preview.actions = next.actions;
   preview.folderConflicts = next.folderConflicts;
   preview.pageConflicts = next.pageConflicts;

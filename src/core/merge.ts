@@ -461,6 +461,41 @@ export async function mergePagesById(
           remote: remotePage.body,
           wholeDocument: true,
         });
+    } else if (!basePage && localPage && remotePage) {
+      // Both sides independently created the same page id. A location
+      // divergence is a path conflict; otherwise title/body may still diverge.
+      if (merged.conflict)
+        conflicts.push({
+          conflictId: `path:${id}`,
+          pageId: id,
+          field: "path",
+          base: "",
+          local: localPage.path,
+          remote: remotePage.path,
+          wholeDocument: true,
+        });
+      else {
+        if (localPage.title !== remotePage.title)
+          conflicts.push({
+            conflictId: `title:${id}`,
+            pageId: id,
+            field: "title",
+            base: "",
+            local: localPage.title,
+            remote: remotePage.title,
+            wholeDocument: false,
+          });
+        if (localPage.body !== remotePage.body)
+          conflicts.push({
+            conflictId: `body:${id}`,
+            pageId: id,
+            field: "body",
+            base: "",
+            local: localPage.body,
+            remote: remotePage.body,
+            wholeDocument: true,
+          });
+      }
     }
   }
 

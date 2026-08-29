@@ -628,3 +628,51 @@ describe("fix round 1 regressions", () => {
     );
   });
 });
+
+describe("fix round 2 regressions", () => {
+  it("conflicts when both sides add the same page id at different locations", async () => {
+    const base = snapshot({ pages: [] });
+    const local = localScan([], [page("p", null, "pages/Local.md")]);
+    const remote = snapshot({ pages: [page("p", null, "pages/Remote.md")] });
+
+    const preview = await buildTreePullPreview(base, local, remote);
+
+    expect(preview.pageConflicts).toContainEqual(
+      expect.objectContaining({ field: "path", pageId: "p" }),
+    );
+    expect(preview.actions).not.toContainEqual(
+      expect.objectContaining({ kind: "create_page", pageId: "p" }),
+    );
+    expect(pendingTreeDecisionCount(preview)).toBeGreaterThan(0);
+  });
+
+  it("keeps the preview unchanged when a resolution fails to recompute", async () => {
+    const base = snapshot({
+      folders: [folder("f", null, "pages/X"), folder("g", null, "pages/B")],
+    });
+    const local = localScan(
+      [folder("f", null, "pages/A"), folder("g", null, "pages/C")],
+      [],
+    );
+    const remote = snapshot({
+      folders: [folder("f", null, "pages/C"), folder("g", null, "pages/B")],
+    });
+
+    const preview = await buildTreePullPreview(base, local, remote);
+    const conflictId = preview.folderConflicts.find(
+      (conflict) => conflict.folderId === "f",
+    )!.conflictId;
+    const beforeResolutions = { ...preview.folderConflictResolutions };
+    const beforeActions = [...preview.actions];
+    const beforeConflicts = [...preview.folderConflicts];
+
+    expect(() =>
+      resolveFolderConflict(preview, conflictId, { choice: "remote" }),
+    ).toThrow();
+
+    expect(preview.folderConflictResolutions).toEqual(beforeResolutions);
+    expect(preview.actions).toEqual(beforeActions);
+    expect(preview.folderConflicts).toEqual(beforeConflicts);
+    expect(pendingTreeDecisionCount(preview)).toBe(1);
+  });
+});
