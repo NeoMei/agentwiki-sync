@@ -111,6 +111,12 @@ export class AgentWikiClient {
     );
   }
 
+  async treeSpaces(): Promise<unknown> {
+    return retryRead(
+      async () => (await this.raw("GET", "/api/sync/v2/spaces")).json,
+    );
+  }
+
   async snapshot(
     spaceId: string,
     revision = "current",

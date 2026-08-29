@@ -12,6 +12,12 @@ import type {
   PushRemotePort,
   PushSessionInfo,
 } from "../../src/ports/push-remote";
+import {
+  treeRevisionContentHashV2,
+  type SyncFolderV2,
+  type SyncPageV2,
+  type TreePushBatchV2,
+} from "@neomei/agentwiki-sync-protocol";
 
 interface Session {
   info: PushSessionInfo;
@@ -35,8 +41,13 @@ export class FakeAgentWiki implements PushRemotePort {
   };
   canPublish = true;
   truncateNextSnapshot = false;
+  protocolVersion: "1" | "2" = "2";
   private revision = 0;
   private readonly pages = new Map<string, SyncPage>();
+  private readonly folders = new Map<string, SyncFolderV2>();
+  private readonly treePages = new Map<string, SyncPageV2>();
+  readonly uploadedBatches: TreePushBatchV2[] = [];
+  private readonly receivedOps: string[] = [];
   private readonly sessions = new Map<string, Session>();
   private readonly changeLog: Array<{ revision: number; item: DeltaItem }> = [];
   async getHead(): Promise<{ revision: string; pageCount?: string }> {
@@ -226,6 +237,42 @@ export class FakeAgentWiki implements PushRemotePort {
   }
   async advanceEmptyRevision(): Promise<void> {
     this.revision += 1;
+  }
+  setProtocol(protocol: "1" | "2"): void {
+    this.protocolVersion = protocol;
+  }
+  async seedTree(input: {
+    folders: SyncFolderV2[];
+    pages: SyncPageV2[];
+  }): Promise<void> {
+    this.folders.clear();
+    this.treePages.clear();
+    for (const folder of input.folders)
+      this.folders.set(folder.folderId, { ...folder });
+    for (const page of input.pages)
+      this.treePages.set(page.pageId, { ...page });
+    this.revision = input.folders.length > 0 || input.pages.length > 0 ? 1 : 0;
+  }
+  tree(): { folders: SyncFolderV2[]; pages: SyncPageV2[] } {
+    return {
+      folders: [...this.folders.values()].map((folder) => ({ ...folder })),
+      pages: [...this.treePages.values()].map((page) => ({ ...page })),
+    };
+  }
+  async treeRevisionHash(): Promise<string> {
+    return treeRevisionContentHashV2({
+      protocolVersion: "2",
+      spaceId: this.spaceId,
+      folders: [...this.folders.values()],
+      pages: [...this.treePages.values()],
+    });
+  }
+  recordTreeBatch(batch: TreePushBatchV2): void {
+    this.uploadedBatches.push(batch);
+    for (const change of batch.changes) this.receivedOps.push(change.operation);
+  }
+  receivedOperations(): string[] {
+    return [...this.receivedOps];
   }
   sessionCount(): number {
     return this.sessions.size;
