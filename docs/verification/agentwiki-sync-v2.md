@@ -4,11 +4,11 @@
 
 - `npm run check`：格式检查、ESLint、strict typecheck、全部单元/集成/E2E/性能测试、生产构建、bundle safety 与 release metadata 检查。
 
-最新收口结果（2026-08-30，插件 0.2.12）：
+最新收口结果（2026-08-30，插件 0.3.0）：
 
 - 测试：**41 个测试文件、323 项测试全部通过**（`vitest run`）。
 - Prettier 通过；ESLint **0 error / 20 warning**（均为既有已知 warning，不含新增错误）。
-- strict typecheck、production build 通过；bundle safety 报告 `main.js` **1,180,773 bytes**；release metadata **0.2.12**。
+- strict typecheck、production build 通过；bundle safety 报告 `main.js` **1,180,773 bytes**；release metadata **0.3.0**。
 
 Task 12 新增回归覆盖：
 
