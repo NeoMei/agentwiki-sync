@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   TREE_SYNC_V2_LIMITS,
   treeRevisionContentHashV2,
@@ -377,6 +377,85 @@ describe("V2TreeRemote", () => {
     ).spaces();
     expect(spaces).toHaveLength(1);
     expect(spaces[0]).toMatchObject({ spaceId: "space", folderCount: "0" });
+  });
+
+  it("uses the v1 space list when v2 discovery has a server failure", async () => {
+    vi.useFakeTimers();
+    try {
+      const http = new FakeHttp();
+      http.route("GET", "/api/sync/v2/spaces", {
+        status: 500,
+        json: {
+          protocolVersion: "2",
+          error: {
+            code: "INTERNAL_ERROR",
+            message: "internal error",
+            retryable: true,
+          },
+        },
+      });
+      http.route("GET", "/api/sync/v1/spaces", {
+        status: 200,
+        json: {
+          protocolVersion: "1",
+          spaces: [
+            {
+              spaceId: "space",
+              displayName: "Space",
+              role: "owner",
+              canRead: true,
+              canPublish: true,
+              currentRevision: "r1",
+              pageCount: "1",
+              revisionManifestByteLength: "10",
+              revisionBodyBytes: "4",
+            },
+          ],
+        },
+      });
+
+      const pending = new V2TreeRemote(
+        client(http),
+        "space",
+        v2Selection(),
+      ).spaces();
+      const assertion = expect(pending).resolves.toEqual([
+        expect.objectContaining({
+          spaceId: "space",
+          displayName: "Space",
+          role: "owner",
+          canPublish: true,
+          folderCount: "0",
+        }),
+      ]);
+      await vi.runAllTimersAsync();
+      await assertion;
+      expect(http.calls.at(-1)?.path).toBe("/api/sync/v1/spaces");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not hide v2 authorization failures behind the v1 fallback", async () => {
+    const http = new FakeHttp();
+    http.route("GET", "/api/sync/v2/spaces", {
+      status: 403,
+      json: {
+        protocolVersion: "2",
+        error: {
+          code: "SPACE_FORBIDDEN",
+          message: "forbidden",
+          retryable: false,
+        },
+      },
+    });
+
+    await expect(
+      new V2TreeRemote(client(http), "space", v2Selection()).spaces(),
+    ).rejects.toMatchObject({ status: 403 });
+    expect(http.calls.map((call) => call.path)).toEqual([
+      "/api/sync/v2/spaces",
+    ]);
   });
 
   it("runs a v2 push session through the adapter", async () => {

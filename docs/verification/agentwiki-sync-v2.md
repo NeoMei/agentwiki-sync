@@ -6,9 +6,9 @@
 
 最新收口结果（2026-08-30，插件 0.2.12）：
 
-- 测试：**41 个测试文件、321 项测试全部通过**（`vitest run`）。
+- 测试：**41 个测试文件、323 项测试全部通过**（`vitest run`）。
 - Prettier 通过；ESLint **0 error / 20 warning**（均为既有已知 warning，不含新增错误）。
-- strict typecheck、production build 通过；bundle safety 报告 `main.js` **1,180,496 bytes**；release metadata **0.2.12**。
+- strict typecheck、production build 通过；bundle safety 报告 `main.js` **1,180,773 bytes**；release metadata **0.2.12**。
 
 Task 12 新增回归覆盖：
 
@@ -23,10 +23,6 @@ Task 12 新增回归覆盖：
 
 以上为回归保护：这些断言在当前实现下直接通过，说明边界已满足；未出现需要修改实现才能通过的 RED 缺陷。
 
-## 人工验收清单（待人工执行）
-
-以下 Step 4 / Step 5 依赖真实 Obsidian GUI、双 Vault 与生产凭据，无头环境无法执行。请人工完成后回填结果；未执行前不要标注为通过。
-
 ## Computer Use 执行记录（2026-08-30）
 
 已在真实 Obsidian 1.13.7 中执行以下可安全完成的 GUI 验收：
@@ -35,11 +31,18 @@ Task 12 新增回归覆盖：
 - 建立隔离 Vault `AgentWiki-Sync-V2-Acceptance-A`，装入当前仓库 HEAD 的 `main.js`、`styles.css`、`manifest.json`，并用 SHA-256 确认隔离 Vault 的 bundle 与仓库 HEAD 一致。
 - 隔离 Vault 中插件真实启用，Ribbon 与命令面板均出现 `AgentWiki Sync`；打开同步中心后，HEAD 对裸错误码正确显示中文：`加载差异失败：库身份不匹配。请检查是否连接了正确的服务器和库。`
 
-尚不能据此把 Step 4 / Step 5 标为全部通过：
+其他 Obsidian 自动化停止后，又将修复后的仓库 HEAD 临时装入真实 `NeoMei-Docs` Vault，并完成了生产只读复验：
 
-- 当前安装在生产 Vault 的 0.2.12 bundle 不是仓库 HEAD，因此该次生产预览不能证明 HEAD 的 `协议：Sync v2` 标签。
-- 隔离 Vault 没有独立的非生产 Space/连接凭据，尚未执行双 Vault 的 Pull/Push 往返。
-- 执行期间另一个 Obsidian 自动化持续抢占 NeoMei-Docs 前台焦点，后续按键无法可靠限定在隔离 Vault；为避免误触生产内容，停止继续进行有状态 GUI 操作。
+- 修复前，HEAD 在同步中心稳定失败：`加载差异失败：服务器内部错误。请稍后再试。`
+- 使用已保存凭据做脱敏、只读的接口探测：V2 `capabilities`、映射 Space 的 `head` 和 `snapshot` 均为 200；全局 V2 `spaces` 为 500；V1 `spaces` 为 200 且返回合法 Space 元数据。
+- 根因是同步中心并行加载状态、增量和全局 Space 列表；V2 列表的单点 500 使整个预览失败，而实际 V2 单 Space 同步接口并未失效。
+- 插件现仅在 V2 Space 发现接口返回 HTTP 5xx 时，使用 V1 列表补齐 Space 名称、角色和发布权限；V2 的 capabilities、head、delta、snapshot 与 push 不降级。403 等鉴权错误仍原样失败，不会被回退掩盖。
+- 修复后的真实同步中心成功显示 `NeoMei-Space · AgentWiki · 所有者`、`协议：Sync v2`、`服务器有更新` 和本地变更列表；界面中没有协议选择器，排版无溢出或错位。
+- 通过键盘进入 `自动合并 — 拉取预览`，确认最终写入边界为单独的 `确认执行` 按钮；随后按 Escape 退出，未点击确认、未 Push/finalize、未产生远端写入。
+
+新增回归测试覆盖：V2 Space 发现 500 时回退 V1 列表；V2 403 时禁止回退。修复后的全量门禁为 41 个测试文件、323 项测试全部通过。
+
+尚未执行的是需要真实写入的双 Vault 往返：隔离 Vault 没有独立的非生产 Space/凭据，生产 Space 不用于破坏性验收。因此 Step 4 保留为后续非生产环境清单；Step 5 已由 Computer Use 完成。
 
 ### Step 4：真实 Obsidian 双 Vault 往返
 
@@ -75,11 +78,11 @@ Task 12 新增回归覆盖：
    - 预期：恢复要么到达 committed，要么回滚，要么在歧义处冻结而不覆盖中断后新产生的本地编辑。
    - 判定：未覆盖中断后的本地编辑；最终状态要么一致要么显式冻结提示，无静默数据丢失。
 
-### Step 5：生产只读探测（待人工执行）
+### Step 5：生产只读探测（Computer Use 已通过）
 
 对已配置的生产凭据，只执行连接、capabilities、status 与 Pull preview，**不执行任何确认写入**。
 
-- 记录：协议选择（`Sync v2` / `Legacy v1`）、服务器实例 ID、Space 的 Folder/Page 数量、status 结果与 Pull preview 结果。
+- 结果：修复后显示 `Sync v2`，完成 status、差异与 Pull preview；V2 Space 列表 500 由 V1 元数据列表兼容，单 Space V2 同步链路保持不变。
 - 确认：未点击“确认执行”、未调用 Push/finalize，未产生任何远端写入。
-- 脱敏：不得记录凭据、页面正文或敏感路径。
-- 判定：能完成只读连接与预览，且日志确认零写入。
+- 脱敏：记录中不含凭据、服务器实例 ID、页面正文或敏感路径。
+- 判定：通过。

@@ -29,7 +29,7 @@ import type {
   TreeSpaceSummary,
   TreeSyncLimits,
 } from "../ports/tree-remote";
-import type { AgentWikiClient } from "./client";
+import { AgentWikiHttpError, type AgentWikiClient } from "./client";
 import {
   capabilitiesHash,
   DecimalByteCountSchema,
@@ -129,10 +129,17 @@ export class V2TreeRemote implements TreeRemotePort {
   }
 
   async spaces(): Promise<TreeSpaceSummary[]> {
-    const parsed = TreeSpaceListResponseV2Schema.parse(
-      await retryRead(async () => this.client.treeSpaces()),
-    );
-    return parsed.spaces.map((space) => ({ ...space }));
+    try {
+      const parsed = TreeSpaceListResponseV2Schema.parse(
+        await this.client.treeSpaces(),
+      );
+      return parsed.spaces.map((space) => ({ ...space }));
+    } catch (error) {
+      if (!(error instanceof AgentWikiHttpError) || error.status < 500)
+        throw error;
+      const fallback = await retryRead(async () => this.client.spaces());
+      return fallback.spaces.map((space) => ({ ...space, folderCount: "0" }));
+    }
   }
 
   async head(): Promise<TreeHead> {
