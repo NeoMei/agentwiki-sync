@@ -6,9 +6,9 @@
 
 最新收口结果（2026-08-30，插件 0.2.12）：
 
-- 测试：**41 个测试文件、319 项测试全部通过**（`vitest run`）。
+- 测试：**41 个测试文件、321 项测试全部通过**（`vitest run`）。
 - Prettier 通过；ESLint **0 error / 20 warning**（均为既有已知 warning，不含新增错误）。
-- strict typecheck、production build 通过；bundle safety 报告 `main.js` **1,180,349 bytes**；release metadata **0.2.12**。
+- strict typecheck、production build 通过；bundle safety 报告 `main.js` **1,180,496 bytes**；release metadata **0.2.12**。
 
 Task 12 新增回归覆盖：
 
@@ -26,6 +26,20 @@ Task 12 新增回归覆盖：
 ## 人工验收清单（待人工执行）
 
 以下 Step 4 / Step 5 依赖真实 Obsidian GUI、双 Vault 与生产凭据，无头环境无法执行。请人工完成后回填结果；未执行前不要标注为通过。
+
+## Computer Use 执行记录（2026-08-30）
+
+已在真实 Obsidian 1.13.7 中执行以下可安全完成的 GUI 验收：
+
+- 当前生产 Vault 的已安装插件完成只读同步预览：映射显示 `NeoMei-Space · AgentWiki · 所有者`、`服务器有更新`、`扫描 6 / 6`、`本地没有未推送的变更`、`服务器变更已与合并基线一致`。未点击自动合并、本地版本、服务器版本或任何确认写入按钮。
+- 建立隔离 Vault `AgentWiki-Sync-V2-Acceptance-A`，装入当前仓库 HEAD 的 `main.js`、`styles.css`、`manifest.json`，并用 SHA-256 确认隔离 Vault 的 bundle 与仓库 HEAD 一致。
+- 隔离 Vault 中插件真实启用，Ribbon 与命令面板均出现 `AgentWiki Sync`；打开同步中心后，HEAD 对裸错误码正确显示中文：`加载差异失败：库身份不匹配。请检查是否连接了正确的服务器和库。`
+
+尚不能据此把 Step 4 / Step 5 标为全部通过：
+
+- 当前安装在生产 Vault 的 0.2.12 bundle 不是仓库 HEAD，因此该次生产预览不能证明 HEAD 的 `协议：Sync v2` 标签。
+- 隔离 Vault 没有独立的非生产 Space/连接凭据，尚未执行双 Vault 的 Pull/Push 往返。
+- 执行期间另一个 Obsidian 自动化持续抢占 NeoMei-Docs 前台焦点，后续按键无法可靠限定在隔离 Vault；为避免误触生产内容，停止继续进行有状态 GUI 操作。
 
 ### Step 4：真实 Obsidian 双 Vault 往返
 
