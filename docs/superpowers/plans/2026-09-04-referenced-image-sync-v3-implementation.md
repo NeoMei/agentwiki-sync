@@ -494,7 +494,7 @@ Expected: FAIL，服务和 v3 revision schema 尚不存在。
 
 - [ ] **Step 3: 实现统一候选校验和 revision 写入**
 
-`advanceV3Locked()` 必须按顺序：验证 Page body hash；权威解析每页引用；比较声明 ID 集合；验证 Attachment 当前状态和 version/blob；计算 canonical v3 manifest/hash；批量写 Folder/Page/Attachment revision rows；写 v3 delta/sidecar/count；更新业务 Page/Attachment 当前字段；创建一条新 head。所有步骤使用调用方已持有的 Space lock transaction。
+`advanceV3Locked()` 必须按顺序：严格拒绝最新 head 的未知未来 schema/recipe；在逐页解析前验证 Task 1 数量/字节硬上限；验证 Page body hash；权威解析每页引用；比较声明 ID 集合；批量加载 Attachment/AttachmentVersion 并验证当前状态、版本 `storageKey` 一致性和现有 AttachmentStorage 中的 Blob 可读性；计算 canonical v3 manifest/hash；以 `createMany` 或有界批次写 Folder/Page/Attachment revision rows；写 v3 delta/sidecar/count；更新业务 Page/Attachment 当前字段；创建一条新 head。所有步骤使用调用方已持有的 Space lock transaction。不得以非空 `storageKey` 字符串替代 Blob 可用性验证；Task 6 的 Push staging 尚未存在时，bootstrap/网页写入使用现有 AttachmentStorage 作为 Blob 权威来源。
 
 ```ts
 if (!sameStringSet(parsedIds, page.referencedAttachmentIds)) {
@@ -509,7 +509,7 @@ if (!sameStringSet(parsedIds, page.referencedAttachmentIds)) {
 
 - [ ] **Step 4: 实现无图片 Space 的模式与首次写入合并**
 
-`legacy_v2`：当前/历史均未发布 v3 且当前正文无 managed candidate；`bootstrap_required`：尚无 v3、当前正文有 candidate；`native_v3`：任一 v3 head 已发布。网页 Page 保存或重命名首次触发 v3 时，必须在同一个 `advanceV3Locked()` 中构造“旧 v2 当前状态 + 本次用户变更”的第一个 v3 head，不创建中间 bootstrap revision。
+`legacy_v2`：当前/历史均未发布 v3且当前正文无 managed candidate；`bootstrap_required`：尚无 v3、当前正文有 candidate；`native_v3`：任一 v3 head 已发布。网页 Page 保存或重命名首次触发 v3 时，必须在同一个 `advanceV3Locked()` 中构造“旧 v2 当前状态 + 本次用户变更”的第一个 v3 head，不创建中间 bootstrap revision。现有调用者在同一事务中先把变更应用到 live rows；Space writer 必须把非空 `changes` 传给 v3 writer，由 v3 writer逐项验证正文、路径/重命名、结构和归档已经反映在 live candidate，不能静默丢弃 `changes`。`SyncV3RevisionWriterService` 在生产 module 中是必需依赖，provider 缺失必须启动/注入失败，不得 fail-open 回落到 legacy writer。
 
 - [ ] **Step 5: 注入事务失败，证明 DB 无部分状态**
 
