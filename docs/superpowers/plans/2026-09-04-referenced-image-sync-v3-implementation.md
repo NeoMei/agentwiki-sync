@@ -199,20 +199,22 @@ model AttachmentVersion {
   attachment SpaceAttachment @relation(fields: [attachmentId], references: [id], onDelete: Restrict)
 
   @@unique([attachmentId, contentHash])
+  @@unique([id, attachmentId])
   @@index([contentHash])
 }
 
 model SyncRevisionAttachmentRow {
   revisionId          String
+  spaceId             String
   attachmentId        String
   attachmentVersionId String
   path                String
   pathKey             String
   ordinal             Int
 
-  revision          SpaceKnowledgeRevision @relation(fields: [revisionId], references: [id], onDelete: Restrict)
-  attachment        SpaceAttachment @relation(fields: [attachmentId], references: [id], onDelete: Restrict)
-  attachmentVersion AttachmentVersion @relation(fields: [attachmentVersionId], references: [id], onDelete: Restrict)
+  revision          SpaceKnowledgeRevision @relation(fields: [revisionId, spaceId], references: [id, spaceId], onDelete: Restrict)
+  attachment        SpaceAttachment @relation(fields: [attachmentId, spaceId], references: [id, spaceId], onDelete: Restrict)
+  attachmentVersion AttachmentVersion @relation(fields: [attachmentVersionId, attachmentId], references: [id, attachmentId], onDelete: Restrict)
 
   @@id([revisionId, attachmentId])
   @@unique([revisionId, pathKey])
@@ -297,13 +299,13 @@ Expected: FAIL，数据库不存在 `AttachmentVersion` 和 `SyncRevisionAttachm
 
 Run: `pnpm --filter @agentwiki/server exec prisma migrate dev --name add_sync_v3_attachments --create-only`
 
-迁移必须：先建表/索引/外键，再以 `INSERT ... SELECT` 从所有现有 active `SpaceAttachment` 回填一版；不得更新历史 Revision；不得删除原 `contentHash/storageKey` 字段；所有 BigInt 使用非负约束；chunk 序号与总数有边界约束。
+迁移必须：先建表/索引/外键，再以 `INSERT ... SELECT` 从所有现有 active `SpaceAttachment` 回填一版；不得更新历史 Revision；不得删除原 `contentHash/storageKey` 字段；所有 BigInt 使用非负约束；chunk 序号与总数有边界约束。`SpaceKnowledgeRevision` 与 `SpaceAttachment` 必须提供可被复合外键引用的 `[id, spaceId]` 唯一键，Revision Attachment 行以 `spaceId` 同时约束 Revision 和 Attachment，且以 `[attachmentVersionId, attachmentId]` 保证版本属于该 Attachment。`path` 必须由数据库约束为非空的 `assets/<single-file-name>` 单段路径，拒绝嵌套、`.`、`..` 和反斜杠。
 
 - [ ] **Step 4: 用迁移前快照验证 apply、重复检查与回滚恢复手册**
 
 Run: `node -e 'if (!process.env.SYNC_V3_TEST_DATABASE_URL) throw new Error("SYNC_V3_TEST_DATABASE_URL is required")' && node --test scripts/sync-v3-attachment-schema-db.test.mjs`
 
-Expected: PASS；测试在独立 schema 中验证迁移前两张 active、一张 archived 附件，回填只覆盖 active，旧 Revision 行数不变。
+Expected: PASS；测试在独立 schema 中验证迁移前两张 active、一张 archived 附件，回填只覆盖 active，旧 Revision 行数不变；通过真实 `prisma migrate deploy` 记录目标 migration 后再次执行并证明 no-op，不以 `psql` 直接执行目标迁移替代 Prisma ledger。数据库凭据不得进入子进程 argv 或错误输出。
 
 - [ ] **Step 5: 生成客户端并跑现有 schema 门**
 
