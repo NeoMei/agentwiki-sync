@@ -39,6 +39,7 @@
 - Create: `packages/sync-protocol/src/sync-v3.spec.ts`
 - Create: `packages/sync-protocol/test-vectors/sync-v3.json`
 - Modify: `packages/sync-protocol/src/index.ts`
+- Modify: `packages/sync-protocol/src/schemas.ts`（只导出既有 `PublicIdSchema`，不改变 v1/v2 wire 规则）
 - Modify: `packages/sync-protocol/package.json`
 - Modify: `packages/sync-protocol/README.md`
 
@@ -75,6 +76,8 @@ export type TreeDeltaItemV3 =
       previousPath: string;
     };
 ```
+
+所有 v3 `attachmentId` / `referencedAttachmentIds` / `declaredAttachmentIds` 字段使用与既有 AgentWiki Space/Page/Revision 相同的 Public ID 约束（`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`），同时接受现有 CUID 和新 UUID；不得把它们收窄为 UUID，也不得为 bootstrap 复制一套同步专用附件身份。
 
 - [ ] **Step 1: 写失败测试，锁定 strict schema、路径、引用集合和能力硬上限**
 
@@ -134,7 +137,7 @@ export const TREE_SYNC_V3_HARD_LIMITS = Object.freeze({
 
 export const SyncAttachmentV3Schema = z
   .object({
-    attachmentId: z.string().uuid(),
+    attachmentId: PublicIdSchema,
     path: FlatAttachmentPathSchema,
     mimeType: z.enum(["image/png", "image/jpeg", "image/webp", "image/gif"]),
     sizeBytes: BoundedDecimalSchema,
