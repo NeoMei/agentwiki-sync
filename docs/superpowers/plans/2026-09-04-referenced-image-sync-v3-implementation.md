@@ -66,6 +66,28 @@ export interface SyncPageV3 extends SyncPageV2 {
   referencedAttachmentIds: string[];
 }
 
+export interface BlobRequirementV3 {
+  contentHash: string;
+  sizeBytes: string;
+  mimeType: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+  width: number;
+  height: number;
+}
+
+export interface CreateTreePushSessionRequestV3 {
+  protocolVersion: "3";
+  baseRevision: string;
+  idempotencyKey: string;
+  capabilitiesHash: string;
+  confirmationHash: string;
+  confirmationByteLength: number;
+  changeCount: number;
+  totalBodyBytes: number;
+  attachmentCount: number;
+  transferBlobBytes: number;
+  blobRequirements: BlobRequirementV3[];
+}
+
 export type TreeDeltaItemV3 =
   | Exclude<TreeDeltaItemV2, { operation: "upsert_page" }>
   | { operation: "upsert_page"; page: SyncPageV3 }
@@ -76,6 +98,8 @@ export type TreeDeltaItemV3 =
       previousPath: string;
     };
 ```
+
+`BlobRequirementV3Schema` 只接受上述五个字段：`sizeBytes` 为大于 0 且不超过 10 MiB 的 canonical decimal string，MIME/尺寸/解码像素与 `SyncAttachmentV3` 使用同一硬上限。create request 必须拒绝旧 `contentHashes` 和任何未知字段；`blobRequirements` 按 `contentHash` 严格升序且唯一，最多 1,000 项。`attachmentCount` 精确表示 confirmation changes 中 `upsert_attachment` 的数量，不是最终 Revision 的 Attachment 总数；同一 Blob 可被多个 Attachment identity 复用，因此只要求 `blobRequirements.length <= attachmentCount`，且 `attachmentCount = 0` 时必须为空。`transferBlobBytes` 等于去重 requirements 的 `sizeBytes` 精确总和并且不得超过 100 MiB。requirements 必须包含 confirmation 中每个 `upsert_attachment.attachment.contentHash` 的唯一集合，包括服务端可能已有的 Blob；schema 无法看到 confirmation preimage，Task 7 必须在 batch upload 与 Finalize 交叉验证这一集合。现有 confirmation manifest/hash、五个 canonical digest 和错误码集合不变。
 
 所有 v3 `attachmentId` / `referencedAttachmentIds` / `declaredAttachmentIds` 字段使用与既有 AgentWiki Space/Page/Revision 相同的 Public ID 约束（`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`），同时接受现有 CUID 和新 UUID；不得把它们收窄为 UUID，也不得为 bootstrap 复制一套同步专用附件身份。
 
@@ -797,11 +821,11 @@ Expected: FAIL。
 
 - [ ] **Step 3: 实现 create 与 canonical batch upload**
 
-create 严格绑定 credential family、credential id、user、Space、base Revision、idempotency key、capability hash、confirmation hash、change/blob counts 和 bytes；upload 只接受 manifest 中实体，每批 receipt 持久化后才能响应。相同 idempotency key + 相同请求返回原 session，不同请求返回 `IDEMPOTENCY_CONFLICT`。
+create request 在任何 change batch 之前携带完整 `blobRequirements`，并严格绑定 credential family、credential id、user、Space、base Revision、idempotency key、capability hash、confirmation hash、change/blob counts 和 bytes。`attachmentCount` 是 confirmation 中 `upsert_attachment` change 数量，不是最终 Revision Attachment 总数；requirements 是这些 upsert 中 `contentHash` 的严格排序唯一集合，`transferBlobBytes` 是其声明 `sizeBytes` 的精确总和。客户端必须声明全部 requirements，包括服务端可能已持有者；create 逐项查询已验证内容存储后只把缺失项返回为 `missingContentHashes`。upload 只接受 manifest 中实体，并逐个交叉验证 `upsert_attachment` 的 hash/size/MIME/width/height 与 create 时 requirements 一致；每批 receipt 持久化后才能响应。收齐 batches 后必须证明 requirements 集合与全部 `upsert_attachment` 的唯一 hash 集合精确相等，不能接受漏报或多报。相同 idempotency key + 相同请求返回原 session，不同请求返回 `IDEMPOTENCY_MISMATCH`。
 
 - [ ] **Step 4: 实现不可取消 Finalize**
 
-Finalize 进入 `finalizing` 后，在同一 serializable transaction 和 Space lock 内重新检查：credential/成员/角色、base head、capability hash、所有 batch receipts、所有 blob receipts、candidate limits、Page 引用集合与 AttachmentVersion。验证成功后调用 `advanceV3Locked()` 并将 terminal result 一同持久化。
+Finalize 进入 `finalizing` 后，在同一 serializable transaction 和 Space lock 内重新检查：credential/成员/角色、base head、capability hash、所有 batch receipts、create-time requirements 与全部 `upsert_attachment` 的唯一 hash/metadata 集合、所有缺失 Blob receipts、candidate limits、Page 引用集合与 AttachmentVersion。对服务端 create 时已经持有、因而未出现在 `missingContentHashes` 的 Blob 也必须复核可读和 metadata 一致；验证成功后调用 `advanceV3Locked()` 并将 terminal result 一同持久化。
 
 ```ts
 if (session.status === "published") {
@@ -1707,11 +1731,11 @@ Expected: FAIL。
 
 - [ ] **Step 3: 扩展 prepared changes 与 confirmation manifest**
 
-`upsert_attachment` 只保存 metadata + `vaultPath` sidecar reference，不把 bytes 放 JSON；Page upsert 包含 sorted unique `referencedAttachmentIds`。preview 确认时生成 exact v3 manifest/hash，journal 落盘并 verify 后才调用 create session。
+`upsert_attachment` 只保存 metadata + `vaultPath` sidecar reference，不把 bytes 放 JSON；Page upsert 包含 sorted unique `referencedAttachmentIds`。preview 确认时生成 exact v3 manifest/hash，并由全部 `upsert_attachment` 先构造按 `contentHash` 严格排序且去重的 `BlobRequirementV3[]`；同 hash 的多 Attachment 必须具有完全相同的 size/MIME/width/height，否则本地失败关闭。`attachmentCount` 使用 upsert change 数量，`transferBlobBytes` 使用去重 requirements 的精确总和。journal 连同这些 create 参数落盘并 verify 后，才调用 create session；纯 detach 和未变 base Attachment 不生成 requirement。
 
 - [ ] **Step 4: 先上传 server 声明缺失的 Blob，再上传 canonical change batches**
 
-每次读取 Vault 前检查 path 当前 hash 与 preview；每个 chunk receipt 立刻持久化。`CAPABILITIES_CHANGED` 只允许清理 session 后完整重建 preview 一次；`BASE_STALE` 标记 superseded 并回到 Pull，不复用旧 confirmation。
+严格顺序为：先用全部 requirements create session，再只上传 server 声明的 `missingContentHashes`，最后上传 canonical change batches。每次读取 Vault 前检查 path 当前 hash 与 preview；每个 chunk receipt 立刻持久化。服务端在 batch upload/Finalize 交叉验证 upsert 与 create-time requirements 的精确唯一集合，客户端不得先探测或猜测服务端已有 Blob。`CAPABILITIES_CHANGED` 只允许清理 session 后完整重建 preview 一次；`BASE_STALE` 标记 superseded 并回到 Pull，不复用旧 confirmation。
 
 - [ ] **Step 5: Finalize 前重扫并进入不可取消态**
 
