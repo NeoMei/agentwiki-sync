@@ -330,7 +330,6 @@ git commit -m "feat(server): persist sync v3 attachment versions"
 - Create: `apps/server/src/markdown-resources/attachment-reference.spec.ts`
 - Modify: `apps/server/src/markdown-resources/markdown-resource.service.ts`
 - Modify: `apps/server/src/markdown-resources/markdown-resource.service.spec.ts`
-- Modify: `apps/server/src/markdown-resources/markdown-resource.module.ts`
 
 **Interfaces:**
 
@@ -380,7 +379,7 @@ it.each([
 });
 ```
 
-再加入：转义括号、尖括号 URL、单/双引号 title、Obsidian alias/尺寸、URL 编码、NFC、case-fold 冲突、历史 `![[name.png]]` 唯一/多义/缺失、非图片普通链接和 fenced code 不误判。
+再加入：转义括号、尖括号 URL、单/双引号/括号 title、Obsidian alias/尺寸、URL 编码、NFC、case-fold 冲突、历史 `![[name.png]]` 唯一/多义/缺失、非图片普通链接、缩进代码、顶层及 blockquote/list 容器中的 fenced code、inline code 和 HTML comment 不误判。标准 Markdown destination 后只允许空白和一个完整合法 title；非法尾随文本、多 title、未闭合 title 均 fail closed。只将 HTTP(S)、FTP 与 protocol-relative 网络 URL 和 `data:` URI归为 external；`file:`、绝对路径及 drive-like 路径仍为非法本地引用。
 
 - [ ] **Step 2: 运行解析测试，确认共享解析器不存在而失败**
 
@@ -406,7 +405,7 @@ export function rewriteAttachmentReferenceRanges(
 }
 ```
 
-解析器只输出结构证据，不访问磁盘；相对 Markdown 路径按 Page 目录解析，最终必须规整为 `assets/<single-file-name>`。
+解析器只输出结构证据，不访问磁盘；相对 Markdown 路径按 Page 目录解析，最终必须规整为 `assets/<single-file-name>`。扫描必须保持线性复杂度，转义判断不得对每个字符反向重扫任意长度的反斜线链。
 
 - [ ] **Step 4: 证明改写只改变 path token**
 
