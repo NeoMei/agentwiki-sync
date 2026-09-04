@@ -167,7 +167,7 @@ Push confirmation manifest 同时绑定 Folder/Page/Attachment changes、Page �
 
 创建 Push session 的请求必须在上传 canonical change batches 之前携带严格的 `blobRequirements`：每项只包含 `contentHash`、`sizeBytes`、`mimeType`、`width` 和 `height`，不包含 `attachmentId`、路径或更新时间。requirements 按 `contentHash` 严格升序且唯一，精确覆盖本次 confirmation changes 中全部 `upsert_attachment.attachment.contentHash` 的去重集合；同一个 Blob 可以由多个 Attachment identity 复用。这里必须声明全部需要的 Blob，包括服务端可能已经持有的内容，客户端不得在 create 前猜测服务端存量；服务端再据此过滤并返回 `missingContentHashes`。
 
-create request 的 `attachmentCount` 表示本次 confirmation 中 `upsert_attachment` change 的数量约束，不是候选最终 Revision 的 Attachment 总数。纯 `detach_attachment`、沿用 base 的未变 Attachment 都不要求 Blob requirement；因此 `blobRequirements.length <= attachmentCount`，`attachmentCount = 0` 时 requirements 必须为空。`transferBlobBytes` 是上述去重 requirements 的 `sizeBytes` 精确总和（包括服务端可能已存在的 Blob），并受 100 MiB 硬上限和协商 capability 约束。公开 request schema 可以校验排序、唯一、数量和精确字节和；requirements 与 confirmation changes 的集合一致性必须由服务端在 batch upload 和 Finalize 时交叉验证。confirmation manifest 与 `confirmationHash` 算法保持不变，因为 `upsert_attachment` 已绑定同一组 Blob 元数据。
+create request 的 `attachmentCount` 表示本次 confirmation 中 `upsert_attachment` change 的数量约束，不是候选最终 Revision 的 Attachment 总数。纯 `detach_attachment`、沿用 base 的未变 Attachment 都不要求 Blob requirement；因此 `attachmentCount <= changeCount`、`blobRequirements.length <= attachmentCount`，`attachmentCount = 0` 时 requirements 必须为空，而 `attachmentCount > 0` 时 requirements 必须非空。`transferBlobBytes` 是上述去重 requirements 的 `sizeBytes` 精确总和（包括服务端可能已存在的 Blob），并受 100 MiB 硬上限和协商 capability 约束。公开 request schema 可以校验排序、唯一、数量和精确字节和；requirements 与 confirmation changes 的集合一致性必须由服务端在 batch upload 和 Finalize 时交叉验证。confirmation manifest 与 `confirmationHash` 算法保持不变，因为 `upsert_attachment` 已绑定同一组 Blob 元数据。
 
 Blob 上传：
 
