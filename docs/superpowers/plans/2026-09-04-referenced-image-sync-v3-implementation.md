@@ -66,7 +66,8 @@ export interface SyncPageV3 extends SyncPageV2 {
 }
 
 export type TreeDeltaItemV3 =
-  | TreeDeltaItemV2
+  | Exclude<TreeDeltaItemV2, { operation: "upsert_page" }>
+  | { operation: "upsert_page"; page: SyncPageV3 }
   | { operation: "upsert_attachment"; attachment: SyncAttachmentV3 }
   | {
       operation: "detach_attachment";
