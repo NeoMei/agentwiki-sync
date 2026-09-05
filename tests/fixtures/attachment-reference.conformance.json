@@ -1,0 +1,289 @@
+[
+  {
+    "name": "canonical",
+    "body": "![[assets/a.png|320]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "managed",
+        "rawTarget": "assets/a.png",
+        "resolvedPath": "assets/a.png"
+      }
+    ]
+  },
+  {
+    "name": "relative",
+    "body": "![alt](../assets/a.png \"title\")",
+    "expected": [
+      {
+        "syntax": "markdown",
+        "classification": "managed",
+        "rawTarget": "../assets/a.png",
+        "resolvedPath": "assets/a.png"
+      }
+    ]
+  },
+  {
+    "name": "angle",
+    "body": "![alt](<../assets/a b.png>)",
+    "expected": [
+      {
+        "syntax": "markdown",
+        "classification": "managed",
+        "rawTarget": "../assets/a b.png",
+        "resolvedPath": "assets/a b.png"
+      }
+    ]
+  },
+  {
+    "name": "escaped-space",
+    "body": "![alt](../assets/a\\ b.png \"title\")",
+    "expected": [
+      {
+        "syntax": "markdown",
+        "classification": "managed",
+        "rawTarget": "../assets/a\\ b.png",
+        "resolvedPath": "assets/a b.png"
+      }
+    ]
+  },
+  {
+    "name": "legacy",
+    "body": "![[a.png]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "managed",
+        "rawTarget": "a.png",
+        "resolvedPath": "assets/a.png"
+      }
+    ]
+  },
+  {
+    "name": "NFC",
+    "body": "![[assets/Café.PNG]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "managed",
+        "rawTarget": "assets/Café.PNG",
+        "resolvedPath": "assets/Café.PNG"
+      }
+    ]
+  },
+  {
+    "name": "external",
+    "body": "![a](https://example.test/a.png) ![b](data:image/png;base64,AA==)",
+    "expected": [
+      {
+        "syntax": "markdown",
+        "classification": "external",
+        "rawTarget": "https://example.test/a.png",
+        "resolvedPath": null
+      },
+      {
+        "syntax": "markdown",
+        "classification": "external",
+        "rawTarget": "data:image/png;base64,AA==",
+        "resolvedPath": null
+      }
+    ]
+  },
+  {
+    "name": "escape-root",
+    "body": "![x](../../secret.png)",
+    "expected": [
+      {
+        "syntax": "markdown",
+        "classification": "invalid",
+        "rawTarget": "../../secret.png",
+        "resolvedPath": null
+      }
+    ]
+  },
+  {
+    "name": "unsupported",
+    "body": "![[assets/a.svg]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "invalid",
+        "rawTarget": "assets/a.svg",
+        "resolvedPath": null
+      }
+    ]
+  },
+  {
+    "name": "page-embed",
+    "body": "![[A note]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "page_embed",
+        "rawTarget": "A note",
+        "resolvedPath": null
+      }
+    ]
+  },
+  {
+    "name": "page-embed-md",
+    "body": "![[folder/note.md#Section]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "page_embed",
+        "rawTarget": "folder/note.md#Section",
+        "resolvedPath": null
+      }
+    ]
+  },
+  {
+    "name": "markdown-assets-prefix",
+    "body": "![x](assets/a.png)",
+    "expected": [
+      {
+        "syntax": "markdown",
+        "classification": "invalid",
+        "rawTarget": "assets/a.png",
+        "resolvedPath": null
+      }
+    ]
+  },
+  {
+    "name": "obsidian-relative",
+    "body": "![[../assets/a.png]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "invalid",
+        "rawTarget": "../assets/a.png",
+        "resolvedPath": null
+      }
+    ]
+  },
+  {
+    "name": "nested-alt",
+    "body": "![alt [nested]](../assets/a.png)",
+    "expected": [
+      {
+        "syntax": "markdown",
+        "classification": "managed",
+        "rawTarget": "../assets/a.png",
+        "resolvedPath": "assets/a.png"
+      }
+    ]
+  },
+  {
+    "name": "inline",
+    "body": "`![[assets/a.png]]` ![[assets/b.png]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "managed",
+        "rawTarget": "assets/b.png",
+        "resolvedPath": "assets/b.png"
+      }
+    ]
+  },
+  {
+    "name": "unequal-ticks",
+    "body": "`` text `![[assets/a.png]]` text `` ![[assets/b.png]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "managed",
+        "rawTarget": "assets/b.png",
+        "resolvedPath": "assets/b.png"
+      }
+    ]
+  },
+  {
+    "name": "unclosed-fence",
+    "body": "```\n![[assets/a.png]]",
+    "expected": []
+  },
+  {
+    "name": "list-fence",
+    "body": "- ```\n  ![[assets/a.png]]\n  ```\n![[assets/b.png]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "managed",
+        "rawTarget": "assets/b.png",
+        "resolvedPath": "assets/b.png"
+      }
+    ]
+  },
+  {
+    "name": "list-fence-exit",
+    "body": "- ```\n  ![[assets/a.png]]\n\n![[assets/b.png]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "managed",
+        "rawTarget": "assets/b.png",
+        "resolvedPath": "assets/b.png"
+      }
+    ]
+  },
+  {
+    "name": "quote-fence-exit",
+    "body": "> ```\n> ![[assets/a.png]]\n\n![[assets/b.png]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "managed",
+        "rawTarget": "assets/b.png",
+        "resolvedPath": "assets/b.png"
+      }
+    ]
+  },
+  {
+    "name": "comment",
+    "body": "<!-- ![[assets/a.png]] --> ![[assets/b.png]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "managed",
+        "rawTarget": "assets/b.png",
+        "resolvedPath": "assets/b.png"
+      }
+    ]
+  },
+  {
+    "name": "malformed-title",
+    "body": "![x](../assets/a.png \"one\" trailing)",
+    "expected": [
+      {
+        "syntax": "markdown",
+        "classification": "invalid",
+        "rawTarget": "../assets/a.png",
+        "resolvedPath": null
+      }
+    ]
+  },
+  {
+    "name": "percent",
+    "body": "![x](../assets/a%20b.png)",
+    "expected": [
+      {
+        "syntax": "markdown",
+        "classification": "managed",
+        "rawTarget": "../assets/a%20b.png",
+        "resolvedPath": "assets/a b.png"
+      }
+    ]
+  },
+  {
+    "name": "escape-paren",
+    "body": "![x](../assets/a\\(b\\).png)",
+    "expected": [
+      {
+        "syntax": "markdown",
+        "classification": "managed",
+        "rawTarget": "../assets/a\\(b\\).png",
+        "resolvedPath": "assets/a(b).png"
+      }
+    ]
+  }
+]

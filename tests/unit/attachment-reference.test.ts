@@ -7,8 +7,49 @@ import {
 import vectors from "@neomei/agentwiki-sync-protocol/test-vectors/sync-v3.json";
 
 import { parseAttachmentReferences } from "../../src/core/attachment-reference";
+import conformanceCases from "../fixtures/attachment-reference.conformance.json";
+
+type NormalizedClassification =
+  "managed" | "page_embed" | "external" | "invalid";
+
+function normalizedClassification(
+  classification: ReturnType<
+    typeof parseAttachmentReferences
+  >[number]["classification"],
+): NormalizedClassification {
+  return classification === "local" || classification === "legacy"
+    ? "managed"
+    : classification;
+}
 
 describe("parseAttachmentReferences", () => {
+  it.each(conformanceCases)(
+    "matches neutral conformance case $name",
+    ({ body, expected }) => {
+      const references = parseAttachmentReferences(body, "pages/note.md");
+
+      expected.forEach((expectedReference, index) => {
+        const targetStart = body.indexOf(expectedReference.rawTarget);
+        expect(references[index]?.targetStart).toBe(targetStart);
+        expect(references[index]?.targetEnd).toBe(
+          targetStart + expectedReference.rawTarget.length,
+        );
+      });
+
+      expect(
+        references.map((reference) => ({
+          syntax: reference.syntax,
+          classification: normalizedClassification(reference.classification),
+          rawTarget: body.slice(reference.targetStart, reference.targetEnd),
+          resolvedPath:
+            reference.classification === "legacy"
+              ? `assets/${reference.target}`
+              : (reference.resolvedPath ?? null),
+        })),
+      ).toEqual(expected);
+    },
+  );
+
   it("preserves source ranges for exact target rewriting", () => {
     const body = "before ![[assets/a.png|320]] after";
     const reference = parseAttachmentReferences(body, "pages/note.md")[0]!;
@@ -191,5 +232,36 @@ describe("parseAttachmentReferences", () => {
     expect(body.slice(reference!.targetStart, reference!.targetEnd)).toBe(
       String.raw`assets/a\].png`,
     );
+  });
+
+  it("balances nested and escaped alt brackets while preserving the exact target range", () => {
+    const body = String.raw`![outer [inner\] literal]](../assets/a.png)`;
+    const [reference] = parseAttachmentReferences(body, "pages/note.md");
+
+    expect(reference).toMatchObject({
+      syntax: "markdown",
+      classification: "local",
+      resolvedPath: "assets/a.png",
+    });
+    expect(body.slice(reference!.targetStart, reference!.targetEnd)).toBe(
+      "../assets/a.png",
+    );
+  });
+
+  it.each([
+    [
+      "nested block quote and list",
+      "> - ```md\r\n>   ![[assets/hidden.png]]\r\n![[assets/real.png]]",
+    ],
+    [
+      "nested list",
+      "- outer\n  - ```md\n    ![[assets/hidden.png]]\n  ![[assets/real.png]]",
+    ],
+  ])("reprocesses the exit line after leaving a %s fence", (_label, body) => {
+    expect(
+      parseAttachmentReferences(body, "pages/note.md").map(
+        (reference) => reference.resolvedPath,
+      ),
+    ).toEqual(["assets/real.png"]);
   });
 });

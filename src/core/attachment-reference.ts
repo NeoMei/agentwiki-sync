@@ -1,7 +1,7 @@
 import { FlatAttachmentPathSchema } from "@neomei/agentwiki-sync-protocol";
 
 export type AttachmentReferenceClassification =
-  "local" | "legacy" | "external" | "invalid";
+  "local" | "legacy" | "page_embed" | "external" | "invalid";
 
 export interface AttachmentReference {
   syntax: "obsidian" | "markdown";
@@ -45,37 +45,117 @@ function stripContainers(line: string): string {
   }
 }
 
+interface FenceContainer {
+  quoteDepth: number;
+  listContentIndent: number | null;
+}
+
+function quotePrefixEnd(
+  line: string,
+  requiredDepth?: number,
+): { cursor: number; depth: number; complete: boolean } {
+  let cursor = 0;
+  let depth = 0;
+  while (requiredDepth === undefined || depth < requiredDepth) {
+    const match = line.slice(cursor).match(/^ {0,3}>[ \t]?/u);
+    if (!match) break;
+    cursor += match[0].length;
+    depth += 1;
+  }
+  return {
+    cursor,
+    depth,
+    complete: requiredDepth === undefined || depth === requiredDepth,
+  };
+}
+
+function openingFenceContext(line: string): {
+  content: string;
+  container: FenceContainer;
+} {
+  const quote = quotePrefixEnd(line);
+  let cursor = quote.cursor;
+  let listContentIndent: number | null = null;
+  for (;;) {
+    const match = line
+      .slice(cursor)
+      .match(/^ {0,3}(?:[-+*]|\d{1,9}[.)])[ \t]/u);
+    if (!match) break;
+    cursor += match[0].length;
+    listContentIndent = cursor - quote.cursor;
+  }
+  return {
+    content: line.slice(cursor),
+    container: { quoteDepth: quote.depth, listContentIndent },
+  };
+}
+
+function activeFenceContent(
+  line: string,
+  container: FenceContainer,
+): { inside: boolean; content: string } {
+  const quote = quotePrefixEnd(line, container.quoteDepth);
+  if (!quote.complete) {
+    return { inside: line.trim().length === 0, content: "" };
+  }
+  const rest = line.slice(quote.cursor);
+  if (container.listContentIndent === null)
+    return { inside: true, content: rest };
+  if (rest.trim().length === 0) return { inside: true, content: "" };
+  let indent = 0;
+  while (rest[indent] === " ") indent += 1;
+  return {
+    inside: indent >= container.listContentIndent,
+    content:
+      indent >= container.listContentIndent
+        ? rest.slice(container.listContentIndent)
+        : rest,
+  };
+}
+
 function excludedMask(body: string): Uint8Array {
   const mask = new Uint8Array(body.length);
   for (const match of body.matchAll(/<!--[\s\S]*?(?:-->|$)/gu))
     mark(mask, match.index, match.index + match[0].length);
 
-  let fence: { marker: "`" | "~"; length: number } | null = null;
+  let fence: ({ marker: "`" | "~"; length: number } & FenceContainer) | null =
+    null;
   let offset = 0;
   for (const lineWithBreak of body.match(/[^\n]*(?:\n|$)/gu) ?? []) {
     if (lineWithBreak.length === 0) continue;
     const line = lineWithBreak.endsWith("\n")
       ? lineWithBreak.slice(0, -1)
       : lineWithBreak;
-    const content = stripContainers(line);
-    const fenceMatch = content.match(/^ {0,3}(`{3,}|~{3,})/u);
     if (fence) {
-      mark(mask, offset, offset + lineWithBreak.length);
-      if (
-        fenceMatch &&
-        fenceMatch[1]![0] === fence.marker &&
-        fenceMatch[1]!.length >= fence.length &&
-        content.slice(fenceMatch[0].length).trim().length === 0
-      )
-        fence = null;
-    } else if (fenceMatch) {
+      const active = activeFenceContent(line, fence);
+      if (!active.inside) fence = null;
+      else {
+        const fenceMatch = active.content.match(/^ {0,3}(`{3,}|~{3,})/u);
+        mark(mask, offset, offset + lineWithBreak.length);
+        if (
+          fenceMatch &&
+          fenceMatch[1]![0] === fence.marker &&
+          fenceMatch[1]!.length >= fence.length &&
+          active.content.slice(fenceMatch[0].length).trim().length === 0
+        )
+          fence = null;
+        offset += lineWithBreak.length;
+        continue;
+      }
+    }
+    const opening = openingFenceContext(line);
+    const fenceMatch = opening.content.match(/^ {0,3}(`{3,}|~{3,})/u);
+    if (fenceMatch) {
       fence = {
         marker: fenceMatch[1]![0] as "`" | "~",
         length: fenceMatch[1]!.length,
+        ...opening.container,
       };
       mark(mask, offset, offset + lineWithBreak.length);
-    } else if (/^(?: {4}|\t)/u.test(content)) {
-      mark(mask, offset, offset + lineWithBreak.length);
+    } else {
+      const content = stripContainers(line);
+      if (/^(?: {4}|\t)/u.test(content))
+        mark(mask, offset, offset + lineWithBreak.length);
     }
     offset += lineWithBreak.length;
   }
@@ -155,6 +235,13 @@ function resolvePath(
   )
     return { classification: "legacy", target };
 
+  if (
+    syntax === "obsidian" &&
+    !target.startsWith("assets/") &&
+    !/\.(?:png|jpe?g|webp|gif)$/iu.test(target)
+  )
+    return { classification: "page_embed", target };
+
   let candidate = target;
   if (syntax === "markdown") {
     const stack = pagePath.normalize("NFC").split("/");
@@ -189,6 +276,24 @@ function findUnescaped(text: string, token: string, start: number): number {
   while (index >= 0 && isEscaped(text, index))
     index = text.indexOf(token, index + 1);
   return index;
+}
+
+function findClosingAltBracket(body: string, start: number): number {
+  let depth = 0;
+  for (let index = start; index < body.length; index += 1) {
+    const character = body[index];
+    if (character === "\n" || character === "\r") return -1;
+    if (character === "\\") {
+      index += 1;
+      continue;
+    }
+    if (character === "[") depth += 1;
+    else if (character === "]") {
+      if (depth === 0) return index;
+      depth -= 1;
+    }
+  }
+  return -1;
 }
 
 function completeTitle(value: string): boolean {
@@ -325,10 +430,8 @@ export function parseAttachmentReferences(
       continue;
     }
     if (!body.startsWith("![", index)) continue;
-    let altClose = index + 2;
-    for (; altClose < body.length; altClose += 1)
-      if (body[altClose] === "]" && !isEscaped(body, altClose)) break;
-    if (body[altClose] !== "]" || body[altClose + 1] !== "(") continue;
+    const altClose = findClosingAltBracket(body, index + 2);
+    if (altClose < 0 || body[altClose + 1] !== "(") continue;
     const open = altClose + 1;
     const close = closingParen(body, open);
     if (close < 0) continue;

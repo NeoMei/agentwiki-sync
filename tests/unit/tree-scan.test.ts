@@ -137,6 +137,26 @@ function snapshotV3(overrides: Partial<TreeSnapshotV3> = {}): TreeSnapshotV3 {
 }
 
 describe("scanLocalTree", () => {
+  it("ignores ordinary Obsidian Page embeds without binary reads or image blockers", async () => {
+    const vault = new MemoryVault({});
+    vault.seedMarkdown(
+      "pages/note.md",
+      "![[A note|Alias]] ![[folder/note.md#Section]]",
+    );
+
+    const scan = await scanLocalTree(
+      vault,
+      "",
+      snapshotV3(),
+      identityState(),
+      imageLimits,
+    );
+
+    expect(scan.attachments).toEqual([]);
+    expect(scan.blockers).toEqual([]);
+    expect(vault.readPaths).toEqual([]);
+  });
+
   it("enumerates folders and pages under the managed pages root", async () => {
     const vault = new MemoryVault({ "Wiki/pages/Guide/B.md": "# B" });
     await vault.createDirectory("Wiki/pages/Empty");

@@ -440,7 +440,11 @@ export async function scanLocalTree(
     for (const [index, reference] of (
       pageReferences.get(page.path) ?? []
     ).entries()) {
-      if (reference.classification === "external") continue;
+      if (
+        reference.classification === "external" ||
+        reference.classification === "page_embed"
+      )
+        continue;
       if (reference.classification === "invalid") {
         blockers.push(
           referenceBlocker(
