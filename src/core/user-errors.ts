@@ -31,7 +31,23 @@ const errorMessages: Record<string, string> = {
   INITIAL_PULL_REQUIRED: "远端已有内容。请先拉取（Pull）建立基线。",
   IDENTITY_REQUIRED: "无法唯一确定页面身份。请重命名其中一个文件后重试。",
   PATH_COLLISION: "目标路径已被占用。请选择其他路径。",
-  SYNC_PROTOCOL_UPGRADE_REQUIRED: "需要升级同步协议。请更新插件后重试。",
+  SYNC_PROTOCOL_UPGRADE_REQUIRED:
+    "需要升级同步协议。请升级服务端或更新插件后重试。",
+  ATTACHMENT_REFERENCE_INVALID:
+    "图片引用格式无效。请修复 Page 中的图片引用后重新预览。",
+  ATTACHMENT_MISSING:
+    "已引用的图片不存在。请恢复图片文件，或移除 Page 中的引用。",
+  ATTACHMENT_CONTENT_INVALID:
+    "图片内容与格式不符或无法解码。请重新导出为 PNG、JPEG、WebP 或 GIF。",
+  ATTACHMENT_NAME_CONFLICT:
+    "图片名称在当前系统上会冲突。请重命名其中一张图片。",
+  ATTACHMENT_REFERENCED: "图片仍被 Page 引用。请先修改引用，再重新预览。",
+  ATTACHMENT_BLOB_MISSING:
+    "服务端图片数据不完整。请重新执行 Pull；若仍失败请联系管理员。",
+  ATTACHMENT_QUOTA_EXCEEDED:
+    "图片超出同步限制。请压缩图片、缩小尺寸或减少本次引用数量。",
+  PUSH_CONFIRMATION_REQUIRED:
+    "预览后内容或服务端能力已变化。请重新预览并明确确认。",
   FOLDER_ID_CONFLICT: "目录标识冲突。请重新预览后重试。",
 };
 

@@ -98,6 +98,35 @@ const mapping = (status: "pending" | "active" = "pending") => ({
 });
 
 describe("SyncRuntime", () => {
+  it("reports referenced-image status through the strict v3 branch without publishing", async () => {
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({ revision: "rev-empty" });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    await runtime.applyPullV3(await runtime.previewPullV3());
+    vault.seedFile("Wiki/assets/image.png", PNG_2X3);
+    vault.seedMarkdown("Wiki/pages/note.md", "![[assets/image.png]]");
+
+    const status = await runtime.statusV3();
+    const delta = await runtime.remoteDeltaV3();
+
+    expect(status.protocolVersion).toBe("3");
+    expect(status.local.attachmentsAdded).toHaveLength(1);
+    expect(status.local.attachmentsAdded[0]?.path).toBe("assets/image.png");
+    expect(
+      status.local.attachmentPageCounts[
+        status.local.attachmentsAdded[0]!.attachmentId
+      ],
+    ).toBe(1);
+    expect(delta).toMatchObject({
+      protocolVersion: "3",
+      ahead: false,
+      items: [],
+    });
+    expect(remote.createInputs).toEqual([]);
+  });
+
   it("fully verifies a v3 snapshot before downloading any Blob or persisting preview effects", async () => {
     const attachment = await v3Attachment(
       "11111111-1111-4111-8111-111111111111",

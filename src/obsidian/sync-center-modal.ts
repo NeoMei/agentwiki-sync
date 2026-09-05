@@ -1,7 +1,11 @@
 import { Modal, Notice, Setting, type App } from "obsidian";
 import { userErrorMessage } from "../core/user-errors";
 import { SyncTargetSelection } from "../application/sync-coordinator";
-import { canRunSyncStrategy } from "./preview-logic";
+import {
+  attachmentOperationLabel,
+  attachmentTransferSummary,
+  canRunSyncStrategy,
+} from "./preview-logic";
 import {
   progressLabel,
   type SyncOperationOptions,
@@ -11,13 +15,32 @@ import { completeModalAction, type ModalTransition } from "./modal-handoff";
 
 export type SyncStrategy = "auto" | "local" | "server";
 
+export interface AttachmentSyncDiff {
+  uploads: number;
+  downloads: number;
+  replacements: number;
+  renames: number;
+  detached: number;
+  uploadBytes: number;
+  downloadBytes: number;
+  transferLimitBytes: number;
+  items: Array<{
+    attachmentId: string;
+    path: string;
+    operation: string;
+    sizeBytes: number;
+    affectedPageCount: number;
+  }>;
+}
+
 export interface SyncDiff {
   canPublish: boolean;
   displayName: string;
   rootPath: string;
   roleLabel: string;
   remoteAhead: boolean;
-  protocolLabel: "Sync v2" | "Legacy v1";
+  protocolLabel: "Sync v3" | "Sync v2" | "Legacy v1";
+  attachmentChanges?: AttachmentSyncDiff | null;
   localFoldersAdded: string[];
   localFoldersMoved: string[];
   localFoldersDeleted: string[];
@@ -64,6 +87,34 @@ const countFolderDiff = (diff: SyncDiff): number =>
   diff.localFoldersAdded.length +
   diff.localFoldersMoved.length +
   diff.localFoldersDeleted.length;
+
+export function syncSummary(diff: SyncDiff): string {
+  const localCount = countDiff(diff);
+  const localFolderCount = countFolderDiff(diff);
+  const remoteCount = diff.remoteUpdated.length + diff.remoteArchived.length;
+  const remoteFolderCount =
+    diff.remoteFoldersUpdated.length + diff.remoteFoldersArchived.length;
+  const localTotal = localCount + localFolderCount;
+  const remoteTotal = remoteCount + remoteFolderCount;
+  const attachmentCount = diff.attachmentChanges
+    ? diff.attachmentChanges.uploads +
+      diff.attachmentChanges.downloads +
+      diff.attachmentChanges.replacements +
+      diff.attachmentChanges.renames +
+      diff.attachmentChanges.detached
+    : 0;
+  let summary: string;
+  if (diff.remoteAhead)
+    summary =
+      remoteTotal > 0 && diff.remoteListed
+        ? `本地 ${localTotal} 处变更（目录 ${localFolderCount} · 页面 ${localCount}）· 服务器 ${remoteTotal} 处更新（目录 ${remoteFolderCount} · 页面 ${remoteCount}）`
+        : "服务器有更新";
+  else if (localTotal > 0)
+    summary = `本地 ${localTotal} 处变更（目录 ${localFolderCount} · 页面 ${localCount}）· 服务器已是基线版本`;
+  else if (attachmentCount > 0) summary = "本地与服务器的页面和目录已同步";
+  else summary = "本地与服务器已同步，无需操作。";
+  return attachmentCount > 0 ? `${summary} · 图片变更见下方` : summary;
+}
 
 export class SyncCenterModal extends Modal {
   private diff: SyncDiff | null = null;
@@ -168,29 +219,24 @@ export class SyncCenterModal extends Modal {
       text: `协议：${diff.protocolLabel}`,
       cls: "agentwiki-sync-protocol-label",
     });
-    const localCount = countDiff(diff);
-    const localFolderCount = countFolderDiff(diff);
-    const remoteCount = diff.remoteUpdated.length + diff.remoteArchived.length;
-    const remoteFolderCount =
-      diff.remoteFoldersUpdated.length + diff.remoteFoldersArchived.length;
-    const localTotal = localCount + localFolderCount;
-    const remoteTotal = remoteCount + remoteFolderCount;
-    let summary: string;
-    if (diff.remoteAhead) {
-      summary =
-        remoteTotal > 0 && diff.remoteListed
-          ? `本地 ${localTotal} 处变更（目录 ${localFolderCount} · 页面 ${localCount}）· 服务器 ${remoteTotal} 处更新（目录 ${remoteFolderCount} · 页面 ${remoteCount}）`
-          : "服务器有更新";
-    } else {
-      summary =
-        localTotal > 0
-          ? `本地 ${localTotal} 处变更（目录 ${localFolderCount} · 页面 ${localCount}）· 服务器已是基线版本`
-          : "本地与服务器已同步，无需操作。";
-    }
     this.contentEl.createEl("p", {
-      text: summary,
+      text: syncSummary(diff),
       cls: "agentwiki-sync-summary",
     });
+    if (diff.attachmentChanges) {
+      this.contentEl.createEl("p", {
+        text: attachmentTransferSummary(diff.attachmentChanges),
+        cls: "agentwiki-sync-summary",
+      });
+      if (diff.attachmentChanges.items.length > 0) {
+        new Setting(this.contentEl).setName("图片变更").setHeading();
+        const list = this.contentEl.createEl("ul");
+        for (const item of diff.attachmentChanges.items)
+          list.createEl("li", {
+            text: `${attachmentOperationLabel(item.operation)}: ${item.path} · ${item.affectedPageCount} 个 Page`,
+          });
+      }
+    }
     if (this.progress)
       this.contentEl.createEl("p", { text: progressLabel(this.progress) });
 

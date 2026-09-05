@@ -48,11 +48,24 @@ describe("preview modal layout", () => {
     expect(source).toContain("folderConflictValidationError");
   });
 
+  it("renders attachment blockers and keep-both choices in the existing preview modal", async () => {
+    const source = await readFile("src/obsidian/preview-modal.ts", "utf8");
+
+    expect(source).toContain("attachmentConflicts");
+    expect(source).toContain("blockers");
+    expect(source).toContain("同时保留");
+    expect(source).toContain("主版本");
+    expect(source).toContain("副本路径");
+    expect(source).toContain("改用副本的页面");
+    expect(source).toContain('addClass("agentwiki-sync-attachment-setting")');
+  });
+
   it("shows the protocol as read-only diagnostic text and never a selector", async () => {
     const source = await readFile("src/obsidian/sync-center-modal.ts", "utf8");
 
     expect(source).toContain("protocolLabel");
     expect(source).toContain("Sync v2");
+    expect(source).toContain("Sync v3");
     expect(source).toContain("Legacy v1");
     expect(source).not.toContain('setName("协议")');
   });
@@ -65,5 +78,15 @@ describe("preview modal layout", () => {
       "grid-template-columns: minmax(10rem, 1fr) minmax(16rem, 3fr);",
     );
     expect(styles).toContain(".agentwiki-sync-modal .setting-item-name");
+  });
+
+  it("keeps attachment rows bounded at 360px and does not load image bytes", async () => {
+    const modal = await readFile("src/obsidian/preview-modal.ts", "utf8");
+    const styles = await readFile("styles.css", "utf8");
+
+    expect(styles).toContain("@container (max-width: 360px)");
+    expect(styles).toContain(".agentwiki-sync-attachment-setting");
+    expect(styles).toContain("overflow-x: hidden");
+    expect(modal).not.toContain('createEl("img"');
   });
 });

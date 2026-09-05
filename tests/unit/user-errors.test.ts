@@ -54,4 +54,37 @@ describe("userErrorMessage", () => {
     ).toContain("循环");
     expect(userErrorMessage(new Error("UNKNOWN_CODE"))).toBe("UNKNOWN_CODE");
   });
+
+  it.each([
+    ["ATTACHMENT_REFERENCE_INVALID", "修复.*引用"],
+    ["ATTACHMENT_MISSING", "恢复.*文件"],
+    ["ATTACHMENT_CONTENT_INVALID", "图片"],
+    ["ATTACHMENT_NAME_CONFLICT", "重命名"],
+    ["ATTACHMENT_REFERENCED", "引用"],
+    ["ATTACHMENT_BLOB_MISSING", "重新.*Pull"],
+    ["ATTACHMENT_QUOTA_EXCEEDED", "压缩.*图片"],
+    ["SYNC_PROTOCOL_UPGRADE_REQUIRED", "升级.*服务端.*插件"],
+  ])("maps v3 code %s to an actionable safe message", (code, action) => {
+    const message = userErrorMessage(new Error(code));
+    expect(message).toMatch(new RegExp(action));
+    expect(message).not.toMatch(/file:\/\/|https?:\/\/|\/Users\//u);
+  });
+
+  it("does not expose absolute paths or Blob URLs from structured error details", () => {
+    const error = new AgentWikiHttpError(409, {
+      protocolVersion: "3",
+      error: {
+        code: "ATTACHMENT_MISSING",
+        retryable: false,
+        details: {
+          path: "/Users/name/Vault/assets/private.png",
+          blobUrl: "https://signed.example/private-token",
+        },
+      },
+    });
+    const message = userErrorMessage(error);
+    expect(message).toContain("恢复");
+    expect(message).not.toContain("/Users/");
+    expect(message).not.toContain("https://");
+  });
 });

@@ -1,19 +1,30 @@
 import type {
   InitialBindingChoice,
   PullPreview,
+  PullPreviewV3,
 } from "../application/sync-runtime";
 import {
+  FlatAttachmentPathSchema,
   pathKey,
   validatePortableDirectoryPath,
 } from "@neomei/agentwiki-sync-protocol";
 import { userErrorMessage } from "../core/user-errors";
+import type {
+  AttachmentConflict,
+  AttachmentConflictResolution,
+} from "../core/merge";
+import type { AttachmentSyncDiff } from "./sync-center-modal";
 
 export const PREVIEW_PAGE_SIZE = 100;
 
-export type SyncProtocolLabel = "Sync v2" | "Legacy v1";
+export type SyncProtocolLabel = "Sync v3" | "Sync v2" | "Legacy v1";
 
-export function protocolLabel(version: "1" | "2"): SyncProtocolLabel {
-  return version === "2" ? "Sync v2" : "Legacy v1";
+export function protocolLabel(version: "1" | "2" | "3"): SyncProtocolLabel {
+  return version === "3"
+    ? "Sync v3"
+    : version === "2"
+      ? "Sync v2"
+      : "Legacy v1";
 }
 
 export function canRunSyncStrategy(
@@ -70,21 +81,93 @@ export function bindingsRequiringInput(
 
 export function pendingPreviewDecisionCount(
   bindings: readonly InitialBindingChoice[],
-  preview: PullPreview | null,
+  preview: PullPreview | PullPreviewV3 | null,
 ): number {
+  const pageConflicts = preview
+    ? "attachmentConflicts" in preview
+      ? preview.pageConflicts
+      : preview.conflicts
+    : [];
   const pendingConflicts =
-    preview?.conflicts.filter(
-      (conflict) => !preview.conflictResolutions[conflict.conflictId],
-    ).length ?? 0;
+    pageConflicts.filter((conflict) => {
+      if (!preview) return false;
+      return "attachmentConflicts" in preview
+        ? !preview.pageConflictResolutions[conflict.conflictId]
+        : !preview.conflictResolutions[conflict.conflictId];
+    }).length ?? 0;
   const pendingFolderConflicts =
     preview?.folderConflicts.filter(
       (conflict) => !preview.folderConflictResolutions[conflict.conflictId],
     ).length ?? 0;
+  const pendingAttachments =
+    preview && "attachmentConflicts" in preview
+      ? preview.attachmentConflicts.filter(
+          (conflict) =>
+            !attachmentConflictResolutionComplete(
+              conflict,
+              preview.attachmentConflictResolutions[conflict.conflictId],
+            ),
+        ).length + preview.blockers.length
+      : 0;
   return (
     bindingsRequiringInput(bindings).length +
     pendingConflicts +
-    pendingFolderConflicts
+    pendingFolderConflicts +
+    pendingAttachments
   );
+}
+
+export function attachmentConflictResolutionComplete(
+  conflict: AttachmentConflict,
+  resolution: AttachmentConflictResolution | null | undefined,
+): boolean {
+  if (!resolution) return false;
+  if (resolution.choice === "local" || resolution.choice === "remote")
+    return true;
+  if (!FlatAttachmentPathSchema.safeParse(resolution.secondaryPath).success)
+    return false;
+  const redirects = [...new Set(resolution.redirectPageIds)];
+  return (
+    (resolution.primary === "local" || resolution.primary === "remote") &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+      resolution.secondaryAttachmentId,
+    ) &&
+    redirects.length === resolution.redirectPageIds.length &&
+    redirects.length > 0 &&
+    redirects.length < conflict.affectedPageIds.length &&
+    redirects.every((pageId) => conflict.affectedPageIds.includes(pageId))
+  );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024)
+    return `${Number((bytes / (1024 * 1024)).toFixed(1))} MB`;
+  if (bytes >= 1024) return `${Number((bytes / 1024).toFixed(1))} KB`;
+  return `${bytes} B`;
+}
+
+export function attachmentTransferSummary(diff: AttachmentSyncDiff): string {
+  return [
+    `图片：上传 ${diff.uploads} 张 / ${formatBytes(diff.uploadBytes)}`,
+    `下载 ${diff.downloads} 张 / ${formatBytes(diff.downloadBytes)}`,
+    `替换 ${diff.replacements}`,
+    diff.renames > 0 ? `重命名 ${diff.renames}` : null,
+    `取消引用 ${diff.detached}`,
+    `单次传输上限 ${formatBytes(diff.transferLimitBytes)}`,
+  ]
+    .filter((item): item is string => item !== null)
+    .join(" · ");
+}
+
+export function attachmentOperationLabel(operation: string): string {
+  const labels: Record<string, string> = {
+    create_attachment: "新增图片",
+    write_attachment: "替换图片",
+    upsert_attachment: "更新图片",
+    remove_attachment_path: "移除旧路径",
+    detach_attachment: "取消引用（两端文件保留）",
+  };
+  return labels[operation] ?? operation;
 }
 
 export function matchCandidates(

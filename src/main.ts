@@ -27,6 +27,7 @@ import {
 import { AgentWikiClient, normalizeServerUrl } from "./agentwiki/client";
 import { V1TreeRemote } from "./agentwiki/v1-tree-remote";
 import { V2TreeRemote } from "./agentwiki/v2-tree-remote";
+import { V3TreeRemote } from "./agentwiki/v3-tree-remote";
 import { AgentWikiPushRemote } from "./agentwiki/push-remote";
 import { SyncRuntime } from "./application/sync-runtime";
 import {
@@ -48,17 +49,25 @@ import {
 } from "./agentwiki/protocol";
 import { userErrorMessage } from "./core/user-errors";
 import type { SyncSpaceSummary } from "./agentwiki/protocol";
-import {
-  assertTreeRuntimeProtocolVersion,
-  type TreeRemotePort,
-} from "./ports/tree-remote";
+import type { TreeRemotePort } from "./ports/tree-remote";
 import { MutableControlRepository } from "./storage/envelope";
 import { DeviceStateRepository } from "./storage/device-state";
 import { StorageMigration } from "./storage/migration";
 import { TreeBaselineRepository } from "./storage/tree-baseline";
-import { preferLocalPull, protocolLabel } from "./obsidian/preview-logic";
+import {
+  attachmentOperationLabel,
+  preferLocalPull,
+  protocolLabel,
+} from "./obsidian/preview-logic";
+import type { TreePushPreviewV3 } from "./application/tree-push-service-v3";
+import type { PullPreviewV3 } from "./application/sync-runtime";
 import type { SyncOperationOptions } from "./application/progress";
 import type { ModalTransition } from "./obsidian/modal-handoff";
+import {
+  resolveAttachmentConflict,
+  resolveFolderConflictV3,
+  resolvePageConflictV3,
+} from "./application/tree-diff";
 
 const actionLabel = (kind: string): string => {
   const labels: Record<string, string> = {
@@ -299,7 +308,20 @@ export default class AgentWikiSyncPlugin extends Plugin {
       client,
       state!.payload.serverInstanceId,
     );
-    assertTreeRuntimeProtocolVersion(selection.version);
+    if (selection.version === "3")
+      return (await new V3TreeRemote(client, "", selection).spaces()).map(
+        (space) => ({
+          spaceId: space.spaceId,
+          displayName: space.displayName,
+          role: space.role,
+          canRead: space.canRead,
+          canPublish: space.canPublish,
+          currentRevision: space.currentRevision,
+          pageCount: space.pageCount,
+          revisionManifestByteLength: space.revisionManifestByteLength,
+          revisionBodyBytes: space.revisionBodyBytes,
+        }),
+      );
     const remote: TreeRemotePort =
       selection.version === "2"
         ? new V2TreeRemote(client, "", selection)
@@ -351,14 +373,26 @@ export default class AgentWikiSyncPlugin extends Plugin {
         const runtime = await this.runtime(mapping);
         if (!runtime) throw new Error("请先连接 AgentWiki 再移除活跃映射");
         await runtime.recover();
-        const status = await runtime.status();
+        const status =
+          runtime.protocolVersion === "3"
+            ? await runtime.statusV3()
+            : await runtime.status();
+        const attachmentDirty =
+          "attachmentsAdded" in status.local
+            ? status.local.attachmentsAdded.length +
+              status.local.attachmentsModified.length +
+              status.local.attachmentsRenamed.length +
+              status.local.attachmentsDetached.length +
+              status.local.attachmentBlockers.length
+            : 0;
         gate = {
           activeTransaction: false,
           localClean:
             status.local.added.length +
               status.local.modified.length +
               status.local.renamed.length +
-              status.local.deleted.length >
+              status.local.deleted.length +
+              attachmentDirty >
             0
               ? false
               : true,
@@ -473,9 +507,12 @@ export default class AgentWikiSyncPlugin extends Plugin {
       state.serverInstanceId,
       requiredVersion,
     );
-    assertTreeRuntimeProtocolVersion(selection.version);
     const protocolSuffix =
-      selection.version === "2" ? "2\0" + selection.capabilitiesHash : "1";
+      selection.version === "3"
+        ? "3\0" + selection.capabilitiesHash
+        : selection.version === "2"
+          ? "2\0" + selection.capabilitiesHash
+          : "1";
     const runtimeKey =
       (this.settings.serverInstanceId ?? "pending") +
       "\0" +
@@ -486,24 +523,34 @@ export default class AgentWikiSyncPlugin extends Plugin {
       protocolSuffix;
     const existing = this.liveRuntimes.get(runtimeKey);
     if (existing) return existing;
-    const remote: TreeRemotePort =
-      selection.version === "2"
-        ? new V2TreeRemote(client, mapping.spaceId, selection)
-        : new V1TreeRemote(client, mapping.spaceId, session.capabilities);
-    const runtime = new SyncRuntime(
-      new ObsidianVaultPort(
-        this.app.vault,
-        this.app.fileManager,
-        mapping.rootPath,
-      ),
-      shared,
-      remote,
-      mapping,
-      deviceKey,
-      spaceKey,
-      state.credentialId,
-      new AgentWikiPushRemote(client, mapping.spaceId),
+    const vault = new ObsidianVaultPort(
+      this.app.vault,
+      this.app.fileManager,
+      mapping.rootPath,
     );
+    const runtime =
+      selection.version === "3"
+        ? SyncRuntime.v3(
+            vault,
+            shared,
+            new V3TreeRemote(client, mapping.spaceId, selection),
+            mapping,
+            deviceKey,
+            spaceKey,
+            state.credentialId,
+          )
+        : new SyncRuntime(
+            vault,
+            shared,
+            selection.version === "2"
+              ? new V2TreeRemote(client, mapping.spaceId, selection)
+              : new V1TreeRemote(client, mapping.spaceId, session.capabilities),
+            mapping,
+            deviceKey,
+            spaceKey,
+            state.credentialId,
+            new AgentWikiPushRemote(client, mapping.spaceId),
+          );
     this.liveRuntimes.set(runtimeKey, runtime);
     return runtime;
   }
@@ -556,8 +603,12 @@ export default class AgentWikiSyncPlugin extends Plugin {
     if (!runtime) throw new Error("请先连接并在设置中添加空间映射。");
     await runtime.recover();
     const [status, delta, spaces] = await Promise.all([
-      runtime.status(options),
-      runtime.remoteDelta(),
+      runtime.protocolVersion === "3"
+        ? runtime.statusV3(options)
+        : runtime.status(options),
+      runtime.protocolVersion === "3"
+        ? runtime.remoteDeltaV3()
+        : runtime.remoteDelta(),
       this.listAccessibleSpaces(),
     ]);
     const space = spaces.find((item) => item.spaceId === mapping.spaceId);
@@ -587,6 +638,112 @@ export default class AgentWikiSyncPlugin extends Plugin {
     const remoteFoldersArchived = delta.items
       .filter((item) => item.operation === "archive_folder")
       .map((item) => item.previousPath);
+    const localAttachments =
+      "attachmentsAdded" in status.local
+        ? [
+            ...status.local.attachmentsAdded.map((attachment) => ({
+              attachment,
+              operation: "upsert_attachment",
+            })),
+            ...status.local.attachmentsModified.map((attachment) => ({
+              attachment,
+              operation: "upsert_attachment",
+            })),
+            ...status.local.attachmentsRenamed.map((attachment) => ({
+              attachment,
+              operation: "upsert_attachment",
+            })),
+            ...status.local.attachmentsDetached.map((attachment) => ({
+              attachment,
+              operation: "detach_attachment",
+            })),
+          ]
+        : [];
+    const remoteAttachments: Array<{
+      attachmentId: string;
+      path: string;
+      sizeBytes: number;
+      operation: "upsert_attachment" | "detach_attachment";
+    }> = [];
+    const remoteAttachmentPageCounts = new Map<string, number>();
+    for (const item of delta.items) {
+      if (item.operation === "upsert_attachment")
+        remoteAttachments.push({
+          attachmentId: item.attachment.attachmentId,
+          path: item.attachment.path,
+          sizeBytes: Number(item.attachment.sizeBytes),
+          operation: item.operation,
+        });
+      else if (item.operation === "detach_attachment")
+        remoteAttachments.push({
+          attachmentId: item.attachmentId,
+          path: item.previousPath,
+          sizeBytes: 0,
+          operation: item.operation,
+        });
+      else if (
+        item.operation === "upsert_page" &&
+        "referencedAttachmentIds" in item.page
+      )
+        for (const attachmentId of item.page.referencedAttachmentIds)
+          remoteAttachmentPageCounts.set(
+            attachmentId,
+            (remoteAttachmentPageCounts.get(attachmentId) ?? 0) + 1,
+          );
+    }
+    const attachmentChanges =
+      status.protocolVersion === "3"
+        ? {
+            uploads:
+              status.local.attachmentsAdded.length +
+              status.local.attachmentsModified.length,
+            downloads: remoteAttachments.filter(
+              (item) => item.operation === "upsert_attachment",
+            ).length,
+            replacements: status.local.attachmentsModified.length,
+            renames: status.local.attachmentsRenamed.length,
+            detached:
+              status.local.attachmentsDetached.length +
+              remoteAttachments.filter(
+                (item) => item.operation === "detach_attachment",
+              ).length,
+            uploadBytes: status.local.attachmentsAdded
+              .concat(status.local.attachmentsModified)
+              .reduce(
+                (total, attachment) => total + Number(attachment.sizeBytes),
+                0,
+              ),
+            downloadBytes: remoteAttachments.reduce(
+              (total, item) => total + item.sizeBytes,
+              0,
+            ),
+            transferLimitBytes: status.capabilities.maxTransferBlobBytes,
+            items: [
+              ...[
+                ...new Map(
+                  localAttachments.map((item) => [
+                    item.attachment.attachmentId,
+                    item,
+                  ]),
+                ).values(),
+              ].map((item) => ({
+                attachmentId: item.attachment.attachmentId,
+                path: item.attachment.path,
+                operation: item.operation,
+                sizeBytes: Number(item.attachment.sizeBytes),
+                affectedPageCount:
+                  status.local.attachmentPageCounts[
+                    item.attachment.attachmentId
+                  ] ?? 0,
+              })),
+              ...remoteAttachments.map((item) => ({
+                ...item,
+                affectedPageCount:
+                  remoteAttachmentPageCounts.get(item.attachmentId) ?? 0,
+              })),
+            ].sort((left, right) => left.path.localeCompare(right.path)),
+          }
+        : null;
     const folderCount =
       localFoldersAdded.length +
       localFoldersMoved.length +
@@ -607,6 +764,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       roleLabel: roleLabel[space.role],
       remoteAhead: delta.ahead,
       protocolLabel: protocolLabel(status.protocolVersion),
+      attachmentChanges,
       localFoldersAdded,
       localFoldersMoved,
       localFoldersDeleted,
@@ -655,6 +813,15 @@ export default class AgentWikiSyncPlugin extends Plugin {
     flow: SyncFlowLock,
     options: SyncOperationOptions,
   ): Promise<ModalTransition | void> {
+    if (runtime.protocolVersion === "3")
+      return this.openV3PullFlow(
+        runtime,
+        flow,
+        "以服务器内容为准",
+        "remote",
+        false,
+        options,
+      );
     const delta = await runtime.remoteDelta();
     if (!delta.ahead) {
       new Notice("服务器没有新的变更可应用。");
@@ -703,6 +870,24 @@ export default class AgentWikiSyncPlugin extends Plugin {
     flow: SyncFlowLock,
     options: SyncOperationOptions,
   ): Promise<ModalTransition | void> {
+    if (runtime.protocolVersion === "3") {
+      const delta = await runtime.remoteDeltaV3();
+      if (!delta.ahead)
+        return this.openPushPreview(
+          runtime,
+          flow,
+          "推送预览（以本地内容为准）",
+          options,
+        );
+      return this.openV3PullFlow(
+        runtime,
+        flow,
+        "以本地内容为准 — 先合并服务器更新",
+        "local",
+        true,
+        options,
+      );
+    }
     const delta = await runtime.remoteDelta();
     if (!delta.ahead) {
       return await this.openPushPreview(
@@ -714,6 +899,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
     }
     const preview = await runtime.previewPull(options);
     preferLocalPull(preview);
+    const releasePhase = flow.phaseRelease();
     return () =>
       new PreviewModal(
         this.app,
@@ -742,9 +928,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
           );
         },
         () => {
-          void runtime
-            .discardPullPreview(preview)
-            .finally(() => flow.phaseRelease()());
+          void runtime.discardPullPreview(preview).finally(releasePhase);
         },
         preview.initialBindings,
         preview,
@@ -756,6 +940,19 @@ export default class AgentWikiSyncPlugin extends Plugin {
     flow: SyncFlowLock,
     options: SyncOperationOptions,
   ): Promise<ModalTransition | void> {
+    if (runtime.protocolVersion === "3") {
+      const delta = await runtime.remoteDeltaV3();
+      if (!delta.ahead)
+        return this.openPushPreview(runtime, flow, "推送预览", options);
+      return this.openV3PullFlow(
+        runtime,
+        flow,
+        "自动合并 — 处理冲突与图片",
+        null,
+        true,
+        options,
+      );
+    }
     const delta = await runtime.remoteDelta();
     if (!delta.ahead) {
       return await this.openPushPreview(runtime, flow, "推送预览", options);
@@ -769,6 +966,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
         (item) => !preview.folderConflictResolutions[item.conflictId],
       ) ||
       preview.initialBindings.some((item) => item.resolution === null);
+    const releasePhase = flow.phaseRelease();
     return () =>
       new PreviewModal(
         this.app,
@@ -799,9 +997,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
           );
         },
         () => {
-          void runtime
-            .discardPullPreview(preview)
-            .finally(() => flow.phaseRelease()());
+          void runtime.discardPullPreview(preview).finally(releasePhase);
         },
         preview.initialBindings,
         preview,
@@ -814,6 +1010,8 @@ export default class AgentWikiSyncPlugin extends Plugin {
     title: string,
     options?: SyncOperationOptions,
   ): Promise<ModalTransition | void> {
+    if (runtime.protocolVersion === "3")
+      return this.openPushPreviewV3(runtime, flow, title, options);
     try {
       const preview = await runtime.previewPush(options);
       if (!preview.changes.length) {
@@ -850,20 +1048,255 @@ export default class AgentWikiSyncPlugin extends Plugin {
       flow.finish();
     }
   }
+
+  private async resolveV3Preference(
+    preview: PullPreviewV3,
+    preference: "local" | "remote" | null,
+  ): Promise<void> {
+    if (!preference) return;
+    for (const conflict of [...preview.attachmentConflicts])
+      await resolveAttachmentConflict(preview, conflict.conflictId, {
+        choice: preference,
+      });
+    for (const conflict of [...preview.pageConflicts])
+      await resolvePageConflictV3(preview, conflict.conflictId, {
+        choice: preference,
+      });
+    for (const conflict of [...preview.folderConflicts])
+      await resolveFolderConflictV3(preview, conflict.conflictId, {
+        choice: preference,
+      });
+  }
+
+  private v3PullLines(preview: PullPreviewV3): string[] {
+    const transferBytes = preview.actions
+      .filter(
+        (item) =>
+          item.kind === "create_attachment" || item.kind === "write_attachment",
+      )
+      .reduce(
+        (total, item) =>
+          total +
+          ("attachment" in item ? Number(item.attachment.sizeBytes) : 0),
+        0,
+      );
+    return [
+      `图片传输：${transferBytes} B · 单次上限 ${preview.capabilities.maxTransferBlobBytes} B`,
+      ...preview.blockers.map(
+        (blocker) => `阻塞：${userErrorMessage(new Error(blocker.code))}`,
+      ),
+      ...preview.actions.map((item) => {
+        if (
+          item.kind === "create_attachment" ||
+          item.kind === "write_attachment"
+        )
+          return `${attachmentOperationLabel(item.kind)}: ${item.attachment.path}`;
+        if (item.kind === "remove_attachment_path")
+          return `${attachmentOperationLabel(item.kind)}: ${item.path}`;
+        if (item.kind === "detach_attachment")
+          return `${attachmentOperationLabel(item.kind)}: ${item.attachmentId}`;
+        return `${actionLabel(item.kind)}: ${item.path}`;
+      }),
+      ...preview.attachmentConflicts.map(
+        (item) => `图片冲突待处理: ${item.attachmentId}`,
+      ),
+    ];
+  }
+
+  private openPreparedV3Pull(
+    runtime: SyncRuntime,
+    flow: SyncFlowLock,
+    title: string,
+    preview: PullPreviewV3,
+    pushAfterPull: boolean,
+  ): ModalTransition {
+    const releasePhase = flow.phaseRelease();
+    return () =>
+      new PreviewModal(
+        this.app,
+        title,
+        this.v3PullLines(preview),
+        async (applyOptions) => {
+          await runtime.applyPullV3(preview, applyOptions);
+          await this.saveSettings();
+          if (!pushAfterPull) {
+            new Notice("已按确认预览更新本地。");
+            return;
+          }
+          flow.advance();
+          return this.openPushPreview(
+            runtime,
+            flow,
+            title.includes("本地")
+              ? "推送预览（以本地内容为准）"
+              : "自动合并 — 推送本地变更",
+            applyOptions,
+          );
+        },
+        () => {
+          void runtime.discardPullPreviewV3(preview).finally(releasePhase);
+        },
+        [],
+        preview,
+      ).open();
+  }
+
+  private async openV3PullFlow(
+    runtime: SyncRuntime,
+    flow: SyncFlowLock,
+    title: string,
+    preference: "local" | "remote" | null,
+    pushAfterPull: boolean,
+    options: SyncOperationOptions,
+  ): Promise<ModalTransition | void> {
+    const delta = await runtime.remoteDeltaV3();
+    if (!delta.ahead) {
+      new Notice("服务器没有新的变更可应用。");
+      flow.finish();
+      return;
+    }
+    try {
+      const preview = await runtime.previewPullV3(options);
+      await this.resolveV3Preference(preview, preference);
+      return this.openPreparedV3Pull(
+        runtime,
+        flow,
+        title,
+        preview,
+        pushAfterPull,
+      );
+    } catch (error) {
+      if (
+        !(error instanceof Error) ||
+        error.message !== "V3_BOOTSTRAP_CONFIRMATION_REQUIRED"
+      )
+        throw error;
+    }
+    const bootstrap = await runtime.previewBootstrapPullV3();
+    return () =>
+      new PreviewModal(
+        this.app,
+        "Sync v3 首次启用预览",
+        [
+          `当前基线：${bootstrap.baseRevision}`,
+          `图片：${bootstrap.attachmentCount} 张`,
+          `传输字节：${bootstrap.transferBytes}`,
+          ...bootstrap.blockers.map(
+            (blocker) =>
+              `Page ${blocker.pageId}: ${userErrorMessage(new Error(blocker.code))}`,
+          ),
+        ],
+        async (confirmOptions) => {
+          const preview = await runtime.confirmBootstrapPullV3(
+            bootstrap,
+            confirmOptions,
+          );
+          await this.resolveV3Preference(preview, preference);
+          flow.advance();
+          return this.openPreparedV3Pull(
+            runtime,
+            flow,
+            title,
+            preview,
+            pushAfterPull,
+          );
+        },
+        flow.phaseRelease(),
+        [],
+        bootstrap,
+      ).open();
+  }
+
+  private async openPushPreviewV3(
+    runtime: SyncRuntime,
+    flow: SyncFlowLock,
+    title: string,
+    options?: SyncOperationOptions,
+  ): Promise<ModalTransition | void> {
+    try {
+      const preview = await runtime.previewPushV3(options);
+      if (!preview.changes.length) {
+        new Notice("本地没有待推送的变更。");
+        flow.finish();
+        return;
+      }
+      const releasePhase = flow.phaseRelease();
+      return () =>
+        new PreviewModal(
+          this.app,
+          title,
+          this.v3PushLines(preview),
+          async (applyOptions) => {
+            try {
+              await runtime.applyPushV3(preview, applyOptions);
+            } catch (error) {
+              if (
+                !(error instanceof Error) ||
+                error.message !== "PUSH_CONFIRMATION_REQUIRED"
+              )
+                throw error;
+              await runtime.discardPushPreviewV3(preview);
+              flow.advance();
+              return this.openPushPreviewV3(runtime, flow, title, applyOptions);
+            }
+            await this.saveSettings();
+            new Notice("推送完成。");
+          },
+          () => {
+            void runtime.discardPushPreviewV3(preview).finally(releasePhase);
+          },
+          [],
+          preview,
+        ).open();
+    } catch (error) {
+      new Notice(userErrorMessage(error));
+      flow.finish();
+    }
+  }
+
+  private v3PushLines(preview: TreePushPreviewV3): string[] {
+    const transferBytes = preview.changes
+      .filter((item) => item.operation === "upsert_attachment")
+      .reduce(
+        (total, item) =>
+          total +
+          (item.operation === "upsert_attachment"
+            ? Number(item.attachment.sizeBytes)
+            : 0),
+        0,
+      );
+    return [
+      `图片上传：${transferBytes} B · 单次上限 ${preview.capabilities.maxTransferBlobBytes} B`,
+      ...preview.changes.map((item) => {
+        if (item.operation === "upsert_attachment")
+          return `${attachmentOperationLabel(item.operation)}: ${item.attachment.path} · ${item.attachment.sizeBytes} B`;
+        if (item.operation === "detach_attachment")
+          return `${attachmentOperationLabel(item.operation)}: ${item.previousPath}`;
+        const path =
+          item.operation === "upsert_page"
+            ? item.page.path
+            : item.operation === "upsert_folder"
+              ? item.folder.path
+              : item.previousPath;
+        return `${actionLabel(item.operation)}: ${path}`;
+      }),
+    ];
+  }
 }
 
 class SyncFlowLock {
   private release: (() => void) | null;
-  private advanced = false;
+  private generation = 0;
   constructor(release: () => void) {
     this.release = release;
   }
   advance(): void {
-    this.advanced = true;
+    this.generation += 1;
   }
   phaseRelease(): () => void {
+    const generation = this.generation;
     return () => {
-      if (!this.advanced) this.finish();
+      if (this.generation === generation) this.finish();
     };
   }
   finish(): void {

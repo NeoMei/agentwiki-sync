@@ -9,6 +9,7 @@ import {
   treeRevisionContentHashV2,
   pathKey,
   type BlobRequirementV3,
+  type TreeDeltaItemV3,
   type TreeSyncCapabilitiesV3,
 } from "@neomei/agentwiki-sync-protocol";
 
@@ -139,12 +140,38 @@ export interface RuntimeStatus {
   local: TreeLocalStatus;
 }
 
+export interface TreeLocalStatusV3 extends TreeLocalStatus {
+  attachmentsAdded: TreeAttachment[];
+  attachmentsModified: TreeAttachment[];
+  attachmentsRenamed: TreeAttachment[];
+  attachmentsDetached: TreeAttachment[];
+  attachmentBlockers: LocalTreeScanV3["blockers"];
+  attachmentPageCounts: Record<string, number>;
+}
+
+export interface RuntimeStatusV3 {
+  protocolVersion: "3";
+  baseRevision: string;
+  remoteRevision: string;
+  local: TreeLocalStatusV3;
+  capabilities: TreeSyncCapabilitiesV3;
+}
+
 export interface RemoteDelta {
   baseRevision: string;
   remoteRevision: string;
   ahead: boolean;
   listed: boolean;
   items: TreeDeltaItem[];
+}
+
+export interface RemoteDeltaV3 {
+  protocolVersion: "3";
+  baseRevision: string;
+  remoteRevision: string;
+  ahead: boolean;
+  listed: boolean;
+  items: TreeDeltaItemV3[];
 }
 
 export interface PullPreview extends TreePullPreview {
@@ -1417,6 +1444,21 @@ export class SyncRuntime {
     };
   }
 
+  async statusV3(options?: SyncOperationOptions): Promise<RuntimeStatusV3> {
+    const remote = this.requireV3Remote();
+    const base = (await this.readBaseSnapshotV3()) ?? this.emptySnapshotV3();
+    const capabilities = await remote.capabilities();
+    const local = await this.scanV3(base, capabilities, options);
+    const head = await remote.head();
+    return {
+      protocolVersion: "3",
+      baseRevision: base.revision,
+      remoteRevision: head.revision,
+      local: computeTreeStatusV3(base, local),
+      capabilities,
+    };
+  }
+
   async remoteDelta(): Promise<RemoteDelta> {
     const base = await this.readBaseSnapshot();
     const head = await this.legacyTreeRemote.head();
@@ -1442,6 +1484,43 @@ export class SyncRuntime {
       };
     } catch {
       return {
+        baseRevision,
+        remoteRevision: head.revision,
+        ahead: true,
+        items: [],
+        listed: false,
+      };
+    }
+  }
+
+  async remoteDeltaV3(): Promise<RemoteDeltaV3> {
+    const remote = this.requireV3Remote();
+    const base = await this.readBaseSnapshotV3();
+    const head = await remote.head();
+    const baseRevision = base?.revision ?? "0";
+    const ahead = head.revision !== baseRevision;
+    if (!ahead || baseRevision === "0" || !base)
+      return {
+        protocolVersion: "3",
+        baseRevision,
+        remoteRevision: head.revision,
+        ahead,
+        items: [],
+        listed: false,
+      };
+    try {
+      const delta = await remote.delta(baseRevision);
+      return {
+        protocolVersion: "3",
+        baseRevision,
+        remoteRevision: delta.toRevision,
+        ahead: true,
+        items: delta.items,
+        listed: true,
+      };
+    } catch {
+      return {
+        protocolVersion: "3",
         baseRevision,
         remoteRevision: head.revision,
         ahead: true,
@@ -1960,6 +2039,13 @@ export class SyncRuntime {
         this.root + "/pull-staging",
         preview.capabilities,
       ).cleanup();
+  }
+
+  async discardPushPreviewV3(preview: TreePushPreviewV3): Promise<void> {
+    if (preview.previewId)
+      await this.control.removeTree?.(
+        this.root + "/push-preview/" + safeKey(preview.previewId),
+      );
   }
 
   private pushManifestChangeV3(
@@ -2704,8 +2790,8 @@ function syncErrorCodeV3(error: unknown): string | null {
 }
 
 function computeTreeStatus(
-  base: TreeSnapshot,
-  local: LocalTreeScan,
+  base: Pick<TreeSnapshot, "folders" | "pages">,
+  local: Pick<LocalTreeScan, "folders" | "pages">,
 ): TreeLocalStatus {
   const baseFolders = new Map(base.folders.map((f) => [f.folderId, f]));
   const localFolders = new Map(local.folders.map((f) => [f.folderId, f]));
@@ -2743,5 +2829,51 @@ function computeTreeStatus(
     renamed,
     deleted,
     ambiguous,
+  };
+}
+
+function computeTreeStatusV3(
+  base: TreeSnapshotV3,
+  local: LocalTreeScanV3,
+): TreeLocalStatusV3 {
+  const pages = computeTreeStatus(base, local);
+  const baseAttachments = new Map(
+    base.attachments.map((attachment) => [attachment.attachmentId, attachment]),
+  );
+  const localAttachmentIds = new Set(
+    local.attachments.map((attachment) => attachment.attachmentId),
+  );
+  return {
+    ...pages,
+    attachmentsAdded: local.attachments.filter(
+      (attachment) => !baseAttachments.has(attachment.attachmentId),
+    ),
+    attachmentsModified: local.attachments.filter((attachment) => {
+      const previous = baseAttachments.get(attachment.attachmentId);
+      return !!previous && previous.contentHash !== attachment.contentHash;
+    }),
+    attachmentsRenamed: local.attachments.filter((attachment) => {
+      const previous = baseAttachments.get(attachment.attachmentId);
+      return !!previous && previous.path !== attachment.path;
+    }),
+    attachmentsDetached: base.attachments.filter(
+      (attachment) => !localAttachmentIds.has(attachment.attachmentId),
+    ),
+    attachmentBlockers: local.blockers,
+    attachmentPageCounts: Object.fromEntries(
+      base.attachments
+        .concat(local.attachments)
+        .map((attachment) => attachment.attachmentId)
+        .filter(
+          (attachmentId, index, values) =>
+            values.indexOf(attachmentId) === index,
+        )
+        .map((attachmentId) => [
+          attachmentId,
+          local.pages.filter((page) =>
+            page.referencedAttachmentIds.includes(attachmentId),
+          ).length,
+        ]),
+    ),
   };
 }

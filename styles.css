@@ -4,6 +4,7 @@
 
 .agentwiki-sync-modal {
   container-type: inline-size;
+  overflow-x: hidden;
 }
 
 .agentwiki-sync-strategy-description {
@@ -57,6 +58,32 @@
 
 .agentwiki-sync-folder-setting .agentwiki-sync-resolution-controls {
   grid-template-columns: minmax(10rem, 1fr) minmax(16rem, 3fr);
+}
+
+.agentwiki-sync-attachment-setting .agentwiki-sync-resolution-controls {
+  grid-template-columns: minmax(9rem, 1fr) minmax(10rem, 1fr) minmax(14rem, 2fr);
+}
+
+.agentwiki-sync-attachment-redirects {
+  border: 1px solid var(--background-modifier-border);
+  display: grid;
+  gap: 0.35em;
+  grid-column: 1 / -1;
+  max-height: 12rem;
+  overflow: auto;
+  padding: 0.75em;
+}
+
+.agentwiki-sync-attachment-redirects label {
+  align-items: center;
+  display: flex;
+  gap: 0.5em;
+  overflow-wrap: anywhere;
+}
+
+.agentwiki-sync-blockers {
+  border-inline-start: 3px solid var(--color-red);
+  padding-inline-start: 0.75em;
 }
 
 .agentwiki-sync-resolution-controls > * {
@@ -159,5 +186,15 @@
     justify-content: flex-end;
     margin-inline-start: 0;
     width: 100%;
+  }
+}
+
+@container (max-width: 360px) {
+  .agentwiki-sync-attachment-setting .agentwiki-sync-resolution-controls {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .agentwiki-sync-attachment-redirects {
+    max-width: 100%;
   }
 }
