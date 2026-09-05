@@ -997,16 +997,23 @@ export class SyncRuntime {
 
   private prefixAction(action: TreePullAction): TreePullAction {
     const prefix = this.mapping.rootPath ? this.mapping.rootPath + "/" : "";
+    const bodyPath = (path: string): string => this.root + "/" + path;
     switch (action.kind) {
       case "create_directory":
       case "trash_directory":
-      case "create_page":
       case "trash_page":
         return { ...action, path: prefix + action.path };
+      case "create_page":
+        return {
+          ...action,
+          path: prefix + action.path,
+          bodyPath: bodyPath(action.bodyPath),
+        };
       case "write_page":
         return {
           ...action,
           path: prefix + action.path,
+          bodyPath: bodyPath(action.bodyPath),
           ...(action.beforePath
             ? { beforePath: prefix + action.beforePath }
             : {}),
@@ -1016,6 +1023,7 @@ export class SyncRuntime {
           ...action,
           fromPath: prefix + action.fromPath,
           path: prefix + action.path,
+          bodyPath: bodyPath(action.bodyPath),
           ...(action.beforePath
             ? { beforePath: prefix + action.beforePath }
             : {}),
@@ -2039,7 +2047,7 @@ export class SyncRuntime {
     await this.assertV3PreviewVaultState(preview, expectedPathStates);
     for (const page of preview.resolvedPages)
       await this.control.write(
-        "tree-preview-body/" + page.pageId + ".md",
+        this.root + "/tree-preview-body/" + page.pageId + ".md",
         page.body,
       );
     const identities = await this.desiredV3Identities(preview);
@@ -2116,7 +2124,9 @@ export class SyncRuntime {
 
   async discardPullPreviewV3(preview: PullPreviewV3): Promise<void> {
     for (const page of preview.resolvedPages)
-      await this.control.remove("tree-preview-body/" + page.pageId + ".md");
+      await this.control.remove(
+        this.root + "/tree-preview-body/" + page.pageId + ".md",
+      );
     if (preview.transferId)
       await new BlobStagingRepository(
         this.control,
@@ -2594,7 +2604,7 @@ export class SyncRuntime {
     const baselineTx = await this.treeBaseline.prepare(snapshot, "pull");
     for (const page of preview.resolvedPages)
       await this.control.write(
-        "tree-preview-body/" + page.pageId + ".md",
+        this.root + "/tree-preview-body/" + page.pageId + ".md",
         page.body,
       );
     await this.treeBaseline.setPhase("applying");
@@ -2854,7 +2864,9 @@ export class SyncRuntime {
 
   async discardPullPreview(preview: PullPreview): Promise<void> {
     for (const page of preview.resolvedPages)
-      await this.control.remove("tree-preview-body/" + page.pageId + ".md");
+      await this.control.remove(
+        this.root + "/tree-preview-body/" + page.pageId + ".md",
+      );
   }
 
   async discardPushPreview(preview: PushPreview): Promise<void> {
