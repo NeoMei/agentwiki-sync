@@ -10,6 +10,7 @@ import {
 } from "../../src/storage/pointer";
 import {
   detachAttachment,
+  emptyTreeIdentityState,
   emptyTreeIdentityStateV2,
   TreeIdentityRepository,
   upgradeTreeIdentityState,
@@ -163,6 +164,42 @@ describe("crash-safe control storage", () => {
 });
 
 describe("tree attachment identities", () => {
+  it.each([
+    ["absent", false, null],
+    ["schema 1", true, 1],
+  ] as const)(
+    "rejects direct schema 2 initialization from %s without changing durable bytes",
+    async (_label, initializeSchema1, expectedSchemaVersion) => {
+      const store = new MemoryControlStore();
+      const path = ".agentwiki/device/tree-identities.json";
+      const repository = new TreeIdentityRepository(store, path);
+      if (initializeSchema1) await repository.write(emptyTreeIdentityState());
+      const durablePaths = [path, `${path}.prev`, `${path}.next`];
+      const before = await Promise.all(
+        durablePaths.map((candidatePath) => store.read(candidatePath)),
+      );
+
+      await expect(
+        repository.write(emptyTreeIdentityStateV2()),
+      ).rejects.toThrow(
+        "Schema 2 identity state requires confirmed activation",
+      );
+
+      await expect(
+        Promise.all(
+          durablePaths.map((candidatePath) => store.read(candidatePath)),
+        ),
+      ).resolves.toEqual(before);
+      const restarted = new TreeIdentityRepository(
+        distinctControlStoreView(store),
+        path,
+      );
+      expect((await restarted.read())?.payload.schemaVersion ?? null).toBe(
+        expectedSchemaVersion,
+      );
+    },
+  );
+
   it("persists schema 2 only through explicit confirmed v3 activation and survives restart", async () => {
     const store = new MemoryControlStore();
     const path = ".agentwiki/device/tree-identities.json";
@@ -205,6 +242,23 @@ describe("tree attachment identities", () => {
     expect(durable?.schemaVersion).toBe(2);
     expect(durable?.attachments?.a1?.active).toBe(true);
     expect(durable?.pendingAttachments?.a1?.attachmentId).toBe("a1");
+
+    const repeatedActivation = await restarted.commitConfirmedV3Activation();
+    expect(repeatedActivation).toEqual(durable);
+    await restarted.write({
+      ...repeatedActivation,
+      pendingPages: {
+        p1: {
+          pageId: "p1",
+          path: "pages/edited.md",
+          contentHash: "b".repeat(64),
+        },
+      },
+    });
+    expect((await restarted.read())?.payload.pendingPages.p1?.path).toBe(
+      "pages/edited.md",
+    );
+
     await expect(
       restarted.write({
         schemaVersion: 1,

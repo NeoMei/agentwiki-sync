@@ -277,6 +277,8 @@ export class TreeIdentityRepository {
   ): Promise<MutableControlEnvelope<TreeIdentityState>> {
     const validated = validateTreeIdentityState(input);
     const current = await this.records.read();
+    if (validated.schemaVersion === 2 && current?.payload.schemaVersion !== 2)
+      throw new Error("Schema 2 identity state requires confirmed activation");
     if (current?.payload.schemaVersion === 2 && validated.schemaVersion !== 2)
       throw new Error("Cannot downgrade confirmed v3 identity state");
     return this.records.write(validated);
