@@ -45,6 +45,21 @@ export class ObsidianControlStore implements ControlStorePort {
     await this.ensureParents(safe);
     await this.adapter.write(safe, value);
   }
+  async readBinary(path: string): Promise<Uint8Array | null> {
+    const safe = safeControlPath(path);
+    return (await this.adapter.exists(safe))
+      ? new Uint8Array(await this.adapter.readBinary(safe))
+      : null;
+  }
+  async writeBinary(path: string, value: Uint8Array): Promise<void> {
+    const safe = safeControlPath(path);
+    await this.ensureParents(safe);
+    const data = value.buffer.slice(
+      value.byteOffset,
+      value.byteOffset + value.byteLength,
+    ) as ArrayBuffer;
+    await this.adapter.writeBinary(safe, data);
+  }
   async remove(path: string): Promise<void> {
     const safe = safeControlPath(path);
     if (await this.adapter.exists(safe)) await this.adapter.remove(safe);

@@ -71,6 +71,32 @@ export class MutableControlRepository<T> {
     const candidates = await Promise.all(
       raws.map((raw) => parseEnvelope(raw, this.guard)),
     );
+    const highestValidGeneration = Math.max(
+      0,
+      ...candidates.flatMap((candidate) =>
+        candidate ? [candidate.writeGeneration] : [],
+      ),
+    );
+    for (let index = 0; index < raws.length; index += 1) {
+      if (candidates[index] !== null || raws[index] === null) continue;
+      try {
+        const rejected = JSON.parse(raws[index]!) as {
+          envelopeSchemaVersion?: unknown;
+          writeGeneration?: unknown;
+          payload?: { schemaVersion?: unknown };
+        };
+        if (
+          rejected.envelopeSchemaVersion === 1 &&
+          Number.isSafeInteger(rejected.writeGeneration) &&
+          (rejected.writeGeneration as number) >= highestValidGeneration &&
+          typeof rejected.payload?.schemaVersion === "number"
+        )
+          throw new Error("检测到未知或未来的控制 payload 版本");
+      } catch (error) {
+        if (error instanceof Error && error.message.includes("payload"))
+          throw error;
+      }
+    }
     if (
       candidates.every((candidate) => candidate === null) &&
       classifications.some((item) => item !== "absent")

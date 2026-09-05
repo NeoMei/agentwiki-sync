@@ -2,14 +2,28 @@ import type { ControlStorePort } from "../../src/ports/control-store";
 
 export class MemoryControlStore implements ControlStorePort {
   readonly files = new Map<string, string>();
+  readonly binaryFiles = new Map<string, Uint8Array>();
+  failNextTextWriteAt: string | null = null;
   async read(path: string): Promise<string | null> {
     return this.files.get(path) ?? null;
   }
   async write(path: string, value: string): Promise<void> {
+    if (this.failNextTextWriteAt === path) {
+      this.failNextTextWriteAt = null;
+      throw new Error("injected text write failure");
+    }
     this.files.set(path, value);
+  }
+  async readBinary(path: string): Promise<Uint8Array | null> {
+    const value = this.binaryFiles.get(path);
+    return value ? value.slice() : null;
+  }
+  async writeBinary(path: string, value: Uint8Array): Promise<void> {
+    this.binaryFiles.set(path, value.slice());
   }
   async remove(path: string): Promise<void> {
     this.files.delete(path);
+    this.binaryFiles.delete(path);
   }
   async rename(from: string, to: string): Promise<void> {
     const value = this.files.get(from);
@@ -20,11 +34,14 @@ export class MemoryControlStore implements ControlStorePort {
   async removeTree(path: string): Promise<void> {
     for (const key of [...this.files.keys()])
       if (key === path || key.startsWith(`${path}/`)) this.files.delete(key);
+    for (const key of [...this.binaryFiles.keys()])
+      if (key === path || key.startsWith(`${path}/`))
+        this.binaryFiles.delete(key);
   }
   async list(path: string): Promise<{ files: string[]; folders: string[] }> {
     const files: string[] = [];
     const folders = new Set<string>();
-    for (const key of this.files.keys()) {
+    for (const key of [...this.files.keys(), ...this.binaryFiles.keys()]) {
       if (!key.startsWith(`${path}/`)) continue;
       const rest = key.slice(path.length + 1);
       const head = rest.split("/")[0]!;

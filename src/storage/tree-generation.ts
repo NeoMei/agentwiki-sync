@@ -1,13 +1,23 @@
-import { treeRevisionContentHashV2 } from "@neomei/agentwiki-sync-protocol";
+import {
+  TreeRevisionContentManifestV3Schema,
+  treeRevisionContentHashV2,
+  treeRevisionContentHashV3,
+} from "@neomei/agentwiki-sync-protocol";
 
 import { canonicalBytes, contentHash } from "../agentwiki/protocol";
 import { opaqueFileKey } from "../core/identity-key";
 import { isValidSyncPath } from "../core/sync-path";
-import type { TreeFolder, TreePage } from "../core/tree-model";
+import type {
+  TreeAttachment,
+  TreeFolder,
+  TreePage,
+  TreePageV3,
+} from "../core/tree-model";
 import { validateTreeSnapshot } from "../core/tree-validation";
 import type { ControlStorePort } from "../ports/control-store";
 
 type PageMetadata = Omit<TreePage, "body">;
+type PageMetadataV3 = Omit<TreePageV3, "body">;
 
 export interface TreeGenerationManifestV2 {
   schemaVersion: 2;
@@ -24,6 +34,50 @@ export interface TreeGenerationManifestV2 {
   lastSuccessfulSyncAt: string;
   folders: Record<string, TreeFolder>;
   pages: Record<string, PageMetadata>;
+}
+
+export interface TreeGenerationManifestV3 {
+  schemaVersion: 3;
+  protocolVersion: "3";
+  generationId: string;
+  spaceId: string;
+  rootPath: string;
+  baseRevision: string;
+  baseRevisionContentHash: string;
+  baseFolderCount: number;
+  basePageCount: number;
+  baseAttachmentCount: number;
+  baseRevisionManifestByteLength: number;
+  baseRevisionBodyBytes: number;
+  baseRevisionAttachmentBytes: number;
+  lastSuccessfulSyncAt: string;
+  folders: Record<string, TreeFolder>;
+  pages: Record<string, PageMetadataV3>;
+  attachments: Record<string, TreeAttachment>;
+}
+
+export type TreeGenerationManifest =
+  TreeGenerationManifestV2 | TreeGenerationManifestV3;
+
+export interface TreeGenerationMetricsV3 {
+  contentHash: string;
+  folderCount: number;
+  pageCount: number;
+  attachmentCount: number;
+  manifestByteLength: number;
+  bodyBytes: number;
+  attachmentBytes: number;
+}
+
+const HASH = /^[a-f0-9]{64}$/u;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, keys: string[]): boolean {
+  const allowed = new Set(keys);
+  return Object.keys(value).every((key) => allowed.has(key));
 }
 
 export class TreeGenerationRepository {
@@ -68,10 +122,68 @@ export class TreeGenerationRepository {
     };
   }
 
+  async metricsV3(input: {
+    spaceId: string;
+    folders: Record<string, TreeFolder>;
+    pages: Record<string, PageMetadataV3>;
+    attachments: Record<string, TreeAttachment>;
+    bodies: Record<string, string>;
+  }): Promise<TreeGenerationMetricsV3> {
+    const hydratedPages: TreePageV3[] = [];
+    let bodyBytes = 0;
+    for (const [pageId, page] of Object.entries(input.pages)) {
+      if (pageId !== page.pageId) throw new Error("Invalid v3 page identity");
+      const body = input.bodies[pageId];
+      if (body === undefined) throw new Error(`Missing base body: ${pageId}`);
+      if ((await contentHash(body)) !== page.contentHash)
+        throw new Error("V3 generation body content hash mismatch");
+      bodyBytes += new TextEncoder().encode(body).byteLength;
+      hydratedPages.push({ ...page, body });
+    }
+    for (const [folderId, folder] of Object.entries(input.folders))
+      if (folderId !== folder.folderId)
+        throw new Error("Invalid v3 folder identity");
+    let attachmentBytes = 0;
+    for (const [attachmentId, attachment] of Object.entries(
+      input.attachments,
+    )) {
+      if (attachmentId !== attachment.attachmentId)
+        throw new Error("Invalid v3 attachment identity");
+      attachmentBytes += Number(attachment.sizeBytes);
+      if (!Number.isSafeInteger(attachmentBytes))
+        throw new Error("Invalid v3 attachment byte count");
+    }
+    const metadata = TreeRevisionContentManifestV3Schema.parse({
+      protocolVersion: "3",
+      spaceId: input.spaceId,
+      folders: Object.values(input.folders),
+      pages: hydratedPages,
+      attachments: Object.values(input.attachments),
+    });
+    return {
+      contentHash: await treeRevisionContentHashV3(metadata),
+      folderCount: Object.keys(input.folders).length,
+      pageCount: Object.keys(input.pages).length,
+      attachmentCount: Object.keys(input.attachments).length,
+      manifestByteLength: canonicalBytes(metadata).byteLength,
+      bodyBytes,
+      attachmentBytes,
+    };
+  }
+
   async write(
     input: TreeGenerationManifestV2,
     bodies: Record<string, string>,
-  ): Promise<TreeGenerationManifestV2> {
+  ): Promise<TreeGenerationManifestV2>;
+  async write(
+    input: TreeGenerationManifestV3,
+    bodies: Record<string, string>,
+  ): Promise<TreeGenerationManifestV3>;
+  async write(
+    input: TreeGenerationManifest,
+    bodies: Record<string, string>,
+  ): Promise<TreeGenerationManifest> {
+    if (input.schemaVersion === 3) return this.writeV3(input, bodies);
     const pages: Record<string, PageMetadata> = {};
     const hydrated: TreePage[] = [];
     let bodyBytes = 0;
@@ -113,17 +225,61 @@ export class TreeGenerationRepository {
     return manifest;
   }
 
-  async verify(generationId: string): Promise<TreeGenerationManifestV2> {
+  private async writeV3(
+    input: TreeGenerationManifestV3,
+    bodies: Record<string, string>,
+  ): Promise<TreeGenerationManifestV3> {
+    const metrics = await this.metricsV3({
+      spaceId: input.spaceId,
+      folders: input.folders,
+      pages: input.pages,
+      attachments: input.attachments,
+      bodies,
+    });
+    if (
+      input.baseRevisionContentHash !== metrics.contentHash ||
+      input.baseFolderCount !== metrics.folderCount ||
+      input.basePageCount !== metrics.pageCount ||
+      input.baseAttachmentCount !== metrics.attachmentCount ||
+      input.baseRevisionManifestByteLength !== metrics.manifestByteLength ||
+      input.baseRevisionBodyBytes !== metrics.bodyBytes ||
+      input.baseRevisionAttachmentBytes !== metrics.attachmentBytes
+    )
+      throw new Error("V3 generation authority hash or metrics mismatch");
+    for (const [pageId, page] of Object.entries(input.pages))
+      await this.store.write(
+        this.bodyPath(
+          input.generationId,
+          await this.localFileName(pageId, page.path),
+        ),
+        bodies[pageId]!,
+      );
+    await this.store.write(
+      this.manifestPath(input.generationId),
+      JSON.stringify(input),
+    );
+    const verified = await this.verify(input.generationId);
+    if (verified.schemaVersion !== 3)
+      throw new Error("V3 generation verification failed");
+    return verified;
+  }
+
+  async verify(generationId: string): Promise<TreeGenerationManifest> {
     const raw = await this.store.read(this.manifestPath(generationId));
     if (raw === null) throw new Error("基线损坏: 清单缺失");
-    let manifest: TreeGenerationManifestV2;
+    let parsed: unknown;
     try {
-      manifest = JSON.parse(raw) as TreeGenerationManifestV2;
+      parsed = JSON.parse(raw);
     } catch {
       throw new Error("基线损坏: 清单无效");
     }
-    if (manifest.schemaVersion !== 2)
-      throw new Error("基线损坏: 未知的清单版本");
+    if (!isRecord(parsed) || typeof parsed.schemaVersion !== "number")
+      throw new Error("基线损坏: 清单无效");
+    if (parsed.schemaVersion > 3)
+      throw new Error("Unknown tree generation schema version");
+    if (parsed.schemaVersion === 3) return this.verifyV3(parsed, generationId);
+    if (parsed.schemaVersion !== 2) throw new Error("基线损坏: 未知的清单版本");
+    const manifest = parsed as unknown as TreeGenerationManifestV2;
     if (
       manifest.generationId !== generationId ||
       manifest.protocolVersion !== "2"
@@ -163,6 +319,83 @@ export class TreeGenerationRepository {
     return manifest;
   }
 
+  private async verifyV3(
+    parsed: Record<string, unknown>,
+    generationId: string,
+  ): Promise<TreeGenerationManifestV3> {
+    if (
+      !hasOnlyKeys(parsed, [
+        "schemaVersion",
+        "protocolVersion",
+        "generationId",
+        "spaceId",
+        "rootPath",
+        "baseRevision",
+        "baseRevisionContentHash",
+        "baseFolderCount",
+        "basePageCount",
+        "baseAttachmentCount",
+        "baseRevisionManifestByteLength",
+        "baseRevisionBodyBytes",
+        "baseRevisionAttachmentBytes",
+        "lastSuccessfulSyncAt",
+        "folders",
+        "pages",
+        "attachments",
+      ]) ||
+      parsed.protocolVersion !== "3" ||
+      parsed.generationId !== generationId ||
+      typeof parsed.spaceId !== "string" ||
+      typeof parsed.rootPath !== "string" ||
+      typeof parsed.baseRevision !== "string" ||
+      typeof parsed.baseRevisionContentHash !== "string" ||
+      !HASH.test(parsed.baseRevisionContentHash) ||
+      typeof parsed.lastSuccessfulSyncAt !== "string" ||
+      !isRecord(parsed.folders) ||
+      !isRecord(parsed.pages) ||
+      !isRecord(parsed.attachments)
+    )
+      throw new Error("Invalid v3 tree generation manifest");
+    for (const metric of [
+      parsed.baseFolderCount,
+      parsed.basePageCount,
+      parsed.baseAttachmentCount,
+      parsed.baseRevisionManifestByteLength,
+      parsed.baseRevisionBodyBytes,
+      parsed.baseRevisionAttachmentBytes,
+    ])
+      if (!Number.isSafeInteger(metric) || (metric as number) < 0)
+        throw new Error("Invalid v3 tree generation manifest");
+    const manifest = parsed as unknown as TreeGenerationManifestV3;
+    const bodies: Record<string, string> = {};
+    for (const [pageId, page] of Object.entries(manifest.pages)) {
+      if (!isRecord(page)) throw new Error("Invalid v3 page metadata");
+      bodies[pageId] = await this.readBodyForPage(
+        generationId,
+        page,
+        page.contentHash,
+      );
+    }
+    const metrics = await this.metricsV3({
+      spaceId: manifest.spaceId,
+      folders: manifest.folders,
+      pages: manifest.pages,
+      attachments: manifest.attachments,
+      bodies,
+    });
+    if (
+      manifest.baseRevisionContentHash !== metrics.contentHash ||
+      manifest.baseFolderCount !== metrics.folderCount ||
+      manifest.basePageCount !== metrics.pageCount ||
+      manifest.baseAttachmentCount !== metrics.attachmentCount ||
+      manifest.baseRevisionManifestByteLength !== metrics.manifestByteLength ||
+      manifest.baseRevisionBodyBytes !== metrics.bodyBytes ||
+      manifest.baseRevisionAttachmentBytes !== metrics.attachmentBytes
+    )
+      throw new Error("基线损坏: v3 修订指标不匹配");
+    return manifest;
+  }
+
   private async hydratePages(
     pages: Record<string, PageMetadata>,
     generationId: string,
@@ -198,7 +431,7 @@ export class TreeGenerationRepository {
   }
 
   async read(generationId: string): Promise<{
-    manifest: TreeGenerationManifestV2;
+    manifest: TreeGenerationManifest;
     bodies: Record<string, string>;
   }> {
     const manifest = await this.verify(generationId);
@@ -212,7 +445,7 @@ export class TreeGenerationRepository {
     return { manifest, bodies };
   }
 
-  async readManifest(generationId: string): Promise<TreeGenerationManifestV2> {
+  async readManifest(generationId: string): Promise<TreeGenerationManifest> {
     return this.verify(generationId);
   }
 

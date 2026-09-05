@@ -55,6 +55,7 @@ import {
 import { MutableControlRepository } from "./storage/envelope";
 import { DeviceStateRepository } from "./storage/device-state";
 import { StorageMigration } from "./storage/migration";
+import { TreeBaselineRepository } from "./storage/tree-baseline";
 import { preferLocalPull, protocolLabel } from "./obsidian/preview-logic";
 import type { SyncOperationOptions } from "./application/progress";
 import type { ModalTransition } from "./obsidian/modal-handoff";
@@ -309,16 +310,20 @@ export default class AgentWikiSyncPlugin extends Plugin {
   private async negotiate(
     client: AgentWikiClient,
     serverInstanceId: string,
+    requiredVersion: "1" | "2" | "3" = "1",
   ): Promise<SyncProtocolSelection> {
     const local = new ObsidianLocalControlStore(this.app);
     return new ProtocolNegotiator(
       client,
       new ProtocolSelectionRepository(local),
-    ).select({
-      serverOrigin: this.settings.serverUrl,
-      serverInstanceId,
-      pluginVersion: this.manifest.version,
-    });
+    ).select(
+      {
+        serverOrigin: this.settings.serverUrl,
+        serverInstanceId,
+        pluginVersion: this.manifest.version,
+      },
+      requiredVersion,
+    );
   }
 
   async addMapping(spaceId: string, rootPath: string): Promise<void> {
@@ -412,10 +417,8 @@ export default class AgentWikiSyncPlugin extends Plugin {
     mapping: NonNullable<ReturnType<AgentWikiSyncPlugin["selectedMapping"]>>,
   ): Promise<SyncRuntime | null> {
     const local = new ObsidianLocalControlStore(this.app);
-    await new VaultIdentityService(
-      new ObsidianControlStore(this.app.vault.adapter),
-      local,
-    ).assertBound();
+    const shared = new ObsidianControlStore(this.app.vault.adapter);
+    await new VaultIdentityService(shared, local).assertBound();
     const connectionState = await new MutableControlRepository(
       local,
       "connection-state.json",
@@ -452,7 +455,24 @@ export default class AgentWikiSyncPlugin extends Plugin {
       session.credentialStatus !== "active"
     )
       throw new Error("认证会话身份不匹配");
-    const selection = await this.negotiate(client, state.serverInstanceId);
+    const deviceKey = await idFileKey(deviceId);
+    const spaceKey = await idFileKey(mapping.spaceId);
+    const controlRoot =
+      ".agentwiki/devices/d-" +
+      deviceKey.replace(/[^A-Za-z0-9_-]/gu, "_") +
+      "/spaces/s-" +
+      spaceKey.replace(/[^A-Za-z0-9_-]/gu, "_");
+    const requiredVersion = await new TreeBaselineRepository(
+      shared,
+      controlRoot,
+      mapping.spaceId,
+      mapping.rootPath,
+    ).requiredProtocolVersion();
+    const selection = await this.negotiate(
+      client,
+      state.serverInstanceId,
+      requiredVersion,
+    );
     assertTreeRuntimeProtocolVersion(selection.version);
     const protocolSuffix =
       selection.version === "2" ? "2\0" + selection.capabilitiesHash : "1";
@@ -476,11 +496,11 @@ export default class AgentWikiSyncPlugin extends Plugin {
         this.app.fileManager,
         mapping.rootPath,
       ),
-      new ObsidianControlStore(this.app.vault.adapter),
+      shared,
       remote,
       mapping,
-      await idFileKey(deviceId),
-      await idFileKey(mapping.spaceId),
+      deviceKey,
+      spaceKey,
       state.credentialId,
       new AgentWikiPushRemote(client, mapping.spaceId),
     );

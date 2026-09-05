@@ -338,7 +338,12 @@ export class SyncRuntime {
 
   private async readBaseSnapshot(): Promise<TreeSnapshot | null> {
     const manifest = await this.treeBaseline.readOptional();
-    if (manifest) return this.treeBaseline.readSnapshot();
+    if (manifest) {
+      const snapshot = await this.treeBaseline.readSnapshot();
+      if (snapshot.protocolVersion === "3")
+        throw new Error("Sync v3 runtime is not enabled yet");
+      return snapshot;
+    }
     return this.treeBaseline.readLegacyEvidence(this.legacyBaseline);
   }
 

@@ -11,8 +11,9 @@ import { TFile, TFolder, requestUrlState } from "../fakes/obsidian-mock";
 
 class FakeDataAdapter {
   readonly files = new Map<string, string>();
+  readonly binaryFiles = new Map<string, Uint8Array>();
   async exists(path: string): Promise<boolean> {
-    return this.files.has(path);
+    return this.files.has(path) || this.binaryFiles.has(path);
   }
   async read(path: string): Promise<string> {
     return this.files.get(path) ?? "";
@@ -20,9 +21,20 @@ class FakeDataAdapter {
   async write(path: string, data: string): Promise<void> {
     this.files.set(path, data);
   }
+  async readBinary(path: string): Promise<ArrayBuffer> {
+    const bytes = this.binaryFiles.get(path) ?? new Uint8Array();
+    return bytes.buffer.slice(
+      bytes.byteOffset,
+      bytes.byteOffset + bytes.byteLength,
+    ) as ArrayBuffer;
+  }
+  async writeBinary(path: string, data: ArrayBuffer): Promise<void> {
+    this.binaryFiles.set(path, new Uint8Array(data.slice(0)));
+  }
   async mkdir(): Promise<void> {}
   async remove(path: string): Promise<void> {
     this.files.delete(path);
+    this.binaryFiles.delete(path);
   }
   async rename(from: string, to: string): Promise<void> {
     const value = this.files.get(from);
@@ -33,6 +45,9 @@ class FakeDataAdapter {
   async rmdir(path: string): Promise<void> {
     for (const key of [...this.files.keys()])
       if (key === path || key.startsWith(`${path}/`)) this.files.delete(key);
+    for (const key of [...this.binaryFiles.keys()])
+      if (key === path || key.startsWith(`${path}/`))
+        this.binaryFiles.delete(key);
   }
 }
 
@@ -196,6 +211,18 @@ describe("ObsidianControlStore", () => {
     expect(await store.read(".agentwiki/b.json")).toBe("one");
     await store.remove(".agentwiki/b.json");
     expect(await store.read(".agentwiki/b.json")).toBeNull();
+  });
+
+  it("uses DataAdapter binary APIs for private control sidecars", async () => {
+    const adapter = new FakeDataAdapter();
+    const store = new ObsidianControlStore(adapter as unknown as DataAdapter);
+    const bytes = new Uint8Array([0, 255, 1, 2]);
+    await store.writeBinary(".agentwiki/private/blob.bin", bytes);
+    expect(await store.readBinary(".agentwiki/private/blob.bin")).toEqual(
+      bytes,
+    );
+    expect(adapter.files.has(".agentwiki/private/blob.bin")).toBe(false);
+    await expect(store.readBinary("../outside.bin")).rejects.toThrow(/Unsafe/);
   });
 });
 

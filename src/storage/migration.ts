@@ -4,6 +4,7 @@ import { contentHash } from "../agentwiki/protocol";
 import type { ControlStorePort } from "../ports/control-store";
 
 interface ManifestRecord {
+  schemaVersion?: number;
   pages: Record<string, PageRecord>;
 }
 
@@ -95,6 +96,19 @@ export class StorageMigration {
       const manifest: unknown = JSON.parse(manifestRaw);
       if (!isManifestRecord(manifest)) {
         result.errors.push(`Invalid manifest: missing pages`);
+        return result;
+      }
+      if (
+        typeof manifest.schemaVersion === "number" &&
+        manifest.schemaVersion > 3
+      ) {
+        result.errors.push(
+          `Unknown tree generation schema version: ${manifest.schemaVersion}`,
+        );
+        return result;
+      }
+      if (manifest.schemaVersion === 3) {
+        result.skipped = Object.keys(manifest.pages).length;
         return result;
       }
 

@@ -1,13 +1,21 @@
 import { canonicalBytes, sha256Hex } from "../agentwiki/protocol";
-import type { TreeSnapshot } from "../core/tree-model";
+import { treeRevisionContentHashV3 } from "@neomei/agentwiki-sync-protocol";
+
+import type { TreeSnapshot, TreeSnapshotV3 } from "../core/tree-model";
 import { validateTreeSnapshot } from "../core/tree-validation";
 import type { ControlStorePort } from "../ports/control-store";
 import type { BaselineRepository } from "./baseline";
 import { MutableControlRepository } from "./envelope";
-import { isCurrentPointerPayload, type CurrentPointerPayload } from "./pointer";
+import {
+  isCurrentPointerPayload,
+  pointerSwapDecision,
+  selectCurrentPointer,
+  type CurrentPointerPayload,
+  type TransactionGate,
+} from "./pointer";
 import {
   TreeGenerationRepository,
-  type TreeGenerationManifestV2,
+  type TreeGenerationManifest,
 } from "./tree-generation";
 
 const EPOCH_RFC3339 = "1970-01-01T00:00:00.000Z";
@@ -26,6 +34,7 @@ interface TreeBaselineJournal {
     | "rolled_back"
     | "failed";
   oldGenerationId: string | null;
+  oldPointerWriteGeneration?: number | null;
   newGenerationId: string;
 }
 
@@ -46,7 +55,11 @@ function isTreeBaselineJournal(value: unknown): value is TreeBaselineJournal {
     ].includes(item.phase ?? "") &&
     (item.oldGenerationId === null ||
       typeof item.oldGenerationId === "string") &&
-    typeof item.newGenerationId === "string"
+    typeof item.newGenerationId === "string" &&
+    (item.oldPointerWriteGeneration === undefined ||
+      item.oldPointerWriteGeneration === null ||
+      (Number.isSafeInteger(item.oldPointerWriteGeneration) &&
+        item.oldPointerWriteGeneration >= 1))
   );
 }
 
@@ -76,8 +89,8 @@ export class TreeBaselineRepository {
     );
   }
 
-  async readOptional(): Promise<TreeGenerationManifestV2 | null> {
-    const current = await this.pointer.read();
+  async readOptional(): Promise<TreeGenerationManifest | null> {
+    const current = await this.selectPointer();
     if (!current?.payload.active) return null;
     const manifest = await this.generations.readManifest(
       current.payload.generationId,
@@ -92,7 +105,23 @@ export class TreeBaselineRepository {
     return manifest;
   }
 
-  async read(): Promise<TreeGenerationManifestV2> {
+  private async selectPointer() {
+    const journal = await this.journal.read();
+    const gate: TransactionGate | null = journal
+      ? {
+          state:
+            journal.payload.phase === "rolled_back"
+              ? "rolling_back"
+              : journal.payload.phase,
+          oldGenerationId: journal.payload.oldGenerationId,
+          newGenerationId: journal.payload.newGenerationId,
+          newGenerationVerified: journal.payload.phase === "committed",
+        }
+      : null;
+    return selectCurrentPointer(await this.pointer.candidates(), gate);
+  }
+
+  async read(): Promise<TreeGenerationManifest> {
     const manifest = await this.readOptional();
     if (!manifest) throw new Error("基线缺失");
     return manifest;
@@ -101,31 +130,116 @@ export class TreeBaselineRepository {
   /**
    * 还原当前 v2 基线的完整 TreeSnapshot（含每页正文），供三方比较使用。
    */
-  async readSnapshot(): Promise<TreeSnapshot> {
+  async readSnapshot(): Promise<TreeSnapshot | TreeSnapshotV3> {
     const manifest = await this.read();
     const { bodies } = await this.generations.read(manifest.generationId);
+    const pages = Object.values(manifest.pages).map((page) => ({
+      ...page,
+      body: bodies[page.pageId]!,
+    }));
+    if (manifest.schemaVersion === 3)
+      return {
+        protocolVersion: "3",
+        spaceId: manifest.spaceId,
+        revision: manifest.baseRevision,
+        revisionContentHash: manifest.baseRevisionContentHash,
+        folders: Object.values(manifest.folders),
+        pages,
+        attachments: Object.values(manifest.attachments),
+      } as TreeSnapshotV3;
     return {
       protocolVersion: "2",
       spaceId: manifest.spaceId,
       revision: manifest.baseRevision,
       revisionContentHash: manifest.baseRevisionContentHash,
       folders: Object.values(manifest.folders),
-      pages: Object.values(manifest.pages).map((page) => ({
-        ...page,
-        body: bodies[page.pageId]!,
-      })),
+      pages,
     };
+  }
+
+  revisionContentHashV3(snapshot: TreeSnapshotV3): Promise<string> {
+    return treeRevisionContentHashV3({
+      protocolVersion: "3",
+      spaceId: snapshot.spaceId,
+      folders: snapshot.folders,
+      pages: snapshot.pages,
+      attachments: snapshot.attachments,
+    });
   }
 
   async prepare(
     snapshot: TreeSnapshot,
     kind: TreeBaselineKind,
+  ): Promise<TreeBaselineJournal>;
+  async prepare(
+    snapshot: TreeSnapshotV3,
+    kind: TreeBaselineKind,
+  ): Promise<TreeBaselineJournal>;
+  async prepare(
+    snapshot: TreeSnapshot | TreeSnapshotV3,
+    kind: TreeBaselineKind,
   ): Promise<TreeBaselineJournal> {
+    const current = await this.selectPointer();
+    if (snapshot.protocolVersion === "3" && kind !== "pull") {
+      const existing = current?.payload.active
+        ? await this.generations.verify(current.payload.generationId)
+        : null;
+      if (existing?.schemaVersion !== 3)
+        throw new Error("V3 bootstrap requires a confirmed Pull");
+    }
+    const generationId = crypto.randomUUID();
+    if (snapshot.protocolVersion === "3") {
+      const folders = Object.fromEntries(
+        snapshot.folders.map((folder) => [folder.folderId, folder]),
+      );
+      const pages = Object.fromEntries(
+        snapshot.pages.map((page) => {
+          const { body: _body, ...metadata } = page;
+          return [page.pageId, metadata];
+        }),
+      );
+      const attachments = Object.fromEntries(
+        snapshot.attachments.map((item) => [item.attachmentId, item]),
+      );
+      const bodies = Object.fromEntries(
+        snapshot.pages.map((page) => [page.pageId, page.body]),
+      );
+      const metrics = await this.generations.metricsV3({
+        spaceId: snapshot.spaceId,
+        folders,
+        pages,
+        attachments,
+        bodies,
+      });
+      if (snapshot.revisionContentHash !== metrics.contentHash)
+        throw new Error("V3 snapshot authority hash mismatch");
+      await this.generations.write(
+        {
+          schemaVersion: 3,
+          protocolVersion: "3",
+          generationId,
+          spaceId: this.spaceId,
+          rootPath: this.rootPath,
+          baseRevision: snapshot.revision,
+          baseRevisionContentHash: snapshot.revisionContentHash,
+          baseFolderCount: metrics.folderCount,
+          basePageCount: metrics.pageCount,
+          baseAttachmentCount: metrics.attachmentCount,
+          baseRevisionManifestByteLength: metrics.manifestByteLength,
+          baseRevisionBodyBytes: metrics.bodyBytes,
+          baseRevisionAttachmentBytes: metrics.attachmentBytes,
+          lastSuccessfulSyncAt: new Date().toISOString(),
+          folders,
+          pages,
+          attachments,
+        },
+        bodies,
+      );
+      return this.writePreparedJournal(current, generationId, kind);
+    }
     const validated = validateTreeSnapshot(snapshot);
     if (validated.protocolVersion !== "2")
-      throw new TypeError("树基线仅接受 v2 快照");
-    const current = await this.pointer.read();
-    const generationId = crypto.randomUUID();
+      throw new TypeError("树基线仅接受 v2/v3 快照");
     const folders = Object.fromEntries(
       validated.folders.map((folder) => [folder.folderId, folder]),
     );
@@ -157,6 +271,14 @@ export class TreeBaselineRepository {
       },
       bodies,
     );
+    return this.writePreparedJournal(current, generationId, kind);
+  }
+
+  private async writePreparedJournal(
+    current: ReturnType<typeof selectCurrentPointer>,
+    generationId: string,
+    kind: TreeBaselineKind,
+  ): Promise<TreeBaselineJournal> {
     const value: TreeBaselineJournal = {
       schemaVersion: 2,
       transactionId: crypto.randomUUID(),
@@ -165,6 +287,7 @@ export class TreeBaselineRepository {
       oldGenerationId: current?.payload.active
         ? current.payload.generationId
         : null,
+      oldPointerWriteGeneration: current?.writeGeneration ?? null,
       newGenerationId: generationId,
     };
     await this.journal.write(value);
@@ -190,14 +313,43 @@ export class TreeBaselineRepository {
     )
       throw new Error("基线身份不匹配");
     const manifestHash = await sha256Hex(canonicalBytes(manifest));
-    await this.pointer.write({
-      schemaVersion: 1,
-      active: true,
-      generationId: current.payload.newGenerationId,
-      manifestHash,
-    });
+    const candidates = await this.pointer.candidates();
+    const decision = pointerSwapDecision(
+      candidates,
+      {
+        writeGeneration:
+          current.payload.oldPointerWriteGeneration ??
+          (current.payload.oldGenerationId === null
+            ? null
+            : Math.max(
+                ...candidates
+                  .filter(
+                    (candidate) =>
+                      candidate.payload.active &&
+                      candidate.payload.generationId ===
+                        current.payload.oldGenerationId,
+                  )
+                  .map((candidate) => candidate.writeGeneration),
+              )),
+        generationId: current.payload.oldGenerationId,
+      },
+      current.payload.newGenerationId,
+    );
+    if (decision === "write")
+      await this.pointer.write({
+        schemaVersion: 1,
+        active: true,
+        generationId: current.payload.newGenerationId,
+        manifestHash,
+      });
     await this.journal.write({ ...current.payload, phase: "committed" });
     await this.pruneGenerations();
+  }
+
+  async requiredProtocolVersion(): Promise<"1" | "2" | "3"> {
+    const current = await this.readOptional();
+    if (!current) return "1";
+    return current.schemaVersion === 3 ? "3" : "2";
   }
 
   /**

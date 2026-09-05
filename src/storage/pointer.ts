@@ -22,6 +22,40 @@ export interface TransactionGate {
   newGenerationVerified?: boolean;
 }
 
+export interface PointerSwapExpectation {
+  writeGeneration: number | null;
+  generationId: string | null;
+}
+
+export function pointerSwapDecision(
+  candidates: Array<
+    Pick<
+      MutableControlEnvelope<CurrentPointerPayload>,
+      "writeGeneration" | "payload"
+    >
+  >,
+  expected: PointerSwapExpectation,
+  newGenerationId: string,
+): "write" | "already_switched" {
+  const highest = [...candidates].sort(
+    (left, right) => right.writeGeneration - left.writeGeneration,
+  )[0];
+  if (
+    highest?.payload.active &&
+    highest.payload.generationId === newGenerationId
+  )
+    return "already_switched";
+  const actualId = highest?.payload.active
+    ? highest.payload.generationId
+    : null;
+  if (
+    (highest?.writeGeneration ?? null) !== expected.writeGeneration ||
+    actualId !== expected.generationId
+  )
+    throw new Error("Tree baseline pointer changed during compare-and-swap");
+  return "write";
+}
+
 export function selectCurrentPointer(
   candidates: Array<
     Pick<
