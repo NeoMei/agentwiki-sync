@@ -118,17 +118,42 @@ class FakeV3Remote {
   }
 }
 
+class CorruptingCompleteStore extends MemoryControlStore {
+  private chunkReads = 0;
+
+  override async readBinary(path: string): Promise<Uint8Array | null> {
+    const bytes = await super.readBinary(path);
+    if (!path.includes("/chunks/") || !bytes) return bytes;
+    this.chunkReads += 1;
+    return this.chunkReads >= 2 ? new Uint8Array(bytes.byteLength) : bytes;
+  }
+}
+
+class FailingCompleteReadStore extends MemoryControlStore {
+  private chunkReads = 0;
+
+  override async readBinary(path: string): Promise<Uint8Array | null> {
+    const bytes = await super.readBinary(path);
+    if (!path.includes("/chunks/") || !bytes) return bytes;
+    this.chunkReads += 1;
+    if (this.chunkReads >= 2) throw new Error("transient staging read");
+    return bytes;
+  }
+}
+
 function transfer(
   remote: FakeV3Remote,
   store = new MemoryControlStore(),
   delays: number[] = [],
+  capabilityOverrides: Partial<TreeSyncCapabilitiesV3> = {},
 ) {
+  const effectiveCapabilities = { ...capabilities, ...capabilityOverrides };
   return {
     store,
     subject: new BlobTransfer(
       remote as unknown as TreeRemotePortV3,
-      new BlobStagingRepository(store, STAGING_ROOT, capabilities),
-      capabilities,
+      new BlobStagingRepository(store, STAGING_ROOT, effectiveCapabilities),
+      effectiveCapabilities,
       {
         now: () => beforeExpiry,
         sleep: async (ms) => void delays.push(ms),
@@ -184,6 +209,37 @@ describe("BlobTransfer", () => {
       persistReceipt: async () => undefined,
     });
     expect(remote.uploaded.map((upload) => upload.index)).toEqual([1]);
+  });
+
+  it("budgets upload bytes only across unique missing hashes", async () => {
+    const remote = new FakeV3Remote();
+    remote.firstResponseLost = false;
+    remote.transientSecondChunk = false;
+    const missingBytes = new Uint8Array([1]);
+    const missing = await requirement(missingBytes);
+    const existing = Array.from({ length: 3 }, (_, index) => ({
+      contentHash: String(index + 1).padStart(64, "0"),
+      sizeBytes: "4",
+      mimeType: "image/png" as const,
+      width: 1,
+      height: 1,
+    }));
+    const { subject } = transfer(remote, undefined, [], {
+      maxTransferBlobBytes: 10,
+    });
+
+    await subject.uploadMissing({
+      sessionId: "session-1",
+      missingContentHashes: [missing.contentHash],
+      requirements: [missing, ...existing],
+      readBlob: async (value) =>
+        value.contentHash === missing.contentHash ? missingBytes : null,
+      persistReceipt: async () => undefined,
+    });
+
+    expect(remote.uploaded.map((upload) => upload.hash)).toEqual([
+      missing.contentHash,
+    ]);
   });
 
   it("uses exponential retry delay for a retryable 503", async () => {
@@ -275,6 +331,64 @@ describe("BlobTransfer", () => {
         path.startsWith(STAGING_ROOT),
       ),
     ).toBe(false);
+  });
+
+  it("cleans staging when the real repository detects complete hash corruption", async () => {
+    const remote = new FakeV3Remote();
+    const bytes = new Uint8Array([1, 2, 3, 4]);
+    const expected = await requirement(bytes);
+    const attachment: SyncAttachmentV3 = {
+      attachmentId: "attachment-1",
+      path: "assets/a.png",
+      ...expected,
+      updatedAt: "2026-09-05T00:00:00.000Z",
+    };
+    remote.downloads.set(attachment.attachmentId, bytes);
+    const store = new CorruptingCompleteStore();
+    const { subject } = transfer(remote, store);
+
+    await expect(
+      subject.downloadMissing({
+        transferId: "download-corrupt",
+        expiresAt: futureExpiry,
+        revision: "revision-1",
+        attachments: [attachment],
+      }),
+    ).rejects.toThrow("Blob staging chunk verification failed");
+    expect(
+      [...store.files.keys(), ...store.binaryFiles.keys()].some((path) =>
+        path.startsWith(STAGING_ROOT),
+      ),
+    ).toBe(false);
+  });
+
+  it("preserves staging when the repository encounters transient storage I/O", async () => {
+    const remote = new FakeV3Remote();
+    const bytes = new Uint8Array([1, 2, 3, 4]);
+    const expected = await requirement(bytes);
+    const attachment: SyncAttachmentV3 = {
+      attachmentId: "attachment-1",
+      path: "assets/a.png",
+      ...expected,
+      updatedAt: "2026-09-05T00:00:00.000Z",
+    };
+    remote.downloads.set(attachment.attachmentId, bytes);
+    const store = new FailingCompleteReadStore();
+    const { subject } = transfer(remote, store);
+
+    await expect(
+      subject.downloadMissing({
+        transferId: "download-transient",
+        expiresAt: futureExpiry,
+        revision: "revision-1",
+        attachments: [attachment],
+      }),
+    ).rejects.toThrow("transient staging read");
+    expect(
+      [...store.files.keys(), ...store.binaryFiles.keys()].some((path) =>
+        path.startsWith(STAGING_ROOT),
+      ),
+    ).toBe(true);
   });
 
   it("rejects duplicate content hashes with inconsistent metadata before transfer", async () => {

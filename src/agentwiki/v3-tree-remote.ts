@@ -197,7 +197,7 @@ export class V3TreeRemote implements TreeRemotePortV3 {
   }
 
   async head(): Promise<TreeHeadV3> {
-    return TreeRevisionHeadResponseV3Schema.parse(
+    const parsed = TreeRevisionHeadResponseV3Schema.parse(
       await this.strictJson(
         "GET",
         `/api/sync/v3/spaces/${encodeURIComponent(this.spaceId)}/head`,
@@ -206,6 +206,9 @@ export class V3TreeRemote implements TreeRemotePortV3 {
         true,
       ),
     );
+    if (parsed.spaceId !== this.spaceId)
+      throw new V3RemoteDeterministicError("HEAD_SPACE_MISMATCH");
+    return parsed;
   }
 
   async *snapshotPages(
@@ -248,6 +251,21 @@ export class V3TreeRemote implements TreeRemotePortV3 {
           true,
         ),
       );
+      if (parsed.spaceId !== this.spaceId)
+        throw new V3RemoteDeterministicError("SNAPSHOT_SPACE_MISMATCH");
+      if (
+        fixedMetadata === null &&
+        revision !== "current" &&
+        parsed.revision !== revision
+      )
+        throw new V3RemoteDeterministicError("SNAPSHOT_TARGET_MISMATCH");
+      if (
+        parsed.folders.length +
+          parsed.pages.length +
+          parsed.attachments.length >
+        this.selection.capabilities.maxPageItems
+      )
+        throw new V3RemoteDeterministicError("SNAPSHOT_PAGE_LIMIT_EXCEEDED");
       const signature = metadataSignature(parsed, metadataKeys);
       if (fixedSignature !== null && fixedSignature !== signature)
         throw new V3RemoteDeterministicError("SNAPSHOT_METADATA_CHANGED");
@@ -392,14 +410,7 @@ export class V3TreeRemote implements TreeRemotePortV3 {
       decimal(metadata.revisionManifestByteLength, "SNAPSHOT_BYTES_INVALID") >
         BigInt(limits.maxClientManifestBytes) ||
       decimal(metadata.revisionBodyBytes, "SNAPSHOT_BYTES_INVALID") >
-        BigInt(limits.maxClientTotalBodyBytes) ||
-      decimal(metadata.revisionAttachmentBytes, "SNAPSHOT_BYTES_INVALID") >
-        BigInt(
-          Math.min(
-            limits.maxTransferBlobBytes,
-            TREE_SYNC_V3_HARD_LIMITS.maxTransferBlobBytes,
-          ),
-        )
+        BigInt(limits.maxClientTotalBodyBytes)
     )
       throw new V3RemoteDeterministicError("SNAPSHOT_LIMIT_EXCEEDED");
   }
@@ -473,14 +484,7 @@ export class V3TreeRemote implements TreeRemotePortV3 {
       decimal(page.toRevisionManifestByteLength, "DELTA_BYTES_INVALID") >
         BigInt(limits.maxClientManifestBytes) ||
       decimal(page.toRevisionBodyBytes, "DELTA_BYTES_INVALID") >
-        BigInt(limits.maxClientTotalBodyBytes) ||
-      decimal(page.toRevisionAttachmentBytes, "DELTA_BYTES_INVALID") >
-        BigInt(
-          Math.min(
-            limits.maxTransferBlobBytes,
-            TREE_SYNC_V3_HARD_LIMITS.maxTransferBlobBytes,
-          ),
-        )
+        BigInt(limits.maxClientTotalBodyBytes)
     )
       throw new V3RemoteDeterministicError("DELTA_LIMIT_EXCEEDED");
   }
@@ -518,8 +522,12 @@ export class V3TreeRemote implements TreeRemotePortV3 {
           true,
         ),
       );
+      if (parsed.spaceId !== this.spaceId)
+        throw new V3RemoteDeterministicError("DELTA_SPACE_MISMATCH");
       if (parsed.fromRevision !== fromRevision)
         throw new V3RemoteDeterministicError("DELTA_METADATA_CHANGED");
+      if (parsed.items.length > this.selection.capabilities.maxPageItems)
+        throw new V3RemoteDeterministicError("DELTA_PAGE_LIMIT_EXCEEDED");
       const signature = metadataSignature(parsed, metadataKeys);
       if (fixedSignature !== null && fixedSignature !== signature)
         throw new V3RemoteDeterministicError("DELTA_METADATA_CHANGED");

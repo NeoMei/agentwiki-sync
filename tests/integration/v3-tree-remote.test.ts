@@ -6,6 +6,8 @@ import {
   treeCapabilitiesHashV3,
   treeRevisionContentHashV3,
   type TreeSyncCapabilitiesV3,
+  type SyncAttachmentV3,
+  type SyncPageV3,
 } from "@neomei/agentwiki-sync-protocol";
 
 import { AgentWikiClient } from "../../src/agentwiki/client";
@@ -60,37 +62,63 @@ const page = {
   referencedAttachmentIds: [],
 };
 
-async function snapshotMetadata(revision = "revision-1") {
+async function snapshotMetadata(
+  revision = "revision-1",
+  input: {
+    spaceId?: string;
+    folders?: (typeof folder)[];
+    pages?: SyncPageV3[];
+    attachments?: SyncAttachmentV3[];
+  } = {},
+) {
+  const spaceId = input.spaceId ?? "space-1";
+  const folders = input.folders ?? [folder];
+  const pages = input.pages ?? [page];
+  const attachments = input.attachments ?? [];
   const manifest = {
     protocolVersion: "3" as const,
-    spaceId: "space-1",
-    folders: [folder],
-    pages: [page],
-    attachments: [],
+    spaceId,
+    folders,
+    pages,
+    attachments,
   };
   return {
     protocolVersion: "3" as const,
-    spaceId: "space-1",
+    spaceId,
     revision,
     sequence: 1,
     revisionContentHash: await treeRevisionContentHashV3(manifest),
-    folderCount: "1",
-    pageCount: "1",
-    attachmentCount: "0",
+    folderCount: String(folders.length),
+    pageCount: String(pages.length),
+    attachmentCount: String(attachments.length),
     revisionManifestByteLength: String(canonicalBytes(manifest).byteLength),
-    revisionBodyBytes: "6",
-    revisionAttachmentBytes: "0",
+    revisionBodyBytes: String(
+      pages.reduce(
+        (total, item) => total + new TextEncoder().encode(item.body).byteLength,
+        0,
+      ),
+    ),
+    revisionAttachmentBytes: String(
+      attachments.reduce(
+        (total, attachment) => total + Number(attachment.sizeBytes),
+        0,
+      ),
+    ),
   };
 }
 
-async function remoteWith(http: FakeHttp): Promise<V3TreeRemote> {
+async function remoteWith(
+  http: FakeHttp,
+  capabilityOverrides: Partial<TreeSyncCapabilitiesV3> = {},
+): Promise<V3TreeRemote> {
+  const effectiveCapabilities = { ...capabilities, ...capabilityOverrides };
   return new V3TreeRemote(
     new AgentWikiClient("https://wiki.example.com", http, () => "secret"),
     "space-1",
     {
       version: "3",
-      capabilities,
-      capabilitiesHash: await treeCapabilitiesHashV3(capabilities),
+      capabilities: effectiveCapabilities,
+      capabilitiesHash: await treeCapabilitiesHashV3(effectiveCapabilities),
     },
     { sleep: async () => undefined },
   );
@@ -103,6 +131,245 @@ async function collect<T>(source: AsyncIterable<T>): Promise<T[]> {
 }
 
 describe("V3TreeRemote", () => {
+  it("accepts a valid Revision whose total attachment bytes exceed the new-transfer budget", async () => {
+    const http = new FakeHttp();
+    const attachments: SyncAttachmentV3[] = Array.from(
+      { length: 11 },
+      (_, index) => ({
+        attachmentId: `attachment-${String(index).padStart(2, "0")}`,
+        path: `assets/${String(index).padStart(2, "0")}.png`,
+        mimeType: "image/png" as const,
+        sizeBytes: String(10 * 1024 * 1024),
+        width: 1,
+        height: 1,
+        contentHash: "0".repeat(64),
+        updatedAt: "2026-09-05T00:00:00.000Z",
+      }),
+    );
+    const referencedPage = {
+      ...page,
+      referencedAttachmentIds: attachments.map(
+        (attachment) => attachment.attachmentId,
+      ),
+    };
+    const metadata = await snapshotMetadata("revision-large", {
+      folders: [folder],
+      pages: [referencedPage],
+      attachments,
+    });
+    http.enqueue({
+      status: 200,
+      json: {
+        ...metadata,
+        folders: [folder],
+        pages: [referencedPage],
+        attachments,
+        nextCursor: null,
+      },
+    });
+
+    await expect(
+      collect((await remoteWith(http)).snapshotPages("revision-large")),
+    ).resolves.toHaveLength(1);
+  });
+
+  it("accepts Delta target metrics above the new-transfer budget", async () => {
+    const http = new FakeHttp();
+    http.enqueue({
+      status: 200,
+      json: {
+        protocolVersion: "3",
+        spaceId: "space-1",
+        fromRevision: "revision-1",
+        toRevision: "revision-2",
+        toSequence: 2,
+        toRevisionContentHash: "0".repeat(64),
+        toFolderCount: "1",
+        toPageCount: "1",
+        toAttachmentCount: "11",
+        toRevisionManifestByteLength: "1024",
+        toRevisionBodyBytes: "6",
+        toRevisionAttachmentBytes: String(110 * 1024 * 1024),
+        items: [],
+        nextCursor: null,
+      },
+    });
+
+    await expect(
+      (await remoteWith(http)).delta("revision-1"),
+    ).resolves.toMatchObject({ toRevision: "revision-2" });
+  });
+
+  it("rejects a snapshot response above the negotiated maxPageItems", async () => {
+    const http = new FakeHttp();
+    const metadata = await snapshotMetadata();
+    http.enqueue({
+      status: 200,
+      json: {
+        ...metadata,
+        folders: [folder],
+        pages: [page],
+        attachments: [],
+        nextCursor: null,
+      },
+    });
+
+    await expect(
+      collect(
+        (await remoteWith(http, { maxPageItems: 1 })).snapshotPages(
+          "revision-1",
+        ),
+      ),
+    ).rejects.toThrow("SNAPSHOT_PAGE_LIMIT_EXCEEDED");
+  });
+
+  it("rejects a Delta response above the negotiated maxPageItems", async () => {
+    const http = new FakeHttp();
+    http.enqueue({
+      status: 200,
+      json: {
+        protocolVersion: "3",
+        spaceId: "space-1",
+        fromRevision: "revision-1",
+        toRevision: "revision-2",
+        toSequence: 2,
+        toRevisionContentHash: "0".repeat(64),
+        toFolderCount: "0",
+        toPageCount: "0",
+        toAttachmentCount: "0",
+        toRevisionManifestByteLength: "64",
+        toRevisionBodyBytes: "0",
+        toRevisionAttachmentBytes: "0",
+        items: [
+          {
+            operation: "archive_page",
+            pageId: "page-1",
+            previousPath: "pages/Old-1.md",
+          },
+          {
+            operation: "archive_page",
+            pageId: "page-2",
+            previousPath: "pages/Old-2.md",
+          },
+        ],
+        nextCursor: null,
+      },
+    });
+
+    await expect(
+      (await remoteWith(http, { maxPageItems: 1 })).delta("revision-1"),
+    ).rejects.toThrow("DELTA_PAGE_LIMIT_EXCEEDED");
+  });
+
+  it("rejects head metadata for a different Space", async () => {
+    const http = new FakeHttp();
+    http.enqueue({
+      status: 200,
+      json: {
+        ...(await snapshotMetadata("revision-1", { spaceId: "space-2" })),
+        publishedAt: null,
+      },
+    });
+
+    await expect((await remoteWith(http)).head()).rejects.toThrow(
+      "HEAD_SPACE_MISMATCH",
+    );
+  });
+
+  it("rejects a fixed snapshot whose first response has another Revision", async () => {
+    const http = new FakeHttp();
+    const metadata = await snapshotMetadata("revision-2");
+    http.enqueue({
+      status: 200,
+      json: {
+        ...metadata,
+        folders: [folder],
+        pages: [page],
+        attachments: [],
+        nextCursor: null,
+      },
+    });
+
+    await expect(
+      collect((await remoteWith(http)).snapshotPages("revision-1")),
+    ).rejects.toThrow("SNAPSHOT_TARGET_MISMATCH");
+  });
+
+  it("rejects a self-consistent snapshot for a different Space", async () => {
+    const http = new FakeHttp();
+    const metadata = await snapshotMetadata("revision-1", {
+      spaceId: "space-2",
+    });
+    http.enqueue({
+      status: 200,
+      json: {
+        ...metadata,
+        folders: [folder],
+        pages: [page],
+        attachments: [],
+        nextCursor: null,
+      },
+    });
+
+    await expect(
+      collect((await remoteWith(http)).snapshotPages("revision-1")),
+    ).rejects.toThrow("SNAPSHOT_SPACE_MISMATCH");
+  });
+
+  it("rejects a self-consistent Delta for a different Space", async () => {
+    const http = new FakeHttp();
+    http.enqueue({
+      status: 200,
+      json: {
+        protocolVersion: "3",
+        spaceId: "space-2",
+        fromRevision: "revision-1",
+        toRevision: "revision-2",
+        toSequence: 2,
+        toRevisionContentHash: "0".repeat(64),
+        toFolderCount: "0",
+        toPageCount: "0",
+        toAttachmentCount: "0",
+        toRevisionManifestByteLength: "64",
+        toRevisionBodyBytes: "0",
+        toRevisionAttachmentBytes: "0",
+        items: [],
+        nextCursor: null,
+      },
+    });
+
+    await expect((await remoteWith(http)).delta("revision-1")).rejects.toThrow(
+      "DELTA_SPACE_MISMATCH",
+    );
+  });
+
+  it("rejects Delta metadata for another fromRevision", async () => {
+    const http = new FakeHttp();
+    http.enqueue({
+      status: 200,
+      json: {
+        protocolVersion: "3",
+        spaceId: "space-1",
+        fromRevision: "revision-other",
+        toRevision: "revision-2",
+        toSequence: 2,
+        toRevisionContentHash: "0".repeat(64),
+        toFolderCount: "0",
+        toPageCount: "0",
+        toAttachmentCount: "0",
+        toRevisionManifestByteLength: "64",
+        toRevisionBodyBytes: "0",
+        toRevisionAttachmentBytes: "0",
+        items: [],
+        nextCursor: null,
+      },
+    });
+
+    await expect((await remoteWith(http)).delta("revision-1")).rejects.toThrow(
+      "DELTA_METADATA_CHANGED",
+    );
+  });
+
   it("pins current snapshots and verifies their complete revision hash", async () => {
     const http = new FakeHttp();
     const metadata = await snapshotMetadata();

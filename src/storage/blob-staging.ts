@@ -38,6 +38,24 @@ export interface BlobStagingJournal {
   blobs: Record<string, BlobStagingEntry>;
 }
 
+export class BlobStagingIntegrityError extends Error {
+  readonly retryable = false;
+
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+function integrityError(
+  code: string,
+  message: string,
+): BlobStagingIntegrityError {
+  return new BlobStagingIntegrityError(code, message);
+}
+
 const PRIVATE_ROOT = /^\.agentwiki\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+$/u;
 const HASH = /^[a-f0-9]{64}$/u;
 const OPAQUE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
@@ -331,7 +349,11 @@ export class BlobStagingRepository {
   ): Promise<void> {
     const journal = await this.readJournalUnsafe(now);
     const entry = journal?.blobs[contentHash];
-    if (!journal || !entry) throw new Error("Blob staging entry missing");
+    if (!journal || !entry)
+      throw integrityError(
+        "BLOB_STAGING_ENTRY_MISSING",
+        "Blob staging entry missing",
+      );
     if (
       !Number.isInteger(chunkIndex) ||
       chunkIndex < 0 ||
@@ -341,11 +363,17 @@ export class BlobStagingRepository {
     )
       throw new RangeError("Blob staging quota exceeded");
     if ((await blobChunkHashV3(bytes)) !== expectedChunkHash)
-      throw new Error("Blob staging chunk hash mismatch");
+      throw integrityError(
+        "BLOB_STAGING_CHUNK_HASH_MISMATCH",
+        "Blob staging chunk hash mismatch",
+      );
     const path = this.chunkPath(contentHash, chunkIndex);
     const existing = await this.store.readBinary!(path);
     if (existing && !bytesEqual(existing, bytes))
-      throw new Error("Blob staging chunk conflict");
+      throw integrityError(
+        "BLOB_STAGING_CHUNK_CONFLICT",
+        "Blob staging chunk conflict",
+      );
     const otherReceivedBytes = Object.entries(entry.receivedChunks).reduce(
       (sum, [index, chunk]) =>
         Number(index) === chunkIndex ? sum : sum + chunk.sizeBytes,
@@ -359,7 +387,10 @@ export class BlobStagingRepository {
     if (!existing) await this.store.writeBinary!(path, bytes);
     const verified = await this.store.readBinary!(path);
     if (!verified || (await blobChunkHashV3(verified)) !== expectedChunkHash)
-      throw new Error("Blob staging chunk verification failed");
+      throw integrityError(
+        "BLOB_STAGING_CHUNK_VERIFICATION_FAILED",
+        "Blob staging chunk verification failed",
+      );
     entry.receivedChunks[String(chunkIndex)] = {
       contentHash: expectedChunkHash,
       sizeBytes: verified.byteLength,
@@ -374,7 +405,11 @@ export class BlobStagingRepository {
   private async completeUnsafe(contentHash: string, now: Date): Promise<void> {
     const journal = await this.readJournalUnsafe(now);
     const entry = journal?.blobs[contentHash];
-    if (!journal || !entry) throw new Error("Blob staging entry missing");
+    if (!journal || !entry)
+      throw integrityError(
+        "BLOB_STAGING_ENTRY_MISSING",
+        "Blob staging entry missing",
+      );
     if (entry.completeHash) {
       const completed = await this.store.readBinary!(
         this.completePath(contentHash),
@@ -384,7 +419,10 @@ export class BlobStagingRepository {
         completed.byteLength !== Number(entry.expected.sizeBytes) ||
         (await blobContentHashV3(completed)) !== contentHash
       )
-        throw new Error("Blob staging complete verification failed");
+        throw integrityError(
+          "BLOB_STAGING_COMPLETE_VERIFICATION_FAILED",
+          "Blob staging complete verification failed",
+        );
       await this.store.removeTree!(`${this.root}/chunks/${contentHash}`);
       return;
     }
@@ -396,13 +434,19 @@ export class BlobStagingRepository {
       indexes.length > this.limits.maxBlobChunks ||
       indexes.some((index, position) => index !== position)
     )
-      throw new Error("Blob staging chunks incomplete");
+      throw integrityError(
+        "BLOB_STAGING_CHUNKS_INCOMPLETE",
+        "Blob staging chunks incomplete",
+      );
     const size = indexes.reduce(
       (sum, index) => sum + entry.receivedChunks[String(index)]!.sizeBytes,
       0,
     );
     if (size !== Number(entry.expected.sizeBytes))
-      throw new Error("Blob staging size mismatch");
+      throw integrityError(
+        "BLOB_STAGING_SIZE_MISMATCH",
+        "Blob staging size mismatch",
+      );
     const bytes = new Uint8Array(size);
     let offset = 0;
     for (const index of indexes) {
@@ -414,17 +458,26 @@ export class BlobStagingRepository {
         (await blobChunkHashV3(chunk)) !==
           entry.receivedChunks[String(index)]!.contentHash
       )
-        throw new Error("Blob staging chunk verification failed");
+        throw integrityError(
+          "BLOB_STAGING_CHUNK_VERIFICATION_FAILED",
+          "Blob staging chunk verification failed",
+        );
       bytes.set(chunk, offset);
       offset += chunk.byteLength;
     }
     if ((await blobContentHashV3(bytes)) !== contentHash)
-      throw new Error("Blob staging complete hash mismatch");
+      throw integrityError(
+        "BLOB_STAGING_COMPLETE_HASH_MISMATCH",
+        "Blob staging complete hash mismatch",
+      );
     const path = this.completePath(contentHash);
     await this.store.writeBinary!(path, bytes);
     const verified = await this.store.readBinary!(path);
     if (!verified || (await blobContentHashV3(verified)) !== contentHash)
-      throw new Error("Blob staging complete verification failed");
+      throw integrityError(
+        "BLOB_STAGING_COMPLETE_VERIFICATION_FAILED",
+        "Blob staging complete verification failed",
+      );
     entry.completeHash = contentHash;
     await this.journal.write(journal);
     await this.store.removeTree!(`${this.root}/chunks/${contentHash}`);
@@ -450,7 +503,10 @@ export class BlobStagingRepository {
       bytes.byteLength !== Number(entry.expected.sizeBytes) ||
       (await blobContentHashV3(bytes)) !== contentHash
     )
-      throw new Error("Blob staging complete verification failed");
+      throw integrityError(
+        "BLOB_STAGING_COMPLETE_VERIFICATION_FAILED",
+        "Blob staging complete verification failed",
+      );
     return bytes;
   }
 

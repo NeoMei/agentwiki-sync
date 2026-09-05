@@ -12,7 +12,10 @@ import {
 
 import { isRetryableReadError, type RetryPolicy } from "../agentwiki/retry";
 import type { TreeRemotePortV3 } from "../ports/tree-remote";
-import type { BlobStagingRepository } from "../storage/blob-staging";
+import {
+  BlobStagingIntegrityError,
+  type BlobStagingRepository,
+} from "../storage/blob-staging";
 
 const DEFAULT_TRANSFER_RETRY: RetryPolicy = {
   maxAttempts: 3,
@@ -368,6 +371,7 @@ export class BlobTransfer {
     } catch (error) {
       if (
         error instanceof BlobTransferDeterministicError ||
+        error instanceof BlobStagingIntegrityError ||
         (typeof error === "object" &&
           error !== null &&
           "retryable" in error &&

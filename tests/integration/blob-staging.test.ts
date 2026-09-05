@@ -2,7 +2,10 @@ import { blobChunkHashV3 } from "@neomei/agentwiki-sync-protocol";
 import { describe, expect, it } from "vitest";
 
 import { canonicalBytes, sha256Hex } from "../../src/agentwiki/protocol";
-import { BlobStagingRepository } from "../../src/storage/blob-staging";
+import {
+  BlobStagingIntegrityError,
+  BlobStagingRepository,
+} from "../../src/storage/blob-staging";
 import {
   distinctControlStoreView,
   MemoryControlStore,
@@ -43,6 +46,31 @@ describe("bounded blob staging", () => {
         requirement.contentHash
       ]?.completeHash,
     ).toBe(requirement.contentHash);
+  });
+
+  it("classifies repository-detected complete corruption as nonretryable integrity failure", async () => {
+    const store = new MemoryControlStore();
+    const repository = new BlobStagingRepository(store, STAGING_ROOT);
+    const bytes = new Uint8Array([1, 2, 3, 4]);
+    const requirement = await blobRequirement(bytes);
+    await repository.begin("transfer-1", [requirement], futureExpiry);
+    await repository.writeChunk(
+      requirement.contentHash,
+      0,
+      bytes,
+      await blobChunkHashV3(bytes),
+      beforeExpiry,
+    );
+    const chunkPath = [...store.binaryFiles.keys()].find((path) =>
+      path.includes("/chunks/"),
+    );
+    store.binaryFiles.set(chunkPath!, new Uint8Array(bytes.byteLength));
+
+    const failure = await repository
+      .complete(requirement.contentHash, beforeExpiry)
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(BlobStagingIntegrityError);
+    expect(failure).toMatchObject({ retryable: false });
   });
 
   it("recovers a chunk written before its journal checkpoint", async () => {
