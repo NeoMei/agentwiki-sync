@@ -25,9 +25,15 @@ interface OperationPath {
   after: TreeTransactionPathState;
 }
 
+interface DirectoryClosure {
+  roots: string[];
+  initial: Record<string, Exclude<PathKind, "missing">>;
+}
+
 interface JournalOperation {
   action: TreePullActionV3;
   paths: OperationPath[];
+  directoryClosure?: DirectoryClosure;
 }
 
 export interface TreeTransactionJournal {
@@ -82,6 +88,20 @@ function isOperationPath(value: unknown): value is OperationPath {
   );
 }
 
+function isDirectoryClosure(value: unknown): value is DirectoryClosure {
+  if (!value || typeof value !== "object") return false;
+  const item = value as Partial<DirectoryClosure>;
+  return (
+    Array.isArray(item.roots) &&
+    item.roots.every((root): root is string => typeof root === "string") &&
+    !!item.initial &&
+    typeof item.initial === "object" &&
+    Object.values(item.initial).every(
+      (kind) => kind === "directory" || kind === "file",
+    )
+  );
+}
+
 function isJournalOperation(value: unknown): value is JournalOperation {
   if (!value || typeof value !== "object") return false;
   const item = value as Partial<JournalOperation>;
@@ -89,7 +109,9 @@ function isJournalOperation(value: unknown): value is JournalOperation {
   return (
     typeof action?.kind === "string" &&
     Array.isArray(item.paths) &&
-    item.paths.every(isOperationPath)
+    item.paths.every(isOperationPath) &&
+    (item.directoryClosure === undefined ||
+      isDirectoryClosure(item.directoryClosure))
   );
 }
 
@@ -309,8 +331,28 @@ export class TreeTransaction {
         const operation = journal.operations[index]!;
         const state = await this.classifyOperation(operation);
         if (state === "before") {
+          if (
+            !(await this.directoryClosureMatches(
+              operation,
+              journal.operations,
+              index,
+            ))
+          ) {
+            journal.state = "ambiguous";
+            await this.save(journal);
+            throw new Error(
+              "TREE_TRANSACTION_AMBIGUOUS: 目录子树出现未记录的变更",
+            );
+          }
           await this.executeOperation(index, operation);
-        } else if (state !== "after") {
+        } else if (
+          state !== "after" ||
+          !(await this.directoryClosureMatches(
+            operation,
+            journal.operations,
+            index + 1,
+          ))
+        ) {
           journal.state = "ambiguous";
           await this.save(journal);
           throw new Error("TREE_TRANSACTION_AMBIGUOUS: 事务前后状态不明确");
@@ -457,6 +499,7 @@ export class TreeTransaction {
     ownedRoots: string[],
     expectedPathStates?: Record<string, TreeTransactionPathState>,
   ): Promise<JournalOperation> {
+    const directoryClosure = await this.captureDirectoryClosure(action);
     let paths: OperationPath[];
     switch (action.kind) {
       case "create_directory":
@@ -618,7 +661,11 @@ export class TreeTransaction {
         throw new Error("ATTACHMENT_SOURCE_MISMATCH");
     }
 
-    return { action, paths };
+    return {
+      action,
+      paths,
+      ...(directoryClosure ? { directoryClosure } : {}),
+    };
   }
 
   private async resultHash(
@@ -739,6 +786,145 @@ export class TreeTransaction {
     return "other";
   }
 
+  private async captureDirectoryClosure(
+    action: TreePullActionV3,
+  ): Promise<DirectoryClosure | undefined> {
+    if (
+      action.kind !== "create_directory" &&
+      action.kind !== "trash_directory" &&
+      action.kind !== "move_directory"
+    )
+      return undefined;
+    const roots =
+      action.kind === "move_directory"
+        ? [action.fromPath, action.path]
+        : [action.path];
+    const initial: DirectoryClosure["initial"] = {};
+    const capture = async (actualRoot: string, logicalRoot: string) => {
+      const rootKind = await this.vault.pathStatus(actualRoot);
+      if (rootKind === "missing") return;
+      initial[logicalRoot] = rootKind;
+      if (rootKind !== "directory") return;
+      for await (const entry of this.vault.listTree(actualRoot))
+        initial[`${logicalRoot}/${entry.relativePath}`] =
+          entry.kind === "directory" ? "directory" : "file";
+    };
+    if (action.kind === "move_directory") {
+      await capture(action.beforePath ?? action.fromPath, action.fromPath);
+      await capture(action.path, action.path);
+    } else await capture(action.path, action.path);
+    return { roots, initial };
+  }
+
+  private applyDirectoryStateAction(
+    state: Map<string, Exclude<PathKind, "missing">>,
+    action: TreePullActionV3,
+  ): void {
+    const remove = (path: string) => {
+      for (const candidate of [...state.keys()])
+        if (isInsideSubtree(candidate, path)) state.delete(candidate);
+    };
+    const move = (fromPath: string, toPath: string) => {
+      const moved = [...state].filter(([path]) =>
+        isInsideSubtree(path, fromPath),
+      );
+      remove(fromPath);
+      for (const [path, kind] of moved)
+        state.set(`${toPath}${path.slice(fromPath.length)}`, kind);
+    };
+    switch (action.kind) {
+      case "create_directory":
+        state.set(action.path, "directory");
+        break;
+      case "trash_directory":
+        remove(action.path);
+        break;
+      case "move_directory":
+        move(action.fromPath, action.path);
+        break;
+      case "create_page":
+        state.set(action.path, "file");
+        break;
+      case "write_page":
+        state.set(action.path, "file");
+        break;
+      case "move_page":
+        move(action.fromPath, action.path);
+        break;
+      case "trash_page":
+        remove(action.path);
+        break;
+      case "create_attachment":
+      case "write_attachment":
+        state.set(action.attachment.path, "file");
+        break;
+      case "remove_attachment_path":
+        remove(action.path);
+        break;
+      case "detach_attachment":
+        break;
+    }
+  }
+
+  private legacyDirectoryClosure(
+    operation: JournalOperation,
+  ): DirectoryClosure {
+    const roots =
+      operation.action.kind === "move_directory"
+        ? [operation.action.fromPath, operation.action.path]
+        : operation.action.kind === "trash_directory" ||
+            operation.action.kind === "create_directory"
+          ? [operation.action.path]
+          : [];
+    const initial: DirectoryClosure["initial"] = {};
+    for (const item of operation.paths)
+      if (item.before.kind !== "missing") initial[item.path] = item.before.kind;
+    return { roots, initial };
+  }
+
+  private async directoryClosureMatches(
+    operation: JournalOperation,
+    allOperations: JournalOperation[],
+    appliedCount: number,
+    transactionWide = false,
+  ): Promise<boolean> {
+    const closure =
+      operation.directoryClosure ?? this.legacyDirectoryClosure(operation);
+    const expectedState = new Map<string, Exclude<PathKind, "missing">>();
+    const seeds = transactionWide
+      ? allOperations.flatMap((candidate) => [
+          candidate.directoryClosure ?? this.legacyDirectoryClosure(candidate),
+        ])
+      : [closure];
+    for (const seed of seeds)
+      for (const [path, kind] of Object.entries(seed.initial))
+        expectedState.set(path, kind);
+    for (let index = 0; index < appliedCount; index += 1)
+      this.applyDirectoryStateAction(
+        expectedState,
+        allOperations[index]!.action,
+      );
+    for (const root of closure.roots) {
+      const expected = new Map<string, PathKind>();
+      for (const [path, kind] of expectedState)
+        if (path !== root && isInsideSubtree(path, root))
+          expected.set(pathKey(path), kind);
+      const actual = new Map<string, PathKind>();
+      if ((await this.vault.pathStatus(root)) === "directory")
+        for await (const entry of this.vault.listTree(root))
+          actual.set(
+            pathKey(`${root}/${entry.relativePath}`),
+            entry.kind === "directory" ? "directory" : "file",
+          );
+      if (
+        actual.size !== expected.size ||
+        [...actual].some(([path, kind]) => expected.get(path) !== kind)
+      )
+        return false;
+    }
+    return true;
+  }
+
   private async executeOperation(
     index: number,
     operation: JournalOperation,
@@ -803,7 +989,16 @@ export class TreeTransaction {
     journal: TreeTransactionJournal,
   ): Promise<boolean> {
     for (const operation of journal.operations) {
-      if ((await this.classifyOperation(operation)) !== "after") return false;
+      if (
+        (await this.classifyOperation(operation)) !== "after" ||
+        !(await this.directoryClosureMatches(
+          operation,
+          journal.operations,
+          journal.operations.length,
+          true,
+        ))
+      )
+        return false;
     }
     return true;
   }
@@ -817,6 +1012,19 @@ export class TreeTransaction {
         const state = await this.classifyOperation(operation);
         if (state === "before") continue;
         if (state === "after") {
+          if (
+            !(await this.directoryClosureMatches(
+              operation,
+              journal.operations,
+              index + 1,
+            ))
+          ) {
+            journal.state = "ambiguous";
+            await this.save(journal);
+            throw new Error(
+              "TREE_TRANSACTION_AMBIGUOUS: 回滚时目录子树出现未记录的变更",
+            );
+          }
           await this.vault.rename(
             operation.action.path,
             operation.action.fromPath,
@@ -849,6 +1057,21 @@ export class TreeTransaction {
       const current = await this.readPathState(item.path);
       if (sameState(current, item.before)) continue;
       if (sameState(current, item.after)) {
+        if (
+          operation.action.kind === "create_directory" &&
+          item.after.kind === "directory" &&
+          !(await this.directoryClosureMatches(
+            operation,
+            journal.operations,
+            index + 1,
+          ))
+        ) {
+          journal.state = "ambiguous";
+          await this.save(journal);
+          throw new Error(
+            "TREE_TRANSACTION_AMBIGUOUS: 回滚时目录子树出现未记录的变更",
+          );
+        }
         await this.revertPath(index, operation, item);
         continue;
       }

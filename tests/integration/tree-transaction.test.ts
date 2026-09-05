@@ -135,6 +135,147 @@ function seededControl(): MemoryControlStore {
 }
 
 describe("TreeTransaction", () => {
+  it("preserves a new child added after preparing a directory trash", async () => {
+    const vault = new MemoryVault({ "pages/Doomed/known.md": "known" });
+    const tx = new TreeTransaction(
+      vault,
+      new MemoryControlStore(),
+      ".agentwiki/tx/trash-closure",
+    );
+    await tx.prepare({
+      baseRevision: "base",
+      targetRevision: "target",
+      targetTreeHash: "0".repeat(64),
+      actions: [
+        { kind: "trash_directory", folderId: "doomed", path: "pages/Doomed" },
+      ],
+    });
+    vault.seedMarkdown("pages/Doomed/user.md", "created after prepare");
+    vault.operationLog.length = 0;
+
+    await expect(tx.apply()).rejects.toThrow(/AMBIGUOUS|unrecorded|unknown/i);
+
+    expect(vault.text("pages/Doomed/user.md")).toBe("created after prepare");
+    expect(vault.text("pages/Doomed/known.md")).toBe("known");
+    expect(vault.operationLog).toEqual([]);
+    expect((await tx.inspect())?.state).toBe("ambiguous");
+  });
+
+  it("preserves a new source child added after preparing a directory move", async () => {
+    const vault = new MemoryVault({ "pages/Old/known.md": "known" });
+    const control = new MemoryControlStore();
+    const root = ".agentwiki/tx/move-closure";
+    const tx = new TreeTransaction(vault, control, root);
+    await tx.prepare({
+      baseRevision: "base",
+      targetRevision: "target",
+      targetTreeHash: "0".repeat(64),
+      actions: [
+        {
+          kind: "move_directory",
+          folderId: "moved",
+          fromPath: "pages/Old",
+          path: "pages/New",
+        },
+      ],
+    });
+    const envelope = JSON.parse(
+      (await control.read(`${root}/journal.json`))!,
+    ) as { payload: unknown };
+    expect(envelope.payload).toMatchObject({
+      schemaVersion: 3,
+      operations: [
+        {
+          directoryClosure: {
+            roots: ["pages/Old", "pages/New"],
+            initial: {
+              "pages/Old": "directory",
+              "pages/Old/known.md": "file",
+            },
+          },
+        },
+      ],
+    });
+    vault.seedMarkdown("pages/Old/user.md", "created after prepare");
+    vault.operationLog.length = 0;
+
+    const recovered = new TreeTransaction(vault, control, root);
+    await expect(recovered.apply()).rejects.toThrow(
+      /AMBIGUOUS|unrecorded|unknown/i,
+    );
+
+    expect(vault.text("pages/Old/user.md")).toBe("created after prepare");
+    expect(vault.text("pages/Old/known.md")).toBe("known");
+    expect(vault.hasDirectory("pages/New")).toBe(false);
+    expect(vault.operationLog).toEqual([]);
+    expect((await recovered.inspect())?.state).toBe("ambiguous");
+  });
+
+  it("does not relocate an unknown child while rolling back a directory move", async () => {
+    const vault = new MemoryVault({ "pages/Old/known.md": "known" });
+    const control = new MemoryControlStore();
+    const root = ".agentwiki/tx/move-rollback-closure";
+    const tx = new TreeTransaction(vault, control, root);
+    await tx.prepare({
+      baseRevision: "base",
+      targetRevision: "target",
+      targetTreeHash: "0".repeat(64),
+      deferCommit: true,
+      actions: [
+        {
+          kind: "move_directory",
+          folderId: "moved",
+          fromPath: "pages/Old",
+          path: "pages/New",
+        },
+      ],
+    });
+    await tx.apply();
+    await tx.markVerified();
+    vault.seedMarkdown("pages/New/user.md", "created after move");
+    vault.operationLog.length = 0;
+
+    const recovered = new TreeTransaction(vault, control, root);
+    await expect(recovered.rollbackVerified()).rejects.toThrow(
+      /AMBIGUOUS|unrecorded|unknown/i,
+    );
+
+    expect(vault.text("pages/New/user.md")).toBe("created after move");
+    expect(vault.text("pages/New/known.md")).toBe("known");
+    expect(vault.hasDirectory("pages/Old")).toBe(false);
+    expect(vault.operationLog).toEqual([]);
+    expect((await recovered.inspect())?.state).toBe("ambiguous");
+  });
+
+  it("does not recursively remove an unknown child while rolling back a created directory", async () => {
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const root = ".agentwiki/tx/create-rollback-closure";
+    const tx = new TreeTransaction(vault, control, root);
+    await tx.prepare({
+      baseRevision: "base",
+      targetRevision: "target",
+      targetTreeHash: "0".repeat(64),
+      deferCommit: true,
+      actions: [
+        { kind: "create_directory", folderId: "new", path: "pages/New" },
+      ],
+    });
+    await tx.apply();
+    vault.seedMarkdown("pages/New/user.md", "created after apply");
+    vault.operationLog.length = 0;
+
+    const recovered = new TreeTransaction(vault, control, root);
+    await expect(recovered.recover()).rejects.toThrow(
+      /AMBIGUOUS|unrecorded|unknown/i,
+    );
+
+    expect(vault.text("pages/New/user.md")).toBe("created after apply");
+    expect(vault.hasDirectory("pages/New")).toBe(true);
+    expect(vault.operationLog).toEqual([]);
+    expect((await recovered.inspect())?.state).toBe("ambiguous");
+  });
+
   it("does not materialize changed bytes as a new approved before-image", async () => {
     const vault = new MemoryVault({ "pages/note.md": "approved" });
     const control = new MemoryControlStore();
