@@ -7,6 +7,10 @@ import {
 } from "../../src/agentwiki/protocol";
 import {
   TREE_SYNC_V3_HARD_LIMITS,
+  blobChunkHashV3,
+  blobContentHashV3,
+  canonicalTreeDeltaItemsV3,
+  treeBatchHashV3,
   treeCapabilitiesHashV3,
   treeRevisionContentHashV2,
   treeRevisionContentHashV3,
@@ -18,6 +22,8 @@ import {
   type SyncPageV2,
   type SyncPageV3,
   type TreePushBatchV2,
+  type TreePushBatchV3,
+  type CreateTreePushSessionRequestV3,
   type TreeSyncCapabilitiesV3,
 } from "@neomei/agentwiki-sync-protocol";
 import type {
@@ -46,6 +52,7 @@ import type {
   TreePage,
   TreeSnapshot,
 } from "../../src/core/tree-model";
+import { AgentWikiHttpError } from "../../src/agentwiki/client";
 
 const CAPABILITIES: TreeSyncLimits = {
   maxPageBytes: 1048576,
@@ -439,12 +446,26 @@ export class FakeTreeRemote implements TreeRemotePort {
 
 export class FakeTreeRemoteV3 implements TreeRemotePortV3 {
   readonly protocolVersion = "3" as const;
-  readonly capabilitiesHash = treeCapabilitiesHashV3(V3_CAPABILITIES);
+  private capabilitiesValue: TreeSyncCapabilitiesV3 =
+    structuredClone(V3_CAPABILITIES);
+  get capabilitiesHash(): Promise<string> {
+    return treeCapabilitiesHashV3(this.capabilitiesValue);
+  }
   readonly downloads: Array<{
     revision: string;
     attachmentId: string;
     contentHash: string;
   }> = [];
+  readonly createInputs: CreateTreePushSessionRequestV3[] = [];
+  readonly uploadedChunkIndexes: number[] = [];
+  readonly uploadedBatches: TreePushBatchV3[] = [];
+  finalizeCalls = 0;
+  abortCalls = 0;
+  loseFinalizeResponseOnce = false;
+  changeCapabilitiesOnCreate = 0;
+  onFinalize?: () => Promise<void> | void;
+  onUploadBlobChunk?: () => Promise<void> | void;
+  onUploadBatch?: () => Promise<void> | void;
   failAfterSnapshot = false;
   downloadFailuresRemaining = 0;
   onDownload?: () => Promise<void> | void;
@@ -454,6 +475,17 @@ export class FakeTreeRemoteV3 implements TreeRemotePortV3 {
   private pages: SyncPageV3[] = [];
   private attachments: SyncAttachmentV3[] = [];
   private readonly blobs = new Map<string, Uint8Array>();
+  private readonly contentBlobs = new Map<string, Uint8Array>();
+  private readonly pushChunks = new Map<string, Map<number, Uint8Array>>();
+  private pushSession: {
+    sessionId: string;
+    input: CreateTreePushSessionRequestV3;
+    status: TreePushSessionStatusV3["status"];
+    missingContentHashes: string[];
+    completedContentHashes: string[];
+    receivedBatchIndexes: number[];
+    result: TreeFinalizeResultV3 | null;
+  } | null = null;
 
   async seedTree(input: {
     revision?: string;
@@ -470,14 +502,26 @@ export class FakeTreeRemoteV3 implements TreeRemotePortV3 {
     }));
     this.attachments = (input.attachments ?? []).map((item) => ({ ...item }));
     this.blobs.clear();
-    for (const [id, bytes] of Object.entries(input.blobs ?? {}))
+    this.contentBlobs.clear();
+    for (const [id, bytes] of Object.entries(input.blobs ?? {})) {
       this.blobs.set(id, bytes.slice());
+      const attachment = this.attachments.find(
+        (item) => item.attachmentId === id,
+      );
+      if (attachment)
+        this.contentBlobs.set(attachment.contentHash, bytes.slice());
+    }
   }
 
   async capabilities(): Promise<TreeSyncCapabilitiesV3> {
-    return {
-      ...V3_CAPABILITIES,
-      allowedMimeTypes: [...V3_CAPABILITIES.allowedMimeTypes],
+    return structuredClone(this.capabilitiesValue);
+  }
+  setCapabilities(overrides: Partial<TreeSyncCapabilitiesV3>): void {
+    this.capabilitiesValue = {
+      ...this.capabilitiesValue,
+      ...overrides,
+      allowedMimeTypes:
+        overrides.allowedMimeTypes ?? this.capabilitiesValue.allowedMimeTypes,
     };
   }
 
@@ -592,26 +636,202 @@ export class FakeTreeRemoteV3 implements TreeRemotePortV3 {
     return { ...result, status: "published", changeSetId: null };
   }
 
-  async createPushSession(): Promise<TreePushSessionV3> {
-    throw new Error("V3_PUSH_NOT_IMPLEMENTED");
+  async createPushSession(
+    input: CreateTreePushSessionRequestV3,
+  ): Promise<TreePushSessionV3> {
+    this.createInputs.push(structuredClone(input));
+    if (this.changeCapabilitiesOnCreate > 0) {
+      this.changeCapabilitiesOnCreate -= 1;
+      this.capabilitiesValue.maxBatchItems -= 1;
+      throw new AgentWikiHttpError(409, {
+        protocolVersion: "3",
+        error: { code: "CAPABILITIES_CHANGED", retryable: true },
+      });
+    }
+    if (input.baseRevision !== this.revision) throw new Error("BASE_STALE");
+    const missingContentHashes = input.blobRequirements
+      .filter((item) => !this.contentBlobs.has(item.contentHash))
+      .map((item) => item.contentHash);
+    this.pushSession = {
+      sessionId: `v3-session-${this.createInputs.length}`,
+      input: structuredClone(input),
+      status: "uploading",
+      missingContentHashes,
+      completedContentHashes: [],
+      receivedBatchIndexes: [],
+      result: null,
+    };
+    return {
+      sessionId: this.pushSession.sessionId,
+      status: this.pushSession.status,
+      expiresAt: "2099-01-01T00:00:00.000Z",
+      missingContentHashes: [...missingContentHashes],
+    };
   }
-  async uploadBatch(): Promise<{ receipt: string }> {
-    throw new Error("V3_PUSH_NOT_IMPLEMENTED");
+  async uploadBatch(
+    sessionId: string,
+    batch: TreePushBatchV3,
+  ): Promise<{ receipt: string }> {
+    if (!this.pushSession || this.pushSession.sessionId !== sessionId)
+      throw new Error("PUSH_SESSION_NOT_FOUND");
+    if (
+      batch.batchHash !==
+      (await treeBatchHashV3({
+        protocolVersion: "3",
+        batchIndex: batch.batchIndex,
+        changes: batch.changes,
+      }))
+    )
+      throw new Error("BATCH_MISMATCH");
+    this.uploadedBatches.push(structuredClone(batch));
+    await this.onUploadBatch?.();
+    this.pushSession.receivedBatchIndexes.push(batch.batchIndex);
+    const received = this.uploadedBatches.reduce(
+      (total, item) => total + item.changes.length,
+      0,
+    );
+    if (received === this.pushSession.input.changeCount)
+      this.pushSession.status = "ready_to_finalize";
+    return { receipt: `batch-${batch.batchIndex}` };
   }
-  async finalize(): Promise<TreeFinalizeResultV3> {
-    throw new Error("V3_PUSH_NOT_IMPLEMENTED");
+  async finalize(
+    sessionId: string,
+    confirmationHash: string,
+  ): Promise<TreeFinalizeResultV3> {
+    this.finalizeCalls += 1;
+    if (!this.pushSession || this.pushSession.sessionId !== sessionId)
+      throw new Error("PUSH_SESSION_NOT_FOUND");
+    if (confirmationHash !== this.pushSession.input.confirmationHash)
+      throw new Error("CONFIRMATION_MISMATCH");
+    if (this.pushSession.result) return this.pushSession.result;
+    const changes = canonicalTreeDeltaItemsV3(
+      this.uploadedBatches.flatMap((batch) => batch.changes),
+    );
+    for (const change of changes) {
+      switch (change.operation) {
+        case "upsert_folder":
+          this.folders = [
+            ...this.folders.filter(
+              (item) => item.folderId !== change.folder.folderId,
+            ),
+            structuredClone(change.folder),
+          ];
+          break;
+        case "archive_folder":
+          this.folders = this.folders.filter(
+            (item) => item.folderId !== change.folderId,
+          );
+          break;
+        case "upsert_attachment":
+          this.attachments = [
+            ...this.attachments.filter(
+              (item) => item.attachmentId !== change.attachment.attachmentId,
+            ),
+            structuredClone(change.attachment),
+          ];
+          this.blobs.set(
+            change.attachment.attachmentId,
+            this.contentBlobs.get(change.attachment.contentHash)!.slice(),
+          );
+          break;
+        case "detach_attachment":
+          this.attachments = this.attachments.filter(
+            (item) => item.attachmentId !== change.attachmentId,
+          );
+          break;
+        case "upsert_page":
+          this.pages = [
+            ...this.pages.filter((item) => item.pageId !== change.page.pageId),
+            structuredClone(change.page),
+          ];
+          break;
+        case "archive_page":
+          this.pages = this.pages.filter(
+            (item) => item.pageId !== change.pageId,
+          );
+          break;
+      }
+    }
+    this.revision = `rev-push-${this.createInputs.length}`;
+    const head = await this.head();
+    const { spaceId: _spaceId, ...terminal } = head;
+    const result: TreeFinalizeResultV3 = {
+      ...terminal,
+      status: "published",
+      changeSetId: `change-${this.createInputs.length}`,
+    };
+    this.pushSession.status = "published";
+    this.pushSession.result = result;
+    await this.onFinalize?.();
+    if (this.loseFinalizeResponseOnce) {
+      this.loseFinalizeResponseOnce = false;
+      throw new Error("finalize response lost");
+    }
+    return result;
   }
-  async getSession(): Promise<TreePushSessionStatusV3> {
-    throw new Error("V3_PUSH_NOT_IMPLEMENTED");
+  async getSession(sessionId: string): Promise<TreePushSessionStatusV3> {
+    if (!this.pushSession || this.pushSession.sessionId !== sessionId)
+      throw new Error("PUSH_SESSION_NOT_FOUND");
+    return {
+      sessionId,
+      status: this.pushSession.status,
+      expiresAt: "2099-01-01T00:00:00.000Z",
+      missingContentHashes: [...this.pushSession.missingContentHashes],
+      completedContentHashes: [...this.pushSession.completedContentHashes],
+      receivedBatchIndexes: [...this.pushSession.receivedBatchIndexes],
+      result: this.pushSession.result
+        ? structuredClone(this.pushSession.result)
+        : null,
+    };
   }
-  async abort(): Promise<void> {}
-  async uploadBlobChunk(): Promise<BlobChunkReceiptV3> {
-    throw new Error("V3_PUSH_NOT_IMPLEMENTED");
+  async abort(): Promise<void> {
+    this.abortCalls += 1;
+    if (this.pushSession) this.pushSession.status = "aborted";
+  }
+  async uploadBlobChunk(
+    _sessionId: string,
+    contentHash: string,
+    chunkIndex: number,
+    bytes: Uint8Array,
+  ): Promise<BlobChunkReceiptV3> {
+    this.uploadedChunkIndexes.push(chunkIndex);
+    const chunks =
+      this.pushChunks.get(contentHash) ?? new Map<number, Uint8Array>();
+    chunks.set(chunkIndex, bytes.slice());
+    this.pushChunks.set(contentHash, chunks);
+    await this.onUploadBlobChunk?.();
+    return {
+      contentHash,
+      chunkIndex,
+      chunkHash: await blobChunkHashV3(bytes),
+      receipt: `blob-${contentHash}-${chunkIndex}`,
+    };
   }
   async completeBlob(
     _sessionId: string,
     requirement: BlobRequirementV3,
+    chunkCount: number,
   ): Promise<CompletedBlobV3> {
+    const chunks = this.pushChunks.get(requirement.contentHash);
+    if (!chunks || chunks.size !== chunkCount)
+      throw new Error("BLOB_INCOMPLETE");
+    const size = [...chunks.values()].reduce(
+      (total, item) => total + item.byteLength,
+      0,
+    );
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (let index = 0; index < chunkCount; index += 1) {
+      const chunk = chunks.get(index);
+      if (!chunk) throw new Error("BLOB_INCOMPLETE");
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    if ((await blobContentHashV3(bytes)) !== requirement.contentHash)
+      throw new Error("UPLOAD_BLOB_MISMATCH");
+    this.contentBlobs.set(requirement.contentHash, bytes);
+    if (this.pushSession)
+      this.pushSession.completedContentHashes.push(requirement.contentHash);
     return { ...requirement, verifiedAt: "2026-09-05T00:00:00.000Z" };
   }
 

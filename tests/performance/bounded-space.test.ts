@@ -4,6 +4,8 @@ import {
   TREE_SYNC_V2_LIMITS,
   TreeCapabilitiesResponseV2Schema,
   partitionTreePushChangesV2,
+  treeCapabilitiesHashV3,
+  treeConfirmationHashV3,
   type TreeSyncCapabilitiesV2,
 } from "@neomei/agentwiki-sync-protocol";
 import { AgentWikiClient } from "../../src/agentwiki/client";
@@ -18,6 +20,12 @@ import { scanMapping } from "../../src/core/status";
 import { emptyTreeIdentityState } from "../../src/storage/tree-identities";
 import { FakeHttp } from "../fakes/fake-http";
 import { MemoryVault } from "../fakes/memory-vault";
+import { MemoryControlStore } from "../fakes/memory-control-store";
+import {
+  TreePushServiceV3,
+  type PreparedTreePushChangeV3,
+} from "../../src/application/tree-push-service-v3";
+import { FakeTreeRemoteV3, V3_CAPABILITIES } from "../fakes/fake-tree-remote";
 
 describe("bounded v1 space", () => {
   it("streams 5,000 metadata entries and deterministically partitions 5,000 changes", async () => {
@@ -82,6 +90,94 @@ describe("bounded v1 space", () => {
     expect(scan.bodyBytes).toBe(100_000_000);
     if (globalThis.gc) expect(delta).toBeLessThan(32 * 1024 * 1024);
   }, 60_000);
+});
+
+describe("bounded strict-v3 push", () => {
+  it("journals the negotiated 100-attachment change bound without reading image bytes before create", async () => {
+    const capabilities = {
+      ...V3_CAPABILITIES,
+      maxRevisionAttachments: 1_000,
+    };
+    const remote = new FakeTreeRemoteV3();
+    remote.setCapabilities(capabilities);
+    const control = new MemoryControlStore();
+    let largestJournalWrite = 0;
+    control.onTextWrite = (path) => {
+      if (path.endsWith("/journal.json.next"))
+        largestJournalWrite = Math.max(
+          largestJournalWrite,
+          control.files.get(path)?.length ?? 0,
+        );
+    };
+    const changes: PreparedTreePushChangeV3[] = Array.from(
+      { length: capabilities.maxChangeCount },
+      (_, index) => {
+        const suffix = String(index).padStart(12, "0");
+        return {
+          operation: "upsert_attachment" as const,
+          attachment: {
+            attachmentId: `00000000-0000-4000-8000-${suffix}`,
+            path: `assets/image-${suffix}.png`,
+            mimeType: "image/png" as const,
+            sizeBytes: "1",
+            width: 1,
+            height: 1,
+            contentHash: index.toString(16).padStart(64, "0"),
+            updatedAt: "2026-09-06T00:00:00.000Z",
+          },
+          vaultPath: `Wiki/assets/image-${suffix}.png`,
+        };
+      },
+    );
+    const capabilitiesHash = await treeCapabilitiesHashV3(capabilities);
+    const confirmationHash = await treeConfirmationHashV3({
+      protocolVersion: "3",
+      spaceId: "space",
+      baseRevision: "rev-3",
+      capabilitiesHash,
+      changes: changes.map((change) => {
+        if (change.operation !== "upsert_attachment")
+          throw new Error("fixture");
+        return {
+          operation: change.operation,
+          attachment: change.attachment,
+        };
+      }),
+    });
+    const controller = new AbortController();
+    controller.abort();
+    let reads = 0;
+    const service = new TreePushServiceV3(
+      remote,
+      control,
+      ".agentwiki/perf-v3",
+      {
+        readBlob: async () => {
+          reads += 1;
+          return null;
+        },
+        revalidateConfirmation: async () => confirmationHash,
+      },
+    );
+
+    await expect(
+      service.publishPrepared(
+        {
+          protocolVersion: "3",
+          spaceId: "space",
+          baseRevision: "rev-3",
+          capabilities,
+          capabilitiesHash,
+          confirmationHash,
+          changes,
+        },
+        { signal: controller.signal },
+      ),
+    ).rejects.toThrow(/取消/);
+    expect(reads).toBe(0);
+    expect(remote.createInputs).toHaveLength(0);
+    expect(largestJournalWrite).toBeLessThan(2 * 1024 * 1024);
+  });
 });
 
 const v2Capabilities: TreeSyncCapabilitiesV2 = {

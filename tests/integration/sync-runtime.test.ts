@@ -178,9 +178,208 @@ describe("SyncRuntime", () => {
     await runtime.applyPullV3(second);
     expect(remote.downloads).toHaveLength(downloads);
     expect(vault.operationLog).toEqual([]);
-    await expect(runtime.previewPush()).rejects.toThrow(
-      /V3_PUSH_NOT_IMPLEMENTED/,
+    expect((await runtime.previewPushV3()).changes).toEqual([]);
+  });
+
+  it("pushes a referenced image through strict v3 and repeats as zero-operation", async () => {
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({ revision: "rev-empty" });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    await runtime.applyPullV3(await runtime.previewPullV3());
+    vault.seedFile("Wiki/assets/image.png", PNG_2X3);
+    vault.seedMarkdown("Wiki/pages/note.md", "![[assets/image.png]]");
+
+    const preview = await runtime.previewPushV3();
+    expect(preview.changes.map((change) => change.operation)).toEqual([
+      "upsert_attachment",
+      "upsert_page",
+    ]);
+    await runtime.applyPushV3(preview);
+    expect(remote.createInputs[0]).toMatchObject({
+      protocolVersion: "3",
+      attachmentCount: 1,
+      transferBlobBytes: PNG_2X3.byteLength,
+    });
+    expect(remote.uploadedChunkIndexes).toEqual([0]);
+    expect(remote.finalizeCalls).toBe(1);
+    expect((await runtime.previewPushV3()).changes).toEqual([]);
+    expect(remote.createInputs).toHaveLength(1);
+  });
+
+  it("retains an edit made after v3 finalize as the next push", async () => {
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({ revision: "rev-empty" });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    await runtime.applyPullV3(await runtime.previewPullV3());
+    vault.seedMarkdown("Wiki/pages/note.md", "first");
+    const first = await runtime.previewPushV3();
+    remote.onFinalize = () =>
+      vault.seedMarkdown("Wiki/pages/note.md", "second");
+
+    await runtime.applyPushV3(first);
+
+    remote.onFinalize = undefined;
+    const next = await runtime.previewPushV3();
+    expect(next.changes).toHaveLength(1);
+    expect(next.changes[0]).toMatchObject({
+      operation: "upsert_page",
+      page: { path: "pages/note.md" },
+    });
+  });
+
+  it("rebuilds a v3 push once after capabilities change", async () => {
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({ revision: "rev-empty" });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    await runtime.applyPullV3(await runtime.previewPullV3());
+    vault.seedMarkdown("Wiki/pages/note.md", "body");
+    const preview = await runtime.previewPushV3();
+    remote.changeCapabilitiesOnCreate = 1;
+
+    await runtime.applyPushV3(preview);
+
+    expect(remote.createInputs).toHaveLength(2);
+    expect(remote.createInputs[1]?.capabilitiesHash).not.toBe(
+      remote.createInputs[0]?.capabilitiesHash,
     );
+    expect(remote.finalizeCalls).toBe(1);
+  });
+
+  it("aborts before finalize when a local image or page drifts during upload", async () => {
+    for (const drift of ["image", "page"] as const) {
+      const remote = new FakeTreeRemoteV3();
+      await remote.seedTree({ revision: "rev-empty" });
+      const vault = new MemoryVault({});
+      const control = new MemoryControlStore();
+      const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+      await runtime.applyPullV3(await runtime.previewPullV3());
+      vault.seedFile("Wiki/assets/image.png", PNG_2X3);
+      vault.seedMarkdown("Wiki/pages/note.md", "![[assets/image.png]]");
+      const preview = await runtime.previewPushV3();
+      if (drift === "image")
+        remote.onUploadBlobChunk = () =>
+          vault.seedFile(
+            "Wiki/assets/image.png",
+            Uint8Array.from([...PNG_2X3.slice(0, -1), 1]),
+          );
+      else
+        remote.onUploadBatch = () =>
+          vault.seedMarkdown("Wiki/pages/note.md", "changed");
+
+      await expect(runtime.applyPushV3(preview)).rejects.toThrow(
+        /CONFIRMATION_MISMATCH|V3_PUSH_BLOCKED/,
+      );
+      expect(remote.abortCalls).toBe(1);
+      expect(remote.finalizeCalls).toBe(0);
+    }
+  });
+
+  it("recovers a published v3 terminal result without re-finalizing", async () => {
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({ revision: "rev-empty" });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    await runtime.applyPullV3(await runtime.previewPullV3());
+    vault.seedMarkdown("Wiki/pages/note.md", "body");
+    remote.loseFinalizeResponseOnce = true;
+    await expect(
+      runtime.applyPushV3(await runtime.previewPushV3()),
+    ).rejects.toThrow(/finalize response lost/);
+    expect(remote.finalizeCalls).toBe(1);
+
+    await SyncRuntime.v3(vault, control, remote, mapping()).recover();
+
+    expect(remote.finalizeCalls).toBe(1);
+    expect(
+      (await SyncRuntime.v3(vault, control, remote, mapping()).previewPushV3())
+        .changes,
+    ).toEqual([]);
+  });
+
+  it("detaches the last reference without deleting local files or reading unreferenced images", async () => {
+    const attachment = await v3Attachment(
+      "11111111-1111-4111-8111-111111111111",
+      "assets/image.png",
+    );
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({
+      revision: "rev-before",
+      pages: [
+        await v3Page(
+          "22222222-2222-4222-8222-222222222222",
+          "pages/note.md",
+          "![[assets/image.png]]",
+          [attachment.attachmentId],
+        ),
+      ],
+      attachments: [attachment],
+      blobs: { [attachment.attachmentId]: PNG_2X3 },
+    });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    await runtime.applyPullV3(await runtime.previewPullV3());
+    vault.seedFile("Wiki/assets/unreferenced.png", PNG_2X3);
+    vault.seedMarkdown("Wiki/pages/note.md", "no image");
+    vault.readPaths.length = 0;
+
+    const preview = await runtime.previewPushV3();
+    expect(preview.changes.map((change) => change.operation)).toEqual([
+      "upsert_page",
+      "detach_attachment",
+    ]);
+    await runtime.applyPushV3(preview);
+    expect((await remote.head()).attachmentCount).toBe("0");
+    expect(vault.exists("Wiki/assets/image.png")).toBe(true);
+    expect(vault.exists("Wiki/assets/unreferenced.png")).toBe(true);
+    expect(vault.readPaths).not.toContain("Wiki/assets/unreferenced.png");
+    expect(remote.createInputs[0]).toMatchObject({
+      attachmentCount: 0,
+      transferBlobBytes: 0,
+      blobRequirements: [],
+    });
+  });
+
+  it("does not require or upload an unchanged base attachment for a page edit", async () => {
+    const attachment = await v3Attachment(
+      "11111111-1111-4111-8111-111111111111",
+      "assets/image.png",
+    );
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({
+      revision: "rev-before",
+      pages: [
+        await v3Page(
+          "22222222-2222-4222-8222-222222222222",
+          "pages/note.md",
+          "![[assets/image.png]]",
+          [attachment.attachmentId],
+        ),
+      ],
+      attachments: [attachment],
+      blobs: { [attachment.attachmentId]: PNG_2X3 },
+    });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    await runtime.applyPullV3(await runtime.previewPullV3());
+    vault.seedMarkdown("Wiki/pages/note.md", "edited\n![[assets/image.png]]");
+
+    await runtime.applyPushV3(await runtime.previewPushV3());
+
+    expect(remote.createInputs[0]).toMatchObject({
+      attachmentCount: 0,
+      transferBlobBytes: 0,
+      blobRequirements: [],
+    });
+    expect(remote.uploadedChunkIndexes).toEqual([]);
   });
 
   it("re-verifies staged Blob bytes before any Vault or generation effect", async () => {
@@ -693,6 +892,15 @@ describe("SyncRuntime", () => {
     expect(vault.text("Wiki/pages/note.md")).toBe(
       "Local note\n\n![[assets/renamed.png]]",
     );
+    const retainedEdit = await runtime.previewPushV3();
+    expect(retainedEdit.changes).toHaveLength(1);
+    expect(retainedEdit.changes[0]).toMatchObject({
+      operation: "upsert_page",
+      page: {
+        pageId,
+        referencedAttachmentIds: [attachmentId],
+      },
+    });
   });
 
   it("recovers a verified v3 Pull after the generation pointer write fails", async () => {

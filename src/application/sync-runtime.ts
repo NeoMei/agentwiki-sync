@@ -1,6 +1,10 @@
 import {
   FlatAttachmentPathSchema,
+  canonicalTreeDeltaItemsV3,
   validatePortableMarkdownPath,
+  treeCapabilitiesHashV3,
+  treeConfirmationHashV3,
+  treeRevisionDeltaV3,
   treeRevisionContentHashV3,
   treeRevisionContentHashV2,
   pathKey,
@@ -15,6 +19,7 @@ import {
   revisionContentHash,
   sha256Hex,
 } from "../agentwiki/protocol";
+import { AgentWikiHttpError } from "../agentwiki/client";
 import { decodeVaultMarkdown } from "../core/markdown";
 import { parseAttachmentReferences } from "../core/attachment-reference";
 import type {
@@ -84,6 +89,11 @@ import {
   TreePushService,
   type PreparedTreePushChange,
 } from "./tree-push-service";
+import {
+  TreePushServiceV3,
+  type PreparedTreePushChangeV3,
+  type TreePushPreviewV3,
+} from "./tree-push-service-v3";
 import type { SpaceMapping } from "./sync-coordinator";
 import {
   cancellationCheckpoint,
@@ -1121,7 +1131,10 @@ export class SyncRuntime {
     );
     if (pushVersion === 1) await this.recoverLegacyPush();
     else if (pushVersion === 2) await this.recoverTreePush();
-    else if (pushVersion !== null) throw new Error("不支持的推送日志版本");
+    else if (pushVersion === 3) {
+      if (!this.remoteV3) throw new Error("不支持的推送日志版本");
+      await this.recoverTreePushV3();
+    } else if (pushVersion !== null) throw new Error("不支持的推送日志版本");
   }
 
   private async recoverLegacyPull(): Promise<void> {
@@ -1287,6 +1300,104 @@ export class SyncRuntime {
     await pushService.markVerified();
   }
 
+  private v3PushService(): TreePushServiceV3 {
+    return new TreePushServiceV3(
+      this.requireV3Remote(),
+      this.control,
+      this.root + "/push",
+      {
+        readBlob: (vaultPath) => this.vault.read(vaultPath),
+        revalidateConfirmation: async ({
+          spaceId,
+          baseRevision,
+          capabilitiesHash,
+          changes: expectedChanges,
+        }) => {
+          if (spaceId !== this.mapping.spaceId)
+            throw new Error("PUSH_SPACE_MISMATCH");
+          const base = await this.readBaseSnapshotV3();
+          if (!base || base.revision !== baseRevision)
+            throw new Error("BASE_STALE");
+          const capabilities = await this.requireV3Remote().capabilities();
+          if ((await treeCapabilitiesHashV3(capabilities)) !== capabilitiesHash)
+            throw new Error("CAPABILITIES_CHANGED");
+          const local = await this.scanV3(base, capabilities);
+          const changes = await this.preparePushChangesV3(
+            base,
+            local,
+            undefined,
+            false,
+          );
+          const expectedUpdatedAt = new Map<string, string>();
+          for (const change of expectedChanges) {
+            if (change.operation === "upsert_folder")
+              expectedUpdatedAt.set(
+                `folder:${change.folder.folderId}`,
+                change.folder.updatedAt,
+              );
+            else if (change.operation === "upsert_page")
+              expectedUpdatedAt.set(
+                `page:${change.page.pageId}`,
+                change.page.updatedAt,
+              );
+            else if (change.operation === "upsert_attachment")
+              expectedUpdatedAt.set(
+                `attachment:${change.attachment.attachmentId}`,
+                change.attachment.updatedAt,
+              );
+          }
+          for (const change of changes) {
+            if (change.operation === "upsert_folder")
+              change.folder.updatedAt =
+                expectedUpdatedAt.get(`folder:${change.folder.folderId}`) ??
+                change.folder.updatedAt;
+            else if (change.operation === "upsert_page")
+              change.page.updatedAt =
+                expectedUpdatedAt.get(`page:${change.page.pageId}`) ??
+                change.page.updatedAt;
+            else if (change.operation === "upsert_attachment")
+              change.attachment.updatedAt =
+                expectedUpdatedAt.get(
+                  `attachment:${change.attachment.attachmentId}`,
+                ) ?? change.attachment.updatedAt;
+          }
+          return treeConfirmationHashV3({
+            protocolVersion: "3",
+            spaceId,
+            baseRevision,
+            capabilitiesHash,
+            changes: changes.map((change) => this.pushManifestChangeV3(change)),
+          });
+        },
+      },
+    );
+  }
+
+  private async recoverTreePushV3(): Promise<void> {
+    const service = this.v3PushService();
+    const push = await service.inspect();
+    if (!push || push.localCommitPhase === "verified") return;
+    const credentialRotated =
+      this.credentialId !== null &&
+      push.credentialIdAtCreation !== null &&
+      this.credentialId !== push.credentialIdAtCreation;
+    if (
+      credentialRotated &&
+      push.remoteState !== "published" &&
+      push.remoteState !== "superseded"
+    ) {
+      await service.supersede();
+      return;
+    }
+    if (push.remoteState === "superseded") return;
+    const result =
+      push.remoteState === "published" && push.result
+        ? push.result
+        : await service.resumePending();
+    if (!result) throw new Error("PUSH_RECOVERY_REQUIRED");
+    await this.finishV3Push(service, result);
+  }
+
   async status(options?: SyncOperationOptions): Promise<RuntimeStatus> {
     const base = await this.readBaseSnapshot();
     const local = await this.scan(options);
@@ -1341,10 +1452,19 @@ export class SyncRuntime {
   }
 
   async hasUnfinishedPush(): Promise<boolean> {
-    if (this.remoteV3) return false;
     const version = await this.readJournalSchemaVersion(
       this.root + "/push/journal.json",
     );
+    if (this.remoteV3) {
+      if (version === null) return false;
+      if (version !== 3) throw new Error("不支持的推送日志版本");
+      const push = await this.v3PushService().inspect();
+      return (
+        !!push &&
+        push.remoteState !== "superseded" &&
+        push.localCommitPhase !== "verified"
+      );
+    }
     if (version === 1) {
       if (!this.legacyRemote) return true;
       const push = await new PushService(
@@ -1842,6 +1962,311 @@ export class SyncRuntime {
       ).cleanup();
   }
 
+  private pushManifestChangeV3(
+    change: PreparedTreePushChangeV3,
+  ): Parameters<typeof treeConfirmationHashV3>[0]["changes"][number] {
+    switch (change.operation) {
+      case "upsert_folder":
+        return { operation: change.operation, folder: change.folder };
+      case "archive_folder":
+        return { ...change };
+      case "upsert_attachment":
+        return { operation: change.operation, attachment: change.attachment };
+      case "upsert_page": {
+        const {
+          payloadPath: _payloadPath,
+          bodyBytes: _bodyBytes,
+          ...page
+        } = change.page;
+        return { operation: change.operation, page };
+      }
+      case "archive_page":
+        return { ...change };
+      case "detach_attachment":
+        return { ...change };
+    }
+  }
+
+  private async preparePushChangesV3(
+    base: TreeSnapshotV3,
+    local: LocalTreeScanV3,
+    options?: SyncOperationOptions,
+    stagePages = true,
+  ): Promise<PreparedTreePushChangeV3[]> {
+    if (local.blockers.length > 0) throw new Error("V3_PUSH_BLOCKED");
+    const baseFolders = new Map(
+      base.folders.map((item) => [item.folderId, item]),
+    );
+    const basePages = new Map(base.pages.map((item) => [item.pageId, item]));
+    const baseAttachments = new Map(
+      base.attachments.map((item) => [item.attachmentId, item]),
+    );
+    const localFolders = local.folders.map((item) => {
+      const prior = baseFolders.get(item.folderId);
+      return prior &&
+        prior.parentFolderId === item.parentFolderId &&
+        prior.name === item.name &&
+        prior.path === item.path &&
+        prior.sortOrder === item.sortOrder
+        ? { ...item, updatedAt: prior.updatedAt }
+        : item;
+    });
+    const localPages = local.pages.map((item) => {
+      const prior = basePages.get(item.pageId);
+      return prior &&
+        prior.folderId === item.folderId &&
+        prior.path === item.path &&
+        prior.title === item.title &&
+        prior.contentHash === item.contentHash &&
+        JSON.stringify(prior.referencedAttachmentIds) ===
+          JSON.stringify(item.referencedAttachmentIds)
+        ? { ...item, updatedAt: prior.updatedAt }
+        : item;
+    });
+    const localAttachments = local.attachments.map((item) => {
+      const prior = baseAttachments.get(item.attachmentId);
+      return prior &&
+        prior.path === item.path &&
+        prior.mimeType === item.mimeType &&
+        prior.sizeBytes === item.sizeBytes &&
+        prior.width === item.width &&
+        prior.height === item.height &&
+        prior.contentHash === item.contentHash
+        ? { ...item, updatedAt: prior.updatedAt }
+        : item;
+    });
+    const changes = canonicalTreeDeltaItemsV3(
+      treeRevisionDeltaV3(
+        {
+          protocolVersion: "3",
+          spaceId: base.spaceId,
+          folders: base.folders,
+          pages: base.pages,
+          attachments: base.attachments,
+        },
+        {
+          protocolVersion: "3",
+          spaceId: this.mapping.spaceId,
+          folders: localFolders,
+          pages: localPages,
+          attachments: localAttachments,
+        },
+      ),
+    );
+    const previewId = crypto.randomUUID();
+    const prepared: PreparedTreePushChangeV3[] = [];
+    let completed = 0;
+    for (const change of changes) {
+      if (change.operation === "upsert_page") {
+        const bodyBytes = new TextEncoder().encode(change.page.body).byteLength;
+        const payloadPath =
+          this.root +
+          "/push-preview/" +
+          previewId +
+          "/" +
+          safeKey(change.page.pageId) +
+          ".md";
+        if (stagePages) await this.control.write(payloadPath, change.page.body);
+        const { body: _body, ...page } = change.page;
+        prepared.push({
+          operation: "upsert_page",
+          page: {
+            ...page,
+            referencedAttachmentIds: [
+              ...new Set(page.referencedAttachmentIds),
+            ].sort(),
+            payloadPath,
+            bodyBytes,
+          },
+        });
+      } else if (change.operation === "upsert_attachment") {
+        prepared.push({
+          operation: "upsert_attachment",
+          attachment: change.attachment,
+          vaultPath: joinRoot(this.mapping.rootPath, change.attachment.path),
+        });
+      } else prepared.push(change);
+      completed += 1;
+      if (completed % 50 === 0)
+        await progressCheckpoint(options, {
+          phase: "merge",
+          completed,
+          total: changes.length,
+          cancellable: true,
+        });
+    }
+    return prepared;
+  }
+
+  async previewPushV3(
+    options?: SyncOperationOptions,
+  ): Promise<TreePushPreviewV3> {
+    const remote = this.requireV3Remote();
+    const base = await this.readBaseSnapshotV3();
+    if (!base) throw new Error("INITIAL_PULL_REQUIRED");
+    const head = await remote.head();
+    if (head.revision !== base.revision) throw new Error("BASE_STALE");
+    const capabilities = await remote.capabilities();
+    const capabilitiesHash = await treeCapabilitiesHashV3(capabilities);
+    if (capabilitiesHash !== (await remote.capabilitiesHash))
+      throw new Error("CAPABILITIES_CHANGED");
+    const local = await this.scanV3(base, capabilities, options);
+    const changes = await this.preparePushChangesV3(base, local, options);
+    const confirmationHash = await treeConfirmationHashV3({
+      protocolVersion: "3",
+      spaceId: this.mapping.spaceId,
+      baseRevision: base.revision,
+      capabilitiesHash,
+      changes: changes.map((change) => this.pushManifestChangeV3(change)),
+    });
+    return {
+      protocolVersion: "3",
+      spaceId: this.mapping.spaceId,
+      baseRevision: base.revision,
+      changes,
+      capabilities,
+      capabilitiesHash,
+      confirmationHash,
+      credentialId: this.credentialId,
+      previewId:
+        changes.find((change) => change.operation === "upsert_page")
+          ?.operation === "upsert_page"
+          ? changes
+              .find((change) => change.operation === "upsert_page")!
+              .page.payloadPath.split("/")
+              .at(-2)
+          : crypto.randomUUID(),
+    };
+  }
+
+  private async finishV3Push(
+    service: TreePushServiceV3,
+    result: Awaited<ReturnType<TreePushServiceV3["resumePending"]>> & {},
+    options?: SyncOperationOptions,
+  ): Promise<void> {
+    if (!result) throw new Error("PUSH_TERMINAL_RESULT_MISSING");
+    const snapshot = await this.downloadRemoteSnapshotV3(
+      result.revision,
+      options,
+    );
+    if (
+      snapshot.revisionContentHash !== result.revisionContentHash ||
+      String(snapshot.folders.length) !== result.folderCount ||
+      String(snapshot.pages.length) !== result.pageCount ||
+      String(snapshot.attachments.length) !== result.attachmentCount
+    )
+      throw new Error("PUSH_TERMINAL_SNAPSHOT_MISMATCH");
+    await this.treeBaseline.prepare(snapshot, "push");
+    await this.treeBaseline.commit();
+    const capabilities = await this.requireV3Remote().capabilities();
+    const local = await this.scanV3(snapshot, capabilities);
+    const identities = upgradeTreeIdentityState(await this.readIdentities());
+    identities.folders = Object.fromEntries(
+      snapshot.folders.map((folder) => [
+        folder.folderId,
+        {
+          folderId: folder.folderId,
+          path: folder.path,
+          pathKey: pathKey(folder.path),
+        },
+      ]),
+    );
+    identities.pendingFolders = {};
+    identities.pendingPages = Object.fromEntries(
+      local.pages
+        .filter((page) => {
+          const remotePage = snapshot.pages.find(
+            (item) => item.pageId === page.pageId,
+          );
+          return (
+            !remotePage ||
+            remotePage.path !== page.path ||
+            remotePage.contentHash !== page.contentHash
+          );
+        })
+        .map((page) => [
+          page.pageId,
+          {
+            pageId: page.pageId,
+            path: page.path,
+            contentHash: page.contentHash,
+          },
+        ]),
+    );
+    identities.attachments = Object.fromEntries(
+      snapshot.attachments.map((attachment) => [
+        attachment.attachmentId,
+        {
+          attachmentId: attachment.attachmentId,
+          path: attachment.path,
+          pathKey: pathKey(attachment.path),
+          baseContentHash: attachment.contentHash,
+          active: true,
+        },
+      ]),
+    );
+    identities.pendingAttachments = Object.fromEntries(
+      local.attachments
+        .filter((attachment) => {
+          const remoteAttachment = snapshot.attachments.find(
+            (item) => item.attachmentId === attachment.attachmentId,
+          );
+          return (
+            !remoteAttachment ||
+            remoteAttachment.path !== attachment.path ||
+            remoteAttachment.contentHash !== attachment.contentHash
+          );
+        })
+        .map((attachment) => [
+          attachment.attachmentId,
+          {
+            attachmentId: attachment.attachmentId,
+            path: attachment.path,
+            pathKey: pathKey(attachment.path),
+            contentHash: attachment.contentHash,
+          },
+        ]),
+    );
+    await this.identities.write(identities);
+    await service.markVerified();
+    this.mapping.status = "active";
+  }
+
+  async applyPushV3(
+    preview: TreePushPreviewV3,
+    options?: SyncOperationOptions,
+  ): Promise<void> {
+    if (!preview.changes.length) return;
+    const service = this.v3PushService();
+    let effectivePreview = preview;
+    let result;
+    try {
+      result = await service.publishPrepared(effectivePreview, options);
+    } catch (error) {
+      if (syncErrorCodeV3(error) !== "CAPABILITIES_CHANGED") throw error;
+      await service.supersede();
+      effectivePreview = await this.previewPushV3(options);
+      result = await service.publishPrepared(effectivePreview, options);
+    }
+    reportProgress(options, {
+      phase: "apply",
+      completed: 0,
+      cancellable: false,
+    });
+    await this.finishV3Push(service, result, options);
+    if (preview.previewId)
+      await this.control.removeTree?.(
+        this.root + "/push-preview/" + safeKey(preview.previewId),
+      );
+    if (
+      effectivePreview.previewId &&
+      effectivePreview.previewId !== preview.previewId
+    )
+      await this.control.removeTree?.(
+        this.root + "/push-preview/" + safeKey(effectivePreview.previewId),
+      );
+  }
+
   async previewPull(options?: SyncOperationOptions): Promise<PullPreview> {
     const base = await this.readBaseSnapshot();
     const head = await this.legacyTreeRemote.head();
@@ -2210,6 +2635,14 @@ export class SyncRuntime {
       remote: conflict.remote,
     };
   }
+}
+
+function syncErrorCodeV3(error: unknown): string | null {
+  if (!(error instanceof AgentWikiHttpError)) return null;
+  const body = error.body;
+  if (!body || typeof body !== "object") return null;
+  const code = (body as { error?: { code?: unknown } }).error?.code;
+  return typeof code === "string" ? code : null;
 }
 
 function computeTreeStatus(

@@ -1,7 +1,15 @@
 import { yieldToUi } from "./sync-coordinator";
 
 export interface SyncProgress {
-  phase: "scan" | "download" | "merge" | "upload" | "finalize" | "apply";
+  phase:
+    | "scan"
+    | "download"
+    | "merge"
+    | "upload"
+    | "upload_blob"
+    | "upload_changes"
+    | "finalize"
+    | "apply";
   completed: number;
   total?: number;
   cancellable: boolean;
@@ -24,6 +32,8 @@ export function progressLabel(progress: SyncProgress): string {
     download: "下载",
     merge: "合并",
     upload: "上传批次",
+    upload_blob: "上传图片分块",
+    upload_changes: "上传变更批次",
     finalize: "服务器原子发布",
     apply: "本地原子应用",
   };
