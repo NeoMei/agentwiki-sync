@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { FakeAgentWiki } from "../fakes/fake-agentwiki";
-import { FakeTreeRemote } from "../fakes/fake-tree-remote";
+import { FakeTreeRemote, FakeTreeRemoteV3 } from "../fakes/fake-tree-remote";
 import { PushService } from "../../src/application/push-service";
 import { MemoryControlStore } from "../fakes/memory-control-store";
 import { mergeBody } from "../../src/core/merge";
-import { contentHash } from "../../src/agentwiki/protocol";
+import { contentHash, sha256Hex } from "../../src/agentwiki/protocol";
 import { SyncRuntime } from "../../src/application/sync-runtime";
 import { MemoryVault } from "../fakes/memory-vault";
 import type { SyncPage } from "../../src/agentwiki/protocol";
@@ -31,6 +31,47 @@ const mapping = {
 };
 
 describe("manual multi-device sync", () => {
+  it("pushes a referenced image from desktop and pulls exact bytes on a second v3 device", async () => {
+    const image = Uint8Array.from(
+      atob(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+      ),
+      (value) => value.charCodeAt(0),
+    );
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({ revision: "empty" });
+    const desktopVault = new MemoryVault({});
+    const desktop = SyncRuntime.v3(
+      desktopVault,
+      new MemoryControlStore(),
+      remote,
+      { ...mapping },
+      "desktop-v3",
+    );
+    await desktop.applyPullV3(await desktop.previewPullV3());
+    desktopVault.seedFile("Wiki/assets/image.png", image);
+    desktopVault.seedMarkdown("Wiki/pages/Guide.md", "![[assets/image.png]]");
+    await desktop.applyPushV3(await desktop.previewPushV3());
+
+    const mobileVault = new MemoryVault({});
+    const mobile = SyncRuntime.v3(
+      mobileVault,
+      new MemoryControlStore(),
+      remote,
+      { ...mapping },
+      "mobile-v3",
+    );
+    await mobile.applyPullV3(await mobile.previewPullV3());
+
+    expect(await mobileVault.read("Wiki/assets/image.png")).toEqual(image);
+    expect(
+      await sha256Hex((await mobileVault.read("Wiki/assets/image.png"))!),
+    ).toBe(await sha256Hex(image));
+    expect(mobileVault.text("Wiki/pages/Guide.md")).toBe(
+      "![[assets/image.png]]",
+    );
+  });
+
   it("rebases a conflicting remote update with local-wins resolutions, then pushes local content", async () => {
     const remote = new FakeTreeRemote();
     const body = "one\ntwo";

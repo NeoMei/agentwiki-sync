@@ -4,13 +4,14 @@ AgentWiki Sync 是一个移动端兼容的 Obsidian 插件，通过可预览、�
 
 ## 当前状态
 
-插件核心、事务恢复、Obsidian 原生 UI 和公开 API 客户端已实现，同时支持 Sync v2 树同步与 Legacy v1。服务端支持 v2 时自动选择 Sync v2，否则回退 Legacy v1；同步中心只显示当前协议（`Sync v2` / `Legacy v1`），不提供手动协议选择器。插件依赖已发布的 `@neomei/agentwiki-sync-protocol@0.4.0` 并通过逐字节一致性测试。仓库同时使用独立 fake AgentWiki 验证端到端客户端流程，不复制 AgentWiki 主项目内部实现。
+插件核心、事务恢复、Obsidian 原生 UI 和公开 API 客户端已实现，同时支持 Sync v3 引用图片、Sync v2 树同步与 Legacy v1。服务端支持 v3 时自动选择 Sync v3；明确不支持时才依次尝试 v2、v1。已进入 v3 generation 的映射不会自动降级；旧服务端遇到受管图片候选会阻止同步，避免静默漏图。插件依赖已发布的 `@neomei/agentwiki-sync-protocol@0.5.1`。仓库中的自动化兼容和故障注入测试使用公开端口与隔离 fake 服务端驱动真实同步 runtime；这些测试不等同于真实桌面或移动设备验收。
 
 ## 协议选择与文件夹
 
-- Sync v2 自动启用：连接时先探测 `/api/sync/v2/capabilities`，校验能力哈希后选择 v2；404 或协议不支持时回退 v1，结果按服务器实例缓存。
+- Sync v3 自动启用：优先探测 `/api/sync/v3/capabilities` 并校验严格能力哈希。引用图片只同步 `pages/` Markdown 实际引用的 PNG、JPEG、WebP 和 GIF；未引用图片不读字节、不进入预览，也不上传或下载。
+- Sync v2/v1 兼容：只有 v3 明确不受支持时才探测 v2，v2 也明确不受支持时才回退 Legacy v1。旧协议只处理不含受管图片候选的页面；已有 v3 generation 或发现图片候选时要求升级，不静默降级。
 - 文件夹映射：v2 下映射目录内的嵌套文件夹与页面作为统一树同步，文件夹 ID、父级、排序与路径保持一致；空文件夹也会被同步保留。Legacy v1 不包含文件夹语义。
-- 确认与恢复：Pull/Push 仍需在预览中确认；冲突、首次绑定、只读 Space 与崩溃恢复行为在两种协议下一致。中断的 Pull/Push 在下次打开同步中心时先恢复，无法唯一判定时冻结该 Space，不会静默覆盖当前文件。
+- 确认与恢复：Pull/Push 仍需在预览中确认；图片内容替换、重命名、keep-both 与 detach 都绑定当前预览提案。Blob 传输、Vault 写入、Markdown 写入或 finalize 中断后从 journal 恢复；无法唯一判定时冻结该 Space，不会静默覆盖当前文件。
 
 ## 安装与使用
 
@@ -40,5 +41,11 @@ npm run check
 - Push 必须先确认预览，远端 head 领先时被阻止。
 - credential 与连接码只进入 Obsidian Secret Storage，不进入 Vault 或诊断。
 - `.agentwiki/` 控制状态按 device/space 隔离，通过 DataAdapter 相对路径访问；基线采用不可变 generation + current pointer，不使用 Node `fs` 或桌面专属 API。
+- Pull 暂存正文和 Blob 只写入当前 device/space 的 `.agentwiki/` 控制目录；不会写入映射目录外的用户文件。Blob 通过需要授权的固定 Revision API 传输，不生成公开图片 URL。
+- Push 确认前的图片字节数是所有 Blob requirement 的保守候选上界；建立 session 后服务端会返回真正缺失的 hash，已有内容可复用为 0 Blob 实传。
 - 所有远端 Markdown 路径须先通过 NFC/casefold 可移植路径校验，Vault 适配器写入时再次执行 mapping-root containment。
 - Secret Storage 不防御用户主动安装的恶意 Obsidian 插件。
+
+## 验证与发布状态
+
+自动化质量门、生产 Web/API、真实 Obsidian 桌面、Android、GitHub Release、社区市场和实际安装 bundle 是独立证据面。当前 Sync v3 的逐项记录见 `docs/verification/referenced-image-sync-v3-2026-09-04.md`；任一真实设备或发布渠道仍为 pending 时，不应把自动化测试称为“完整发布”或“真实双端通过”。

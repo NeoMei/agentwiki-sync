@@ -93,6 +93,75 @@ describe("bounded v1 space", () => {
 });
 
 describe("bounded strict-v3 push", () => {
+  it("rejects an over-limit declared Blob transfer before reading bytes or creating a session", async () => {
+    const capabilities = {
+      ...V3_CAPABILITIES,
+      maxTransferBlobBytes: 10,
+    };
+    const changes: PreparedTreePushChangeV3[] = Array.from(
+      { length: 11 },
+      (_, index) => ({
+        operation: "upsert_attachment" as const,
+        attachment: {
+          attachmentId: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+          path: `assets/over-limit-${index}.png`,
+          mimeType: "image/png" as const,
+          sizeBytes: "1",
+          width: 1,
+          height: 1,
+          contentHash: index.toString(16).padStart(64, "0"),
+          updatedAt: "2026-09-06T00:00:00.000Z",
+        },
+        vaultPath: `Wiki/assets/over-limit-${index}.png`,
+      }),
+    );
+    const capabilitiesHash = await treeCapabilitiesHashV3(capabilities);
+    const confirmationHash = await treeConfirmationHashV3({
+      protocolVersion: "3",
+      spaceId: "space",
+      baseRevision: "rev-3",
+      capabilitiesHash,
+      changes: changes.map((change) => ({
+        operation: "upsert_attachment" as const,
+        attachment:
+          change.operation === "upsert_attachment"
+            ? change.attachment
+            : (() => {
+                throw new Error("fixture");
+              })(),
+      })),
+    });
+    const remote = new FakeTreeRemoteV3();
+    remote.setCapabilities(capabilities);
+    let reads = 0;
+    const service = new TreePushServiceV3(
+      remote,
+      new MemoryControlStore(),
+      ".agentwiki/perf-v3-over-limit",
+      {
+        readBlob: async () => {
+          reads += 1;
+          return null;
+        },
+        revalidateConfirmation: async () => confirmationHash,
+      },
+    );
+
+    await expect(
+      service.publishPrepared({
+        protocolVersion: "3",
+        spaceId: "space",
+        baseRevision: "rev-3",
+        capabilities,
+        capabilitiesHash,
+        confirmationHash,
+        changes,
+      }),
+    ).rejects.toThrow(/BLOB_LIMIT_EXCEEDED/);
+    expect(reads).toBe(0);
+    expect(remote.createInputs).toHaveLength(0);
+  });
+
   it("journals the negotiated 100-attachment change bound without reading image bytes before create", async () => {
     const capabilities = {
       ...V3_CAPABILITIES,
