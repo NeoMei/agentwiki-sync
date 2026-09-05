@@ -1841,21 +1841,30 @@ export class SyncRuntime {
       if (staged) return staged;
     }
     const aliases = preview.attachmentPlan.identityAliases;
+    const remappedSourceAttachmentId =
+      preview.attachmentPlan.sourceAttachmentIdByAttachmentId[
+        action.attachment.attachmentId
+      ];
+    const sourceAttachmentId =
+      remappedSourceAttachmentId ?? action.attachment.attachmentId;
     const selected =
       action.source === "local"
         ? preview.local.attachments
         : action.source === "base"
           ? preview.base.attachments
           : preview.remote.attachments;
-    const candidates = [
-      ...selected,
-      ...preview.local.attachments,
-      ...preview.base.attachments,
-      ...preview.remote.attachments,
-    ].filter(
+    const candidatePool = remappedSourceAttachmentId
+      ? selected
+      : [
+          ...selected,
+          ...preview.local.attachments,
+          ...preview.base.attachments,
+          ...preview.remote.attachments,
+        ];
+    const candidates = candidatePool.filter(
       (item, index, all) =>
         (aliases[item.attachmentId] ?? item.attachmentId) ===
-          action.attachment.attachmentId &&
+          sourceAttachmentId &&
         item.contentHash === action.attachment.contentHash &&
         all.findIndex(
           (candidate) =>

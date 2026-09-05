@@ -49,6 +49,8 @@ export interface AttachmentMergePlan {
   pageAttachmentRedirects: Record<string, Record<string, string>>;
   /** Which side supplies the bytes for a materialized attachment. */
   sourceByAttachmentId: Record<string, "base" | "local" | "remote">;
+  /** Original identity whose bytes materialize a resolved attachment. */
+  sourceAttachmentIdByAttachmentId: Record<string, string>;
 }
 
 export interface AttachmentMergeInput {
@@ -314,6 +316,7 @@ export function mergeAttachmentsById(
   const detachedAttachmentIds: string[] = [];
   const pageAttachmentRedirects: Record<string, Record<string, string>> = {};
   const sourceByAttachmentId: Record<string, "base" | "local" | "remote"> = {};
+  const sourceAttachmentIdByAttachmentId: Record<string, string> = {};
   const secondaryProposalOwnerById = new Map<string, string>();
 
   for (const id of [...knownIds].sort()) {
@@ -389,6 +392,7 @@ export function mergeAttachmentsById(
       sourceByAttachmentId[id] = resolution.primary;
       sourceByAttachmentId[resolution.secondaryAttachmentId] =
         resolution.primary === "local" ? "remote" : "local";
+      sourceAttachmentIdByAttachmentId[resolution.secondaryAttachmentId] = id;
       for (const pageId of resolution.redirectPageIds)
         (pageAttachmentRedirects[pageId] ??= {})[id] =
           resolution.secondaryAttachmentId;
@@ -516,6 +520,7 @@ export function mergeAttachmentsById(
     identityAliases,
     pageAttachmentRedirects,
     sourceByAttachmentId,
+    sourceAttachmentIdByAttachmentId,
   };
 }
 
