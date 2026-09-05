@@ -15,14 +15,15 @@
 - 新 E2E 兼容矩阵覆盖 v1/v2/v3、带图/无图、旧服务端图片候选阻止。“v3 attached revision + v2 adapter”与“v3 empty projection + v2 adapter”使用真实 `AgentWikiClient → V2TreeRemote → SyncRuntime` 和受控 HTTP 响应，分别验证 409 升级边界与严格空 v2 projection；这仍是旧 adapter 自动化，不是已发布旧插件 binary 的真实设备 E2E。
 - 新 E2E 流覆盖 Web 侧 seed → Obsidian Pull、Obsidian 图片替换 Push → 第二设备 Pull、非重叠合并、显式冲突选择、detach 和未引用图片零传输。
 - 故障注入覆盖 Blob upload/download、finalize response、Vault 图片写、Markdown 写、generation staging/switch，并从新 runtime 恢复或安全回滚。
+- 第四个真实阻断修复 checkpoint `4fbe81c73b2ce0c57a2addf00ed07689cecc525a`：零下载双端 rename 的 keep-both 副本在选择 remote 来源时，先证明 remote snapshot 中存在精确原 attachment ID/hash，再允许从相同原 ID/hash 的本地 rename 复用字节；不同 ID 或 hash 仍 `ATTACHMENT_SOURCE_MISMATCH`，实际 size/hash 校验保留。focused v3 E2E 为 27/27 PASS，typecheck/build exit 0；候选 `main.js` SHA-256 为 `05c389ae4d13d5b4225e8712c5e383ed21bab82d55d9edca6c33fd4f1e7dc050`。真实双 Page keep-both 复验结果单独记录在下方桌面证据中。
 - 兼容安全刷新：只把开发依赖链中的 `fast-uri` 从 3.1.5 更新到 3.1.7；不 force、不升级上游 major。刷新后完整 `npm audit` 为 0 known vulnerabilities。
 
-最终提交前重跑并填写：
+最终提交前重跑：
 
-- `npx vitest run tests/e2e/referenced-image-sync-v3.test.ts tests/e2e/manual-sync-flow.test.ts tests/performance/bounded-space.test.ts`：3 files / 41 tests PASS，exit 0。
+- `npx vitest run tests/e2e/referenced-image-sync-v3.test.ts tests/e2e/manual-sync-flow.test.ts tests/performance/bounded-space.test.ts`：3 files / 45 tests PASS，exit 0。
 - `npm ci`：exit 0；`npm audit --json`：0 known vulnerabilities，exit 0。
-- `npm run check`：52 files / 694 tests PASS，format/typecheck/build/bundle/release checks 均 exit 0；lint 0 errors、17 个已记录 warnings；bundle safety 1,486,057 bytes；release metadata 0.4.0。
-- `git diff --check` 与源码/fixture/bundle 边界检查：提交前再次执行。
+- `npm run check`：52 files / 698 tests PASS，format/typecheck/build/bundle/release checks 均 exit 0；lint 0 errors、17 个已记录 warnings；bundle safety 1,487,204 bytes；release metadata 0.4.0。
+- `git diff --check` 与源码/fixture/bundle 边界检查：exit 0。
 
 ## 公开协议与生产服务
 
@@ -46,7 +47,8 @@
 - `e2df559` 新 synthetic Space/mapping 完成四图 Pull、新引用 PNG Push（源文件 1,103 B）、远端 Page refetch/固定 revision hash 与真实 Web 五图渲染；未引用图 0 read。随后暴露已完成 Pull 对新 Push baseline journal 的错误永久依赖，该问题由 `0084814` 修复。
 - 真实安装 `0084814` 后：reload/recover clean；auto 与 server 重复同步均为 0 session/0 Blob；第二次 Page-only Push 后再次 noop PASS；`FileManager.renameFile` 图片改名保持 attachment ID、旧路径消失、引用改写且 0 Blob；二进制替换后远端 hash/size 精确；detach 后远端附件仍 active/not archived，本地已 detach 图和未引用图仍保留；最终 sync-center clean。详细受控证据来自计划目录 `controller-desktop-evidence.md`，未包含 credential。
 - Push modal 在 session 建立前显示全部 Blob requirements 的保守候选字节上界；服务端返回 missing hashes 后才能知道实传量。真实 rename 中 modal 显示 1,103 B，但已有 hash 被复用，实际 0 Blob；这是文案精确度 concern，不是公开 URL 或额外传输证据。
-- 被置为 ambiguous 的旧 fixture 未被产品代码自动改写绕过。真实 double-rename conflict、keep-both 和中断事务恢复仍 **NOT RUN / PENDING**；keep-both local/remote primary 双路径已有真实 runtime 自动化 apply → Push → 新设备 Pull，不等于真实桌面验收。
+- 被置为 ambiguous 的旧 fixture 未被产品代码自动改写绕过。真实 `684a040` 候选已进入单 Page 双端 rename 冲突预览：正文与图片路径冲突均可见，确认按钮在未完成选择时保持 disabled，copy path 和 redirect Page UI 可见。该 fixture 只有一个引用 Page，而现有 Core 要求 keep-both 必须“至少一页改用副本且至少一页保留主副本”（0 < redirects < affected Pages），因此单引用 Page 无法完成 keep-both。这是已有 Core 规则的真实产品限制，留给 whole-branch review 对照 spec 评估；本任务不扩大修复。双 Page 实际尝试在 `736b83f` 暴露同 ID/同 hash、不同 rename path 的零下载来源复用错误，已由 `4fbe81c` 最小修复。
+- 真实安装 `4fbe81c` 后，在保留的双 Page conflict 现场选择 Page local x2、keep-both primary local、copy path `assets/remote-webp-copy.webp` 且仅 redirect Second Page；Pull confirm 与后续 Push confirm 均成功。严格 server snapshot 保持 primary ID、生成显式 secondary ID，第一页只引用 primary、第二页只引用 secondary 且正文路径已改写；两份本地文件均为 1,124 B，哈希与 server 完全一致；reload 后 sync-center clean。最终候选的中断事务真实恢复仍 **NOT RUN / PENDING**。
 
 ## Android / 移动端
 
