@@ -26,6 +26,7 @@ const mapping = () => ({
 });
 
 class StrictControlStore implements ControlStorePort {
+  failNextRemoveAt: string | null = null;
   constructor(readonly backing = new MemoryControlStore()) {}
   private safe(path: string): void {
     if (
@@ -53,6 +54,10 @@ class StrictControlStore implements ControlStorePort {
   }
   remove(path: string) {
     this.safe(path);
+    if (this.failNextRemoveAt === path) {
+      this.failNextRemoveAt = null;
+      throw new Error(`injected remove failure: ${path}`);
+    }
     return this.backing.remove(path);
   }
   rename(from: string, to: string) {
@@ -186,10 +191,14 @@ describe("Pull preview control sidecars", () => {
         control.remove(candidate),
       ),
     );
+    control.backing.files.set(previewSidecar("local"), "recovery evidence");
 
     await expect(
       SyncRuntime.v3(vault, control, remote, mapping()).recover(),
     ).rejects.toThrow(/V3_PULL_CONTROL_RECOVERY_EVIDENCE_MISSING/);
+    expect(control.backing.files.get(previewSidecar("local"))).toBe(
+      "recovery evidence",
+    );
   });
 
   it("rolls back a non-first verified Pull when baseline preparation never starts", async () => {
@@ -222,6 +231,25 @@ describe("Pull preview control sidecars", () => {
     await SyncRuntime.v3(vault, control, remote, mapping()).recover();
 
     expect(vault.text("Wiki/pages/Note.md")).toBe("before");
+    expect(control.backing.files.has(previewSidecar("local"))).toBe(false);
+  });
+
+  it("removes scoped Page bodies after committed v3 Pull recovery", async () => {
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({ pages: [await page("remote")] });
+    const vault = new MemoryVault({});
+    const control = new StrictControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    control.failNextRemoveAt = previewSidecar("local");
+
+    await expect(
+      runtime.applyPullV3(await runtime.previewPullV3()),
+    ).rejects.toThrow(/injected remove failure/);
+    expect(control.backing.files.has(previewSidecar("local"))).toBe(true);
+
+    await SyncRuntime.v3(vault, control, remote, mapping()).recover();
+
+    expect(control.backing.files.has(previewSidecar("local"))).toBe(false);
   });
 
   it("keeps v3 sidecars inside .agentwiki for the strict Obsidian control boundary", async () => {
@@ -313,5 +341,32 @@ describe("Pull preview control sidecars", () => {
     expect(control.backing.files.has(`tree-preview-body/${PAGE_ID}.md`)).toBe(
       false,
     );
+  });
+
+  it("removes scoped Page bodies after committed legacy tree Pull recovery", async () => {
+    const remote = new FakeTreeRemote();
+    await remote.seed([
+      {
+        pageId: PAGE_ID,
+        path: "pages/Note.md",
+        title: "Note",
+        body: "remote",
+        contentHash: await contentHash("remote"),
+        updatedAt: "2026-09-06T00:00:00.000Z",
+      },
+    ]);
+    const vault = new MemoryVault({});
+    const control = new StrictControlStore();
+    const runtime = new SyncRuntime(vault, control, remote, mapping());
+    control.failNextRemoveAt = previewSidecar("local");
+
+    await expect(
+      runtime.applyPull(await runtime.previewPull()),
+    ).rejects.toThrow(/injected remove failure/);
+    expect(control.backing.files.has(previewSidecar("local"))).toBe(true);
+
+    await new SyncRuntime(vault, control, remote, mapping()).recover();
+
+    expect(control.backing.files.has(previewSidecar("local"))).toBe(false);
   });
 });

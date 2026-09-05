@@ -374,6 +374,79 @@ describe("referenced image sync v3 end to end", () => {
     expect((await remote.head()).attachmentCount).toBe("0");
   });
 
+  it("preserves a renamed and replaced attachment ID through detach, another Push, reload, and exact re-reference", async () => {
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({
+      revision: "before",
+      pages: [await page("![[assets/image.png]]", [ATTACHMENT_ID])],
+      attachments: [await attachment()],
+      blobs: { [ATTACHMENT_ID]: IMAGE },
+    });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    await runtime.applyPullV3(await runtime.previewPullV3());
+
+    await vault.rename("Wiki/assets/image.png", "Wiki/assets/local-renamed.png");
+    await runtime.recordRename(
+      "Wiki/assets/image.png",
+      "Wiki/assets/local-renamed.png",
+    );
+    vault.seedFile("Wiki/assets/local-renamed.png", REPLACEMENT);
+    vault.seedMarkdown("Wiki/pages/Note.md", "![[assets/local-renamed.png]]");
+    await runtime.applyPushV3(await runtime.previewPushV3());
+
+    vault.seedMarkdown("Wiki/pages/Note.md", "detached");
+    await runtime.applyPushV3(await runtime.previewPushV3());
+    vault.seedMarkdown("Wiki/pages/Note.md", "detached after another edit");
+    await runtime.applyPushV3(await runtime.previewPushV3());
+
+    const restarted = SyncRuntime.v3(vault, control, remote, mapping());
+    await restarted.recover();
+    vault.seedMarkdown(
+      "Wiki/pages/Note.md",
+      "detached after another edit\n![[assets/local-renamed.png]]",
+    );
+    const preview = await restarted.previewPushV3();
+    const upsert = preview.changes.find(
+      (change) => change.operation === "upsert_attachment",
+    );
+    expect(upsert).toMatchObject({
+      operation: "upsert_attachment",
+      attachment: {
+        attachmentId: ATTACHMENT_ID,
+        path: "assets/local-renamed.png",
+        contentHash: await sha256Hex(REPLACEMENT),
+      },
+    });
+    await restarted.applyPushV3(preview);
+    expect((await remote.head()).attachmentCount).toBe("1");
+
+    vault.seedMarkdown("Wiki/pages/Note.md", "detached again");
+    await restarted.applyPushV3(await restarted.previewPushV3());
+    vault.seedFile("Wiki/assets/local-renamed.png", REMOTE_REPLACEMENT);
+    vault.seedMarkdown(
+      "Wiki/pages/Note.md",
+      "detached again\n![[assets/local-renamed.png]]",
+    );
+    const differentHash = await restarted.previewPushV3();
+    const differentHashUpsert = differentHash.changes.find(
+      (change) => change.operation === "upsert_attachment",
+    );
+    expect(differentHashUpsert).toMatchObject({
+      operation: "upsert_attachment",
+      attachment: {
+        path: "assets/local-renamed.png",
+        contentHash: await sha256Hex(REMOTE_REPLACEMENT),
+      },
+    });
+    expect(
+      differentHashUpsert?.operation === "upsert_attachment"
+        ? differentHashUpsert.attachment.attachmentId
+        : null,
+    ).not.toBe(ATTACHMENT_ID);
+  });
+
   it("propagates remote and local attachment renames without changing bytes", async () => {
     const remote = new FakeTreeRemoteV3();
     const original = await attachment();

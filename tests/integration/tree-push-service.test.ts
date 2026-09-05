@@ -488,6 +488,10 @@ class StrictV3PushRemote implements TreeRemotePortV3 {
   failAfterChunk: number | null = null;
   failAfterReadyOnce = false;
   loseFinalizeResponseOnce = false;
+  finalizeErrorOnce: AgentWikiHttpError | null = null;
+  publishBeforeFinalizeError = false;
+  abortErrorOnce: Error | null = null;
+  leaveReadyAfterAbort = false;
   finalizeCalls = 0;
   abortCalls = 0;
   private status: TreePushSessionStatusV3 | null = null;
@@ -608,9 +612,8 @@ class StrictV3PushRemote implements TreeRemotePortV3 {
     }
     return { receipt: `batch-${batch.batchIndex}` };
   }
-  async finalize(): Promise<TreeFinalizeResultV3> {
-    this.finalizeCalls += 1;
-    const result: TreeFinalizeResultV3 = {
+  private terminalResult(): TreeFinalizeResultV3 {
+    return {
       protocolVersion: "3",
       status: "published",
       revision: "r2",
@@ -625,8 +628,22 @@ class StrictV3PushRemote implements TreeRemotePortV3 {
       revisionAttachmentBytes: "10",
       changeSetId: "change-set-v3",
     };
+  }
+  private publish(): TreeFinalizeResultV3 {
+    const result = this.terminalResult();
     if (this.status)
       this.status = { ...this.status, status: "published", result };
+    return result;
+  }
+  async finalize(): Promise<TreeFinalizeResultV3> {
+    this.finalizeCalls += 1;
+    if (this.finalizeErrorOnce) {
+      const error = this.finalizeErrorOnce;
+      this.finalizeErrorOnce = null;
+      if (this.publishBeforeFinalizeError) this.publish();
+      throw error;
+    }
+    const result = this.publish();
     if (this.loseFinalizeResponseOnce) {
       this.loseFinalizeResponseOnce = false;
       throw new Error("finalize response lost");
@@ -639,6 +656,12 @@ class StrictV3PushRemote implements TreeRemotePortV3 {
   }
   async abort(): Promise<void> {
     this.abortCalls += 1;
+    if (this.abortErrorOnce) {
+      const error = this.abortErrorOnce;
+      this.abortErrorOnce = null;
+      throw error;
+    }
+    if (this.leaveReadyAfterAbort) return;
     if (this.status) this.status.status = "aborted";
   }
   async downloadBlob(): Promise<Uint8Array> {
@@ -810,6 +833,136 @@ describe("TreePushServiceV3", () => {
       revision: "r2",
     });
     expect(remote.finalizeCalls).toBe(1);
+  });
+
+  it("supersedes a confirmed unpublished attachment-name rejection without re-finalizing", async () => {
+    store = new MemoryControlStore();
+    const blob = Uint8Array.from({ length: 10 }, (_, index) => index);
+    const first = await v3Prepared(blob);
+    const remote = new StrictV3PushRemote();
+    remote.finalizeErrorOnce = new AgentWikiHttpError(409, {
+      protocolVersion: "3",
+      error: { code: "ATTACHMENT_NAME_CONFLICT", retryable: false },
+    });
+    const service = new TreePushServiceV3(
+      remote,
+      store,
+      ".agentwiki/tree/deterministic-rejection",
+      {
+        readBlob: async () => blob,
+        revalidateConfirmation: async () => first.currentHash.value,
+      },
+    );
+
+    await expect(service.publishPrepared(first.preview)).rejects.toMatchObject({
+      body: { error: { code: "ATTACHMENT_NAME_CONFLICT" } },
+    });
+    expect(await service.inspect()).toMatchObject({
+      remoteState: "superseded",
+    });
+    expect(remote.finalizeCalls).toBe(1);
+    expect(remote.abortCalls).toBe(1);
+    await expect(service.resumePending()).rejects.toThrow(/\u5df2\u53d6\u6d88/);
+    expect(remote.finalizeCalls).toBe(1);
+
+    const second = await v3Prepared(blob);
+    await expect(service.publishPrepared(second.preview)).resolves.toMatchObject({
+      revision: "r2",
+    });
+    expect(remote.createInputs).toHaveLength(2);
+    expect(remote.finalizeCalls).toBe(2);
+  });
+
+  it("keeps deterministic rejection evidence when abort fails, then supersedes on recovery", async () => {
+    store = new MemoryControlStore();
+    const blob = Uint8Array.from({ length: 10 }, (_, index) => index);
+    const { preview, currentHash } = await v3Prepared(blob);
+    const remote = new StrictV3PushRemote();
+    remote.finalizeErrorOnce = new AgentWikiHttpError(409, {
+      protocolVersion: "3",
+      error: { code: "ATTACHMENT_NAME_CONFLICT", retryable: false },
+    });
+    remote.abortErrorOnce = new Error("abort transport failed");
+    const service = new TreePushServiceV3(
+      remote,
+      store,
+      ".agentwiki/tree/rejection-abort-recovery",
+      {
+        readBlob: async () => blob,
+        revalidateConfirmation: async () => currentHash.value,
+      },
+    );
+
+    await expect(service.publishPrepared(preview)).rejects.toMatchObject({
+      body: { error: { code: "ATTACHMENT_NAME_CONFLICT" } },
+    });
+    expect(await service.inspect()).toMatchObject({ remoteState: "finalizing" });
+    expect(remote.finalizeCalls).toBe(1);
+
+    await expect(service.resumePending()).resolves.toBeNull();
+    expect(await service.inspect()).toMatchObject({
+      remoteState: "superseded",
+    });
+    expect(remote.finalizeCalls).toBe(1);
+    expect(remote.abortCalls).toBe(2);
+  });
+
+  it("commits a result published during deterministic-rejection recovery", async () => {
+    store = new MemoryControlStore();
+    const blob = Uint8Array.from({ length: 10 }, (_, index) => index);
+    const { preview, currentHash } = await v3Prepared(blob);
+    const remote = new StrictV3PushRemote();
+    remote.finalizeErrorOnce = new AgentWikiHttpError(409, {
+      protocolVersion: "3",
+      error: { code: "ATTACHMENT_NAME_CONFLICT", retryable: false },
+    });
+    remote.publishBeforeFinalizeError = true;
+    const service = new TreePushServiceV3(
+      remote,
+      store,
+      ".agentwiki/tree/rejection-published-race",
+      {
+        readBlob: async () => blob,
+        revalidateConfirmation: async () => currentHash.value,
+      },
+    );
+
+    await expect(service.publishPrepared(preview)).resolves.toMatchObject({
+      revision: "r2",
+    });
+    expect(await service.inspect()).toMatchObject({ remoteState: "published" });
+    expect(remote.abortCalls).toBe(0);
+    expect(remote.finalizeCalls).toBe(1);
+  });
+
+  it("does not supersede an unclassified strict nonretryable finalize error", async () => {
+    store = new MemoryControlStore();
+    const blob = Uint8Array.from({ length: 10 }, (_, index) => index);
+    const { preview, currentHash } = await v3Prepared(blob);
+    const remote = new StrictV3PushRemote();
+    remote.finalizeErrorOnce = new AgentWikiHttpError(500, {
+      protocolVersion: "3",
+      error: { code: "INTERNAL_ERROR", retryable: false },
+    });
+    const service = new TreePushServiceV3(
+      remote,
+      store,
+      ".agentwiki/tree/unclassified-finalize",
+      {
+        readBlob: async () => blob,
+        revalidateConfirmation: async () => currentHash.value,
+      },
+    );
+
+    await expect(service.publishPrepared(preview)).rejects.toMatchObject({
+      body: { error: { code: "INTERNAL_ERROR" } },
+    });
+    expect(await service.inspect()).toMatchObject({ remoteState: "finalizing" });
+    expect(remote.abortCalls).toBe(0);
+    await expect(service.resumePending()).resolves.toMatchObject({
+      revision: "r2",
+    });
+    expect(remote.finalizeCalls).toBe(2);
   });
 
   it("ignores cancellation once finalizing is durable", async () => {

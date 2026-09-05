@@ -964,6 +964,14 @@ export class SyncRuntime {
     }
   }
 
+  private async discardTerminalPullPreviewBodies(): Promise<void> {
+    try {
+      await this.control.removeTree?.(this.root + "/tree-preview-body");
+    } catch {
+      // Terminal transaction metadata no longer depends on preview bodies.
+    }
+  }
+
   private async readJournalSchemaVersion(path: string): Promise<number | null> {
     let best: { writeGeneration: number; version: number } | null = null;
     for (const candidate of [path, path + ".prev", path + ".next"]) {
@@ -1252,7 +1260,7 @@ export class SyncRuntime {
     );
     const tree = await treeTx.inspect();
     const v3After = await this.v3PullControlAfter.read();
-    if (tree?.schemaVersion === 3) {
+    if (tree?.schemaVersion === 3 && tree.deferCommit) {
       if ((tree.state === "verified" || tree.state === "committed") && !v3After)
         throw new Error("V3_PULL_CONTROL_RECOVERY_EVIDENCE_MISSING");
       if (
@@ -1277,6 +1285,7 @@ export class SyncRuntime {
             this.control,
             this.root + "/pull-staging",
           ).cleanup();
+          await this.discardTerminalPullPreviewBodies();
           return;
         }
         await this.treeBaseline.recover(tree.transactionId);
@@ -1309,6 +1318,12 @@ export class SyncRuntime {
         this.control,
         this.root + "/pull-staging",
       ).cleanup();
+      const terminalTree = await treeTx.inspect();
+      if (
+        terminalTree?.state === "committed" ||
+        terminalTree?.state === "rolled_back"
+      )
+        await this.discardTerminalPullPreviewBodies();
       return;
     }
     let committedTransactionId: string | null =
@@ -1320,6 +1335,12 @@ export class SyncRuntime {
         recovered?.state === "committed" ? recovered.transactionId : null;
     }
     await this.treeBaseline.recover(committedTransactionId);
+    const terminalTree = await treeTx.inspect();
+    if (
+      terminalTree?.state === "committed" ||
+      terminalTree?.state === "rolled_back"
+    )
+      await this.discardTerminalPullPreviewBodies();
   }
 
   private async recoverLegacyPush(): Promise<void> {
@@ -1483,7 +1504,10 @@ export class SyncRuntime {
       push.remoteState === "published" && push.result
         ? push.result
         : await service.resumePending();
-    if (!result) throw new Error("PUSH_RECOVERY_REQUIRED");
+    if (!result) {
+      if ((await service.inspect())?.remoteState === "superseded") return;
+      throw new Error("PUSH_RECOVERY_REQUIRED");
+    }
     await this.finishV3Push(service, result);
   }
 
@@ -2475,18 +2499,6 @@ export class SyncRuntime {
           },
         ]),
     );
-    identities.attachments = Object.fromEntries(
-      snapshot.attachments.map((attachment) => [
-        attachment.attachmentId,
-        {
-          attachmentId: attachment.attachmentId,
-          path: attachment.path,
-          pathKey: pathKey(attachment.path),
-          baseContentHash: attachment.contentHash,
-          active: true,
-        },
-      ]),
-    );
     identities.pendingAttachments = Object.fromEntries(
       local.attachments
         .filter((attachment) => {
@@ -2509,6 +2521,34 @@ export class SyncRuntime {
           },
         ]),
     );
+    const projectedAttachmentIds = new Set(
+      snapshot.attachments.map((attachment) => attachment.attachmentId),
+    );
+    identities.attachments = Object.fromEntries([
+      ...snapshot.attachments.map(
+        (attachment) =>
+          [
+            attachment.attachmentId,
+            {
+              attachmentId: attachment.attachmentId,
+              path: attachment.path,
+              pathKey: pathKey(attachment.path),
+              baseContentHash: attachment.contentHash,
+              active: true,
+            },
+          ] as const,
+      ),
+      ...Object.values(identities.attachments)
+        .filter(
+          (identity) =>
+            !projectedAttachmentIds.has(identity.attachmentId) &&
+            !identities.pendingAttachments[identity.attachmentId],
+        )
+        .map(
+          (identity) =>
+            [identity.attachmentId, { ...identity, active: false }] as const,
+        ),
+    ]);
     await this.identities.write(identities);
     await service.markVerified();
     this.mapping.status = "active";

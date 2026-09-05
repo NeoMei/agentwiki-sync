@@ -107,6 +107,7 @@ export interface TreePushJournalV3 {
     | "published"
     | "superseded";
   result: TreeFinalizeResultV3 | null;
+  finalizeRejectionCode?: "ATTACHMENT_NAME_CONFLICT";
   localCommitPhase: "not_started" | "verified";
 }
 
@@ -236,6 +237,7 @@ function isTreePushJournalV3(value: unknown): value is TreePushJournalV3 {
       "credentialIdAtCreation",
       "remoteState",
       "result",
+      "finalizeRejectionCode",
       "localCommitPhase",
     ])
   )
@@ -278,6 +280,8 @@ function isTreePushJournalV3(value: unknown): value is TreePushJournalV3 {
     ].includes(String(value.remoteState)) ||
     (value.result !== null &&
       !TreeFinalizePushResponseV3Schema.safeParse(value.result).success) ||
+    (value.finalizeRejectionCode !== undefined &&
+      value.finalizeRejectionCode !== "ATTACHMENT_NAME_CONFLICT") ||
     (value.localCommitPhase !== "not_started" &&
       value.localCommitPhase !== "verified")
   )
@@ -307,6 +311,22 @@ function isTreePushJournalV3(value: unknown): value is TreePushJournalV3 {
       return false;
   }
   return true;
+}
+
+function deterministicFinalizeRejectionCode(
+  error: unknown,
+): "ATTACHMENT_NAME_CONFLICT" | null {
+  if (!(error instanceof AgentWikiHttpError)) return null;
+  if (!error.body || typeof error.body !== "object") return null;
+  const envelope = error.body as {
+    protocolVersion?: unknown;
+    error?: { code?: unknown; retryable?: unknown };
+  };
+  return envelope.protocolVersion === "3" &&
+    envelope.error?.code === "ATTACHMENT_NAME_CONFLICT" &&
+    envelope.error.retryable === false
+    ? "ATTACHMENT_NAME_CONFLICT"
+    : null;
 }
 
 function v3Manifest(
@@ -716,6 +736,87 @@ export class TreePushServiceV3 {
     return result;
   }
 
+  private rejectionError(
+    code: "ATTACHMENT_NAME_CONFLICT",
+  ): AgentWikiHttpError {
+    return new AgentWikiHttpError(409, {
+      protocolVersion: "3",
+      error: { code, retryable: false },
+    });
+  }
+
+  private async resolveFinalizeRejection(
+    journal: TreePushJournalV3,
+    error: unknown,
+    returnAfterSupersede: boolean,
+    knownStatus?: Awaited<ReturnType<TreeRemotePortV3["getSession"]>>,
+  ): Promise<TreeFinalizeResultV3 | null> {
+    const publishedResult = async (
+      status: Awaited<ReturnType<TreeRemotePortV3["getSession"]>>,
+    ): Promise<TreeFinalizeResultV3 | null> =>
+      status.result ? this.commitResult(journal, status.result) : null;
+    let status: Awaited<ReturnType<TreeRemotePortV3["getSession"]>>;
+    try {
+      status = knownStatus ?? (await this.remote.getSession(journal.sessionId!));
+    } catch {
+      throw error;
+    }
+    const published = await publishedResult(status);
+    if (published) return published;
+    if (status.status !== "ready_to_finalize") throw error;
+    try {
+      await this.remote.abort(journal.sessionId!);
+    } catch {
+      try {
+        const raced = await this.remote.getSession(journal.sessionId!);
+        const racedResult = await publishedResult(raced);
+        if (racedResult) return racedResult;
+      } catch {
+        // Preserve the durable rejection and finalizing journal for recovery.
+      }
+      throw error;
+    }
+    let terminal: Awaited<ReturnType<TreeRemotePortV3["getSession"]>>;
+    try {
+      terminal = await this.remote.getSession(journal.sessionId!);
+    } catch {
+      throw error;
+    }
+    const terminalResult = await publishedResult(terminal);
+    if (terminalResult) return terminalResult;
+    if (terminal.status !== "aborted" && terminal.status !== "expired")
+      throw error;
+    journal.remoteState = "superseded";
+    await this.save(journal);
+    if (returnAfterSupersede) return null;
+    throw error;
+  }
+
+  private async finalize(
+    journal: TreePushJournalV3,
+    returnAfterSupersede = false,
+  ): Promise<TreeFinalizeResultV3 | null> {
+    try {
+      return await this.commitResult(
+        journal,
+        await this.remote.finalize(
+          journal.sessionId!,
+          journal.confirmationHash,
+        ),
+      );
+    } catch (error) {
+      const code = deterministicFinalizeRejectionCode(error);
+      if (!code) throw error;
+      journal.finalizeRejectionCode = code;
+      await this.save(journal);
+      return this.resolveFinalizeRejection(
+        journal,
+        error,
+        returnAfterSupersede,
+      );
+    }
+  }
+
   private async cancelBeforeFinalize(
     journal: TreePushJournalV3,
     clear: boolean,
@@ -761,10 +862,9 @@ export class TreePushServiceV3 {
       completed: 0,
       cancellable: false,
     });
-    return this.commitResult(
-      journal,
-      await this.remote.finalize(journal.sessionId!, journal.confirmationHash),
-    );
+    const result = await this.finalize(journal);
+    if (!result) throw new Error("PUSH_RECOVERY_REQUIRED");
+    return result;
   }
 
   async publishPrepared(
@@ -814,13 +914,9 @@ export class TreePushServiceV3 {
           completed: 0,
           cancellable: false,
         });
-        return this.commitResult(
-          journal,
-          await this.remote.finalize(
-            session.sessionId,
-            journal.confirmationHash,
-          ),
-        );
+        const result = await this.finalize(journal);
+        if (!result) throw new Error("PUSH_RECOVERY_REQUIRED");
+        return result;
       }
       return await this.runUploading(
         journal,
@@ -859,8 +955,15 @@ export class TreePushServiceV3 {
       await this.save(journal);
     }
     const status = await this.remote.getSession(journal.sessionId);
-    if (status.status === "published" && status.result)
+    if (status.result)
       return this.commitResult(journal, status.result);
+    if (journal.finalizeRejectionCode)
+      return this.resolveFinalizeRejection(
+        journal,
+        this.rejectionError(journal.finalizeRejectionCode),
+        true,
+        status,
+      );
     if (status.status === "aborted" || status.status === "expired")
       throw new Error("推送会话无法恢复");
     for (const hash of status.completedContentHashes) {
@@ -886,10 +989,7 @@ export class TreePushServiceV3 {
       }
       journal.remoteState = "finalizing";
       await this.save(journal);
-      return this.commitResult(
-        journal,
-        await this.remote.finalize(journal.sessionId, journal.confirmationHash),
-      );
+      return this.finalize(journal, true);
     }
     return this.runUploading(
       journal,

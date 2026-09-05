@@ -459,6 +459,7 @@ export class FakeTreeRemoteV3 implements TreeRemotePortV3 {
   readonly createInputs: CreateTreePushSessionRequestV3[] = [];
   readonly uploadedChunkIndexes: number[] = [];
   readonly uploadedBatches: TreePushBatchV3[] = [];
+  private currentSessionBatches: TreePushBatchV3[] = [];
   finalizeCalls = 0;
   abortCalls = 0;
   loseFinalizeResponseOnce = false;
@@ -661,6 +662,7 @@ export class FakeTreeRemoteV3 implements TreeRemotePortV3 {
       receivedBatchIndexes: [],
       result: null,
     };
+    this.currentSessionBatches = [];
     return {
       sessionId: this.pushSession.sessionId,
       status: this.pushSession.status,
@@ -684,9 +686,10 @@ export class FakeTreeRemoteV3 implements TreeRemotePortV3 {
     )
       throw new Error("BATCH_MISMATCH");
     this.uploadedBatches.push(structuredClone(batch));
+    this.currentSessionBatches.push(structuredClone(batch));
     await this.onUploadBatch?.();
     this.pushSession.receivedBatchIndexes.push(batch.batchIndex);
-    const received = this.uploadedBatches.reduce(
+    const received = this.currentSessionBatches.reduce(
       (total, item) => total + item.changes.length,
       0,
     );
@@ -705,7 +708,7 @@ export class FakeTreeRemoteV3 implements TreeRemotePortV3 {
       throw new Error("CONFIRMATION_MISMATCH");
     if (this.pushSession.result) return this.pushSession.result;
     const changes = canonicalTreeDeltaItemsV3(
-      this.uploadedBatches.flatMap((batch) => batch.changes),
+      this.currentSessionBatches.flatMap((batch) => batch.changes),
     );
     for (const change of changes) {
       switch (change.operation) {

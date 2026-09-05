@@ -248,6 +248,7 @@ export class TreeTransaction {
     transactionId: string;
     baseRevision: string;
     targetRevision: string;
+    deferCommit: boolean;
   } | null> {
     const value = await this.journal.read();
     return value
@@ -257,6 +258,7 @@ export class TreeTransaction {
           transactionId: value.payload.transactionId,
           baseRevision: value.payload.baseRevision,
           targetRevision: value.payload.targetRevision,
+          deferCommit: value.payload.deferCommit === true,
         }
       : null;
   }
