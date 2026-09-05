@@ -18,6 +18,30 @@ import {
 } from "../fakes/blob-staging-fixture";
 
 describe("bounded blob staging", () => {
+  it("reads existing schema-1 staging but records revision-bound schema-2 staging", async () => {
+    const store = new MemoryControlStore();
+    const repository = new BlobStagingRepository(store, STAGING_ROOT);
+    const requirement = await blobRequirement(new Uint8Array([1]));
+    await repository.begin("legacy-transfer", [requirement], futureExpiry);
+    await expect(repository.readJournal(beforeExpiry)).resolves.toMatchObject({
+      schemaVersion: 1,
+      transferId: "legacy-transfer",
+    });
+    await repository.cleanup();
+
+    await repository.begin(
+      "bound-transfer",
+      [requirement],
+      futureExpiry,
+      "revision-1",
+    );
+    await expect(repository.readJournal(beforeExpiry)).resolves.toMatchObject({
+      schemaVersion: 2,
+      transferId: "bound-transfer",
+      revision: "revision-1",
+    });
+  });
+
   it("checkpoints verified chunks and completes only after a binary reread", async () => {
     const store = new MemoryControlStore();
     const repository = new BlobStagingRepository(store, STAGING_ROOT);

@@ -306,6 +306,31 @@ describe("BlobTransfer", () => {
     expect(remote.maxActive).toBeLessThanOrEqual(2);
   });
 
+  it("does not resume schema-1 staging without a fixed revision binding", async () => {
+    const remote = new FakeV3Remote();
+    const bytes = new Uint8Array([1]);
+    const expected = await requirement(bytes);
+    const attachment: SyncAttachmentV3 = {
+      attachmentId: "attachment-1",
+      path: "assets/a.png",
+      ...expected,
+      updatedAt: "2026-09-05T00:00:00.000Z",
+    };
+    const store = new MemoryControlStore();
+    const staging = new BlobStagingRepository(store, STAGING_ROOT);
+    await staging.begin("download-1", [expected], futureExpiry);
+    const { subject } = transfer(remote, store);
+
+    await expect(
+      subject.downloadMissing({
+        transferId: "download-1",
+        expiresAt: futureExpiry,
+        revision: "revision-1",
+        attachments: [attachment],
+      }),
+    ).rejects.toThrow(/BLOB_STAGING_RESUME_MISMATCH/);
+  });
+
   it("cleans staging when downloaded bytes do not match the fixed manifest hash", async () => {
     const remote = new FakeV3Remote();
     const good = new Uint8Array([1]);

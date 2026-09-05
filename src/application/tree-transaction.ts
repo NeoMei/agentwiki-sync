@@ -14,15 +14,15 @@ const encoder = new TextEncoder();
 
 type PathKind = "directory" | "file" | "missing";
 
-interface PathState {
+export interface TreeTransactionPathState {
   kind: PathKind;
   hash: string | null;
 }
 
 interface OperationPath {
   path: string;
-  before: PathState;
-  after: PathState;
+  before: TreeTransactionPathState;
+  after: TreeTransactionPathState;
 }
 
 interface JournalOperation {
@@ -57,11 +57,13 @@ export interface TreeTransactionInput {
   actions: TreePullActionV3[];
   /** Keep sidecars and the applied state until generation/identity commit. */
   deferCommit?: boolean;
+  /** Exact raw Vault states captured by the confirmed preview scan. */
+  expectedPathStates?: Record<string, TreeTransactionPathState>;
 }
 
-function isPathState(value: unknown): value is PathState {
+function isPathState(value: unknown): value is TreeTransactionPathState {
   if (!value || typeof value !== "object") return false;
-  const item = value as Partial<PathState>;
+  const item = value as Partial<TreeTransactionPathState>;
   return (
     (item.kind === "directory" ||
       item.kind === "file" ||
@@ -135,7 +137,10 @@ function decodeBase64(value: string): Uint8Array {
   return bytes;
 }
 
-function sameState(left: PathState, right: PathState): boolean {
+function sameState(
+  left: TreeTransactionPathState,
+  right: TreeTransactionPathState,
+): boolean {
   return left.kind === right.kind && left.hash === right.hash;
 }
 
@@ -240,6 +245,12 @@ export class TreeTransaction {
     )
       throw new Error("存在未终结的事务，请先执行恢复（recover）");
 
+    if (input.expectedPathStates) {
+      for (const [path, expected] of Object.entries(input.expectedPathStates))
+        if (!sameState(await this.readPathState(path), expected))
+          throw new Error("STALE_PULL_PREVIEW");
+    }
+
     const ownedRoots = input.actions.flatMap((action) => {
       switch (action.kind) {
         case "trash_page":
@@ -266,6 +277,7 @@ export class TreeTransaction {
           index,
           input.actions[index]!,
           ownedRoots,
+          input.expectedPathStates,
         ),
       );
     }
@@ -423,7 +435,7 @@ export class TreeTransaction {
     await this.rollback(journal);
   }
 
-  private async readPathState(path: string): Promise<PathState> {
+  private async readPathState(path: string): Promise<TreeTransactionPathState> {
     const kind = await this.vault.pathStatus(path);
     if (kind === "directory") return { kind: "directory", hash: null };
     if (kind === "file") {
@@ -443,6 +455,7 @@ export class TreeTransaction {
     index: number,
     action: TreePullActionV3,
     ownedRoots: string[],
+    expectedPathStates?: Record<string, TreeTransactionPathState>,
   ): Promise<JournalOperation> {
     let paths: OperationPath[];
     switch (action.kind) {
@@ -530,6 +543,17 @@ export class TreeTransaction {
       case "detach_attachment":
         paths = [];
         break;
+    }
+
+    if (expectedPathStates) {
+      for (const item of paths) {
+        const sourcePath = beforeSourcePath(action, item.path);
+        const expected = expectedPathStates[sourcePath];
+        if (!expected) throw new Error("STALE_PULL_PREVIEW");
+        item.before = expected;
+        if (!sameState(await this.readPathState(sourcePath), expected))
+          throw new Error("STALE_PULL_PREVIEW");
+      }
     }
 
     for (let pathIndex = 0; pathIndex < paths.length; pathIndex += 1) {

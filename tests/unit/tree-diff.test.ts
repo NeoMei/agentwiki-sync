@@ -128,7 +128,14 @@ function localScanV3(
   attachments: TreeAttachment[],
   blockers: LocalTreeScanV3["blockers"] = [],
 ): LocalTreeScanV3 {
-  return { rootPath: "Wiki", folders: [], pages, attachments, blockers };
+  return {
+    rootPath: "Wiki",
+    folders: [],
+    pages,
+    attachments,
+    blockers,
+    rawPathStates: {},
+  };
 }
 
 function keepBothCollisionPreview(): Promise<TreePullPreviewV3> {

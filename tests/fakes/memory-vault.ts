@@ -11,6 +11,7 @@ export class MemoryVault implements VaultPort {
   operations = 0;
   failAfterOperations: number | null = null;
   onRename?: (fromPath: string, toPath: string) => Promise<void> | void;
+  onRead?: (path: string) => Promise<void> | void;
   private rootStatusOverride: "folder" | "missing" | "file" | null = null;
 
   constructor(initial: Record<string, string>) {
@@ -147,7 +148,9 @@ export class MemoryVault implements VaultPort {
   }
   async read(path: string): Promise<Uint8Array | null> {
     this.readPaths.push(path);
-    return this.files.get(path)?.slice() ?? null;
+    const value = this.files.get(path)?.slice() ?? null;
+    await this.onRead?.(path);
+    return value;
   }
   async write(path: string, bytes: Uint8Array): Promise<void> {
     this.fail();

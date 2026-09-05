@@ -30,13 +30,16 @@ interface BlobStagingEntry {
   completeHash?: string;
 }
 
-export interface BlobStagingJournal {
-  schemaVersion: 1;
+interface BlobStagingJournalFields {
   transferId: string;
   expiresAt: string;
   expectedBytes: number;
   blobs: Record<string, BlobStagingEntry>;
 }
+
+export type BlobStagingJournal =
+  | (BlobStagingJournalFields & { schemaVersion: 1 })
+  | (BlobStagingJournalFields & { schemaVersion: 2; revision: string });
 
 export class BlobStagingIntegrityError extends Error {
   readonly retryable = false;
@@ -71,17 +74,26 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isJournal(value: unknown): value is BlobStagingJournal {
-  if (!isRecord(value) || value.schemaVersion !== 1) return false;
   if (
-    !Object.keys(value).every((key) =>
-      [
-        "schemaVersion",
-        "transferId",
-        "expiresAt",
-        "expectedBytes",
-        "blobs",
-      ].includes(key),
-    )
+    !isRecord(value) ||
+    (value.schemaVersion !== 1 && value.schemaVersion !== 2)
+  )
+    return false;
+  const allowedKeys =
+    value.schemaVersion === 1
+      ? ["schemaVersion", "transferId", "expiresAt", "expectedBytes", "blobs"]
+      : [
+          "schemaVersion",
+          "transferId",
+          "revision",
+          "expiresAt",
+          "expectedBytes",
+          "blobs",
+        ];
+  if (
+    !Object.keys(value).every((key) => allowedKeys.includes(key)) ||
+    (value.schemaVersion === 2 &&
+      (typeof value.revision !== "string" || !OPAQUE_ID.test(value.revision)))
   )
     return false;
   if (
@@ -222,11 +234,13 @@ export class BlobStagingRepository {
     transferId: string,
     requirements: BlobRequirementV3[],
     expiresAt: string,
+    revision?: string,
   ): Promise<void> {
     return this.exclusive(async () => {
       if (
         !OPAQUE_ID.test(transferId) ||
         !RFC3339.test(expiresAt) ||
+        (revision !== undefined && !OPAQUE_ID.test(revision)) ||
         !Number.isFinite(Date.parse(expiresAt))
       )
         throw new TypeError("Invalid Blob staging journal");
@@ -256,7 +270,9 @@ export class BlobStagingRepository {
         blobs[expected.contentHash] = { expected, receivedChunks: {} };
       }
       await this.journal.write({
-        schemaVersion: 1,
+        ...(revision === undefined
+          ? { schemaVersion: 1 as const }
+          : { schemaVersion: 2 as const, revision }),
         transferId,
         expiresAt,
         expectedBytes,

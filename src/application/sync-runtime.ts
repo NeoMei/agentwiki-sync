@@ -1,8 +1,10 @@
 import {
   FlatAttachmentPathSchema,
+  validatePortableMarkdownPath,
   treeRevisionContentHashV3,
   treeRevisionContentHashV2,
   pathKey,
+  type BlobRequirementV3,
   type TreeSyncCapabilitiesV3,
 } from "@neomei/agentwiki-sync-protocol";
 
@@ -29,6 +31,7 @@ import type {
 import { scanLocalTree } from "../core/tree-scan";
 import type {
   TreeDeltaItem,
+  TreeAttachment,
   TreeFolder,
   TreePage,
   TreeSnapshot,
@@ -46,7 +49,10 @@ import type { VaultPort } from "../ports/vault";
 import { BaselineRepository } from "../storage/baseline";
 import { MutableControlRepository } from "../storage/envelope";
 import { TreeBaselineRepository } from "../storage/tree-baseline";
-import { BlobStagingRepository } from "../storage/blob-staging";
+import {
+  BlobStagingRepository,
+  type BlobStagingJournal,
+} from "../storage/blob-staging";
 import {
   emptyTreeIdentityState,
   upgradeTreeIdentityState,
@@ -68,7 +74,10 @@ import {
   type TreePullPreviewV3,
 } from "./tree-diff";
 import { BlobTransfer } from "./blob-transfer";
-import { TreeTransaction } from "./tree-transaction";
+import {
+  TreeTransaction,
+  type TreeTransactionPathState,
+} from "./tree-transaction";
 import { PullTransaction } from "./pull-transaction";
 import { PushService } from "./push-service";
 import {
@@ -148,6 +157,7 @@ export interface PullPreviewV3 extends TreePullPreviewV3 {
   scanEpoch: number;
   capabilities: TreeSyncCapabilitiesV3;
   transferId: string | null;
+  expectedVaultPathStates: Record<string, TreeTransactionPathState>;
 }
 
 export interface PushPreview {
@@ -982,6 +992,104 @@ export class SyncRuntime {
     return this.prefixAction(action);
   }
 
+  private expectedV3VaultPathStates(
+    local: LocalTreeScanV3,
+    actions: TreePullActionV3[],
+  ): Record<string, TreeTransactionPathState> {
+    const expected: Record<string, TreeTransactionPathState> = {};
+    const stateAt = (path: string): TreeTransactionPathState =>
+      local.rawPathStates[path] ?? { kind: "missing", hash: null };
+    const add = (path: string, state = stateAt(path)): void => {
+      expected[joinRoot(this.mapping.rootPath, path)] = state;
+    };
+    const addSubtree = (path: string): void => {
+      add(path);
+      const prefix = `${path}/`;
+      for (const [candidate, state] of Object.entries(local.rawPathStates))
+        if (candidate.startsWith(prefix)) add(candidate, state);
+    };
+    const addProjectedMissingSubtree = (
+      source: string,
+      target: string,
+    ): void => {
+      add(target);
+      const prefix = `${source}/`;
+      for (const candidate of Object.keys(local.rawPathStates))
+        if (candidate.startsWith(prefix))
+          add(`${target}/${candidate.slice(prefix.length)}`);
+    };
+
+    for (const folder of local.folders) add(folder.path);
+    for (const page of local.pages) add(page.path);
+    for (const attachment of local.attachments) add(attachment.path);
+
+    for (const action of actions) {
+      switch (action.kind) {
+        case "create_directory":
+        case "create_page":
+          add(action.path);
+          break;
+        case "trash_directory":
+          addSubtree(action.path);
+          break;
+        case "move_directory": {
+          const source = action.beforePath ?? action.fromPath;
+          addSubtree(source);
+          addProjectedMissingSubtree(source, action.path);
+          break;
+        }
+        case "write_page":
+          add(action.beforePath ?? action.path);
+          if (action.beforePath) add(action.path);
+          break;
+        case "move_page":
+          add(action.beforePath ?? action.fromPath);
+          if (action.beforePath) add(action.fromPath);
+          add(action.path);
+          break;
+        case "trash_page":
+          add(action.path);
+          break;
+        case "create_attachment":
+        case "write_attachment":
+          add(action.attachment.path);
+          break;
+        case "remove_attachment_path":
+          add(action.path);
+          break;
+        case "detach_attachment":
+          break;
+      }
+    }
+    return expected;
+  }
+
+  private async readVaultPathState(
+    path: string,
+  ): Promise<TreeTransactionPathState> {
+    const kind = await this.vault.pathStatus(path);
+    if (kind === "directory") return { kind, hash: null };
+    if (kind === "missing") return { kind, hash: null };
+    const bytes = await this.vault.read(path);
+    return {
+      kind: "file",
+      hash: bytes ? await sha256Hex(bytes) : null,
+    };
+  }
+
+  private async assertV3PreviewVaultState(
+    preview: PullPreviewV3,
+    expectedPathStates: Record<string, TreeTransactionPathState>,
+  ): Promise<void> {
+    if (preview.scanEpoch !== this.scanEpoch)
+      throw new Error("STALE_PULL_PREVIEW");
+    for (const [path, expected] of Object.entries(expectedPathStates)) {
+      const actual = await this.readVaultPathState(path);
+      if (actual.kind !== expected.kind || actual.hash !== expected.hash)
+        throw new Error("STALE_PULL_PREVIEW");
+    }
+  }
+
   async establishEmptyBase(): Promise<void> {
     const head = await this.legacyTreeRemote.head();
     await this.treeBaseline.prepare(
@@ -1280,7 +1388,54 @@ export class SyncRuntime {
     return this.previewPullV3(options);
   }
 
+  private async assertNoActiveV3PullTransaction(): Promise<void> {
+    const active = await new TreeTransaction(
+      this.vault,
+      this.control,
+      this.root + "/pull",
+    ).inspect();
+    if (
+      active &&
+      active.state !== "committed" &&
+      active.state !== "rolled_back"
+    )
+      throw new Error("PULL_RECOVERY_REQUIRED");
+  }
+
+  private blobRequirements(attachments: TreeAttachment[]): BlobRequirementV3[] {
+    const byHash = new Map<string, BlobRequirementV3>();
+    for (const attachment of attachments)
+      if (!byHash.has(attachment.contentHash))
+        byHash.set(attachment.contentHash, {
+          contentHash: attachment.contentHash,
+          sizeBytes: attachment.sizeBytes,
+          mimeType: attachment.mimeType,
+          width: attachment.width,
+          height: attachment.height,
+        });
+    return [...byHash.values()].sort((left, right) =>
+      left.contentHash.localeCompare(right.contentHash),
+    );
+  }
+
+  private stagingMatchesPull(
+    journal: BlobStagingJournal,
+    revision: string,
+    attachments: TreeAttachment[],
+  ): boolean {
+    if (journal.schemaVersion !== 2 || journal.revision !== revision)
+      return false;
+    const requirements = this.blobRequirements(attachments);
+    if (Object.keys(journal.blobs).length !== requirements.length) return false;
+    return requirements.every(
+      (expected) =>
+        JSON.stringify(journal.blobs[expected.contentHash]?.expected) ===
+        JSON.stringify(expected),
+    );
+  }
+
   async previewPullV3(options?: SyncOperationOptions): Promise<PullPreviewV3> {
+    await this.assertNoActiveV3PullTransaction();
     const remotePort = this.requireV3Remote();
     const space = (await remotePort.spaces()).find(
       (item) => item.spaceId === this.mapping.spaceId,
@@ -1292,23 +1447,33 @@ export class SyncRuntime {
     const capabilities = await remotePort.capabilities();
     const base = (await this.readBaseSnapshotV3()) ?? this.emptySnapshotV3();
     const local = await this.scanV3(base, capabilities, options);
+    const scanEpoch = this.scanEpoch;
     const missing = remote.attachments.filter((attachment) => {
       const localAttachment = local.attachments.find(
         (item) => item.attachmentId === attachment.attachmentId,
       );
       return localAttachment?.contentHash !== attachment.contentHash;
     });
+    const staging = new BlobStagingRepository(
+      this.control,
+      this.root + "/pull-staging",
+      capabilities,
+    );
+    const existingStaging = await staging.readJournal();
     let transferId: string | null = null;
     if (missing.length > 0) {
-      transferId = crypto.randomUUID();
-      const expiresAt = new Date(
-        Date.now() + capabilities.blobStagingTtlSeconds * 1000,
-      ).toISOString();
-      const staging = new BlobStagingRepository(
-        this.control,
-        this.root + "/pull-staging",
-        capabilities,
-      );
+      const reusable =
+        existingStaging &&
+        this.stagingMatchesPull(existingStaging, remote.revision, missing)
+          ? existingStaging
+          : null;
+      if (existingStaging && !reusable) await staging.cleanup();
+      transferId = reusable?.transferId ?? crypto.randomUUID();
+      const expiresAt =
+        reusable?.expiresAt ??
+        new Date(
+          Date.now() + capabilities.blobStagingTtlSeconds * 1000,
+        ).toISOString();
       await new BlobTransfer(remotePort, staging, capabilities).downloadMissing(
         {
           transferId,
@@ -1318,7 +1483,7 @@ export class SyncRuntime {
           signal: options?.signal,
         },
       );
-    }
+    } else if (existingStaging) await staging.cleanup();
     await progressCheckpoint(options, {
       phase: "merge",
       completed: 0,
@@ -1328,9 +1493,13 @@ export class SyncRuntime {
     return {
       ...tree,
       artifactRoots: transferId ? [this.root + "/pull-staging"] : [],
-      scanEpoch: this.scanEpoch,
+      scanEpoch,
       capabilities,
       transferId,
+      expectedVaultPathStates: this.expectedV3VaultPathStates(
+        local,
+        tree.actions,
+      ),
     };
   }
 
@@ -1574,11 +1743,17 @@ export class SyncRuntime {
   ): Promise<void> {
     if (pendingTreeDecisionCount(preview) > 0)
       throw new Error("拉取存在未解决的结构化冲突");
+    const expectedPathStates = this.expectedV3VaultPathStates(
+      preview.local,
+      preview.actions,
+    );
+    await this.assertV3PreviewVaultState(preview, expectedPathStates);
     await progressCheckpoint(options, {
       phase: "apply",
       completed: 0,
       cancellable: true,
     });
+    await this.assertV3PreviewVaultState(preview, expectedPathStates);
     for (const page of preview.resolvedPages)
       await this.control.write(
         "tree-preview-body/" + page.pageId + ".md",
@@ -1605,6 +1780,7 @@ export class SyncRuntime {
         }),
         actions: preview.actions.map((action) => this.prefixActionV3(action)),
         deferCommit: true,
+        expectedPathStates,
       },
       transactionId,
     );
@@ -1708,6 +1884,8 @@ export class SyncRuntime {
 
   private async localHasLegacyManagedImageCandidate(): Promise<boolean> {
     for await (const entry of this.vault.listMarkdown(this.mapping.rootPath)) {
+      if (!entry.relativePath.startsWith("pages/")) continue;
+      validatePortableMarkdownPath(entry.relativePath);
       const body = decodeVaultMarkdown(entry.bytes).normalized;
       if (
         parseAttachmentReferences(body, entry.relativePath).some(

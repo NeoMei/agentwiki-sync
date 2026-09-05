@@ -135,6 +135,49 @@ function seededControl(): MemoryControlStore {
 }
 
 describe("TreeTransaction", () => {
+  it("does not materialize changed bytes as a new approved before-image", async () => {
+    const vault = new MemoryVault({ "pages/note.md": "approved" });
+    const control = new MemoryControlStore();
+    control.files.set("tree-preview-body/note.md", "remote");
+    const tx = new TreeTransaction(
+      vault,
+      control,
+      ".agentwiki/tx/expected-before",
+    );
+    const approvedHash = await sha256Hex(new TextEncoder().encode("approved"));
+    vault.onRead = (path) => {
+      if (path !== "pages/note.md") return;
+      vault.onRead = undefined;
+      vault.seedMarkdown(path, "changed after expected-state check");
+    };
+
+    await expect(
+      tx.prepare({
+        baseRevision: "base",
+        targetRevision: "target",
+        targetTreeHash: "0".repeat(64),
+        expectedPathStates: {
+          "pages/note.md": { kind: "file", hash: approvedHash },
+        },
+        actions: [
+          {
+            kind: "write_page",
+            pageId: "note",
+            path: "pages/note.md",
+            bodyPath: "tree-preview-body/note.md",
+          },
+        ],
+      }),
+    ).rejects.toThrow(/STALE_PULL_PREVIEW/);
+
+    expect(vault.operationLog).toEqual([]);
+    expect(vault.text("pages/note.md")).toBe(
+      "changed after expected-state check",
+    );
+    expect(await tx.inspect()).toBeNull();
+    expect(control.binaryFiles.size).toBe(0);
+  });
+
   it("creates the new image before rewriting markdown and removes the old path last", async () => {
     const vault = new MemoryVault({
       "Wiki/pages/note.md": "![[../assets/old.png]]",

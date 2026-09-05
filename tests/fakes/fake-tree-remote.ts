@@ -446,6 +446,8 @@ export class FakeTreeRemoteV3 implements TreeRemotePortV3 {
     contentHash: string;
   }> = [];
   failAfterSnapshot = false;
+  downloadFailuresRemaining = 0;
+  onDownload?: () => Promise<void> | void;
   syncMode: TreeSpaceSummaryV3["syncMode"] = "native_v3";
   private revision = "rev-3";
   private folders: SyncFolderV2[] = [];
@@ -619,6 +621,11 @@ export class FakeTreeRemoteV3 implements TreeRemotePortV3 {
     contentHash: string;
   }): Promise<Uint8Array> {
     this.downloads.push({ ...input });
+    await this.onDownload?.();
+    if (this.downloadFailuresRemaining > 0) {
+      this.downloadFailuresRemaining -= 1;
+      throw new Error("injected retryable download failure");
+    }
     if (input.revision !== this.revision) throw new Error("REVISION_GONE");
     const bytes = this.blobs.get(input.attachmentId);
     if (!bytes) throw new Error("ATTACHMENT_BLOB_MISSING");

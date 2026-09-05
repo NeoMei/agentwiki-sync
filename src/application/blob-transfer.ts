@@ -319,6 +319,8 @@ export class BlobTransfer {
         ]),
       );
       if (
+        existing.schemaVersion !== 2 ||
+        existing.revision !== input.revision ||
         existing.transferId !== input.transferId ||
         existing.expiresAt !== input.expiresAt ||
         Object.keys(existing.blobs).length !== expectedByHash.size ||
@@ -334,7 +336,12 @@ export class BlobTransfer {
           "BLOB_STAGING_RESUME_MISMATCH",
         );
     } else
-      await this.staging.begin(input.transferId, requirements, input.expiresAt);
+      await this.staging.begin(
+        input.transferId,
+        requirements,
+        input.expiresAt,
+        input.revision,
+      );
     try {
       await this.workers(byHash.values(), async (attachment) => {
         assertNotAborted(input.signal);

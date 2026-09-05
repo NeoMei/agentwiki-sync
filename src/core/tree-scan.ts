@@ -138,6 +138,11 @@ export interface LocalTreeScanV3 {
   pages: TreePageV3[];
   attachments: TreeAttachment[];
   blockers: AttachmentScanBlocker[];
+  /** Exact raw Vault state observed before Markdown normalization. */
+  rawPathStates: Record<
+    string,
+    { kind: "directory" | "file" | "missing"; hash: string | null }
+  >;
 }
 
 const MANAGED_ROOT = "pages";
@@ -278,18 +283,37 @@ export async function scanLocalTree(
   const directories: string[] = [];
   const markdown = new Map<string, Uint8Array>();
   const files = new Map<string, VaultTreeEntry>();
+  const rawPathStates: LocalTreeScanV3["rawPathStates"] = {};
   let scanned = 0;
   for await (const entry of vault.listTree(rootPath)) {
     scanned += 1;
     if (scanned % 50 === 0) await onProgress?.(scanned);
     if (entry.kind === "file") {
       files.set(entry.relativePath, entry);
+      if (entry.relativePath.startsWith(MANAGED_PREFIX)) {
+        const involvedBytes =
+          entry.bytes ??
+          (await vault.read(joinRoot(rootPath, entry.relativePath)));
+        rawPathStates[entry.relativePath] = {
+          kind: "file",
+          hash: involvedBytes ? await sha256Hex(involvedBytes) : null,
+        };
+      }
       continue;
     }
     if (entry.relativePath === MANAGED_ROOT) continue;
     if (!entry.relativePath.startsWith(MANAGED_PREFIX)) continue;
-    if (entry.kind === "directory") directories.push(entry.relativePath);
-    else markdown.set(entry.relativePath, entry.bytes ?? new Uint8Array());
+    if (entry.kind === "directory") {
+      directories.push(entry.relativePath);
+      rawPathStates[entry.relativePath] = { kind: "directory", hash: null };
+    } else {
+      const bytes = entry.bytes ?? new Uint8Array();
+      markdown.set(entry.relativePath, bytes);
+      rawPathStates[entry.relativePath] = {
+        kind: "file",
+        hash: await sha256Hex(bytes),
+      };
+    }
   }
 
   // Stable ID resolution is pathKey-first. Committed local identity wins, then
@@ -578,6 +602,7 @@ export async function scanLocalTree(
       continue;
     }
     const hash = await sha256Hex(bytes);
+    rawPathStates[path] = { kind: "file", hash };
     const needsTransfer =
       !baseContentHashes.has(hash) && !chargedContentHashes.has(hash);
     if (
@@ -680,5 +705,12 @@ export async function scanLocalTree(
         ].join("\0"),
       ),
   );
-  return { rootPath, folders, pages: v3Pages, attachments, blockers };
+  return {
+    rootPath,
+    folders,
+    pages: v3Pages,
+    attachments,
+    blockers,
+    rawPathStates,
+  };
 }
