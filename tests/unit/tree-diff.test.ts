@@ -702,7 +702,12 @@ describe("buildTreePullPreviewV3", () => {
 
     await resolvePageConflictV3(preview, conflictId, { choice: "local" });
 
-    expect(preview.pageConflicts).toEqual([]);
+    expect(preview.pageConflicts.map((item) => item.conflictId)).toEqual([
+      conflictId,
+    ]);
+    expect(preview.pageConflictResolutions[conflictId]).toEqual({
+      choice: "local",
+    });
     expect(preview.resolvedPages[0]?.body).toBe(
       "local\n![[assets/renamed.png]]",
     );

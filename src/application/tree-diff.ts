@@ -812,11 +812,18 @@ async function computePreviewV3(
   const baseLegacy = legacySnapshot(base);
   const localLegacy = legacyScan(local);
   const remoteLegacy = legacySnapshot(remote);
+  const appliedPagePlan = await resolvePagePlan(
+    pagePlan,
+    pageConflictResolutions,
+    baseLegacy,
+    localLegacy,
+    remoteLegacy,
+  );
   const legacy = computePreview(
     baseLegacy,
     localLegacy,
     remoteLegacy,
-    pagePlan,
+    appliedPagePlan,
     folderConflictResolutions,
     pageConflictResolutions,
   );
@@ -826,13 +833,22 @@ async function computePreviewV3(
     local,
     remote,
   );
-  const attachmentPlan = mergeAttachmentsById({
+  const attachmentInput = {
     base: base.attachments,
     local: local.attachments,
     remote: remote.attachments,
     affectedPageIdsByAttachment: affectedPagesByAttachment(sourcePages),
+  };
+  const attachmentPlan = mergeAttachmentsById({
+    ...attachmentInput,
     resolutions: attachmentConflictResolutions,
   });
+  const displayedAttachmentConflicts = new Map(
+    [
+      ...mergeAttachmentsById(attachmentInput).conflicts,
+      ...attachmentPlan.conflicts,
+    ].map((conflict) => [conflict.conflictId, conflict]),
+  );
   const aliases = attachmentPlan.identityAliases;
   const sourceAttachments = [
     ...local.attachments,
@@ -910,14 +926,28 @@ async function computePreviewV3(
       pages: resolvedPages,
       attachments: attachmentPlan.attachments,
     });
+  const localPages = new Map(local.pages.map((page) => [page.pageId, page]));
+  const finalPages = new Map(resolvedPages.map((page) => [page.pageId, page]));
   const legacyActions = rewrittenLegacy.actions.filter((action) => {
     if (
       action.kind === "create_page" ||
       action.kind === "write_page" ||
       action.kind === "move_page" ||
       action.kind === "trash_page"
-    )
-      return !unresolvedPageIds.has(action.pageId);
+    ) {
+      if (unresolvedPageIds.has(action.pageId)) return false;
+      if (action.kind !== "trash_page") {
+        const localPage = localPages.get(action.pageId);
+        const finalPage = finalPages.get(action.pageId);
+        if (
+          localPage &&
+          finalPage &&
+          localPage.path === finalPage.path &&
+          localPage.contentHash === finalPage.contentHash
+        )
+          return false;
+      }
+    }
     return true;
   });
   const attachment = attachmentActions(
@@ -929,11 +959,13 @@ async function computePreviewV3(
     revision: remote.revision,
     actions: sortTreePullActionsV3([...attachment, ...legacyActions]),
     blockers: [...local.blockers, ...rewriteBlockers],
-    attachmentConflicts: attachmentPlan.conflicts,
+    attachmentConflicts: [...displayedAttachmentConflicts.values()].sort(
+      (left, right) => left.conflictId.localeCompare(right.conflictId),
+    ),
     attachmentConflictResolutions,
     folderConflicts: legacy.folderConflicts,
     folderConflictResolutions,
-    pageConflicts: legacy.pageConflicts,
+    pageConflicts: pagePlan.conflicts,
     pageConflictResolutions,
     base,
     local,
@@ -1022,18 +1054,11 @@ export async function resolvePageConflictV3(
     ...preview.pageConflictResolutions,
     [conflictId]: resolution,
   };
-  const pagePlan = await resolvePagePlan(
-    preview.pagePlan,
-    resolutions,
-    legacySnapshot(preview.base),
-    legacyScan(preview.local),
-    legacySnapshot(preview.remote),
-  );
   const next = await computePreviewV3(
     preview.base,
     preview.local,
     preview.remote,
-    pagePlan,
+    preview.pagePlan,
     preview.folderConflictResolutions,
     resolutions,
     preview.attachmentConflictResolutions,
@@ -1187,7 +1212,9 @@ export function pendingTreeDecisionCount(
   ).length;
   if (!("attachmentConflicts" in preview))
     return unresolvedFolders + unresolvedPages;
-  const unresolvedAttachments = preview.attachmentConflicts.length;
+  const unresolvedAttachments = preview.attachmentConflicts.filter(
+    (conflict) => !preview.attachmentConflictResolutions[conflict.conflictId],
+  ).length;
   return (
     unresolvedFolders +
     unresolvedPages +

@@ -501,6 +501,157 @@ describe("referenced image sync v3 end to end", () => {
       expect(follower.text("Wiki/pages/Two.md")).toBe(`![[${secondaryPath}]]`);
     },
   );
+
+  it.each(["local", "manual", "remote"] as const)(
+    "keeps a resolved %s Page body choice while redirecting its attachment to the keep-both copy",
+    async (pageChoice) => {
+      const secondPageId = "33333333-3333-4333-8333-333333333333";
+      const secondaryAttachmentId = "44444444-4444-4444-8444-444444444444";
+      const secondaryPath = "assets/image-remote.png";
+      const makePage = async (
+        pageId: string,
+        path: string,
+        label: "base" | "local" | "remote",
+      ) => ({
+        ...(await page(`${label} ${path}\n![[assets/image.png]]`, [
+          ATTACHMENT_ID,
+        ])),
+        pageId,
+        path,
+        title: path.endsWith("One.md") ? "One" : "Two",
+      });
+      const remote = new FakeTreeRemoteV3();
+      await remote.seedTree({
+        revision: "base",
+        pages: [
+          await makePage(PAGE_ID, "pages/One.md", "base"),
+          await makePage(secondPageId, "pages/Two.md", "base"),
+        ],
+        attachments: [await attachment()],
+        blobs: { [ATTACHMENT_ID]: IMAGE },
+      });
+      const vault = new MemoryVault({});
+      const runtime = SyncRuntime.v3(
+        vault,
+        new MemoryControlStore(),
+        remote,
+        mapping(),
+      );
+      await runtime.applyPullV3(await runtime.previewPullV3());
+      vault.seedMarkdown(
+        "Wiki/pages/One.md",
+        "local pages/One.md\n![[assets/image.png]]",
+      );
+      vault.seedMarkdown(
+        "Wiki/pages/Two.md",
+        "local pages/Two.md\n![[assets/image.png]]",
+      );
+      vault.seedFile("Wiki/assets/image.png", REPLACEMENT);
+      await remote.seedTree({
+        revision: "remote-change",
+        pages: [
+          await makePage(PAGE_ID, "pages/One.md", "remote"),
+          await makePage(secondPageId, "pages/Two.md", "remote"),
+        ],
+        attachments: [await attachment(REMOTE_REPLACEMENT)],
+        blobs: { [ATTACHMENT_ID]: REMOTE_REPLACEMENT },
+      });
+
+      const sourcePreview = await runtime.previewPullV3();
+      expect(sourcePreview.pageConflicts).toHaveLength(2);
+      const resolvedPagesPreview = structuredClone(sourcePreview);
+      for (const conflict of sourcePreview.pageConflicts) {
+        const selectedBody =
+          pageChoice === "manual"
+            ? `manual ${conflict.pageId}\n![[assets/image.png]]`
+            : undefined;
+        await resolvePageConflictV3(
+          resolvedPagesPreview,
+          conflict.conflictId,
+          pageChoice === "manual"
+            ? { choice: "manual", manualValue: selectedBody }
+            : { choice: pageChoice },
+        );
+      }
+      // The modal serializes each choice by recomputing from its immutable
+      // source preview, then copies the accumulated resolution maps across.
+      const preview = structuredClone(sourcePreview);
+      preview.pageConflictResolutions = structuredClone(
+        resolvedPagesPreview.pageConflictResolutions,
+      );
+      expect(preview.attachmentConflicts).toHaveLength(1);
+      await resolveAttachmentConflict(
+        preview,
+        preview.attachmentConflicts[0]!.conflictId,
+        {
+          choice: "keep_both",
+          primary: "local",
+          secondaryAttachmentId,
+          secondaryPath,
+          redirectPageIds: [secondPageId],
+        },
+      );
+
+      const firstBody =
+        pageChoice === "manual"
+          ? `manual ${PAGE_ID}\n![[assets/image.png]]`
+          : `${pageChoice} pages/One.md\n![[assets/image.png]]`;
+      const secondBody =
+        pageChoice === "manual"
+          ? `manual ${secondPageId}\n![[${secondaryPath}]]`
+          : `${pageChoice} pages/Two.md\n![[${secondaryPath}]]`;
+      expect(
+        preview.resolvedPages.find((item) => item.pageId === PAGE_ID),
+      ).toMatchObject({
+        body: firstBody,
+        referencedAttachmentIds: [ATTACHMENT_ID],
+      });
+      expect(
+        preview.resolvedPages.find((item) => item.pageId === secondPageId),
+      ).toMatchObject({
+        body: secondBody,
+        referencedAttachmentIds: [secondaryAttachmentId],
+      });
+      expect(preview.actions).toContainEqual(
+        expect.objectContaining({
+          kind: "write_page",
+          pageId: secondPageId,
+          path: "pages/Two.md",
+        }),
+      );
+
+      await runtime.applyPullV3(preview);
+      expect(vault.text("Wiki/pages/One.md")).toBe(firstBody);
+      expect(vault.text("Wiki/pages/Two.md")).toBe(secondBody);
+      const primaryBytes = (await vault.read("Wiki/assets/image.png"))!;
+      const secondaryBytes = (await vault.read(`Wiki/${secondaryPath}`))!;
+      expect(primaryBytes).toEqual(REPLACEMENT);
+      expect(secondaryBytes).toEqual(REMOTE_REPLACEMENT);
+      expect(await sha256Hex(primaryBytes)).toBe(await sha256Hex(REPLACEMENT));
+      expect(await sha256Hex(secondaryBytes)).toBe(
+        await sha256Hex(REMOTE_REPLACEMENT),
+      );
+
+      await runtime.applyPushV3(await runtime.previewPushV3());
+      const followerVault = new MemoryVault({});
+      const follower = SyncRuntime.v3(
+        followerVault,
+        new MemoryControlStore(),
+        remote,
+        mapping(),
+        `resolved-${pageChoice}`,
+      );
+      await follower.applyPullV3(await follower.previewPullV3());
+      expect(followerVault.text("Wiki/pages/One.md")).toBe(firstBody);
+      expect(followerVault.text("Wiki/pages/Two.md")).toBe(secondBody);
+      expect(await followerVault.read("Wiki/assets/image.png")).toEqual(
+        REPLACEMENT,
+      );
+      expect(await followerVault.read(`Wiki/${secondaryPath}`)).toEqual(
+        REMOTE_REPLACEMENT,
+      );
+    },
+  );
 });
 
 describe("referenced image sync v3 fault recovery", () => {
