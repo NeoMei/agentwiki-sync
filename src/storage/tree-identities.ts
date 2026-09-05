@@ -6,6 +6,11 @@ import {
 } from "@neomei/agentwiki-sync-protocol";
 
 import { validatePublicId } from "../core/identity-key";
+import type { ControlStorePort } from "../ports/control-store";
+import {
+  MutableControlRepository,
+  type MutableControlEnvelope,
+} from "./envelope";
 
 export interface TreeFolderIdentity {
   folderId: string;
@@ -112,7 +117,6 @@ function assertPendingPages(value: unknown): void {
 
 function assertAttachmentRecords(value: unknown, pending: boolean): void {
   if (!isRecord(value)) throw new TypeError("Invalid tree identity record");
-  const pathOwners = new Map<string, string>();
   for (const [id, raw] of Object.entries(value)) {
     const keys = pending
       ? ["attachmentId", "path", "pathKey", "contentHash"]
@@ -131,10 +135,29 @@ function assertAttachmentRecords(value: unknown, pending: boolean): void {
       (!pending && typeof raw.active !== "boolean")
     )
       throw new TypeError("Invalid tree attachment identity");
-    const owner = pathOwners.get(raw.pathKey);
-    if (owner && owner !== id)
-      throw new TypeError("Invalid tree attachment identity");
-    pathOwners.set(raw.pathKey, id);
+  }
+}
+
+function assertAttachmentOwnership(
+  attachments: Record<string, TreeAttachmentIdentity>,
+  pendingAttachments: Record<string, TreePendingAttachmentIdentity>,
+): void {
+  const idsByPath = new Map<string, string>();
+  const pathsById = new Map<string, string>();
+  const owners = [
+    ...Object.values(attachments).filter((identity) => identity.active),
+    ...Object.values(pendingAttachments),
+  ];
+  for (const owner of owners) {
+    const pathOwner = idsByPath.get(owner.pathKey);
+    const idPath = pathsById.get(owner.attachmentId);
+    if (
+      (pathOwner !== undefined && pathOwner !== owner.attachmentId) ||
+      (idPath !== undefined && idPath !== owner.pathKey)
+    )
+      throw new TypeError("Invalid tree attachment identity ownership");
+    idsByPath.set(owner.pathKey, owner.attachmentId);
+    pathsById.set(owner.attachmentId, owner.pathKey);
   }
 }
 
@@ -192,6 +215,10 @@ export function validateTreeIdentityState(input: unknown): TreeIdentityState {
   assertPendingPages(input.pendingPages);
   assertAttachmentRecords(input.attachments, false);
   assertAttachmentRecords(input.pendingAttachments, true);
+  assertAttachmentOwnership(
+    input.attachments as Record<string, TreeAttachmentIdentity>,
+    input.pendingAttachments as Record<string, TreePendingAttachmentIdentity>,
+  );
   return input as unknown as TreeIdentityState;
 }
 
@@ -219,4 +246,55 @@ export function detachAttachment(
   const pendingAttachments = { ...state.pendingAttachments };
   delete pendingAttachments[attachmentId];
   return { ...state, attachments, pendingAttachments };
+}
+
+const isTreeIdentityState = (value: unknown): value is TreeIdentityState => {
+  try {
+    validateTreeIdentityState(value);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+export class TreeIdentityRepository {
+  private readonly records: MutableControlRepository<TreeIdentityState>;
+
+  constructor(store: ControlStorePort, path: string) {
+    this.records = new MutableControlRepository(
+      store,
+      path,
+      isTreeIdentityState,
+    );
+  }
+
+  read(): Promise<MutableControlEnvelope<TreeIdentityState> | null> {
+    return this.records.read();
+  }
+
+  async write(
+    input: TreeIdentityState,
+  ): Promise<MutableControlEnvelope<TreeIdentityState>> {
+    const validated = validateTreeIdentityState(input);
+    const current = await this.records.read();
+    if (current?.payload.schemaVersion === 2 && validated.schemaVersion !== 2)
+      throw new Error("Cannot downgrade confirmed v3 identity state");
+    return this.records.write(validated);
+  }
+
+  async commitConfirmedV3Activation(): Promise<TreeIdentityStateV2> {
+    const current = (await this.records.read())?.payload ?? {
+      schemaVersion: 1 as const,
+      folders: {},
+      pendingFolders: {},
+      pendingPages: {},
+    };
+    if (current.schemaVersion === 2) return current as TreeIdentityStateV2;
+    const activated = upgradeTreeIdentityState(current);
+    await this.records.write(activated);
+    const durable = (await this.records.read())?.payload;
+    if (durable?.schemaVersion !== 2)
+      throw new Error("Confirmed v3 identity activation was not durable");
+    return durable as TreeIdentityStateV2;
+  }
 }

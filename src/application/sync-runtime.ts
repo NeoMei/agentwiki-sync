@@ -35,7 +35,7 @@ import { MutableControlRepository } from "../storage/envelope";
 import { TreeBaselineRepository } from "../storage/tree-baseline";
 import {
   emptyTreeIdentityState,
-  validateTreeIdentityState,
+  TreeIdentityRepository,
   type TreeIdentityState,
 } from "../storage/tree-identities";
 import {
@@ -204,15 +204,6 @@ const isPullControlAfterState = (
   );
 };
 
-const isTreeIdentityState = (value: unknown): value is TreeIdentityState => {
-  try {
-    validateTreeIdentityState(value);
-    return true;
-  } catch {
-    return false;
-  }
-};
-
 const safeKey = (value: string) => value.replace(/[^A-Za-z0-9_-]/gu, "_");
 const joinRoot = (root: string, relative: string) => root + "/" + relative;
 const emptySnapshot = (
@@ -232,7 +223,7 @@ export class SyncRuntime {
   private readonly root: string;
   private readonly treeBaseline: TreeBaselineRepository;
   private readonly legacyBaseline: BaselineRepository;
-  private readonly identities: MutableControlRepository<TreeIdentityState>;
+  private readonly identities: TreeIdentityRepository;
   private readonly moveHints: MutableControlRepository<MoveHintsState>;
   private readonly pullControlAfter: MutableControlRepository<PullControlAfterState>;
   private renameQueue: Promise<void> = Promise.resolve();
@@ -264,10 +255,9 @@ export class SyncRuntime {
       mapping.spaceId,
       mapping.rootPath,
     );
-    this.identities = new MutableControlRepository(
+    this.identities = new TreeIdentityRepository(
       control,
       this.root + "/tree-identities.json",
-      isTreeIdentityState,
     );
     this.moveHints = new MutableControlRepository(
       control,

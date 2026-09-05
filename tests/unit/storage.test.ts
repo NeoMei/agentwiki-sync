@@ -11,9 +11,11 @@ import {
 import {
   detachAttachment,
   emptyTreeIdentityStateV2,
+  TreeIdentityRepository,
   upgradeTreeIdentityState,
   validateTreeIdentityState,
 } from "../../src/storage/tree-identities";
+import { distinctControlStoreView } from "../fakes/memory-control-store";
 
 describe("crash-safe control storage", () => {
   it("recovers the highest valid envelope and freezes same-generation forks", async () => {
@@ -161,6 +163,59 @@ describe("crash-safe control storage", () => {
 });
 
 describe("tree attachment identities", () => {
+  it("persists schema 2 only through explicit confirmed v3 activation and survives restart", async () => {
+    const store = new MemoryControlStore();
+    const path = ".agentwiki/device/tree-identities.json";
+    const repository = new TreeIdentityRepository(store, path);
+    await repository.write({
+      schemaVersion: 1,
+      folders: {},
+      pendingFolders: {},
+      pendingPages: {},
+      attachments: {
+        a1: {
+          attachmentId: "a1",
+          path: "assets/a.png",
+          pathKey: "assets/a.png",
+          baseContentHash: "a".repeat(64),
+          active: true,
+        },
+      },
+      pendingAttachments: {
+        a1: {
+          attachmentId: "a1",
+          path: "assets/a.png",
+          pathKey: "assets/a.png",
+          contentHash: "a".repeat(64),
+        },
+      },
+    });
+
+    expect((await repository.read())?.payload.schemaVersion).toBe(1);
+    const activated = await repository.commitConfirmedV3Activation();
+    expect(activated.schemaVersion).toBe(2);
+    expect(activated.attachments.a1?.active).toBe(true);
+    expect(activated.pendingAttachments.a1?.attachmentId).toBe("a1");
+
+    const restarted = new TreeIdentityRepository(
+      distinctControlStoreView(store),
+      path,
+    );
+    const durable = (await restarted.read())?.payload;
+    expect(durable?.schemaVersion).toBe(2);
+    expect(durable?.attachments?.a1?.active).toBe(true);
+    expect(durable?.pendingAttachments?.a1?.attachmentId).toBe("a1");
+    await expect(
+      restarted.write({
+        schemaVersion: 1,
+        folders: {},
+        pendingFolders: {},
+        pendingPages: {},
+      }),
+    ).rejects.toThrow("Cannot downgrade confirmed v3 identity state");
+    expect((await restarted.read())?.payload.schemaVersion).toBe(2);
+  });
+
   it("upgrades schema 1 without inventing attachment ownership", () => {
     const state = upgradeTreeIdentityState({
       schemaVersion: 1,
@@ -216,5 +271,101 @@ describe("tree attachment identities", () => {
         },
       }),
     ).toThrow(/Invalid tree attachment identity/);
+  });
+
+  it("validates active and pending attachment owners as one identity graph", () => {
+    const samePath = "assets/a.png";
+    const otherPath = "assets/b.png";
+    const active = {
+      attachmentId: "a1",
+      path: samePath,
+      pathKey: samePath,
+      baseContentHash: "a".repeat(64),
+      active: true,
+    };
+    const pending = {
+      attachmentId: "a1",
+      path: samePath,
+      pathKey: samePath,
+      contentHash: "a".repeat(64),
+    };
+    expect(() =>
+      validateTreeIdentityState({
+        ...emptyTreeIdentityStateV2(),
+        attachments: { a1: active },
+        pendingAttachments: { a1: pending },
+      }),
+    ).not.toThrow();
+    expect(() =>
+      validateTreeIdentityState({
+        ...emptyTreeIdentityStateV2(),
+        attachments: { a1: active },
+        pendingAttachments: {
+          a2: { ...pending, attachmentId: "a2" },
+        },
+      }),
+    ).toThrow(/attachment identity ownership/i);
+    expect(() =>
+      validateTreeIdentityState({
+        ...emptyTreeIdentityStateV2(),
+        attachments: { a1: active },
+        pendingAttachments: {
+          a1: { ...pending, path: otherPath, pathKey: otherPath },
+        },
+      }),
+    ).toThrow(/attachment identity ownership/i);
+  });
+
+  it("keeps inactive hints strict without reserving their paths", () => {
+    const path = "assets/a.png";
+    const freshId = "00000000-0000-4000-8000-000000000001";
+    const inactive = {
+      attachmentId: "old-a",
+      path,
+      pathKey: path,
+      baseContentHash: "a".repeat(64),
+      active: false,
+    };
+
+    expect(() =>
+      validateTreeIdentityState({
+        ...emptyTreeIdentityStateV2(),
+        attachments: {
+          "old-a": inactive,
+          "old-b": {
+            ...inactive,
+            attachmentId: "old-b",
+            baseContentHash: "b".repeat(64),
+          },
+          [freshId]: {
+            ...inactive,
+            attachmentId: freshId,
+            baseContentHash: "c".repeat(64),
+            active: true,
+          },
+        },
+      }),
+    ).not.toThrow();
+    expect(() =>
+      validateTreeIdentityState({
+        ...emptyTreeIdentityStateV2(),
+        attachments: {
+          "old-a": inactive,
+          "old-b": {
+            ...inactive,
+            attachmentId: "old-b",
+            baseContentHash: "b".repeat(64),
+          },
+        },
+        pendingAttachments: {
+          [freshId]: {
+            attachmentId: freshId,
+            path,
+            pathKey: path,
+            contentHash: "c".repeat(64),
+          },
+        },
+      }),
+    ).not.toThrow();
   });
 });

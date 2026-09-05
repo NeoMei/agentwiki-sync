@@ -291,27 +291,180 @@ describe("v3 tree generations", () => {
     ).rejects.toThrow(/authority|hash|metrics/i);
   });
 
-  it("rejects an attachment identity mismatch and a missing page reference", async () => {
+  it("rejects an attachment record-key identity mismatch", async () => {
+    const store = new MemoryControlStore();
+    const repository = new TreeGenerationRepository(
+      store,
+      ".agentwiki/device/tree-v2",
+    );
+    const image = attachment("a1", "assets/a.png");
+    await expect(
+      repository.metricsV3({
+        spaceId: "space-1",
+        folders: {},
+        pages: {},
+        attachments: { wrong: image },
+        bodies: {},
+      }),
+    ).rejects.toThrow("Invalid v3 attachment identity");
+  });
+
+  it("rejects a page reference to a missing attachment", async () => {
+    const repository = new TreeGenerationRepository(
+      new MemoryControlStore(),
+      ".agentwiki/device/tree-v2",
+    );
+    const body = "# image";
+    const metadata = {
+      ...pageV3("p1", null, "pages/A.md", ["missing"]),
+      contentHash: await contentHash(body),
+    };
+
+    await expect(
+      repository.metricsV3({
+        spaceId: "space-1",
+        folders: {},
+        pages: { p1: metadata },
+        attachments: {},
+        bodies: { p1: body },
+      }),
+    ).rejects.toThrow("Invalid v3 page attachment reference");
+  });
+
+  it("persists and returns the same canonical public v3 records that authority metrics hash", async () => {
     const store = new MemoryControlStore();
     const repository = new TreeGenerationRepository(
       store,
       ".agentwiki/device/tree-v2",
     );
     const body = "# image";
-    const image = attachment("a1", "assets/a.png");
+    const decomposedPagePath = "pages/Cafe\u0301.md";
+    const decomposedAttachmentPath = "assets/Cafe\u0301.png";
     const metadata = {
-      ...pageV3("p1", null, "pages/A.md", ["missing"]),
+      ...pageV3("p1", null, decomposedPagePath, ["a1"]),
       contentHash: await contentHash(body),
     };
-    const metrics = await repository
-      .metricsV3({
-        spaceId: "space-1",
-        folders: {},
+    const image = attachment("a1", decomposedAttachmentPath);
+    const authority = await repository.metricsV3({
+      spaceId: "space-1",
+      folders: {},
+      pages: { p1: metadata },
+      attachments: { a1: image },
+      bodies: { p1: body },
+    });
+
+    const written = await repository.write(
+      makeManifestV3({
         pages: { p1: metadata },
         attachments: { a1: image },
-        bodies: { p1: body },
-      })
-      .catch(() => null);
-    expect(metrics).toBeNull();
+        baseRevisionContentHash: authority.contentHash,
+        basePageCount: authority.pageCount,
+        baseAttachmentCount: authority.attachmentCount,
+        baseRevisionManifestByteLength: authority.manifestByteLength,
+        baseRevisionBodyBytes: authority.bodyBytes,
+        baseRevisionAttachmentBytes: authority.attachmentBytes,
+      }),
+      { p1: body },
+    );
+
+    expect(written.pages.p1?.path).toBe("pages/Café.md");
+    expect(written.attachments.a1?.path).toBe("assets/Café.png");
+    await expect(repository.readManifest("g3")).resolves.toEqual(written);
+
+    const manifestPath =
+      ".agentwiki/device/tree-v2/generations/g3/manifest.json";
+    const noncanonical = JSON.parse(
+      (await store.read(manifestPath)) ?? "{}",
+    ) as unknown as TreeGenerationManifestV3;
+    const storedPage = noncanonical.pages.p1;
+    if (!storedPage) throw new Error("expected stored Page metadata");
+    storedPage.path = decomposedPagePath;
+    await store.write(manifestPath, JSON.stringify(noncanonical));
+    await expect(repository.verify("g3")).rejects.toThrow(
+      "Noncanonical v3 tree generation manifest",
+    );
+  });
+
+  it.each([
+    ["generationId", "../g3", "Invalid v3 generation ID"],
+    ["baseRevision", "../rev", "Invalid v3 base revision"],
+    ["lastSuccessfulSyncAt", "tomorrow", "Invalid v3 sync timestamp"],
+    [
+      "lastSuccessfulSyncAt",
+      "2026-02-30T00:00:00.000Z",
+      "Invalid v3 sync timestamp",
+    ],
+  ] as const)(
+    "rejects invalid local v3 field %s",
+    async (field, value, message) => {
+      const store = new MemoryControlStore();
+      const repository = new TreeGenerationRepository(
+        store,
+        ".agentwiki/device/tree-v2",
+      );
+      const authority = await repository.metricsV3({
+        spaceId: "space-1",
+        folders: {},
+        pages: {},
+        attachments: {},
+        bodies: {},
+      });
+      const manifest = {
+        ...makeManifestV3({
+          baseRevisionContentHash: authority.contentHash,
+          baseRevisionManifestByteLength: authority.manifestByteLength,
+        }),
+        [field]: value,
+      };
+
+      await expect(repository.write(manifest, {})).rejects.toThrow(message);
+      expect(store.files.size).toBe(0);
+    },
+  );
+
+  it.each([
+    ["generationId", "../g3", "Invalid v3 tree generation manifest"],
+    ["baseRevision", "../rev", "Invalid v3 base revision"],
+    ["lastSuccessfulSyncAt", "tomorrow", "Invalid v3 sync timestamp"],
+  ] as const)(
+    "rejects corrupt persisted local v3 field %s",
+    async (field, value, message) => {
+      const store = new MemoryControlStore();
+      const repository = new TreeGenerationRepository(
+        store,
+        ".agentwiki/device/tree-v2",
+      );
+      const authority = await repository.metricsV3({
+        spaceId: "space-1",
+        folders: {},
+        pages: {},
+        attachments: {},
+        bodies: {},
+      });
+      const manifest = {
+        ...makeManifestV3({
+          baseRevisionContentHash: authority.contentHash,
+          baseRevisionManifestByteLength: authority.manifestByteLength,
+        }),
+        [field]: value,
+      };
+      await store.write(
+        ".agentwiki/device/tree-v2/generations/g3/manifest.json",
+        JSON.stringify(manifest),
+      );
+
+      await expect(repository.verify("g3")).rejects.toThrow(message);
+    },
+  );
+
+  it("rejects an invalid generation lookup before reading control storage", async () => {
+    const repository = new TreeGenerationRepository(
+      new MemoryControlStore(),
+      ".agentwiki/device/tree-v2",
+    );
+
+    await expect(repository.verify("../g3")).rejects.toThrow(
+      "Invalid tree generation ID",
+    );
   });
 });

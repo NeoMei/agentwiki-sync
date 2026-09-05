@@ -702,6 +702,84 @@ describe("scanLocalTree", () => {
     expect(identities.attachments?.detached?.active).toBe(false);
   });
 
+  it("does not let different-hash inactive hints reserve a reusable path", async () => {
+    const hash = await sha256Hex(pngBytes);
+    const vault = new MemoryVault({});
+    vault.seedFile("assets/a.png", pngBytes);
+    vault.seedMarkdown("pages/note.md", "![[assets/a.png]]");
+    const identities = identityState({
+      attachments: {
+        oldOne: {
+          attachmentId: "old-one",
+          path: "assets/a.png",
+          pathKey: pathKey("assets/a.png"),
+          baseContentHash: "b".repeat(64),
+          active: false,
+        },
+        oldTwo: {
+          attachmentId: "old-two",
+          path: "assets/a.png",
+          pathKey: pathKey("assets/a.png"),
+          baseContentHash: "c".repeat(64),
+          active: false,
+        },
+      },
+    });
+
+    const scan = await scanLocalTree(
+      vault,
+      "",
+      snapshotV3(),
+      identities,
+      imageLimits,
+    );
+
+    expect(scan.blockers).toEqual([]);
+    expect(scan.attachments[0]?.contentHash).toBe(hash);
+    expect(scan.attachments[0]?.attachmentId).not.toMatch(/^old-/u);
+    expect(
+      identities.pendingAttachments?.[scan.attachments[0]!.attachmentId],
+    ).toMatchObject({ path: "assets/a.png", contentHash: hash });
+  });
+
+  it("blocks recovery when multiple inactive IDs exactly match one path and hash", async () => {
+    const hash = await sha256Hex(pngBytes);
+    const vault = new MemoryVault({});
+    vault.seedFile("assets/a.png", pngBytes);
+    vault.seedMarkdown("pages/note.md", "![[assets/a.png]]");
+    const hint = {
+      attachmentId: "old-one",
+      path: "assets/a.png",
+      pathKey: pathKey("assets/a.png"),
+      baseContentHash: hash,
+      active: false,
+    };
+    const identities = identityState({
+      attachments: {
+        "old-one": hint,
+        "old-two": { ...hint, attachmentId: "old-two" },
+      },
+    });
+
+    const scan = await scanLocalTree(
+      vault,
+      "",
+      snapshotV3(),
+      identities,
+      imageLimits,
+    );
+
+    expect(scan.attachments).toEqual([]);
+    expect(scan.blockers).toEqual([
+      expect.objectContaining({
+        code: "ATTACHMENT_NAME_CONFLICT",
+        path: "assets/a.png",
+      }),
+    ]);
+    expect(identities.attachments?.["old-one"]?.active).toBe(false);
+    expect(identities.attachments?.["old-two"]?.active).toBe(false);
+  });
+
   it("keeps generated attachment IDs stable across repeated nested-root scans", async () => {
     const vault = new MemoryVault({});
     vault.seedFile("Mappings/One/assets/a.png", pngBytes);

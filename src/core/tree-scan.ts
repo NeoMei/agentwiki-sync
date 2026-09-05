@@ -615,15 +615,10 @@ export async function scanLocalTree(
       const detachedMatch = detachedMatches[0];
       if (detachedMatch) {
         const keysForId = new Set([
+          detachedMatch.pathKey,
           ...candidates
             .filter((candidate) => candidate.id === detachedMatch.attachmentId)
             .map((candidate) => candidate.key),
-          ...Object.values(identities.attachments ?? {})
-            .filter(
-              (identity) =>
-                identity.attachmentId === detachedMatch.attachmentId,
-            )
-            .map((identity) => identity.pathKey),
         ]);
         if (keysForId.size > 1) {
           blockers.push({

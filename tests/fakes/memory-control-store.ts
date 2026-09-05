@@ -51,3 +51,18 @@ export class MemoryControlStore implements ControlStorePort {
     return { files, folders: [...folders] };
   }
 }
+
+export function distinctControlStoreView(
+  backing: MemoryControlStore,
+): ControlStorePort {
+  return {
+    read: (path) => backing.read(path),
+    write: (path, value) => backing.write(path, value),
+    readBinary: (path) => backing.readBinary(path),
+    writeBinary: (path, value) => backing.writeBinary(path, value),
+    remove: (path) => backing.remove(path),
+    rename: (from, to) => backing.rename(from, to),
+    removeTree: (path) => backing.removeTree(path),
+    list: (path) => backing.list(path),
+  };
+}

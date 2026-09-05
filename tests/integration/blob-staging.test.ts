@@ -3,7 +3,10 @@ import { describe, expect, it } from "vitest";
 
 import { canonicalBytes, sha256Hex } from "../../src/agentwiki/protocol";
 import { BlobStagingRepository } from "../../src/storage/blob-staging";
-import { MemoryControlStore } from "../fakes/memory-control-store";
+import {
+  distinctControlStoreView,
+  MemoryControlStore,
+} from "../fakes/memory-control-store";
 import {
   beforeExpiry,
   blobRequirement,
@@ -71,6 +74,32 @@ describe("bounded blob staging", () => {
     await expect(
       repository.complete(requirement.contentHash, beforeExpiry),
     ).resolves.toBeUndefined();
+  });
+
+  it("recovers sequentially through a distinct store wrapper over the same durable bytes", async () => {
+    const store = new MemoryControlStore();
+    const bytes = new Uint8Array([4, 3, 2, 1]);
+    const requirement = await blobRequirement(bytes);
+    const firstProcess = new BlobStagingRepository(store, STAGING_ROOT);
+    await firstProcess.begin("transfer-1", [requirement], futureExpiry);
+    await firstProcess.writeChunk(
+      requirement.contentHash,
+      0,
+      bytes,
+      await blobChunkHashV3(bytes),
+      beforeExpiry,
+    );
+
+    const restarted = new BlobStagingRepository(
+      distinctControlStoreView(store),
+      STAGING_ROOT,
+    );
+    await expect(
+      restarted.complete(requirement.contentHash, beforeExpiry),
+    ).resolves.toBeUndefined();
+    await expect(
+      restarted.readComplete(requirement.contentHash, beforeExpiry),
+    ).resolves.toEqual(bytes);
   });
 
   it("serializes concurrent blob checkpoints without losing either receipt", async () => {

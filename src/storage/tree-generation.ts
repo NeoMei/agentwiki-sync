@@ -1,8 +1,13 @@
 import {
+  FlatAttachmentPathSchema,
+  PublicIdSchema,
   TreeRevisionContentManifestV3Schema,
   treeRevisionContentHashV2,
   treeRevisionContentHashV3,
+  validatePortableDirectoryPath,
+  validatePortableMarkdownPath,
 } from "@neomei/agentwiki-sync-protocol";
+import { z } from "zod";
 
 import { canonicalBytes, contentHash } from "../agentwiki/protocol";
 import { opaqueFileKey } from "../core/identity-key";
@@ -70,6 +75,7 @@ export interface TreeGenerationMetricsV3 {
 }
 
 const HASH = /^[a-f0-9]{64}$/u;
+const RFC3339 = z.iso.datetime({ offset: true });
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -78,6 +84,38 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function hasOnlyKeys(value: Record<string, unknown>, keys: string[]): boolean {
   const allowed = new Set(keys);
   return Object.keys(value).every((key) => allowed.has(key));
+}
+
+function assertV3LocalFields(
+  manifest: Pick<
+    TreeGenerationManifestV3,
+    "generationId" | "baseRevision" | "lastSuccessfulSyncAt"
+  >,
+): void {
+  if (!PublicIdSchema.safeParse(manifest.generationId).success)
+    throw new Error("Invalid v3 generation ID");
+  if (!PublicIdSchema.safeParse(manifest.baseRevision).success)
+    throw new Error("Invalid v3 base revision");
+  if (!RFC3339.safeParse(manifest.lastSuccessfulSyncAt).success)
+    throw new Error("Invalid v3 sync timestamp");
+}
+
+function assertCanonicalV3Paths(manifest: TreeGenerationManifestV3): void {
+  try {
+    for (const folder of Object.values(manifest.folders))
+      if (validatePortableDirectoryPath(folder.path).path !== folder.path)
+        throw new Error("noncanonical");
+    for (const page of Object.values(manifest.pages))
+      if (validatePortableMarkdownPath(page.path).path !== page.path)
+        throw new Error("noncanonical");
+    for (const attachment of Object.values(manifest.attachments)) {
+      const parsed = FlatAttachmentPathSchema.safeParse(attachment.path);
+      if (!parsed.success || parsed.data !== attachment.path)
+        throw new Error("noncanonical");
+    }
+  } catch {
+    throw new Error("Noncanonical v3 tree generation manifest");
+  }
 }
 
 export class TreeGenerationRepository {
@@ -122,13 +160,18 @@ export class TreeGenerationRepository {
     };
   }
 
-  async metricsV3(input: {
+  private async canonicalV3(input: {
     spaceId: string;
     folders: Record<string, TreeFolder>;
     pages: Record<string, PageMetadataV3>;
     attachments: Record<string, TreeAttachment>;
     bodies: Record<string, string>;
-  }): Promise<TreeGenerationMetricsV3> {
+  }): Promise<{
+    metrics: TreeGenerationMetricsV3;
+    folders: Record<string, TreeFolder>;
+    pages: Record<string, PageMetadataV3>;
+    attachments: Record<string, TreeAttachment>;
+  }> {
     const hydratedPages: TreePageV3[] = [];
     let bodyBytes = 0;
     for (const [pageId, page] of Object.entries(input.pages)) {
@@ -143,6 +186,10 @@ export class TreeGenerationRepository {
     for (const [folderId, folder] of Object.entries(input.folders))
       if (folderId !== folder.folderId)
         throw new Error("Invalid v3 folder identity");
+    const attachmentIds = new Set(Object.keys(input.attachments));
+    for (const page of hydratedPages)
+      if (page.referencedAttachmentIds.some((id) => !attachmentIds.has(id)))
+        throw new Error("Invalid v3 page attachment reference");
     let attachmentBytes = 0;
     for (const [attachmentId, attachment] of Object.entries(
       input.attachments,
@@ -160,15 +207,45 @@ export class TreeGenerationRepository {
       pages: hydratedPages,
       attachments: Object.values(input.attachments),
     });
+    const folders = Object.fromEntries(
+      metadata.folders.map((folder) => [folder.folderId, folder]),
+    );
+    const pages = Object.fromEntries(
+      metadata.pages.map((page) => {
+        const { body: _body, ...rest } = page;
+        return [page.pageId, rest];
+      }),
+    );
+    const attachments = Object.fromEntries(
+      metadata.attachments.map((attachment) => [
+        attachment.attachmentId,
+        attachment,
+      ]),
+    );
     return {
-      contentHash: await treeRevisionContentHashV3(metadata),
-      folderCount: Object.keys(input.folders).length,
-      pageCount: Object.keys(input.pages).length,
-      attachmentCount: Object.keys(input.attachments).length,
-      manifestByteLength: canonicalBytes(metadata).byteLength,
-      bodyBytes,
-      attachmentBytes,
+      folders,
+      pages,
+      attachments,
+      metrics: {
+        contentHash: await treeRevisionContentHashV3(metadata),
+        folderCount: metadata.folders.length,
+        pageCount: metadata.pages.length,
+        attachmentCount: metadata.attachments.length,
+        manifestByteLength: canonicalBytes(metadata).byteLength,
+        bodyBytes,
+        attachmentBytes,
+      },
     };
+  }
+
+  async metricsV3(input: {
+    spaceId: string;
+    folders: Record<string, TreeFolder>;
+    pages: Record<string, PageMetadataV3>;
+    attachments: Record<string, TreeAttachment>;
+    bodies: Record<string, string>;
+  }): Promise<TreeGenerationMetricsV3> {
+    return (await this.canonicalV3(input)).metrics;
   }
 
   async write(
@@ -229,13 +306,15 @@ export class TreeGenerationRepository {
     input: TreeGenerationManifestV3,
     bodies: Record<string, string>,
   ): Promise<TreeGenerationManifestV3> {
-    const metrics = await this.metricsV3({
+    assertV3LocalFields(input);
+    const canonical = await this.canonicalV3({
       spaceId: input.spaceId,
       folders: input.folders,
       pages: input.pages,
       attachments: input.attachments,
       bodies,
     });
+    const { metrics } = canonical;
     if (
       input.baseRevisionContentHash !== metrics.contentHash ||
       input.baseFolderCount !== metrics.folderCount ||
@@ -246,7 +325,13 @@ export class TreeGenerationRepository {
       input.baseRevisionAttachmentBytes !== metrics.attachmentBytes
     )
       throw new Error("V3 generation authority hash or metrics mismatch");
-    for (const [pageId, page] of Object.entries(input.pages))
+    const manifest: TreeGenerationManifestV3 = {
+      ...input,
+      folders: canonical.folders,
+      pages: canonical.pages,
+      attachments: canonical.attachments,
+    };
+    for (const [pageId, page] of Object.entries(manifest.pages))
       await this.store.write(
         this.bodyPath(
           input.generationId,
@@ -256,7 +341,7 @@ export class TreeGenerationRepository {
       );
     await this.store.write(
       this.manifestPath(input.generationId),
-      JSON.stringify(input),
+      JSON.stringify(manifest),
     );
     const verified = await this.verify(input.generationId);
     if (verified.schemaVersion !== 3)
@@ -265,6 +350,8 @@ export class TreeGenerationRepository {
   }
 
   async verify(generationId: string): Promise<TreeGenerationManifest> {
+    if (!PublicIdSchema.safeParse(generationId).success)
+      throw new Error("Invalid tree generation ID");
     const raw = await this.store.read(this.manifestPath(generationId));
     if (raw === null) throw new Error("基线损坏: 清单缺失");
     let parsed: unknown;
@@ -367,6 +454,8 @@ export class TreeGenerationRepository {
       if (!Number.isSafeInteger(metric) || (metric as number) < 0)
         throw new Error("Invalid v3 tree generation manifest");
     const manifest = parsed as unknown as TreeGenerationManifestV3;
+    assertV3LocalFields(manifest);
+    assertCanonicalV3Paths(manifest);
     const bodies: Record<string, string> = {};
     for (const [pageId, page] of Object.entries(manifest.pages)) {
       if (!isRecord(page)) throw new Error("Invalid v3 page metadata");
