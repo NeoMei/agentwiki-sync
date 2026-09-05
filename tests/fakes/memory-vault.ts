@@ -7,8 +7,10 @@ export class MemoryVault implements VaultPort {
   readonly folders = new Set<string>();
   readonly trash = new Map<string, Uint8Array>();
   readonly trashedDirectories = new Set<string>();
+  readonly operationLog: string[] = [];
   operations = 0;
   failAfterOperations: number | null = null;
+  onRename?: (fromPath: string, toPath: string) => Promise<void> | void;
   private rootStatusOverride: "folder" | "missing" | "file" | null = null;
 
   constructor(initial: Record<string, string>) {
@@ -104,11 +106,13 @@ export class MemoryVault implements VaultPort {
   }
   async createDirectory(path: string): Promise<void> {
     this.fail();
+    this.operationLog.push(`mkdir:${path}`);
     this.folders.add(path);
     this.deriveParents(path);
   }
   async trashDirectory(path: string): Promise<void> {
     this.fail();
+    this.operationLog.push(`trash-dir:${path}`);
     if (!this.folders.has(path)) throw new Error("missing directory source");
     const prefix = `${path}/`;
     for (const dir of [...this.folders])
@@ -147,14 +151,17 @@ export class MemoryVault implements VaultPort {
   }
   async write(path: string, bytes: Uint8Array): Promise<void> {
     this.fail();
+    this.operationLog.push(`write:${path}`);
     this.files.set(path, bytes.slice());
   }
   async remove(path: string): Promise<void> {
     this.fail();
+    this.operationLog.push(`remove:${path}`);
     this.files.delete(path);
   }
   async rename(from: string, to: string): Promise<void> {
     this.fail();
+    this.operationLog.push(`rename:${from}->${to}`);
     if (this.folders.has(from)) {
       if (this.folders.has(to) || this.files.has(to))
         throw new Error("rename conflict");
@@ -176,6 +183,7 @@ export class MemoryVault implements VaultPort {
         }
       }
       this.deriveParents(to);
+      await this.onRename?.(from, to);
       return;
     }
     const value = this.files.get(from);
@@ -183,9 +191,11 @@ export class MemoryVault implements VaultPort {
     this.files.delete(from);
     this.files.set(to, value);
     this.deriveParents(to);
+    await this.onRename?.(from, to);
   }
   async trashFile(path: string): Promise<void> {
     this.fail();
+    this.operationLog.push(`trash:${path}`);
     const value = this.files.get(path);
     if (!value) throw new Error("missing trash source");
     this.trash.set(path, value);

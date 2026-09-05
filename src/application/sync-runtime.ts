@@ -1,6 +1,9 @@
 import {
+  FlatAttachmentPathSchema,
+  treeRevisionContentHashV3,
   treeRevisionContentHashV2,
   pathKey,
+  type TreeSyncCapabilitiesV3,
 } from "@neomei/agentwiki-sync-protocol";
 
 import {
@@ -11,41 +14,60 @@ import {
   sha256Hex,
 } from "../agentwiki/protocol";
 import { decodeVaultMarkdown } from "../core/markdown";
+import { parseAttachmentReferences } from "../core/attachment-reference";
 import type {
-  FolderConflict,
-  FolderConflictResolution,
-  PageMergePlan,
+  AttachmentPullAction,
   StructuredConflict,
   TreePullAction,
+  TreePullActionV3,
 } from "../core/merge";
-import type { LocalTreeScan, TreeScanLimits } from "../core/tree-scan";
+import type {
+  LocalTreeScan,
+  LocalTreeScanV3,
+  TreeScanLimits,
+} from "../core/tree-scan";
 import { scanLocalTree } from "../core/tree-scan";
 import type {
   TreeDeltaItem,
   TreeFolder,
   TreePage,
   TreeSnapshot,
+  TreeSnapshotV3,
 } from "../core/tree-model";
+import { validateTreeSnapshotV3 } from "../core/tree-validation";
 import type { ControlStorePort } from "../ports/control-store";
 import type { PushRemotePort } from "../ports/push-remote";
-import type { TreeRemotePort, TreeSyncLimits } from "../ports/tree-remote";
+import type {
+  TreeRemotePort,
+  TreeRemotePortV3,
+  TreeSyncLimits,
+} from "../ports/tree-remote";
 import type { VaultPort } from "../ports/vault";
 import { BaselineRepository } from "../storage/baseline";
 import { MutableControlRepository } from "../storage/envelope";
 import { TreeBaselineRepository } from "../storage/tree-baseline";
+import { BlobStagingRepository } from "../storage/blob-staging";
 import {
   emptyTreeIdentityState,
+  upgradeTreeIdentityState,
   TreeIdentityRepository,
+  validateTreeIdentityState,
+  type TreeAttachmentIdentity,
+  type TreeIdentityStateV2,
   type TreeIdentityState,
+  type TreePendingAttachmentIdentity,
 } from "../storage/tree-identities";
 import {
   buildTreePullPreview,
+  buildTreePullPreviewV3,
   pendingTreeDecisionCount,
   resolveFolderConflict,
   resolvePageConflict,
   type PageConflictResolution,
   type TreePullPreview,
+  type TreePullPreviewV3,
 } from "./tree-diff";
+import { BlobTransfer } from "./blob-transfer";
 import { TreeTransaction } from "./tree-transaction";
 import { PullTransaction } from "./pull-transaction";
 import { PushService } from "./push-service";
@@ -55,6 +77,7 @@ import {
 } from "./tree-push-service";
 import type { SpaceMapping } from "./sync-coordinator";
 import {
+  cancellationCheckpoint,
   progressCheckpoint,
   reportProgress,
   type SyncOperationOptions,
@@ -118,6 +141,13 @@ export interface PullPreview extends TreePullPreview {
     { base: string; local: string; remote: string }
   >;
   localCandidates: LocalCandidate[];
+}
+
+export interface PullPreviewV3 extends TreePullPreviewV3 {
+  artifactRoots: string[];
+  scanEpoch: number;
+  capabilities: TreeSyncCapabilitiesV3;
+  transferId: string | null;
 }
 
 export interface PushPreview {
@@ -190,6 +220,31 @@ interface PullControlAfterState {
   identities: PendingIdentities;
   moveHints: MoveHintsState;
 }
+
+interface V3PullControlAfterState {
+  schemaVersion: 2;
+  transactionId: string;
+  phase: "pending" | "applied";
+  identities: TreeIdentityStateV2;
+}
+
+const isV3PullControlAfterState = (
+  value: unknown,
+): value is V3PullControlAfterState => {
+  if (!value || typeof value !== "object") return false;
+  const state = value as Partial<V3PullControlAfterState>;
+  if (
+    state.schemaVersion !== 2 ||
+    typeof state.transactionId !== "string" ||
+    !["pending", "applied"].includes(state.phase ?? "")
+  )
+    return false;
+  try {
+    return validateTreeIdentityState(state.identities).schemaVersion === 2;
+  } catch {
+    return false;
+  }
+};
 const isPullControlAfterState = (
   value: unknown,
 ): value is PullControlAfterState => {
@@ -205,7 +260,8 @@ const isPullControlAfterState = (
 };
 
 const safeKey = (value: string) => value.replace(/[^A-Za-z0-9_-]/gu, "_");
-const joinRoot = (root: string, relative: string) => root + "/" + relative;
+const joinRoot = (root: string, relative: string) =>
+  root ? `${root}/${relative}` : relative;
 const emptySnapshot = (
   protocolVersion: "1" | "2",
   spaceId: string,
@@ -226,18 +282,22 @@ export class SyncRuntime {
   private readonly identities: TreeIdentityRepository;
   private readonly moveHints: MutableControlRepository<MoveHintsState>;
   private readonly pullControlAfter: MutableControlRepository<PullControlAfterState>;
+  private readonly v3PullControlAfter: MutableControlRepository<V3PullControlAfterState>;
   private renameQueue: Promise<void> = Promise.resolve();
+  private suppressRenameHints = 0;
+  private remoteV3: TreeRemotePortV3 | null;
 
   constructor(
     private readonly vault: VaultPort,
     private readonly control: ControlStorePort,
-    private readonly remote: TreeRemotePort,
+    private readonly remote: TreeRemotePort | null,
     private readonly mapping: SpaceMapping,
     deviceKey = "local",
     spaceKey = safeKey(mapping.spaceId),
     private readonly credentialId: string | null = null,
     private readonly legacyRemote: PushRemotePort | null = null,
   ) {
+    this.remoteV3 = null;
     this.root =
       ".agentwiki/devices/d-" +
       safeKey(deviceKey) +
@@ -269,6 +329,33 @@ export class SyncRuntime {
       this.root + "/pull-control-after.json",
       isPullControlAfterState,
     );
+    this.v3PullControlAfter = new MutableControlRepository(
+      control,
+      this.root + "/v3-pull-control-after.json",
+      isV3PullControlAfterState,
+    );
+  }
+
+  static v3(
+    vault: VaultPort,
+    control: ControlStorePort,
+    remote: TreeRemotePortV3,
+    mapping: SpaceMapping,
+    deviceKey = "local",
+    spaceKey = safeKey(mapping.spaceId),
+    credentialId: string | null = null,
+  ): SyncRuntime {
+    const runtime = new SyncRuntime(
+      vault,
+      control,
+      null,
+      mapping,
+      deviceKey,
+      spaceKey,
+      credentialId,
+    );
+    runtime.remoteV3 = remote;
+    return runtime;
   }
 
   invalidate(): void {
@@ -279,11 +366,19 @@ export class SyncRuntime {
     return this.mapping.spaceId;
   }
 
-  get protocolVersion(): "1" | "2" {
-    return this.remote.protocolVersion;
+  get protocolVersion(): "1" | "2" | "3" {
+    return (
+      this.remoteV3?.protocolVersion ?? this.legacyTreeRemote.protocolVersion
+    );
+  }
+
+  private get legacyTreeRemote(): TreeRemotePort {
+    if (!this.remote) throw new Error("SYNC_PROTOCOL_UPGRADE_REQUIRED");
+    return this.remote;
   }
 
   async recordRename(fromPath: string, toPath: string): Promise<void> {
+    if (this.suppressRenameHints > 0) return;
     const operation = this.renameQueue.then(() =>
       this.recordRenameNow(fromPath, toPath),
     );
@@ -291,21 +386,68 @@ export class SyncRuntime {
     return operation;
   }
 
+  private async withoutRenameHints<T>(operation: () => Promise<T>): Promise<T> {
+    this.suppressRenameHints += 1;
+    try {
+      return await operation();
+    } finally {
+      this.suppressRenameHints -= 1;
+    }
+  }
+
   private async recordRenameNow(
     fromPath: string,
     toPath: string,
   ): Promise<void> {
-    const prefix = this.mapping.rootPath + "/";
-    if (!fromPath.startsWith(prefix) || !toPath.startsWith(prefix)) return;
+    const prefix = this.mapping.rootPath ? this.mapping.rootPath + "/" : "";
+    if (
+      (prefix &&
+        (!fromPath.startsWith(prefix) || !toPath.startsWith(prefix))) ||
+      (!prefix && (!fromPath || !toPath))
+    )
+      return;
     if (
       fromPath.includes(".agentwiki-tmp-") ||
       toPath.includes(".agentwiki-tmp-")
     )
       return;
-    const base = await this.readBaseSnapshot();
-    if (!base) return;
+    const baseV3 = await this.readBaseSnapshotV3();
     const fromRel = fromPath.slice(prefix.length);
     const toRel = toPath.slice(prefix.length);
+    const toAttachmentPath = FlatAttachmentPathSchema.safeParse(toRel);
+    const attachment = baseV3?.attachments.find(
+      (item) => pathKey(item.path) === pathKey(fromRel),
+    );
+    if (attachment) {
+      if (!toAttachmentPath.success) return;
+      const bytes = await this.vault.read(toPath);
+      if (!bytes || (await sha256Hex(bytes)) !== attachment.contentHash) return;
+      const identities = await this.readIdentities();
+      if (identities.schemaVersion === 2) {
+        const attachments = (identities.attachments ??= {});
+        attachments[attachment.attachmentId] = {
+          attachmentId: attachment.attachmentId,
+          path: toAttachmentPath.data,
+          pathKey: pathKey(toAttachmentPath.data),
+          baseContentHash: attachment.contentHash,
+          active: true,
+        };
+      } else {
+        // Schema 1 remains durable until a confirmed v3 activation. A rename
+        // hint can still preserve the stable ID as pending without activating
+        // schema 2 merely because Obsidian emitted a file event.
+        (identities.pendingAttachments ??= {})[attachment.attachmentId] = {
+          attachmentId: attachment.attachmentId,
+          path: toAttachmentPath.data,
+          pathKey: pathKey(toAttachmentPath.data),
+          contentHash: attachment.contentHash,
+        };
+      }
+      await this.identities.write(identities);
+      return;
+    }
+    const base = baseV3 ?? (await this.readBaseSnapshot());
+    if (!base) return;
     const page = base.pages.find(
       (item) => pathKey(item.path) === pathKey(fromRel),
     );
@@ -337,6 +479,14 @@ export class SyncRuntime {
     return this.treeBaseline.readLegacyEvidence(this.legacyBaseline);
   }
 
+  private async readBaseSnapshotV3(): Promise<TreeSnapshotV3 | null> {
+    const manifest = await this.treeBaseline.readOptional();
+    if (!manifest) return null;
+    const snapshot = await this.treeBaseline.readSnapshot();
+    if (snapshot.protocolVersion !== "3") return null;
+    return snapshot;
+  }
+
   private async scan(
     options?: SyncOperationOptions,
     preBindPages?: TreePage[],
@@ -345,7 +495,7 @@ export class SyncRuntime {
     const status = await this.vault.rootStatus(this.mapping.rootPath);
     if (status === "missing") throw new Error("MAPPING_ROOT_MISSING");
     if (status === "file") throw new Error("MAPPING_ROOT_NOT_DIRECTORY");
-    const capabilities = await this.remote.capabilities();
+    const capabilities = await this.legacyTreeRemote.capabilities();
     const base = await this.readBaseSnapshot();
     const identities = await this.readIdentities();
     const hints = (await this.moveHints.read())?.payload.hints ?? [];
@@ -385,7 +535,11 @@ export class SyncRuntime {
     const local = await scanLocalTree(
       this.vault,
       this.mapping.rootPath,
-      base ?? emptySnapshot(this.remote.protocolVersion, this.mapping.spaceId),
+      base ??
+        emptySnapshot(
+          this.legacyTreeRemote.protocolVersion,
+          this.mapping.spaceId,
+        ),
       identities,
       limits,
       async (completed) => {
@@ -397,7 +551,7 @@ export class SyncRuntime {
         });
       },
     );
-    if (this.remote.protocolVersion === "1") {
+    if (this.legacyTreeRemote.protocolVersion === "1") {
       local.folders = [];
       for (const page of local.pages) page.folderId = null;
       identities.pendingFolders = {};
@@ -424,8 +578,8 @@ export class SyncRuntime {
       revisionManifestByteLength: string;
       revisionBodyBytes: string;
     } | null = null;
-    const capabilities = await this.remote.capabilities();
-    for await (const segment of this.remote.snapshotPages(revision)) {
+    const capabilities = await this.legacyTreeRemote.capabilities();
+    for await (const segment of this.legacyTreeRemote.snapshotPages(revision)) {
       const current = {
         protocolVersion: segment.protocolVersion,
         spaceId: segment.spaceId,
@@ -517,6 +671,186 @@ export class SyncRuntime {
     };
   }
 
+  private requireV3Remote(): TreeRemotePortV3 {
+    if (!this.remoteV3) throw new Error("SYNC_PROTOCOL_UPGRADE_REQUIRED");
+    return this.remoteV3;
+  }
+
+  private emptySnapshotV3(): TreeSnapshotV3 {
+    return {
+      protocolVersion: "3",
+      spaceId: this.mapping.spaceId,
+      revision: "0",
+      revisionContentHash: "",
+      folders: [],
+      pages: [],
+      attachments: [],
+    };
+  }
+
+  private async downloadRemoteSnapshotV3(
+    revision: string,
+    options?: SyncOperationOptions,
+  ): Promise<TreeSnapshotV3> {
+    const remote = this.requireV3Remote();
+    const capabilities = await remote.capabilities();
+    const folders: TreeSnapshotV3["folders"] = [];
+    const pages: TreeSnapshotV3["pages"] = [];
+    const attachments: TreeSnapshotV3["attachments"] = [];
+    let pinned: Omit<
+      Awaited<ReturnType<TreeRemotePortV3["head"]>>,
+      "publishedAt"
+    > | null = null;
+    for await (const segment of remote.snapshotPages(revision)) {
+      const current = {
+        protocolVersion: segment.protocolVersion,
+        spaceId: segment.spaceId,
+        revision: segment.revision,
+        sequence: segment.sequence,
+        revisionContentHash: segment.revisionContentHash,
+        folderCount: segment.folderCount,
+        pageCount: segment.pageCount,
+        attachmentCount: segment.attachmentCount,
+        revisionManifestByteLength: segment.revisionManifestByteLength,
+        revisionBodyBytes: segment.revisionBodyBytes,
+        revisionAttachmentBytes: segment.revisionAttachmentBytes,
+      };
+      if (pinned && JSON.stringify(pinned) !== JSON.stringify(current))
+        throw new Error("快照分页元数据已变更");
+      pinned = current;
+      folders.push(...segment.folders);
+      pages.push(...segment.pages);
+      attachments.push(...segment.attachments);
+      cancellationCheckpoint(options, true);
+    }
+    if (!pinned) throw new Error("快照未返回元数据");
+    if (revision !== "current" && pinned.revision !== revision)
+      throw new Error("快照修订不匹配");
+    decimalWithinLimit(pinned.folderCount, capabilities.maxClientSpaceFolders);
+    decimalWithinLimit(pinned.pageCount, capabilities.maxClientSpacePages);
+    decimalWithinLimit(
+      pinned.attachmentCount,
+      capabilities.maxRevisionAttachments,
+    );
+    if (
+      String(folders.length) !== pinned.folderCount ||
+      String(pages.length) !== pinned.pageCount ||
+      String(attachments.length) !== pinned.attachmentCount
+    )
+      throw new Error("快照对象数量不匹配");
+    const snapshot = validateTreeSnapshotV3({
+      protocolVersion: "3",
+      spaceId: pinned.spaceId,
+      revision: pinned.revision,
+      revisionContentHash: pinned.revisionContentHash,
+      folders,
+      pages,
+      attachments,
+    });
+    const manifest = {
+      protocolVersion: "3" as const,
+      spaceId: snapshot.spaceId,
+      folders: snapshot.folders,
+      pages: snapshot.pages,
+      attachments: snapshot.attachments,
+    };
+    const bodyBytes = snapshot.pages.reduce(
+      (total, page) => total + new TextEncoder().encode(page.body).byteLength,
+      0,
+    );
+    const attachmentBytes = snapshot.attachments.reduce(
+      (total, attachment) => total + Number(attachment.sizeBytes),
+      0,
+    );
+    if (
+      String(bodyBytes) !== pinned.revisionBodyBytes ||
+      String(attachmentBytes) !== pinned.revisionAttachmentBytes ||
+      String(canonicalBytes(manifest).byteLength) !==
+        pinned.revisionManifestByteLength ||
+      (await treeRevisionContentHashV3(manifest)) !== pinned.revisionContentHash
+    )
+      throw new Error("快照完整性不匹配");
+    const completed = folders.length + pages.length + attachments.length;
+    await progressCheckpoint(options, {
+      phase: "download",
+      completed,
+      total: completed,
+      cancellable: true,
+    });
+    return snapshot;
+  }
+
+  private async scanV3(
+    base: TreeSnapshotV3,
+    capabilities: TreeSyncCapabilitiesV3,
+    options?: SyncOperationOptions,
+  ): Promise<LocalTreeScanV3> {
+    const epoch = this.scanEpoch;
+    const status = await this.vault.rootStatus(this.mapping.rootPath);
+    if (status === "missing") throw new Error("MAPPING_ROOT_MISSING");
+    if (status === "file") throw new Error("MAPPING_ROOT_NOT_DIRECTORY");
+    const identities = await this.readIdentities();
+    const hints = (await this.moveHints.read())?.payload.hints ?? [];
+    for (const hint of hints) {
+      const bytes = await this.vault.read(
+        joinRoot(this.mapping.rootPath, hint.toPath),
+      );
+      if (!bytes) continue;
+      const body = decodeVaultMarkdown(bytes).normalized;
+      identities.pendingPages[hint.pageId] = {
+        pageId: hint.pageId,
+        path: hint.toPath,
+        contentHash: await contentHash(body),
+      };
+    }
+    const scanBase = structuredClone(base);
+    const renamedById = new Map<
+      string,
+      TreeAttachmentIdentity | TreePendingAttachmentIdentity
+    >([
+      ...Object.values(identities.attachments ?? {})
+        .filter((identity) => identity.active)
+        .map((identity) => [identity.attachmentId, identity] as const),
+      ...Object.values(identities.pendingAttachments ?? {}).map(
+        (identity) => [identity.attachmentId, identity] as const,
+      ),
+    ]);
+    scanBase.attachments = scanBase.attachments.map((attachment) => {
+      const identity = renamedById.get(attachment.attachmentId);
+      return identity &&
+        ("baseContentHash" in identity
+          ? identity.baseContentHash
+          : identity.contentHash) === attachment.contentHash
+        ? { ...attachment, path: identity.path }
+        : attachment;
+    });
+    reportProgress(options, {
+      phase: "scan",
+      completed: 0,
+      cancellable: true,
+    });
+    const scan = await scanLocalTree(
+      this.vault,
+      this.mapping.rootPath,
+      scanBase,
+      identities,
+      {
+        ...capabilities,
+        maxFolders: capabilities.maxClientSpaceFolders,
+        maxPages: capabilities.maxClientSpacePages,
+      },
+      async (completed) =>
+        progressCheckpoint(options, {
+          phase: "scan",
+          completed,
+          cancellable: true,
+        }),
+    );
+    if (epoch !== this.scanEpoch) throw new Error("扫描纪元已变更");
+    await this.identities.write(identities);
+    return scan;
+  }
+
   private computeManifestBytes(
     protocolVersion: "1" | "2",
     spaceId: string,
@@ -591,7 +925,7 @@ export class SyncRuntime {
   }
 
   private prefixAction(action: TreePullAction): TreePullAction {
-    const prefix = this.mapping.rootPath + "/";
+    const prefix = this.mapping.rootPath ? this.mapping.rootPath + "/" : "";
     switch (action.kind) {
       case "create_directory":
       case "trash_directory":
@@ -627,8 +961,29 @@ export class SyncRuntime {
     }
   }
 
+  private prefixActionV3(action: TreePullActionV3): TreePullActionV3 {
+    if (
+      action.kind === "create_attachment" ||
+      action.kind === "write_attachment"
+    )
+      return {
+        ...action,
+        attachment: {
+          ...action.attachment,
+          path: joinRoot(this.mapping.rootPath, action.attachment.path),
+        },
+      };
+    if (action.kind === "remove_attachment_path")
+      return {
+        ...action,
+        path: joinRoot(this.mapping.rootPath, action.path),
+      };
+    if (action.kind === "detach_attachment") return action;
+    return this.prefixAction(action);
+  }
+
   async establishEmptyBase(): Promise<void> {
-    const head = await this.remote.head();
+    const head = await this.legacyTreeRemote.head();
     await this.treeBaseline.prepare(
       {
         protocolVersion: "2",
@@ -649,7 +1004,8 @@ export class SyncRuntime {
       this.root + "/pull/journal.json",
     );
     if (pullVersion === 1) await this.recoverLegacyPull();
-    else if (pullVersion === 2) await this.recoverTreePull();
+    else if (pullVersion === 2 || pullVersion === 3)
+      await this.recoverTreePull();
     else if (pullVersion !== null) throw new Error("不支持的拉取日志版本");
 
     const pushVersion = await this.readJournalSchemaVersion(
@@ -715,10 +1071,40 @@ export class SyncRuntime {
       this.root + "/pull",
     );
     const tree = await treeTx.inspect();
+    const v3After = await this.v3PullControlAfter.read();
+    if (
+      tree &&
+      v3After?.payload.transactionId === tree.transactionId &&
+      (tree.state === "verified" || tree.state === "committed")
+    ) {
+      await treeTx.assertApplied();
+      const hasBaselineTransaction = await this.treeBaseline.hasTransaction(
+        tree.transactionId,
+      );
+      if (!hasBaselineTransaction) {
+        if (tree.state === "verified") {
+          await this.withoutRenameHints(() => treeTx.rollbackVerified());
+          await new BlobStagingRepository(
+            this.control,
+            this.root + "/pull-staging",
+          ).cleanup();
+          return;
+        }
+        throw new Error("V3_BASELINE_RECOVERY_EVIDENCE_MISSING");
+      }
+      await this.treeBaseline.recover(tree.transactionId);
+      await this.applyV3ControlAfter(tree.transactionId);
+      await treeTx.markCommitted();
+      await new BlobStagingRepository(
+        this.control,
+        this.root + "/pull-staging",
+      ).cleanup();
+      return;
+    }
     let committedTransactionId: string | null =
       tree?.state === "committed" ? tree.transactionId : null;
     if (tree && !committedTransactionId) {
-      await treeTx.recover();
+      await this.withoutRenameHints(() => treeTx.recover());
       const recovered = await treeTx.inspect();
       committedTransactionId =
         recovered?.state === "committed" ? recovered.transactionId : null;
@@ -758,7 +1144,7 @@ export class SyncRuntime {
 
   private async recoverTreePush(): Promise<void> {
     const pushService = new TreePushService(
-      this.remote,
+      this.legacyTreeRemote,
       this.control,
       this.root + "/push",
     );
@@ -796,14 +1182,17 @@ export class SyncRuntime {
   async status(options?: SyncOperationOptions): Promise<RuntimeStatus> {
     const base = await this.readBaseSnapshot();
     const local = await this.scan(options);
-    const head = await this.remote.head();
+    const head = await this.legacyTreeRemote.head();
     return {
-      protocolVersion: this.remote.protocolVersion,
+      protocolVersion: this.legacyTreeRemote.protocolVersion,
       baseRevision: base?.revision ?? "0",
       remoteRevision: head.revision,
       local: computeTreeStatus(
         base ??
-          emptySnapshot(this.remote.protocolVersion, this.mapping.spaceId),
+          emptySnapshot(
+            this.legacyTreeRemote.protocolVersion,
+            this.mapping.spaceId,
+          ),
         local,
       ),
     };
@@ -811,7 +1200,7 @@ export class SyncRuntime {
 
   async remoteDelta(): Promise<RemoteDelta> {
     const base = await this.readBaseSnapshot();
-    const head = await this.remote.head();
+    const head = await this.legacyTreeRemote.head();
     const baseRevision = base?.revision ?? "0";
     const ahead = head.revision !== baseRevision;
     if (!ahead || baseRevision === "0" || !base) {
@@ -824,7 +1213,7 @@ export class SyncRuntime {
       };
     }
     try {
-      const delta = await this.remote.delta(baseRevision);
+      const delta = await this.legacyTreeRemote.delta(baseRevision);
       return {
         baseRevision,
         remoteRevision: delta.toRevision,
@@ -844,6 +1233,7 @@ export class SyncRuntime {
   }
 
   async hasUnfinishedPush(): Promise<boolean> {
+    if (this.remoteV3) return false;
     const version = await this.readJournalSchemaVersion(
       this.root + "/push/journal.json",
     );
@@ -862,7 +1252,7 @@ export class SyncRuntime {
     }
     if (version === null) return false;
     const push = await new TreePushService(
-      this.remote,
+      this.legacyTreeRemote,
       this.control,
       this.root + "/push",
     ).inspect();
@@ -873,10 +1263,418 @@ export class SyncRuntime {
     );
   }
 
+  async previewBootstrapPullV3() {
+    return this.requireV3Remote().bootstrapPreview();
+  }
+
+  async confirmBootstrapPullV3(
+    preview: Awaited<ReturnType<TreeRemotePortV3["bootstrapPreview"]>>,
+    options?: SyncOperationOptions,
+  ): Promise<PullPreviewV3> {
+    if (preview.blockers.length > 0) throw new Error("V3_BOOTSTRAP_BLOCKED");
+    await this.requireV3Remote().bootstrapConfirmed({
+      baseRevision: preview.baseRevision,
+      confirmationHash: preview.candidateHash,
+      userConfirmed: true,
+    });
+    return this.previewPullV3(options);
+  }
+
+  async previewPullV3(options?: SyncOperationOptions): Promise<PullPreviewV3> {
+    const remotePort = this.requireV3Remote();
+    const space = (await remotePort.spaces()).find(
+      (item) => item.spaceId === this.mapping.spaceId,
+    );
+    if (space?.syncMode === "bootstrap_required")
+      throw new Error("V3_BOOTSTRAP_CONFIRMATION_REQUIRED");
+    const head = await remotePort.head();
+    const remote = await this.downloadRemoteSnapshotV3(head.revision, options);
+    const capabilities = await remotePort.capabilities();
+    const base = (await this.readBaseSnapshotV3()) ?? this.emptySnapshotV3();
+    const local = await this.scanV3(base, capabilities, options);
+    const missing = remote.attachments.filter((attachment) => {
+      const localAttachment = local.attachments.find(
+        (item) => item.attachmentId === attachment.attachmentId,
+      );
+      return localAttachment?.contentHash !== attachment.contentHash;
+    });
+    let transferId: string | null = null;
+    if (missing.length > 0) {
+      transferId = crypto.randomUUID();
+      const expiresAt = new Date(
+        Date.now() + capabilities.blobStagingTtlSeconds * 1000,
+      ).toISOString();
+      const staging = new BlobStagingRepository(
+        this.control,
+        this.root + "/pull-staging",
+        capabilities,
+      );
+      await new BlobTransfer(remotePort, staging, capabilities).downloadMissing(
+        {
+          transferId,
+          expiresAt,
+          revision: remote.revision,
+          attachments: missing,
+          signal: options?.signal,
+        },
+      );
+    }
+    await progressCheckpoint(options, {
+      phase: "merge",
+      completed: 0,
+      cancellable: true,
+    });
+    const tree = await buildTreePullPreviewV3(base, local, remote);
+    return {
+      ...tree,
+      artifactRoots: transferId ? [this.root + "/pull-staging"] : [],
+      scanEpoch: this.scanEpoch,
+      capabilities,
+      transferId,
+    };
+  }
+
+  private async attachmentSourceBytes(
+    preview: PullPreviewV3,
+    action: Extract<
+      AttachmentPullAction,
+      { kind: "create_attachment" | "write_attachment" }
+    >,
+  ): Promise<Uint8Array | null> {
+    const staging = new BlobStagingRepository(
+      this.control,
+      this.root + "/pull-staging",
+      preview.capabilities,
+    );
+    if (preview.transferId) {
+      const staged = await staging.readComplete(action.attachment.contentHash);
+      if (staged) return staged;
+    }
+    const aliases = preview.attachmentPlan.identityAliases;
+    const selected =
+      action.source === "local"
+        ? preview.local.attachments
+        : action.source === "base"
+          ? preview.base.attachments
+          : preview.remote.attachments;
+    const candidates = [
+      ...selected,
+      ...preview.local.attachments,
+      ...preview.base.attachments,
+      ...preview.remote.attachments,
+    ].filter(
+      (item, index, all) =>
+        (aliases[item.attachmentId] ?? item.attachmentId) ===
+          action.attachment.attachmentId &&
+        item.contentHash === action.attachment.contentHash &&
+        all.findIndex(
+          (candidate) =>
+            candidate.path === item.path &&
+            candidate.contentHash === item.contentHash,
+        ) === index,
+    );
+    for (const candidate of candidates) {
+      const bytes = await this.vault.read(
+        joinRoot(this.mapping.rootPath, candidate.path),
+      );
+      if (bytes && (await sha256Hex(bytes)) === action.attachment.contentHash)
+        return bytes;
+    }
+    return null;
+  }
+
+  private async desiredV3Identities(
+    preview: PullPreviewV3,
+  ): Promise<TreeIdentityStateV2> {
+    const current = upgradeTreeIdentityState(await this.readIdentities());
+    const remotePages = new Map(
+      preview.remote.pages.map((page) => [page.pageId, page]),
+    );
+    const remoteAttachments = new Map(
+      preview.remote.attachments.map((attachment) => [
+        attachment.attachmentId,
+        attachment,
+      ]),
+    );
+    const attachments: TreeIdentityStateV2["attachments"] = {};
+    const pendingAttachments: TreeIdentityStateV2["pendingAttachments"] = {};
+    for (const attachment of preview.resolvedAttachments) {
+      const remote = remoteAttachments.get(attachment.attachmentId);
+      if (!remote) {
+        pendingAttachments[attachment.attachmentId] = {
+          attachmentId: attachment.attachmentId,
+          path: attachment.path,
+          pathKey: pathKey(attachment.path),
+          contentHash: attachment.contentHash,
+        };
+        continue;
+      }
+      attachments[attachment.attachmentId] = {
+        attachmentId: attachment.attachmentId,
+        path: attachment.path,
+        pathKey: pathKey(attachment.path),
+        baseContentHash: remote.contentHash,
+        active: true,
+      };
+    }
+    for (const attachment of [
+      ...Object.values(current.attachments),
+      ...preview.base.attachments,
+      ...preview.remote.attachments,
+    ]) {
+      if (
+        attachments[attachment.attachmentId] ||
+        pendingAttachments[attachment.attachmentId]
+      )
+        continue;
+      const path = attachment.path;
+      attachments[attachment.attachmentId] = {
+        attachmentId: attachment.attachmentId,
+        path,
+        pathKey: pathKey(path),
+        baseContentHash:
+          "baseContentHash" in attachment
+            ? attachment.baseContentHash
+            : attachment.contentHash,
+        active: false,
+      };
+    }
+    const pendingPages = Object.fromEntries(
+      preview.resolvedPages
+        .filter((page) => {
+          const remote = remotePages.get(page.pageId);
+          return (
+            !remote ||
+            remote.path !== page.path ||
+            remote.contentHash !== page.contentHash
+          );
+        })
+        .map((page) => [
+          page.pageId,
+          {
+            pageId: page.pageId,
+            path: page.path,
+            contentHash: page.contentHash,
+          },
+        ]),
+    );
+    return upgradeTreeIdentityState({
+      schemaVersion: 2,
+      folders: Object.fromEntries(
+        preview.resolvedFolders.map((folder) => [
+          folder.folderId,
+          {
+            folderId: folder.folderId,
+            path: folder.path,
+            pathKey: pathKey(folder.path),
+          },
+        ]),
+      ),
+      pendingFolders: {},
+      pendingPages,
+      attachments,
+      pendingAttachments,
+    });
+  }
+
+  private async verifyResolvedV3Vault(
+    preview: PullPreviewV3,
+    identities: TreeIdentityStateV2,
+  ): Promise<void> {
+    const actual = await scanLocalTree(
+      this.vault,
+      this.mapping.rootPath,
+      {
+        protocolVersion: "3",
+        spaceId: this.mapping.spaceId,
+        revision: preview.revision,
+        revisionContentHash: await treeRevisionContentHashV3({
+          protocolVersion: "3",
+          spaceId: this.mapping.spaceId,
+          folders: preview.resolvedFolders,
+          pages: preview.resolvedPages,
+          attachments: preview.resolvedAttachments,
+        }),
+        folders: preview.resolvedFolders,
+        pages: preview.resolvedPages,
+        attachments: preview.resolvedAttachments,
+      },
+      structuredClone(identities),
+      {
+        ...preview.capabilities,
+        maxFolders: preview.capabilities.maxClientSpaceFolders,
+        maxPages: preview.capabilities.maxClientSpacePages,
+      },
+    );
+    if (actual.blockers.length > 0) throw new Error("V3_VAULT_VERIFY_FAILED");
+    const folders = new Map(
+      actual.folders.map((item) => [item.folderId, item]),
+    );
+    const pages = new Map(actual.pages.map((item) => [item.pageId, item]));
+    const attachments = new Map(
+      actual.attachments.map((item) => [item.attachmentId, item]),
+    );
+    if (
+      folders.size !== preview.resolvedFolders.length ||
+      pages.size !== preview.resolvedPages.length ||
+      attachments.size !== preview.resolvedAttachments.length
+    )
+      throw new Error("V3_VAULT_VERIFY_FAILED");
+    for (const expected of preview.resolvedFolders) {
+      const value = folders.get(expected.folderId);
+      if (
+        !value ||
+        value.path !== expected.path ||
+        value.parentFolderId !== expected.parentFolderId
+      )
+        throw new Error("V3_VAULT_VERIFY_FAILED");
+    }
+    for (const expected of preview.resolvedPages) {
+      const value = pages.get(expected.pageId);
+      if (
+        !value ||
+        value.path !== expected.path ||
+        value.contentHash !== expected.contentHash ||
+        JSON.stringify(value.referencedAttachmentIds) !==
+          JSON.stringify(expected.referencedAttachmentIds)
+      )
+        throw new Error("V3_VAULT_VERIFY_FAILED");
+    }
+    for (const expected of preview.resolvedAttachments) {
+      const value = attachments.get(expected.attachmentId);
+      if (
+        !value ||
+        value.path !== expected.path ||
+        value.contentHash !== expected.contentHash ||
+        value.sizeBytes !== expected.sizeBytes ||
+        value.mimeType !== expected.mimeType ||
+        value.width !== expected.width ||
+        value.height !== expected.height
+      )
+        throw new Error("V3_VAULT_VERIFY_FAILED");
+    }
+  }
+
+  private async applyV3ControlAfter(transactionId: string): Promise<void> {
+    const after = await this.v3PullControlAfter.read();
+    if (
+      !after ||
+      after.payload.transactionId !== transactionId ||
+      after.payload.phase === "applied"
+    )
+      return;
+    await this.identities.commitConfirmedV3Activation();
+    await this.identities.write(after.payload.identities);
+    await this.v3PullControlAfter.write({ ...after.payload, phase: "applied" });
+  }
+
+  async applyPullV3(
+    preview: PullPreviewV3,
+    options?: SyncOperationOptions,
+  ): Promise<void> {
+    if (pendingTreeDecisionCount(preview) > 0)
+      throw new Error("拉取存在未解决的结构化冲突");
+    await progressCheckpoint(options, {
+      phase: "apply",
+      completed: 0,
+      cancellable: true,
+    });
+    for (const page of preview.resolvedPages)
+      await this.control.write(
+        "tree-preview-body/" + page.pageId + ".md",
+        page.body,
+      );
+    const identities = await this.desiredV3Identities(preview);
+    const tx = new TreeTransaction(
+      this.vault,
+      this.control,
+      this.root + "/pull",
+      (action) => this.attachmentSourceBytes(preview, action),
+    );
+    const transactionId = crypto.randomUUID();
+    await tx.prepare(
+      {
+        baseRevision: preview.base.revision,
+        targetRevision: preview.revision,
+        targetTreeHash: await treeRevisionContentHashV3({
+          protocolVersion: "3",
+          spaceId: this.mapping.spaceId,
+          folders: preview.resolvedFolders,
+          pages: preview.resolvedPages,
+          attachments: preview.resolvedAttachments,
+        }),
+        actions: preview.actions.map((action) => this.prefixActionV3(action)),
+        deferCommit: true,
+      },
+      transactionId,
+    );
+    await this.v3PullControlAfter.write({
+      schemaVersion: 2,
+      transactionId,
+      phase: "pending",
+      identities,
+    });
+    try {
+      await this.withoutRenameHints(() => tx.apply());
+      await this.verifyResolvedV3Vault(preview, identities);
+      await tx.markVerified();
+    } catch (error) {
+      await this.withoutRenameHints(() => tx.recover());
+      await this.treeBaseline.recover(null);
+      throw error;
+    }
+    try {
+      await this.treeBaseline.prepare(preview.remote, "pull", transactionId);
+      await this.treeBaseline.setPhase("applying");
+      await tx.assertApplied();
+      await this.treeBaseline.recover(transactionId);
+    } catch (error) {
+      // If no baseline journal exists, the pointer cannot have switched and a
+      // verified Vault result is still safely reversible. Once the journal
+      // exists, recovery decides whether to finish the durable pointer switch.
+      const baselineJournalExists =
+        await this.treeBaseline.hasTransaction(transactionId);
+      if (!baselineJournalExists) {
+        await this.withoutRenameHints(() => tx.rollbackVerified());
+        await new BlobStagingRepository(
+          this.control,
+          this.root + "/pull-staging",
+          preview.capabilities,
+        ).cleanup();
+      }
+      throw error;
+    }
+    await this.applyV3ControlAfter(transactionId);
+    await tx.markCommitted();
+    await new BlobStagingRepository(
+      this.control,
+      this.root + "/pull-staging",
+      preview.capabilities,
+    ).cleanup();
+    await this.discardPullPreviewV3(preview);
+    this.mapping.status = "active";
+  }
+
+  async discardPullPreviewV3(preview: PullPreviewV3): Promise<void> {
+    for (const page of preview.resolvedPages)
+      await this.control.remove("tree-preview-body/" + page.pageId + ".md");
+    if (preview.transferId)
+      await new BlobStagingRepository(
+        this.control,
+        this.root + "/pull-staging",
+        preview.capabilities,
+      ).cleanup();
+  }
+
   async previewPull(options?: SyncOperationOptions): Promise<PullPreview> {
     const base = await this.readBaseSnapshot();
-    const head = await this.remote.head();
+    const head = await this.legacyTreeRemote.head();
     const remote = await this.downloadRemoteSnapshot(head.revision, options);
+    if (
+      remote.pages.some((page) => this.hasLegacyManagedImageCandidate(page)) ||
+      (await this.localHasLegacyManagedImageCandidate())
+    )
+      throw new Error("SYNC_PROTOCOL_UPGRADE_REQUIRED");
     const local = await this.scan(options, base ? undefined : remote.pages);
     const tree = await buildTreePullPreview(
       base ?? emptySnapshot(remote.protocolVersion, remote.spaceId),
@@ -898,6 +1696,29 @@ export class SyncRuntime {
         vaultByteHash: page.contentHash,
       })),
     };
+  }
+
+  private hasLegacyManagedImageCandidate(page: TreePage): boolean {
+    return parseAttachmentReferences(page.body, page.path).some(
+      (reference) =>
+        reference.classification !== "external" &&
+        reference.classification !== "page_embed",
+    );
+  }
+
+  private async localHasLegacyManagedImageCandidate(): Promise<boolean> {
+    for await (const entry of this.vault.listMarkdown(this.mapping.rootPath)) {
+      const body = decodeVaultMarkdown(entry.bytes).normalized;
+      if (
+        parseAttachmentReferences(body, entry.relativePath).some(
+          (reference) =>
+            reference.classification !== "external" &&
+            reference.classification !== "page_embed",
+        )
+      )
+        return true;
+    }
+    return false;
   }
 
   async applyPull(
@@ -956,7 +1777,7 @@ export class SyncRuntime {
       },
       baselineTx.transactionId,
     );
-    await tx.apply();
+    await this.withoutRenameHints(() => tx.apply());
     await this.treeBaseline.commit();
     await this.commitIdentities(
       preview.resolvedFolders,
@@ -969,8 +1790,9 @@ export class SyncRuntime {
   }
 
   async previewPush(options?: SyncOperationOptions): Promise<PushPreview> {
+    if (this.remoteV3) throw new Error("V3_PUSH_NOT_IMPLEMENTED");
     const base = await this.readBaseSnapshot();
-    const head = await this.remote.head();
+    const head = await this.legacyTreeRemote.head();
     if (this.mapping.status === "pending") {
       const remoteHasContent =
         head.pageCount !== "0" || head.folderCount !== "0";
@@ -984,11 +1806,15 @@ export class SyncRuntime {
     if (head.revision !== baseRevision) throw new Error("BASE_STALE");
     const local = await this.scan(options);
     const changes = await this.computePushChanges(
-      base ?? emptySnapshot(this.remote.protocolVersion, this.mapping.spaceId),
+      base ??
+        emptySnapshot(
+          this.legacyTreeRemote.protocolVersion,
+          this.mapping.spaceId,
+        ),
       local,
       options,
     );
-    const capabilities = await this.remote.capabilities();
+    const capabilities = await this.legacyTreeRemote.capabilities();
     return {
       spaceId: this.mapping.spaceId,
       baseRevision,
@@ -1004,7 +1830,7 @@ export class SyncRuntime {
     local: LocalTreeScan,
     options?: SyncOperationOptions,
   ): Promise<PreparedTreePushChange[]> {
-    const isV1 = this.remote.protocolVersion === "1";
+    const isV1 = this.legacyTreeRemote.protocolVersion === "1";
     const baseFolders = new Map(base.folders.map((f) => [f.folderId, f]));
     const localFolders = new Map(local.folders.map((f) => [f.folderId, f]));
     const basePages = new Map(base.pages.map((p) => [p.pageId, p]));
@@ -1113,7 +1939,7 @@ export class SyncRuntime {
   ): Promise<void> {
     if (!preview.changes.length) return;
     const service = new TreePushService(
-      this.remote,
+      this.legacyTreeRemote,
       this.control,
       this.root + "/push",
     );

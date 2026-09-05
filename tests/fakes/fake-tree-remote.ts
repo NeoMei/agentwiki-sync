@@ -1,14 +1,24 @@
 import {
+  canonicalBytes,
   capabilitiesHash,
   contentHash,
   revisionContentHash,
   type SyncPage,
 } from "../../src/agentwiki/protocol";
 import {
+  TREE_SYNC_V3_HARD_LIMITS,
+  treeCapabilitiesHashV3,
   treeRevisionContentHashV2,
+  treeRevisionContentHashV3,
+  type BlobChunkReceiptV3,
+  type BlobRequirementV3,
+  type CompletedBlobV3,
+  type SyncAttachmentV3,
   type SyncFolderV2,
   type SyncPageV2,
+  type SyncPageV3,
   type TreePushBatchV2,
+  type TreeSyncCapabilitiesV3,
 } from "@neomei/agentwiki-sync-protocol";
 import type {
   TreeDelta,
@@ -21,6 +31,14 @@ import type {
   TreeSpaceSummary,
   TreeSyncLimits,
   TreeCreatePushSession,
+  TreeRemotePortV3,
+  TreeSnapshotSegmentV3,
+  TreeHeadV3,
+  TreeSpaceSummaryV3,
+  TreeBootstrapPreviewV3,
+  TreeFinalizeResultV3,
+  TreePushSessionV3,
+  TreePushSessionStatusV3,
 } from "../../src/ports/tree-remote";
 import type {
   TreeDeltaItem,
@@ -44,6 +62,19 @@ const CAPABILITIES: TreeSyncLimits = {
   maxResponseBytes: 4194304,
   maxPageItems: 200,
   pushSessionTtlSeconds: 900,
+};
+
+export const V3_CAPABILITIES: TreeSyncCapabilitiesV3 = {
+  ...CAPABILITIES,
+  maxChangeCount: 100,
+  maxClientTotalBodyBytes: 2 * 1024 * 1024,
+  maxClientSpaceFolders: CAPABILITIES.maxClientSpaceFolders!,
+  maxSnapshotObjects: CAPABILITIES.maxSnapshotObjects!,
+  maxDeltaItems: CAPABILITIES.maxDeltaItems!,
+  ...TREE_SYNC_V3_HARD_LIMITS,
+  allowedMimeTypes: ["image/gif", "image/jpeg", "image/png", "image/webp"],
+  blobStagingTtlSeconds: 900,
+  downloadAuthorizationTtlSeconds: 300,
 };
 
 interface Session {
@@ -403,5 +434,194 @@ export class FakeTreeRemote implements TreeRemotePort {
 
   sessionCount(): number {
     return this.sessions.size;
+  }
+}
+
+export class FakeTreeRemoteV3 implements TreeRemotePortV3 {
+  readonly protocolVersion = "3" as const;
+  readonly capabilitiesHash = treeCapabilitiesHashV3(V3_CAPABILITIES);
+  readonly downloads: Array<{
+    revision: string;
+    attachmentId: string;
+    contentHash: string;
+  }> = [];
+  failAfterSnapshot = false;
+  syncMode: TreeSpaceSummaryV3["syncMode"] = "native_v3";
+  private revision = "rev-3";
+  private folders: SyncFolderV2[] = [];
+  private pages: SyncPageV3[] = [];
+  private attachments: SyncAttachmentV3[] = [];
+  private readonly blobs = new Map<string, Uint8Array>();
+
+  async seedTree(input: {
+    revision?: string;
+    folders?: SyncFolderV2[];
+    pages?: SyncPageV3[];
+    attachments?: SyncAttachmentV3[];
+    blobs?: Record<string, Uint8Array>;
+  }): Promise<void> {
+    this.revision = input.revision ?? "rev-3";
+    this.folders = (input.folders ?? []).map((item) => ({ ...item }));
+    this.pages = (input.pages ?? []).map((item) => ({
+      ...item,
+      referencedAttachmentIds: [...item.referencedAttachmentIds],
+    }));
+    this.attachments = (input.attachments ?? []).map((item) => ({ ...item }));
+    this.blobs.clear();
+    for (const [id, bytes] of Object.entries(input.blobs ?? {}))
+      this.blobs.set(id, bytes.slice());
+  }
+
+  async capabilities(): Promise<TreeSyncCapabilitiesV3> {
+    return {
+      ...V3_CAPABILITIES,
+      allowedMimeTypes: [...V3_CAPABILITIES.allowedMimeTypes],
+    };
+  }
+
+  async refreshCapabilities(): Promise<TreeSyncCapabilitiesV3> {
+    return this.capabilities();
+  }
+
+  private async metrics() {
+    const manifest = {
+      protocolVersion: "3" as const,
+      spaceId: "space",
+      folders: this.folders,
+      pages: this.pages,
+      attachments: this.attachments,
+    };
+    return {
+      hash: await treeRevisionContentHashV3(manifest),
+      manifestBytes: canonicalBytes(manifest).byteLength,
+      bodyBytes: this.pages.reduce(
+        (total, page) => total + new TextEncoder().encode(page.body).byteLength,
+        0,
+      ),
+      attachmentBytes: this.attachments.reduce(
+        (total, attachment) => total + Number(attachment.sizeBytes),
+        0,
+      ),
+    };
+  }
+
+  async spaces(): Promise<TreeSpaceSummaryV3[]> {
+    const value = await this.metrics();
+    return [
+      {
+        spaceId: "space",
+        displayName: "Space",
+        role: "owner",
+        canRead: true,
+        canPublish: true,
+        syncMode: this.syncMode,
+        currentRevision: this.revision,
+        folderCount: String(this.folders.length),
+        pageCount: String(this.pages.length),
+        attachmentCount: String(this.attachments.length),
+        revisionManifestByteLength: String(value.manifestBytes),
+        revisionBodyBytes: String(value.bodyBytes),
+        revisionAttachmentBytes: String(value.attachmentBytes),
+      },
+    ];
+  }
+
+  async head(): Promise<TreeHeadV3> {
+    const value = await this.metrics();
+    return {
+      protocolVersion: "3",
+      spaceId: "space",
+      revision: this.revision,
+      sequence: 3,
+      revisionContentHash: value.hash,
+      folderCount: String(this.folders.length),
+      pageCount: String(this.pages.length),
+      attachmentCount: String(this.attachments.length),
+      revisionManifestByteLength: String(value.manifestBytes),
+      revisionBodyBytes: String(value.bodyBytes),
+      revisionAttachmentBytes: String(value.attachmentBytes),
+      publishedAt: "2026-09-05T00:00:00.000Z",
+    };
+  }
+
+  async *snapshotPages(
+    revision = this.revision,
+  ): AsyncIterable<TreeSnapshotSegmentV3> {
+    if (revision !== this.revision) throw new Error("REVISION_GONE");
+    const head = await this.head();
+    const { publishedAt: _publishedAt, ...metadata } = head;
+    yield {
+      ...metadata,
+      folders: this.folders.map((item) => ({ ...item })),
+      pages: this.pages.map((item) => ({
+        ...item,
+        referencedAttachmentIds: [...item.referencedAttachmentIds],
+      })),
+      attachments: this.attachments.map((item) => ({ ...item })),
+    };
+    if (this.failAfterSnapshot) throw new Error("SNAPSHOT_FINAL_HASH_MISMATCH");
+  }
+
+  async delta() {
+    return { toRevision: this.revision, items: [] };
+  }
+
+  async bootstrapPreview(): Promise<TreeBootstrapPreviewV3> {
+    return {
+      protocolVersion: "3",
+      mode: "bootstrap_required",
+      baseRevision: this.revision,
+      candidateHash: (await this.metrics()).hash,
+      attachmentCount: String(this.attachments.length),
+      transferBytes: String((await this.metrics()).attachmentBytes),
+      blockers: [],
+    };
+  }
+
+  async bootstrapConfirmed(input: {
+    baseRevision: string;
+    confirmationHash: string;
+    userConfirmed: true;
+  }): Promise<TreeFinalizeResultV3> {
+    void input;
+    this.syncMode = "native_v3";
+    const head = await this.head();
+    const { spaceId: _spaceId, ...result } = head;
+    return { ...result, status: "published", changeSetId: null };
+  }
+
+  async createPushSession(): Promise<TreePushSessionV3> {
+    throw new Error("V3_PUSH_NOT_IMPLEMENTED");
+  }
+  async uploadBatch(): Promise<{ receipt: string }> {
+    throw new Error("V3_PUSH_NOT_IMPLEMENTED");
+  }
+  async finalize(): Promise<TreeFinalizeResultV3> {
+    throw new Error("V3_PUSH_NOT_IMPLEMENTED");
+  }
+  async getSession(): Promise<TreePushSessionStatusV3> {
+    throw new Error("V3_PUSH_NOT_IMPLEMENTED");
+  }
+  async abort(): Promise<void> {}
+  async uploadBlobChunk(): Promise<BlobChunkReceiptV3> {
+    throw new Error("V3_PUSH_NOT_IMPLEMENTED");
+  }
+  async completeBlob(
+    _sessionId: string,
+    requirement: BlobRequirementV3,
+  ): Promise<CompletedBlobV3> {
+    return { ...requirement, verifiedAt: "2026-09-05T00:00:00.000Z" };
+  }
+
+  async downloadBlob(input: {
+    revision: string;
+    attachmentId: string;
+    contentHash: string;
+  }): Promise<Uint8Array> {
+    this.downloads.push({ ...input });
+    if (input.revision !== this.revision) throw new Error("REVISION_GONE");
+    const bytes = this.blobs.get(input.attachmentId);
+    if (!bytes) throw new Error("ATTACHMENT_BLOB_MISSING");
+    return bytes.slice();
   }
 }

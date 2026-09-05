@@ -1,7 +1,11 @@
 import { pathKey } from "@neomei/agentwiki-sync-protocol";
 
 import { sha256Hex } from "../agentwiki/protocol";
-import type { TreePullAction } from "../core/merge";
+import type {
+  AttachmentPullAction,
+  TreePullAction,
+  TreePullActionV3,
+} from "../core/merge";
 import type { ControlStorePort } from "../ports/control-store";
 import type { VaultPort } from "../ports/vault";
 import { MutableControlRepository } from "../storage/envelope";
@@ -22,12 +26,12 @@ interface OperationPath {
 }
 
 interface JournalOperation {
-  action: TreePullAction;
+  action: TreePullActionV3;
   paths: OperationPath[];
 }
 
 export interface TreeTransactionJournal {
-  schemaVersion: 2;
+  schemaVersion: 2 | 3;
   transactionId: string;
   baseRevision: string;
   targetRevision: string;
@@ -35,19 +39,24 @@ export interface TreeTransactionJournal {
   state:
     | "prepared"
     | "applying"
+    | "applied"
+    | "verified"
     | "committed"
     | "rolling_back"
     | "rolled_back"
     | "ambiguous";
   nextOperation: number;
   operations: JournalOperation[];
+  deferCommit?: boolean;
 }
 
 export interface TreeTransactionInput {
   baseRevision: string;
   targetRevision: string;
   targetTreeHash: string;
-  actions: TreePullAction[];
+  actions: TreePullActionV3[];
+  /** Keep sidecars and the applied state until generation/identity commit. */
+  deferCommit?: boolean;
 }
 
 function isPathState(value: unknown): value is PathState {
@@ -74,7 +83,7 @@ function isOperationPath(value: unknown): value is OperationPath {
 function isJournalOperation(value: unknown): value is JournalOperation {
   if (!value || typeof value !== "object") return false;
   const item = value as Partial<JournalOperation>;
-  const action = item.action as Partial<TreePullAction> | undefined;
+  const action = item.action as Partial<TreePullActionV3> | undefined;
   return (
     typeof action?.kind === "string" &&
     Array.isArray(item.paths) &&
@@ -87,7 +96,7 @@ function isTreeTransactionJournal(
 ): value is TreeTransactionJournal {
   if (!value || typeof value !== "object") return false;
   const item = value as Partial<TreeTransactionJournal>;
-  if (item.schemaVersion !== 2) return false;
+  if (item.schemaVersion !== 2 && item.schemaVersion !== 3) return false;
   return (
     typeof item.transactionId === "string" &&
     typeof item.baseRevision === "string" &&
@@ -96,6 +105,8 @@ function isTreeTransactionJournal(
     [
       "prepared",
       "applying",
+      "applied",
+      "verified",
       "committed",
       "rolling_back",
       "rolled_back",
@@ -104,7 +115,8 @@ function isTreeTransactionJournal(
     Number.isSafeInteger(item.nextOperation) &&
     (item.nextOperation ?? -1) >= 0 &&
     Array.isArray(item.operations) &&
-    item.operations.every(isJournalOperation)
+    item.operations.every(isJournalOperation) &&
+    (item.deferCommit === undefined || typeof item.deferCommit === "boolean")
   );
 }
 
@@ -132,9 +144,9 @@ function pathDepth(path: string): number {
 }
 
 function isPageUpsert(
-  action: TreePullAction,
+  action: TreePullActionV3,
 ): action is Extract<
-  TreePullAction,
+  TreePullActionV3,
   { kind: "create_page" | "write_page" | "move_page" }
 > {
   return (
@@ -144,7 +156,23 @@ function isPageUpsert(
   );
 }
 
-function beforeSourcePath(action: TreePullAction, journalPath: string): string {
+function isAttachmentFileAction(
+  action: TreePullActionV3,
+): action is Extract<
+  TreePullActionV3,
+  { kind: "create_attachment" | "write_attachment" | "remove_attachment_path" }
+> {
+  return (
+    action.kind === "create_attachment" ||
+    action.kind === "write_attachment" ||
+    action.kind === "remove_attachment_path"
+  );
+}
+
+function beforeSourcePath(
+  action: TreePullActionV3,
+  journalPath: string,
+): string {
   if (
     action.kind === "move_page" &&
     action.beforePath &&
@@ -173,6 +201,12 @@ export class TreeTransaction {
     private readonly vault: VaultPort,
     private readonly control: ControlStorePort,
     private readonly root: string,
+    private readonly readAttachmentSource?: (
+      action: Extract<
+        AttachmentPullAction,
+        { kind: "create_attachment" | "write_attachment" }
+      >,
+    ) => Promise<Uint8Array | null>,
   ) {
     this.journal = new MutableControlRepository(
       control,
@@ -217,6 +251,10 @@ export class TreeTransaction {
         case "create_page":
         case "write_page":
         case "create_directory":
+        case "create_attachment":
+        case "write_attachment":
+        case "remove_attachment_path":
+        case "detach_attachment":
           return [];
       }
     });
@@ -232,7 +270,7 @@ export class TreeTransaction {
       );
     }
     await this.journal.write({
-      schemaVersion: 2,
+      schemaVersion: 3,
       transactionId,
       baseRevision: input.baseRevision,
       targetRevision: input.targetRevision,
@@ -240,6 +278,7 @@ export class TreeTransaction {
       state: "prepared",
       nextOperation: 0,
       operations,
+      deferCommit: input.deferCommit ?? false,
     });
   }
 
@@ -267,9 +306,14 @@ export class TreeTransaction {
         journal.nextOperation = index + 1;
         await this.save(journal);
       }
-      journal.state = "committed";
-      await this.save(journal);
-      await this.discardSidecars();
+      if (journal.deferCommit) {
+        journal.state = "applied";
+        await this.save(journal);
+      } else {
+        journal.state = "committed";
+        await this.save(journal);
+        await this.discardSidecars();
+      }
     } catch (error) {
       if (journal.state === "ambiguous") throw error;
       journal.state = "rolling_back";
@@ -282,14 +326,27 @@ export class TreeTransaction {
     const journal = await this.load();
     if (journal.state === "committed" || journal.state === "rolled_back")
       return;
+    if (journal.state === "verified") return;
     if (journal.state === "ambiguous")
       throw new Error(
         "TREE_TRANSACTION_AMBIGUOUS: 事务状态不明确，请按恢复指引处理",
       );
+    if (journal.state === "applied") {
+      await this.rollback(journal);
+      return;
+    }
     if (await this.isFullyApplied(journal)) {
-      journal.state = "committed";
-      await this.save(journal);
-      await this.discardSidecars();
+      if (!journal.deferCommit) {
+        journal.state = "committed";
+        await this.save(journal);
+        await this.discardSidecars();
+        return;
+      }
+      // A deferred v3 transaction is not authoritative until the caller has
+      // durably recorded full Vault verification. A crash before that record
+      // therefore rolls back in this recovery call instead of exposing an
+      // intermediate `applied` state that would require a second restart.
+      await this.rollback(journal);
       return;
     }
     await this.rollback(journal);
@@ -313,6 +370,10 @@ export class TreeTransaction {
     return `${this.root}/results/${operationIndex}.md`;
   }
 
+  private attachmentResultPath(operationIndex: number): string {
+    return `${this.root}/results/${operationIndex}.bin`;
+  }
+
   private async discardSidecars(): Promise<void> {
     for (const dir of ["before", "results"]) {
       try {
@@ -321,6 +382,45 @@ export class TreeTransaction {
         // Best-effort: residual sidecars are inert after a terminal state.
       }
     }
+  }
+
+  async assertApplied(): Promise<void> {
+    const journal = await this.load();
+    if (
+      journal.state !== "applied" &&
+      journal.state !== "verified" &&
+      journal.state !== "committed"
+    )
+      throw new Error("TREE_TRANSACTION_NOT_APPLIED");
+    if (!(await this.isFullyApplied(journal))) {
+      journal.state = "ambiguous";
+      await this.save(journal);
+      throw new Error("TREE_TRANSACTION_AMBIGUOUS: 事务结果已被修改");
+    }
+  }
+
+  async markVerified(): Promise<void> {
+    const journal = await this.load();
+    if (journal.state === "verified" || journal.state === "committed") return;
+    await this.assertApplied();
+    journal.state = "verified";
+    await this.save(journal);
+  }
+
+  async markCommitted(): Promise<void> {
+    const journal = await this.load();
+    if (journal.state === "committed") return;
+    await this.assertApplied();
+    journal.state = "committed";
+    await this.save(journal);
+    await this.discardSidecars();
+  }
+
+  async rollbackVerified(): Promise<void> {
+    const journal = await this.load();
+    if (journal.state !== "verified")
+      throw new Error("TREE_TRANSACTION_NOT_VERIFIED");
+    await this.rollback(journal);
   }
 
   private async readPathState(path: string): Promise<PathState> {
@@ -341,7 +441,7 @@ export class TreeTransaction {
 
   private async materializeOperation(
     index: number,
-    action: TreePullAction,
+    action: TreePullActionV3,
     ownedRoots: string[],
   ): Promise<JournalOperation> {
     let paths: OperationPath[];
@@ -408,6 +508,28 @@ export class TreeTransaction {
           },
         ];
         break;
+      case "create_attachment":
+      case "write_attachment":
+        paths = [
+          {
+            path: action.attachment.path,
+            before: await this.readPathState(action.attachment.path),
+            after: { kind: "file", hash: action.attachment.contentHash },
+          },
+        ];
+        break;
+      case "remove_attachment_path":
+        paths = [
+          {
+            path: action.path,
+            before: await this.readPathState(action.path),
+            after: { kind: "missing", hash: null },
+          },
+        ];
+        break;
+      case "detach_attachment":
+        paths = [];
+        break;
     }
 
     for (let pathIndex = 0; pathIndex < paths.length; pathIndex += 1) {
@@ -416,10 +538,24 @@ export class TreeTransaction {
         const bytes = await this.fileBytes(beforeSourcePath(action, item.path));
         if ((await sha256Hex(bytes)) !== item.before.hash)
           throw new Error("前置快照读取失败");
-        await this.control.write(
-          this.beforePath(index, pathIndex),
-          encodeBase64(bytes),
-        );
+        if (isAttachmentFileAction(action)) {
+          if (!this.control.writeBinary || !this.control.readBinary)
+            throw new Error("ATTACHMENT_SOURCE_UNAVAILABLE");
+          await this.control.writeBinary(
+            this.beforePath(index, pathIndex),
+            bytes,
+          );
+          const durable = await this.control.readBinary(
+            this.beforePath(index, pathIndex),
+          );
+          if (!durable || (await sha256Hex(durable)) !== item.before.hash)
+            throw new Error("回滚前置快照已损坏");
+        } else {
+          await this.control.write(
+            this.beforePath(index, pathIndex),
+            encodeBase64(bytes),
+          );
+        }
       }
     }
 
@@ -432,6 +568,30 @@ export class TreeTransaction {
       )
         throw new Error("拉取结果边车校验失败");
       await this.control.write(this.resultPath(index), body);
+    }
+
+    if (
+      action.kind === "create_attachment" ||
+      action.kind === "write_attachment"
+    ) {
+      if (!this.readAttachmentSource || !this.control.writeBinary)
+        throw new Error("ATTACHMENT_SOURCE_UNAVAILABLE");
+      const bytes = await this.readAttachmentSource(action);
+      if (
+        !bytes ||
+        bytes.byteLength !== Number(action.attachment.sizeBytes) ||
+        (await sha256Hex(bytes)) !== action.attachment.contentHash
+      )
+        throw new Error("ATTACHMENT_SOURCE_MISMATCH");
+      await this.control.writeBinary(this.attachmentResultPath(index), bytes);
+      const durable = await this.control.readBinary?.(
+        this.attachmentResultPath(index),
+      );
+      if (
+        !durable ||
+        (await sha256Hex(durable)) !== action.attachment.contentHash
+      )
+        throw new Error("ATTACHMENT_SOURCE_MISMATCH");
     }
 
     return { action, paths };
@@ -587,6 +747,25 @@ export class TreeTransaction {
       case "trash_page":
         await this.vault.trashFile(action.path);
         break;
+      case "create_attachment":
+      case "write_attachment": {
+        const bytes = await this.control.readBinary?.(
+          this.attachmentResultPath(index),
+        );
+        if (
+          !bytes ||
+          (await sha256Hex(bytes)) !== action.attachment.contentHash
+        )
+          throw new Error("ATTACHMENT_SOURCE_MISMATCH");
+        await this.vault.ensureParentDirectories(action.attachment.path);
+        await this.vault.write(action.attachment.path, bytes);
+        break;
+      }
+      case "remove_attachment_path":
+        await this.vault.trashFile(action.path);
+        break;
+      case "detach_attachment":
+        break;
     }
   }
 
@@ -709,9 +888,14 @@ export class TreeTransaction {
   ): Promise<Uint8Array> {
     const pathIndex = operation.paths.findIndex((item) => item.path === path);
     if (pathIndex < 0) throw new Error("回滚前置快照缺失");
-    const raw = await this.control.read(this.beforePath(index, pathIndex));
-    if (raw === null) throw new Error("回滚前置快照缺失");
-    const bytes = decodeBase64(raw);
+    const binary = isAttachmentFileAction(operation.action)
+      ? await this.control.readBinary?.(this.beforePath(index, pathIndex))
+      : null;
+    const raw = binary
+      ? null
+      : await this.control.read(this.beforePath(index, pathIndex));
+    if (!binary && raw === null) throw new Error("回滚前置快照缺失");
+    const bytes = binary ?? decodeBase64(raw!);
     if ((await sha256Hex(bytes)) !== operation.paths[pathIndex]?.before.hash)
       throw new Error("回滚前置快照已损坏");
     return bytes;

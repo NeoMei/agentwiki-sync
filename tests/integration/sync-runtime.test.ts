@@ -1,19 +1,59 @@
 import { describe, expect, it } from "vitest";
 import { SyncRuntime } from "../../src/application/sync-runtime";
+import { resolvePageConflictV3 } from "../../src/application/tree-diff";
 import {
   canonicalBytes,
   confirmationHash,
   contentHash,
   sha256Hex,
 } from "../../src/agentwiki/protocol";
-import { FakeTreeRemote } from "../fakes/fake-tree-remote";
+import { FakeTreeRemote, FakeTreeRemoteV3 } from "../fakes/fake-tree-remote";
 import { FakeAgentWiki } from "../fakes/fake-agentwiki";
 import { MemoryControlStore } from "../fakes/memory-control-store";
 import { MemoryVault } from "../fakes/memory-vault";
 import { BaselineRepository } from "../../src/storage/baseline";
 import { TreeBaselineRepository } from "../../src/storage/tree-baseline";
+import { TreeIdentityRepository } from "../../src/storage/tree-identities";
 import { PushService } from "../../src/application/push-service";
-import type { TreeFolder, TreePage } from "../../src/core/tree-model";
+import type {
+  TreeAttachment,
+  TreeFolder,
+  TreePage,
+  TreePageV3,
+} from "../../src/core/tree-model";
+
+const PNG_2X3 = Uint8Array.from([
+  137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0,
+  0, 0, 3, 8, 6, 0, 0, 0, 0, 0, 0, 0,
+]);
+
+async function v3Attachment(
+  attachmentId: string,
+  path: string,
+): Promise<TreeAttachment> {
+  return {
+    attachmentId,
+    path,
+    mimeType: "image/png",
+    sizeBytes: String(PNG_2X3.byteLength),
+    width: 2,
+    height: 3,
+    contentHash: await sha256Hex(PNG_2X3),
+    updatedAt: "2026-09-05T00:00:00.000Z",
+  };
+}
+
+async function v3Page(
+  pageId: string,
+  path: string,
+  body: string,
+  attachmentIds: string[],
+): Promise<TreePageV3> {
+  return {
+    ...(await page(pageId, path, body)),
+    referencedAttachmentIds: attachmentIds,
+  };
+}
 
 function folder(
   folderId: string,
@@ -58,6 +98,459 @@ const mapping = (status: "pending" | "active" = "pending") => ({
 });
 
 describe("SyncRuntime", () => {
+  it("fully verifies a v3 snapshot before downloading any Blob or persisting preview effects", async () => {
+    const attachment = await v3Attachment(
+      "11111111-1111-4111-8111-111111111111",
+      "assets/image.png",
+    );
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({
+      pages: [
+        await v3Page(
+          "22222222-2222-4222-8222-222222222222",
+          "pages/note.md",
+          "![[assets/image.png]]",
+          [attachment.attachmentId],
+        ),
+      ],
+      attachments: [attachment],
+      blobs: { [attachment.attachmentId]: PNG_2X3 },
+    });
+    remote.failAfterSnapshot = true;
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    const progress: string[] = [];
+
+    await expect(
+      runtime.previewPullV3({
+        onProgress: (event) => progress.push(event.phase),
+      }),
+    ).rejects.toThrow(/SNAPSHOT_FINAL_HASH_MISMATCH/);
+    expect(remote.downloads).toEqual([]);
+    expect(vault.operations).toBe(0);
+    expect(control.files.size).toBe(0);
+    expect(control.binaryFiles.size).toBe(0);
+    expect(progress).toEqual([]);
+  });
+
+  it("downloads and applies a v3 referenced image, then the same revision is a zero-operation pull", async () => {
+    const attachment = await v3Attachment(
+      "11111111-1111-4111-8111-111111111111",
+      "assets/image.png",
+    );
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({
+      pages: [
+        await v3Page(
+          "22222222-2222-4222-8222-222222222222",
+          "pages/note.md",
+          "![[assets/image.png]]",
+          [attachment.attachmentId],
+        ),
+      ],
+      attachments: [attachment],
+      blobs: { [attachment.attachmentId]: PNG_2X3 },
+    });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+
+    const first = await runtime.previewPullV3();
+    await runtime.applyPullV3(first);
+    expect(vault.exists("Wiki/assets/image.png")).toBe(true);
+    expect(vault.text("Wiki/pages/note.md")).toBe("![[assets/image.png]]");
+    expect(
+      (
+        await new TreeBaselineRepository(
+          control,
+          ".agentwiki/devices/d-local/spaces/s-space",
+          "space",
+          "Wiki",
+        ).readSnapshot()
+      ).protocolVersion,
+    ).toBe("3");
+
+    vault.operationLog.length = 0;
+    const downloads = remote.downloads.length;
+    const second = await runtime.previewPullV3();
+    expect(second.actions).toEqual([]);
+    await runtime.applyPullV3(second);
+    expect(remote.downloads).toHaveLength(downloads);
+    expect(vault.operationLog).toEqual([]);
+    await expect(runtime.previewPush()).rejects.toThrow(
+      /V3_PUSH_NOT_IMPLEMENTED/,
+    );
+  });
+
+  it("re-verifies staged Blob bytes before any Vault or generation effect", async () => {
+    const attachment = await v3Attachment(
+      "11111111-1111-4111-8111-111111111111",
+      "assets/image.png",
+    );
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({
+      pages: [
+        await v3Page(
+          "22222222-2222-4222-8222-222222222222",
+          "pages/note.md",
+          "![[assets/image.png]]",
+          [attachment.attachmentId],
+        ),
+      ],
+      attachments: [attachment],
+      blobs: { [attachment.attachmentId]: PNG_2X3 },
+    });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    const preview = await runtime.previewPullV3();
+    const stagedPath =
+      ".agentwiki/devices/d-local/spaces/s-space/pull-staging/complete/" +
+      attachment.contentHash +
+      ".bin";
+    control.binaryFiles.set(stagedPath, Uint8Array.of(0));
+
+    await expect(runtime.applyPullV3(preview)).rejects.toThrow(
+      /complete verification failed/i,
+    );
+
+    expect(vault.operationLog).toEqual([]);
+    expect(
+      await new TreeBaselineRepository(
+        control,
+        ".agentwiki/devices/d-local/spaces/s-space",
+        "space",
+        "Wiki",
+      ).readOptional(),
+    ).toBeNull();
+  });
+
+  it("pulls a remote attachment rename without redownloading identical local bytes and preserves an independent local Markdown edit", async () => {
+    const attachmentId = "11111111-1111-4111-8111-111111111111";
+    const pageId = "22222222-2222-4222-8222-222222222222";
+    const original = await v3Attachment(attachmentId, "assets/image.png");
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({
+      revision: "rev-before",
+      pages: [
+        await v3Page(pageId, "pages/note.md", "![[assets/image.png]]", [
+          attachmentId,
+        ]),
+      ],
+      attachments: [original],
+      blobs: { [attachmentId]: PNG_2X3 },
+    });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    await runtime.applyPullV3(await runtime.previewPullV3());
+    const downloads = remote.downloads.length;
+    vault.seedMarkdown(
+      "Wiki/pages/note.md",
+      "Local note\n\n![[assets/image.png]]",
+    );
+    const renamed = await v3Attachment(attachmentId, "assets/renamed.png");
+    await remote.seedTree({
+      revision: "rev-after",
+      pages: [
+        await v3Page(pageId, "pages/note.md", "![[assets/renamed.png]]", [
+          attachmentId,
+        ]),
+      ],
+      attachments: [renamed],
+      blobs: { [attachmentId]: PNG_2X3 },
+    });
+
+    const preview = await runtime.previewPullV3();
+    expect(remote.downloads).toHaveLength(downloads);
+    expect(preview.pageConflicts).toHaveLength(1);
+    await resolvePageConflictV3(preview, preview.pageConflicts[0]!.conflictId, {
+      choice: "local",
+    });
+    await runtime.applyPullV3(preview);
+
+    expect(vault.exists("Wiki/assets/image.png")).toBe(false);
+    expect(vault.exists("Wiki/assets/renamed.png")).toBe(true);
+    expect(vault.text("Wiki/pages/note.md")).toBe(
+      "Local note\n\n![[assets/renamed.png]]",
+    );
+  });
+
+  it("recovers a verified v3 Pull after the generation pointer write fails", async () => {
+    const attachment = await v3Attachment(
+      "11111111-1111-4111-8111-111111111111",
+      "assets/image.png",
+    );
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({
+      pages: [
+        await v3Page(
+          "22222222-2222-4222-8222-222222222222",
+          "pages/note.md",
+          "![[assets/image.png]]",
+          [attachment.attachmentId],
+        ),
+      ],
+      attachments: [attachment],
+      blobs: { [attachment.attachmentId]: PNG_2X3 },
+    });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    const preview = await runtime.previewPullV3();
+    control.failNextTextWriteAt =
+      ".agentwiki/devices/d-local/spaces/s-space/tree-v2/current.json.next";
+
+    await expect(runtime.applyPullV3(preview)).rejects.toThrow(
+      /injected text write failure/,
+    );
+    const restarted = SyncRuntime.v3(vault, control, remote, mapping());
+    await restarted.recover();
+
+    expect(
+      (
+        await new TreeBaselineRepository(
+          control,
+          ".agentwiki/devices/d-local/spaces/s-space",
+          "space",
+          "Wiki",
+        ).readSnapshot()
+      ).protocolVersion,
+    ).toBe("3");
+    expect(
+      (
+        await new TreeIdentityRepository(
+          control,
+          ".agentwiki/devices/d-local/spaces/s-space/tree-identities.json",
+        ).read()
+      )?.payload.schemaVersion,
+    ).toBe(2);
+  });
+
+  it("rolls back an uncommitted v3 Pull when generation writing fails", async () => {
+    const attachment = await v3Attachment(
+      "11111111-1111-4111-8111-111111111111",
+      "assets/image.png",
+    );
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({
+      pages: [
+        await v3Page(
+          "22222222-2222-4222-8222-222222222222",
+          "pages/note.md",
+          "![[assets/image.png]]",
+          [attachment.attachmentId],
+        ),
+      ],
+      attachments: [attachment],
+      blobs: { [attachment.attachmentId]: PNG_2X3 },
+    });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    const preview = await runtime.previewPullV3();
+    control.failWhenTextPathIncludes = "/tree-v2/generations/";
+
+    await expect(runtime.applyPullV3(preview)).rejects.toThrow(
+      /injected text write failure/,
+    );
+    expect(vault.operationLog).toEqual([
+      "write:Wiki/assets/image.png",
+      "write:Wiki/pages/note.md",
+      "trash:Wiki/pages/note.md",
+      "trash:Wiki/assets/image.png",
+    ]);
+    expect(
+      [...control.binaryFiles.keys()].some((path) =>
+        path.includes("/pull-staging/"),
+      ),
+    ).toBe(false);
+    control.failWhenTextPathIncludes = null;
+    const restarted = SyncRuntime.v3(vault, control, remote, mapping());
+    await restarted.recover();
+
+    expect(vault.exists("Wiki/pages/note.md")).toBe(false);
+    expect(vault.exists("Wiki/assets/image.png")).toBe(false);
+    expect(
+      await new TreeBaselineRepository(
+        control,
+        ".agentwiki/devices/d-local/spaces/s-space",
+        "space",
+        "Wiki",
+      ).readOptional(),
+    ).toBeNull();
+    expect(
+      (
+        await new TreeIdentityRepository(
+          control,
+          ".agentwiki/devices/d-local/spaces/s-space/tree-identities.json",
+        ).read()
+      )?.payload.schemaVersion,
+    ).not.toBe(2);
+  });
+
+  it("does not switch the generation pointer when the user edits after generation write", async () => {
+    const pageId = "22222222-2222-4222-8222-222222222222";
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({
+      pages: [await v3Page(pageId, "pages/note.md", "remote", [])],
+    });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    const preview = await runtime.previewPullV3();
+    let injected = false;
+    control.onTextWrite = async (path) => {
+      if (injected || !path.endsWith("/manifest.json")) return;
+      injected = true;
+      vault.seedMarkdown("Wiki/pages/note.md", "user edit");
+    };
+
+    await expect(runtime.applyPullV3(preview)).rejects.toThrow(
+      /TREE_TRANSACTION_AMBIGUOUS/,
+    );
+
+    expect(vault.text("Wiki/pages/note.md")).toBe("user edit");
+    expect(
+      await new TreeBaselineRepository(
+        control,
+        ".agentwiki/devices/d-local/spaces/s-space",
+        "space",
+        "Wiki",
+      ).readOptional(),
+    ).toBeNull();
+  });
+
+  it("records a stable attachment rename at an empty mapping root and ignores transaction temp renames", async () => {
+    const attachmentId = "11111111-1111-4111-8111-111111111111";
+    const attachment = await v3Attachment(attachmentId, "assets/image.png");
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({
+      pages: [
+        await v3Page(
+          "22222222-2222-4222-8222-222222222222",
+          "pages/note.md",
+          "![[assets/image.png]]",
+          [attachmentId],
+        ),
+      ],
+      attachments: [attachment],
+      blobs: { [attachmentId]: PNG_2X3 },
+    });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, {
+      spaceId: "space",
+      rootPath: "",
+      status: "pending",
+    });
+    await runtime.applyPullV3(await runtime.previewPullV3());
+    await vault.rename("assets/image.png", "assets/renamed.png");
+    vault.seedMarkdown("pages/note.md", "![[assets/renamed.png]]");
+
+    await runtime.recordRename(
+      "assets/.agentwiki-tmp-image.png",
+      "assets/ignored.png",
+    );
+    await runtime.recordRename("assets/image.png", "assets/renamed.png");
+    const preview = await runtime.previewPullV3();
+
+    expect(preview.local.attachments).toContainEqual(
+      expect.objectContaining({ attachmentId, path: "assets/renamed.png" }),
+    );
+  });
+
+  it("preserves a stable page ID when the user renames a page under v3", async () => {
+    const pageId = "22222222-2222-4222-8222-222222222222";
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({
+      pages: [await v3Page(pageId, "pages/Before.md", "body", [])],
+    });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    await runtime.applyPullV3(await runtime.previewPullV3());
+    await vault.rename("Wiki/pages/Before.md", "Wiki/pages/After.md");
+    await runtime.recordRename("Wiki/pages/Before.md", "Wiki/pages/After.md");
+
+    const preview = await runtime.previewPullV3();
+
+    expect(preview.local.pages).toContainEqual(
+      expect.objectContaining({ pageId, path: "pages/After.md" }),
+    );
+  });
+
+  it("does not turn its own v3 transaction rename event into a user move hint", async () => {
+    const pageId = "22222222-2222-4222-8222-222222222222";
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({
+      revision: "rev-before",
+      pages: [await v3Page(pageId, "pages/Before.md", "body", [])],
+    });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    await runtime.applyPullV3(await runtime.previewPullV3());
+    await remote.seedTree({
+      revision: "rev-after",
+      pages: [await v3Page(pageId, "pages/After.md", "body", [])],
+    });
+    vault.onRename = (fromPath, toPath) =>
+      runtime.recordRename(fromPath, toPath);
+
+    await runtime.applyPullV3(await runtime.previewPullV3());
+
+    expect(
+      [...control.files.keys()].some((path) =>
+        path.endsWith("/move-hints.json"),
+      ),
+    ).toBe(false);
+  });
+
+  it.each([
+    ["local", "Local ![image](../assets/missing.png)", ""],
+    ["remote", "", "Remote ![image](../assets/missing.png)"],
+    ["unsupported", "", "Remote ![image](../assets/missing.svg)"],
+  ])(
+    "fails closed on a %s managed image candidate when using legacy sync",
+    async (_side, localBody, remoteBody) => {
+      const remote = new FakeTreeRemote();
+      if (remoteBody)
+        await remote.seed([await page("p1", "pages/Note.md", remoteBody)]);
+      const vault = new MemoryVault(
+        localBody ? { "Wiki/pages/Local.md": localBody } : {},
+      );
+      const control = new MemoryControlStore();
+      const runtime = new SyncRuntime(vault, control, remote, mapping());
+
+      await expect(runtime.previewPull()).rejects.toThrow(
+        /SYNC_PROTOCOL_UPGRADE_REQUIRED/,
+      );
+      expect(control.files.size).toBe(0);
+    },
+  );
+
+  it("keeps external image references compatible with legacy sync", async () => {
+    const remote = new FakeTreeRemote();
+    await remote.seed([
+      await page(
+        "p1",
+        "pages/Remote.md",
+        "![remote](https://example.com/image.png)",
+      ),
+    ]);
+    const runtime = new SyncRuntime(
+      new MemoryVault({
+        "Wiki/pages/Local.md": "![inline](data:image/png;base64,AA==)",
+      }),
+      new MemoryControlStore(),
+      remote,
+      mapping(),
+    );
+
+    await expect(runtime.previewPull()).resolves.toBeDefined();
+  });
   it("pulls, moves, pushes, and re-pulls an empty folder tree", async () => {
     const remote = new FakeTreeRemote();
     await remote.seedTree({

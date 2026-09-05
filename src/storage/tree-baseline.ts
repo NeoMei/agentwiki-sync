@@ -170,14 +170,17 @@ export class TreeBaselineRepository {
   async prepare(
     snapshot: TreeSnapshot,
     kind: TreeBaselineKind,
+    transactionId?: string,
   ): Promise<TreeBaselineJournal>;
   async prepare(
     snapshot: TreeSnapshotV3,
     kind: TreeBaselineKind,
+    transactionId?: string,
   ): Promise<TreeBaselineJournal>;
   async prepare(
     snapshot: TreeSnapshot | TreeSnapshotV3,
     kind: TreeBaselineKind,
+    transactionId?: string,
   ): Promise<TreeBaselineJournal> {
     const current = await this.selectPointer();
     if (snapshot.protocolVersion === "3" && kind !== "pull") {
@@ -235,7 +238,12 @@ export class TreeBaselineRepository {
         },
         bodies,
       );
-      return this.writePreparedJournal(current, generationId, kind);
+      return this.writePreparedJournal(
+        current,
+        generationId,
+        kind,
+        transactionId,
+      );
     }
     const validated = validateTreeSnapshot(snapshot);
     if (validated.protocolVersion !== "2")
@@ -271,17 +279,23 @@ export class TreeBaselineRepository {
       },
       bodies,
     );
-    return this.writePreparedJournal(current, generationId, kind);
+    return this.writePreparedJournal(
+      current,
+      generationId,
+      kind,
+      transactionId,
+    );
   }
 
   private async writePreparedJournal(
     current: ReturnType<typeof selectCurrentPointer>,
     generationId: string,
     kind: TreeBaselineKind,
+    transactionId: string = crypto.randomUUID(),
   ): Promise<TreeBaselineJournal> {
     const value: TreeBaselineJournal = {
       schemaVersion: 2,
-      transactionId: crypto.randomUUID(),
+      transactionId,
       kind,
       phase: "prepared",
       oldGenerationId: current?.payload.active
@@ -298,6 +312,10 @@ export class TreeBaselineRepository {
     const current = await this.journal.read();
     if (!current) throw new Error("基线日志缺失");
     await this.journal.write({ ...current.payload, phase });
+  }
+
+  async hasTransaction(transactionId: string): Promise<boolean> {
+    return (await this.journal.read())?.payload.transactionId === transactionId;
   }
 
   async commit(): Promise<void> {

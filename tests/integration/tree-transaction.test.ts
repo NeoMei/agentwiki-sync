@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
 
-import { contentHash } from "../../src/agentwiki/protocol";
+import {
+  canonicalBytes,
+  contentHash,
+  sha256Hex,
+} from "../../src/agentwiki/protocol";
 import { buildTreePullPreview } from "../../src/application/tree-diff";
 import { TreeTransaction } from "../../src/application/tree-transaction";
 import { sortTreePullActions } from "../../src/application/tree-preview";
-import type { TreePullAction } from "../../src/core/merge";
+import type { TreePullAction, TreePullActionV3 } from "../../src/core/merge";
 import type {
   TreeFolder,
   TreePage,
@@ -13,6 +17,28 @@ import type {
 import type { LocalTreeScan } from "../../src/core/tree-scan";
 import { MemoryControlStore } from "../fakes/memory-control-store";
 import { MemoryVault } from "../fakes/memory-vault";
+
+const IMAGE_BYTES = Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]);
+
+async function attachmentAction(
+  kind: "create_attachment" | "write_attachment",
+  path: string,
+): Promise<Extract<TreePullActionV3, { kind: typeof kind }>> {
+  return {
+    kind,
+    attachment: {
+      attachmentId: "11111111-1111-4111-8111-111111111111",
+      path,
+      mimeType: "image/png",
+      sizeBytes: String(IMAGE_BYTES.byteLength),
+      width: 1,
+      height: 1,
+      contentHash: await sha256Hex(IMAGE_BYTES),
+      updatedAt: "2026-09-05T00:00:00.000Z",
+    },
+    source: "remote",
+  };
+}
 
 function folder(
   folderId: string,
@@ -109,6 +135,205 @@ function seededControl(): MemoryControlStore {
 }
 
 describe("TreeTransaction", () => {
+  it("creates the new image before rewriting markdown and removes the old path last", async () => {
+    const vault = new MemoryVault({
+      "Wiki/pages/note.md": "![[../assets/old.png]]",
+      "Wiki/assets/old.png": "old image",
+    });
+    const control = new MemoryControlStore();
+    control.files.set("tree-preview-body/note.md", "![[../assets/new.png]]");
+    const tx = new TreeTransaction(
+      vault,
+      control,
+      ".agentwiki/tx/attachment-order",
+      async () => IMAGE_BYTES,
+    );
+    await tx.prepare({
+      baseRevision: "base",
+      targetRevision: "target",
+      targetTreeHash: "0".repeat(64),
+      deferCommit: true,
+      actions: [
+        await attachmentAction("create_attachment", "Wiki/assets/new.png"),
+        {
+          kind: "write_page",
+          pageId: "note",
+          path: "Wiki/pages/note.md",
+          bodyPath: "tree-preview-body/note.md",
+        },
+        {
+          kind: "remove_attachment_path",
+          attachmentId: "11111111-1111-4111-8111-111111111111",
+          path: "Wiki/assets/old.png",
+        },
+      ],
+    });
+
+    await tx.apply();
+
+    expect(vault.operationLog).toEqual([
+      "write:Wiki/assets/new.png",
+      "write:Wiki/pages/note.md",
+      "trash:Wiki/assets/old.png",
+    ]);
+    expect((await tx.inspect())?.state).toBe("applied");
+    await tx.markCommitted();
+    expect((await tx.inspect())?.state).toBe("committed");
+  });
+
+  it("does not overwrite a user edit while recovering an attachment write", async () => {
+    const vault = new MemoryVault({ "Wiki/assets/image.png": "before" });
+    const control = new MemoryControlStore();
+    const tx = new TreeTransaction(
+      vault,
+      control,
+      ".agentwiki/tx/attachment-user-edit",
+      async () => IMAGE_BYTES,
+    );
+    await tx.prepare({
+      baseRevision: "base",
+      targetRevision: "target",
+      targetTreeHash: "0".repeat(64),
+      actions: [
+        await attachmentAction("write_attachment", "Wiki/assets/image.png"),
+        { kind: "create_directory", folderId: "next", path: "Wiki/pages/X" },
+      ],
+    });
+    vault.failAfterOperations = 2;
+    await expect(tx.apply()).rejects.toThrow();
+    vault.failAfterOperations = null;
+    await vault.write(
+      "Wiki/assets/image.png",
+      new TextEncoder().encode("user edit"),
+    );
+
+    await expect(tx.recover()).rejects.toThrow(/TREE_TRANSACTION_AMBIGUOUS/);
+    expect(vault.text("Wiki/assets/image.png")).toBe("user edit");
+    expect((await tx.inspect())?.state).toBe("ambiguous");
+  });
+
+  it("stores attachment before images as private binary sidecars", async () => {
+    const vault = new MemoryVault({ "Wiki/assets/image.png": "before" });
+    const control = new MemoryControlStore();
+    const root = ".agentwiki/tx/attachment-binary-before";
+    const tx = new TreeTransaction(
+      vault,
+      control,
+      root,
+      async () => IMAGE_BYTES,
+    );
+
+    await tx.prepare({
+      baseRevision: "base",
+      targetRevision: "target",
+      targetTreeHash: "0".repeat(64),
+      actions: [
+        await attachmentAction("write_attachment", "Wiki/assets/image.png"),
+      ],
+    });
+
+    expect(control.binaryFiles.has(`${root}/before/0-0.bin`)).toBe(true);
+    expect(control.files.has(`${root}/before/0-0.bin`)).toBe(false);
+  });
+
+  it("rolls back a fully applied deferred transaction in one recovery call when final verification was not recorded", async () => {
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const root = ".agentwiki/tx/deferred-crash-before-verify";
+    const tx = new TreeTransaction(
+      vault,
+      control,
+      root,
+      async () => IMAGE_BYTES,
+    );
+    const action = await attachmentAction(
+      "create_attachment",
+      "Wiki/assets/image.png",
+    );
+    await tx.prepare({
+      baseRevision: "base",
+      targetRevision: "target",
+      targetTreeHash: "0".repeat(64),
+      deferCommit: true,
+      actions: [action],
+    });
+    vault.seedFile("Wiki/assets/image.png", IMAGE_BYTES);
+
+    const journalPath = `${root}/journal.json`;
+    const envelope = JSON.parse((await control.read(journalPath))!) as {
+      payload: Record<string, unknown>;
+      payloadHash: string;
+    };
+    envelope.payload = {
+      ...envelope.payload,
+      state: "applying",
+      nextOperation: 1,
+    };
+    envelope.payloadHash = await sha256Hex(canonicalBytes(envelope.payload));
+    control.files.set(journalPath, JSON.stringify(envelope));
+
+    await tx.recover();
+
+    expect((await tx.inspect())?.state).toBe("rolled_back");
+    expect(vault.exists("Wiki/assets/image.png")).toBe(false);
+  });
+
+  it.each([
+    ["image write", 2],
+    ["Markdown write", 3],
+    ["old attachment removal", 4],
+  ])(
+    "rolls back the full attachment/Page sequence after a fault at %s",
+    async (_checkpoint, operation) => {
+      const vault = new MemoryVault({
+        "Wiki/pages/note.md": "![[assets/old.png]]",
+        "Wiki/assets/old.png": "old image",
+      });
+      const control = new MemoryControlStore();
+      control.files.set("tree-preview-body/note.md", "![[assets/new.png]]");
+      const tx = new TreeTransaction(
+        vault,
+        control,
+        ".agentwiki/tx/attachment-fault-" + operation,
+        async () => IMAGE_BYTES,
+      );
+      await tx.prepare({
+        baseRevision: "base",
+        targetRevision: "target",
+        targetTreeHash: "0".repeat(64),
+        deferCommit: true,
+        actions: [
+          await attachmentAction("create_attachment", "Wiki/assets/new.png"),
+          {
+            kind: "write_page",
+            pageId: "note",
+            path: "Wiki/pages/note.md",
+            bodyPath: "tree-preview-body/note.md",
+          },
+          {
+            kind: "remove_attachment_path",
+            attachmentId: "11111111-1111-4111-8111-111111111111",
+            path: "Wiki/assets/old.png",
+          },
+          {
+            kind: "create_directory",
+            folderId: "33333333-3333-4333-8333-333333333333",
+            path: "Wiki/pages/after-attachment-sequence",
+          },
+        ],
+      });
+
+      vault.failAfterOperations = operation;
+      await expect(tx.apply()).rejects.toThrow(/injected vault failure/);
+      vault.failAfterOperations = null;
+      await tx.recover();
+
+      expect((await tx.inspect())?.state).toBe("rolled_back");
+      expect(vault.exists("Wiki/assets/new.png")).toBe(false);
+      expect(vault.text("Wiki/pages/note.md")).toBe("![[assets/old.png]]");
+      expect(vault.text("Wiki/assets/old.png")).toBe("old image");
+    },
+  );
   it.each([0, 1, 2, 3, 4, 5])(
     "recovers a folder/page plan after fault %s",
     async (fault) => {

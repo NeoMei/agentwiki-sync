@@ -4,15 +4,22 @@ export class MemoryControlStore implements ControlStorePort {
   readonly files = new Map<string, string>();
   readonly binaryFiles = new Map<string, Uint8Array>();
   failNextTextWriteAt: string | null = null;
+  failWhenTextPathIncludes: string | null = null;
+  onTextWrite?: (path: string) => Promise<void> | void;
   async read(path: string): Promise<string | null> {
     return this.files.get(path) ?? null;
   }
   async write(path: string, value: string): Promise<void> {
-    if (this.failNextTextWriteAt === path) {
+    if (
+      this.failNextTextWriteAt === path ||
+      (this.failWhenTextPathIncludes !== null &&
+        path.includes(this.failWhenTextPathIncludes))
+    ) {
       this.failNextTextWriteAt = null;
       throw new Error("injected text write failure");
     }
     this.files.set(path, value);
+    await this.onTextWrite?.(path);
   }
   async readBinary(path: string): Promise<Uint8Array | null> {
     const value = this.binaryFiles.get(path);
