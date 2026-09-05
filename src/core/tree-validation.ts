@@ -1,15 +1,20 @@
 import {
+  FlatAttachmentPathSchema,
   pathKey,
   validatePortableDirectoryPath,
   validatePortableMarkdownPath,
 } from "@neomei/agentwiki-sync-protocol";
 
 import type {
+  TreeAttachment,
   TreeFolder,
   TreePage,
+  TreePageV3,
   TreePushChange,
   TreeSnapshot,
+  TreeSnapshotV3,
 } from "./tree-model";
+import { parseAttachmentReferences } from "./attachment-reference";
 
 function assertManagedRoot(
   folders: TreeFolder[],
@@ -195,6 +200,97 @@ export function validateTreeSnapshot(input: TreeSnapshot): TreeSnapshot {
   assertUniqueIdsAndPathKeys(folders, pages);
   assertParentsAndNoCycles(folders, pages);
   return { ...input, folders, pages };
+}
+
+function validateAttachmentReferences(
+  pages: TreePageV3[],
+  attachments: TreeAttachment[],
+): void {
+  const attachmentIds = new Set(attachments.map((item) => item.attachmentId));
+  const referenced = new Set<string>();
+  const idByPath = new Map(
+    attachments.map((item) => [pathKey(item.path), item.attachmentId]),
+  );
+  for (const page of pages) {
+    const declared = page.referencedAttachmentIds;
+    if (
+      declared.some((id, index) =>
+        index === 0
+          ? !attachmentIds.has(id)
+          : !attachmentIds.has(id) || declared[index - 1]! >= id,
+      )
+    )
+      throw new TypeError(
+        `ATTACHMENT_REFERENCES_INVALID: Page ${page.pageId} manifest`,
+      );
+    const parsed = new Set<string>();
+    for (const reference of parseAttachmentReferences(page.body, page.path)) {
+      if (reference.classification === "invalid")
+        throw new TypeError(
+          `ATTACHMENT_REFERENCES_INVALID: Page ${page.pageId} contains an invalid local image reference`,
+        );
+      if (
+        reference.classification !== "local" &&
+        reference.classification !== "legacy"
+      )
+        continue;
+      const resolved =
+        reference.classification === "legacy"
+          ? `assets/${reference.target}`
+          : reference.resolvedPath!;
+      const id = idByPath.get(pathKey(resolved));
+      if (id) parsed.add(id);
+    }
+    const parsedIds = [...parsed].sort();
+    if (
+      parsedIds.length !== declared.length ||
+      parsedIds.some((id, index) => id !== declared[index])
+    )
+      throw new TypeError(
+        `ATTACHMENT_REFERENCES_INVALID: Page ${page.pageId} Markdown mismatch`,
+      );
+    for (const id of declared) referenced.add(id);
+  }
+  if (attachments.some((item) => !referenced.has(item.attachmentId)))
+    throw new TypeError(
+      "ATTACHMENT_REFERENCES_INVALID: unreferenced attachment",
+    );
+}
+
+export function validateTreeSnapshotV3(input: TreeSnapshotV3): TreeSnapshotV3 {
+  if (input.protocolVersion !== "3")
+    throw new TypeError(
+      `Unknown protocol version: ${String(input.protocolVersion)}`,
+    );
+  const legacy = validateTreeSnapshot({
+    protocolVersion: "2",
+    spaceId: input.spaceId,
+    revision: input.revision,
+    revisionContentHash: input.revisionContentHash,
+    folders: input.folders,
+    pages: input.pages,
+  });
+  const attachmentIds = new Set<string>();
+  const attachmentPathKeys = new Set<string>();
+  const attachments = input.attachments.map((attachment) => {
+    if (attachmentIds.has(attachment.attachmentId))
+      throw new TypeError(
+        `DUPLICATE_ATTACHMENT_ID: ${attachment.attachmentId}`,
+      );
+    attachmentIds.add(attachment.attachmentId);
+    const parsed = FlatAttachmentPathSchema.parse(attachment.path);
+    const key = pathKey(parsed);
+    if (attachmentPathKeys.has(key))
+      throw new TypeError(`ATTACHMENT_PATH_COLLISION: ${attachment.path}`);
+    attachmentPathKeys.add(key);
+    return { ...attachment, path: parsed };
+  });
+  const pages = legacy.pages.map((page, index) => ({
+    ...page,
+    referencedAttachmentIds: [...input.pages[index]!.referencedAttachmentIds],
+  }));
+  validateAttachmentReferences(pages, attachments);
+  return { ...input, folders: legacy.folders, pages, attachments };
 }
 
 export function sortTreeChanges<T extends TreePushChange>(changes: T[]): T[] {

@@ -2,16 +2,26 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildTreePullPreview,
+  buildTreePullPreviewV3,
   pendingTreeDecisionCount,
+  resolveAttachmentConflict,
   resolveFolderConflict,
+  resolveFolderConflictV3,
+  resolvePageConflictV3,
 } from "../../src/application/tree-diff";
-import type { TreePullPreview } from "../../src/application/tree-diff";
 import type {
+  TreePullPreview,
+  TreePullPreviewV3,
+} from "../../src/application/tree-diff";
+import type {
+  TreeAttachment,
   TreeFolder,
   TreePage,
+  TreePageV3,
   TreeSnapshot,
+  TreeSnapshotV3,
 } from "../../src/core/tree-model";
-import type { LocalTreeScan } from "../../src/core/tree-scan";
+import type { LocalTreeScan, LocalTreeScanV3 } from "../../src/core/tree-scan";
 
 function folder(
   folderId: string,
@@ -65,6 +75,60 @@ function snapshot(overrides: Partial<TreeSnapshot> = {}): TreeSnapshot {
 
 function localScan(folders: TreeFolder[], pages: TreePage[]): LocalTreeScan {
   return { rootPath: "Wiki", folders, pages };
+}
+
+function attachment(
+  attachmentId: string,
+  path: string,
+  contentHash = "a".repeat(64),
+): TreeAttachment {
+  return {
+    attachmentId,
+    path,
+    mimeType: "image/png",
+    sizeBytes: "1",
+    width: 1,
+    height: 1,
+    contentHash,
+    updatedAt: "2026-09-04T00:00:00Z",
+  };
+}
+
+function pageV3(
+  pageId: string,
+  path: string,
+  body: string,
+  referencedAttachmentIds: string[] = ["a"],
+): TreePageV3 {
+  return {
+    ...page(pageId, null, path, { body }),
+    referencedAttachmentIds,
+  };
+}
+
+function snapshotV3(
+  pages: TreePageV3[],
+  attachments: TreeAttachment[],
+  overrides: Partial<TreeSnapshotV3> = {},
+): TreeSnapshotV3 {
+  return {
+    protocolVersion: "3",
+    spaceId: "space-1",
+    revision: "rev-3",
+    revisionContentHash: "0".repeat(64),
+    folders: [],
+    pages,
+    attachments,
+    ...overrides,
+  };
+}
+
+function localScanV3(
+  pages: TreePageV3[],
+  attachments: TreeAttachment[],
+  blockers: LocalTreeScanV3["blockers"] = [],
+): LocalTreeScanV3 {
+  return { rootPath: "Wiki", folders: [], pages, attachments, blockers };
 }
 
 function moveConflictPreview(): Promise<TreePullPreview> {
@@ -340,6 +404,250 @@ describe("buildTreePullPreview", () => {
 
     expect(preview.pageConflicts).toHaveLength(1);
     expect(pendingTreeDecisionCount(preview)).toBe(1);
+  });
+});
+
+describe("buildTreePullPreviewV3", () => {
+  it("keeps an independent local body edit while rewriting a remote attachment rename", async () => {
+    const originalBody = 'before\n![alt](../assets/a.png "title")';
+    const localBody = 'local edit\n![alt](../assets/a.png "title")';
+    const base = snapshotV3(
+      [pageV3("p", "pages/P.md", originalBody)],
+      [attachment("a", "assets/a.png")],
+    );
+    const local = localScanV3(
+      [pageV3("p", "pages/P.md", localBody)],
+      [attachment("a", "assets/a.png")],
+    );
+    const remote = snapshotV3(
+      [pageV3("p", "pages/P.md", originalBody)],
+      [attachment("a", "assets/renamed.png")],
+      { revision: "rev-remote" },
+    );
+
+    const preview = await buildTreePullPreviewV3(base, local, remote);
+
+    expect(preview.blockers).toEqual([]);
+    expect(preview.attachmentConflicts).toEqual([]);
+    expect(preview.resolvedPages[0]).toMatchObject({
+      body: 'local edit\n![alt](../assets/renamed.png "title")',
+      referencedAttachmentIds: ["a"],
+    });
+    const kinds = preview.actions.map((action) => action.kind);
+    expect(kinds).toEqual([
+      "create_attachment",
+      "write_page",
+      "remove_attachment_path",
+    ]);
+  });
+
+  it("recomputes relative image traversal when a parent Folder moves", async () => {
+    const root = folder("f", null, "pages/Old");
+    const movedParent = folder("parent", null, "pages/New");
+    const moved = folder("f", "parent", "pages/New/Old");
+    const body = "![x](../../assets/a.png)";
+    const base = snapshotV3(
+      [{ ...pageV3("p", "pages/Old/P.md", body), folderId: "f" }],
+      [attachment("a", "assets/a.png")],
+      { folders: [root] },
+    );
+    const local = {
+      ...localScanV3(
+        [{ ...pageV3("p", "pages/Old/P.md", body), folderId: "f" }],
+        [attachment("a", "assets/a.png")],
+      ),
+      folders: [root],
+    };
+    const remote = snapshotV3(
+      [{ ...pageV3("p", "pages/New/P.md", body), folderId: "f" }],
+      [attachment("a", "assets/a.png")],
+      { folders: [movedParent, moved] },
+    );
+
+    const preview = await buildTreePullPreviewV3(base, local, remote);
+
+    expect(preview.resolvedPages[0]?.path).toBe("pages/New/Old/P.md");
+    expect(preview.resolvedPages[0]?.body).toBe("![x](../../../assets/a.png)");
+    expect(preview.resolvedPages[0]?.referencedAttachmentIds).toEqual(["a"]);
+  });
+
+  it("preserves scan blockers and excludes them from a confirmable preview", async () => {
+    const blocker = {
+      code: "ATTACHMENT_MISSING" as const,
+      pagePath: "pages/P.md",
+      target: "assets/missing.png",
+      detail: "missing",
+    };
+    const preview = await buildTreePullPreviewV3(
+      snapshotV3([], []),
+      localScanV3([], [], [blocker]),
+      snapshotV3([], []),
+    );
+    expect(preview.blockers).toContainEqual(blocker);
+    expect(pendingTreeDecisionCount(preview)).toBe(1);
+  });
+
+  it("keeps keep-both pending until an explicit valid Page redirect is resolved", async () => {
+    const body = "![[assets/a.png]]";
+    const base = snapshotV3(
+      [pageV3("p1", "pages/P1.md", body), pageV3("p2", "pages/P2.md", body)],
+      [attachment("a", "assets/a.png")],
+    );
+    const local = localScanV3(
+      [pageV3("p1", "pages/P1.md", body), pageV3("p2", "pages/P2.md", body)],
+      [attachment("a", "assets/a.png", "b".repeat(64))],
+    );
+    const remote = snapshotV3(
+      [pageV3("p1", "pages/P1.md", body), pageV3("p2", "pages/P2.md", body)],
+      [attachment("a", "assets/a.png", "c".repeat(64))],
+    );
+    const preview: TreePullPreviewV3 = await buildTreePullPreviewV3(
+      base,
+      local,
+      remote,
+    );
+    expect(pendingTreeDecisionCount(preview)).toBe(1);
+
+    await resolveAttachmentConflict(
+      preview,
+      preview.attachmentConflicts[0]!.conflictId,
+      {
+        choice: "keep_both",
+        primary: "remote",
+        secondaryAttachmentId: "22222222-2222-4222-8222-222222222222",
+        secondaryPath: "assets/a (2).png",
+        redirectPageIds: ["p2"],
+      },
+    );
+
+    expect(pendingTreeDecisionCount(preview)).toBe(0);
+    expect(
+      preview.resolvedPages.find((page) => page.pageId === "p1"),
+    ).toMatchObject({
+      body: "![[assets/a.png]]",
+      referencedAttachmentIds: ["a"],
+    });
+    expect(
+      preview.resolvedPages.find((page) => page.pageId === "p2"),
+    ).toMatchObject({
+      body: "![[assets/a (2).png]]",
+      referencedAttachmentIds: ["22222222-2222-4222-8222-222222222222"],
+    });
+  });
+
+  it("detaches after the last reference without scheduling removal of the local image", async () => {
+    const base = snapshotV3(
+      [pageV3("p", "pages/P.md", "![[assets/a.png]]")],
+      [attachment("a", "assets/a.png")],
+    );
+    const noReference = pageV3("p", "pages/P.md", "plain", []);
+    const preview = await buildTreePullPreviewV3(
+      base,
+      localScanV3([noReference], [attachment("a", "assets/a.png")]),
+      snapshotV3([noReference], []),
+    );
+    expect(preview.actions).toContainEqual({
+      kind: "detach_attachment",
+      attachmentId: "a",
+    });
+    expect(preview.actions).not.toContainEqual(
+      expect.objectContaining({ kind: "remove_attachment_path" }),
+    );
+  });
+
+  it("recomputes attachment rewrites after a v3 Page body resolution", async () => {
+    const baseBody = "base\n![[assets/a.png]]";
+    const localBody = "local\n![[assets/a.png]]";
+    const remoteBody = "remote\n![[assets/a.png]]";
+    const base = snapshotV3(
+      [pageV3("p", "pages/P.md", baseBody)],
+      [attachment("a", "assets/a.png")],
+    );
+    const local = localScanV3(
+      [pageV3("p", "pages/P.md", localBody)],
+      [attachment("a", "assets/a.png")],
+    );
+    const remote = snapshotV3(
+      [pageV3("p", "pages/P.md", remoteBody)],
+      [attachment("a", "assets/renamed.png")],
+    );
+    const preview = await buildTreePullPreviewV3(base, local, remote);
+    const conflictId = preview.pageConflicts[0]!.conflictId;
+
+    await resolvePageConflictV3(preview, conflictId, { choice: "local" });
+
+    expect(preview.pageConflicts).toEqual([]);
+    expect(preview.resolvedPages[0]?.body).toBe(
+      "local\n![[assets/renamed.png]]",
+    );
+    expect(pendingTreeDecisionCount(preview)).toBe(0);
+  });
+
+  it("re-derives attachment IDs from an independently merged final Page body", async () => {
+    const baseBody = "top\n![[assets/a.png]]\nbottom";
+    const localBody = "LOCAL\n![[assets/a.png]]\nbottom";
+    const remoteBody = "top\n![[assets/a.png]]\n![[assets/b.png]]\nbottom";
+    const base = snapshotV3(
+      [pageV3("p", "pages/P.md", baseBody, ["a"])],
+      [attachment("a", "assets/a.png")],
+    );
+    const local = localScanV3(
+      [pageV3("p", "pages/P.md", localBody, ["a"])],
+      [attachment("a", "assets/a.png")],
+    );
+    const remote = snapshotV3(
+      [pageV3("p", "pages/P.md", remoteBody, ["a", "b"])],
+      [attachment("a", "assets/a.png"), attachment("b", "assets/b.png")],
+    );
+
+    const preview = await buildTreePullPreviewV3(base, local, remote);
+
+    expect(preview.pageConflicts).toEqual([]);
+    expect(preview.blockers).toEqual([]);
+    expect(preview.resolvedPages[0]?.body).toContain("LOCAL");
+    expect(preview.resolvedPages[0]?.body).toContain("assets/b.png");
+    expect(preview.resolvedPages[0]?.referencedAttachmentIds).toEqual([
+      "a",
+      "b",
+    ]);
+    expect(
+      preview.resolvedAttachments.map((item) => item.attachmentId),
+    ).toEqual(["a", "b"]);
+  });
+
+  it("recomputes the typed v3 candidate after a Folder resolution", async () => {
+    const parentA = folder("pa", null, "pages/A");
+    const parentB = folder("pb", null, "pages/B");
+    const baseFolder = folder("f", null, "pages/X");
+    const localFolder = folder("f", "pa", "pages/A/X");
+    const remoteFolder = folder("f", "pb", "pages/B/X");
+    const body = "![x](../../../assets/a.png)";
+    const base = snapshotV3(
+      [{ ...pageV3("p", "pages/X/P.md", body), folderId: "f" }],
+      [attachment("a", "assets/a.png")],
+      { folders: [parentA, parentB, baseFolder] },
+    );
+    const local = {
+      ...localScanV3(
+        [{ ...pageV3("p", "pages/A/X/P.md", body), folderId: "f" }],
+        [attachment("a", "assets/a.png")],
+      ),
+      folders: [parentA, parentB, localFolder],
+    };
+    const remote = snapshotV3(
+      [{ ...pageV3("p", "pages/B/X/P.md", body), folderId: "f" }],
+      [attachment("a", "assets/a.png")],
+      { folders: [parentA, parentB, remoteFolder] },
+    );
+    const preview = await buildTreePullPreviewV3(base, local, remote);
+    const conflictId = preview.folderConflicts[0]!.conflictId;
+
+    await resolveFolderConflictV3(preview, conflictId, { choice: "remote" });
+
+    expect(preview.folderConflicts).toEqual([]);
+    expect(preview.resolvedPages[0]?.path).toBe("pages/B/X/P.md");
+    expect(preview.resolvedPages[0]?.referencedAttachmentIds).toEqual(["a"]);
+    expect(pendingTreeDecisionCount(preview)).toBe(0);
   });
 });
 

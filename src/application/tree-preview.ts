@@ -6,6 +6,7 @@ import type {
   PageMergePlan,
   StructuredConflict,
   TreePullAction,
+  TreePullActionV3,
 } from "../core/merge";
 import type { LocalTreeScan } from "../core/tree-scan";
 import type { TreeSnapshot } from "../core/tree-model";
@@ -265,6 +266,75 @@ export function sortTreePullActions(
   actions: TreePullAction[],
 ): TreePullAction[] {
   return topologicalSort(actions);
+}
+
+function isAttachmentAction(
+  action: TreePullActionV3,
+): action is Exclude<TreePullActionV3, TreePullAction> {
+  return (
+    action.kind === "create_attachment" ||
+    action.kind === "write_attachment" ||
+    action.kind === "remove_attachment_path" ||
+    action.kind === "detach_attachment"
+  );
+}
+
+/**
+ * Keep the proven legacy topology intact while bracketing Page mutations with
+ * the v3 attachment safety order: materialize bytes first, then Pages, then
+ * release an owned old path, and detach identity last.
+ */
+export function sortTreePullActionsV3(
+  actions: TreePullActionV3[],
+): TreePullActionV3[] {
+  const materialize = actions
+    .filter(
+      (action) =>
+        action.kind === "create_attachment" ||
+        action.kind === "write_attachment",
+    )
+    .sort((left, right) => {
+      const leftAttachment = "attachment" in left ? left.attachment : null;
+      const rightAttachment = "attachment" in right ? right.attachment : null;
+      if (!leftAttachment || !rightAttachment) return 0;
+      const pathDelta = comparePathKeys(
+        leftAttachment.path,
+        rightAttachment.path,
+      );
+      return (
+        pathDelta ||
+        compareIds(leftAttachment.attachmentId, rightAttachment.attachmentId)
+      );
+    });
+  const legacy = sortTreePullActions(
+    actions.filter(
+      (action): action is TreePullAction => !isAttachmentAction(action),
+    ),
+  );
+  const remove = actions
+    .filter((action) => action.kind === "remove_attachment_path")
+    .sort((left, right) => {
+      if (
+        left.kind !== "remove_attachment_path" ||
+        right.kind !== "remove_attachment_path"
+      )
+        return 0;
+      return (
+        comparePathKeys(left.path, right.path) ||
+        compareIds(left.attachmentId, right.attachmentId)
+      );
+    });
+  const detach = actions
+    .filter((action) => action.kind === "detach_attachment")
+    .sort((left, right) => {
+      if (
+        left.kind !== "detach_attachment" ||
+        right.kind !== "detach_attachment"
+      )
+        return 0;
+      return compareIds(left.attachmentId, right.attachmentId);
+    });
+  return [...materialize, ...legacy, ...remove, ...detach];
 }
 
 export function orderPreviewActions(

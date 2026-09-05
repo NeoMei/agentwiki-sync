@@ -1,7 +1,13 @@
 import { diff3Merge } from "node-diff3";
-import { pathKey } from "@neomei/agentwiki-sync-protocol";
 import { contentHash, sha256Hex } from "../agentwiki/protocol";
-import type { TreeFolder, TreePage } from "./tree-model";
+import type { TreeAttachment, TreeFolder, TreePage } from "./tree-model";
+
+export type {
+  AttachmentConflict,
+  AttachmentConflictResolution,
+  AttachmentMergeClassification,
+  AttachmentMergePlan,
+} from "./attachment-merge";
 
 export interface StructuredConflict {
   conflictId: string;
@@ -158,6 +164,30 @@ export type TreePullAction =
       beforePath?: string;
     }
   | { kind: "trash_page"; pageId: string; path: string };
+
+/**
+ * Attachment actions are intentionally separate from the legacy transaction
+ * union. Task 16/17 own the journaled runtime consumer for this v3 surface.
+ */
+export type AttachmentPullAction =
+  | {
+      kind: "create_attachment";
+      attachment: TreeAttachment;
+      source: "base" | "local" | "remote";
+    }
+  | {
+      kind: "write_attachment";
+      attachment: TreeAttachment;
+      source: "base" | "local" | "remote";
+    }
+  | {
+      kind: "remove_attachment_path";
+      attachmentId: string;
+      path: string;
+    }
+  | { kind: "detach_attachment"; attachmentId: string };
+
+export type TreePullActionV3 = TreePullAction | AttachmentPullAction;
 
 export interface ResolvedFolderLocation {
   folderId: string;

@@ -6,6 +6,15 @@ import {
 
 import { contentHash } from "../agentwiki/protocol";
 
+import { parseAttachmentReferences } from "../core/attachment-reference";
+import {
+  mergeAttachmentsById,
+  rewriteAttachmentPageReferences,
+  type AttachmentConflict,
+  type AttachmentConflictResolution,
+  type AttachmentMergePlan,
+  type AttachmentRewriteBlocker,
+} from "../core/attachment-merge";
 import {
   mergeFoldersById,
   mergePagesById,
@@ -17,16 +26,38 @@ import {
   type ResolvedPageLocation,
   type StructuredConflict,
   type TreePullAction,
+  type TreePullActionV3,
 } from "../core/merge";
-import type { LocalTreeScan } from "../core/tree-scan";
-import type { TreeFolder, TreePage, TreeSnapshot } from "../core/tree-model";
-import { validateTreeSnapshot } from "../core/tree-validation";
-import { orderPreviewActions, type PreviewCandidate } from "./tree-preview";
+import type {
+  AttachmentScanBlocker,
+  LocalTreeScan,
+  LocalTreeScanV3,
+} from "../core/tree-scan";
+import type {
+  TreeAttachment,
+  TreeFolder,
+  TreePage,
+  TreePageV3,
+  TreeSnapshot,
+  TreeSnapshotV3,
+} from "../core/tree-model";
+import {
+  validateTreeSnapshot,
+  validateTreeSnapshotV3,
+} from "../core/tree-validation";
+import {
+  orderPreviewActions,
+  sortTreePullActionsV3,
+  type PreviewCandidate,
+} from "./tree-preview";
 
 export type {
+  AttachmentConflict,
+  AttachmentConflictResolution,
   FolderConflict,
   FolderConflictResolution,
   TreePullAction,
+  TreePullActionV3,
 } from "../core/merge";
 
 export interface TreePullPreview {
@@ -43,6 +74,26 @@ export interface TreePullPreview {
   pagePlan: PageMergePlan;
   resolvedFolders: TreeFolder[];
   resolvedPages: TreePage[];
+}
+
+export interface TreePullPreviewV3 {
+  revision: string;
+  actions: TreePullActionV3[];
+  blockers: Array<AttachmentScanBlocker | AttachmentRewriteBlocker>;
+  attachmentConflicts: AttachmentConflict[];
+  attachmentConflictResolutions: Record<string, AttachmentConflictResolution>;
+  folderConflicts: FolderConflict[];
+  folderConflictResolutions: Record<string, FolderConflictResolution>;
+  pageConflicts: StructuredConflict[];
+  pageConflictResolutions: Record<string, PageConflictResolution>;
+  readonly base: TreeSnapshotV3;
+  readonly local: LocalTreeScanV3;
+  readonly remote: TreeSnapshotV3;
+  pagePlan: PageMergePlan;
+  attachmentPlan: AttachmentMergePlan;
+  resolvedFolders: TreeFolder[];
+  resolvedPages: TreePageV3[];
+  resolvedAttachments: TreeAttachment[];
 }
 
 export interface PageConflictResolution {
@@ -589,6 +640,433 @@ export async function buildTreePullPreview(
   return computePreview(base, local, remote, pagePlan, {}, {});
 }
 
+function legacySnapshot(snapshot: TreeSnapshotV3): TreeSnapshot {
+  return {
+    protocolVersion: "2",
+    spaceId: snapshot.spaceId,
+    revision: snapshot.revision,
+    revisionContentHash: snapshot.revisionContentHash,
+    folders: snapshot.folders,
+    pages: snapshot.pages.map(
+      ({ referencedAttachmentIds: _ids, ...page }) => page,
+    ),
+  };
+}
+
+function legacyScan(scan: LocalTreeScanV3): LocalTreeScan {
+  return {
+    rootPath: scan.rootPath,
+    folders: scan.folders,
+    pages: scan.pages.map(({ referencedAttachmentIds: _ids, ...page }) => page),
+  };
+}
+
+function sourcePageFor(
+  resolved: TreePage,
+  base: TreeSnapshotV3,
+  local: LocalTreeScanV3,
+  remote: TreeSnapshotV3,
+): TreePageV3 | undefined {
+  const candidates = [local.pages, remote.pages, base.pages]
+    .map((pages) => pages.find((page) => page.pageId === resolved.pageId))
+    .filter((page): page is TreePageV3 => page !== undefined);
+  const exact = candidates.find((page) => page.body === resolved.body);
+  if (exact) return exact;
+
+  const idsByPath = new Map<string, Set<string>>();
+  for (const attachment of [
+    ...local.attachments,
+    ...remote.attachments,
+    ...base.attachments,
+  ]) {
+    const key = pathKey(attachment.path);
+    const ids = idsByPath.get(key) ?? new Set<string>();
+    ids.add(attachment.attachmentId);
+    idsByPath.set(key, ids);
+  }
+  for (const candidate of candidates) {
+    const ids = new Set<string>();
+    let valid = true;
+    for (const reference of parseAttachmentReferences(
+      resolved.body,
+      candidate.path,
+    )) {
+      if (reference.classification === "invalid") {
+        valid = false;
+        break;
+      }
+      if (
+        reference.classification !== "local" &&
+        reference.classification !== "legacy"
+      )
+        continue;
+      const referenceKey = pathKey(
+        reference.classification === "legacy"
+          ? `assets/${reference.target}`
+          : reference.resolvedPath!,
+      );
+      const matchingIds = idsByPath.get(referenceKey);
+      if (!matchingIds || matchingIds.size !== 1) {
+        valid = false;
+        break;
+      }
+      ids.add([...matchingIds][0]!);
+    }
+    if (valid)
+      return {
+        ...candidate,
+        body: resolved.body,
+        referencedAttachmentIds: [...ids].sort(),
+      };
+  }
+  return candidates[0];
+}
+
+function attachmentReferencesByPage(
+  pages: TreePage[],
+  base: TreeSnapshotV3,
+  local: LocalTreeScanV3,
+  remote: TreeSnapshotV3,
+): Map<string, TreePageV3> {
+  const result = new Map<string, TreePageV3>();
+  for (const page of pages) {
+    const source = sourcePageFor(page, base, local, remote);
+    if (source) result.set(page.pageId, source);
+  }
+  return result;
+}
+
+function affectedPagesByAttachment(
+  sourcePages: Map<string, TreePageV3>,
+): Record<string, string[]> {
+  const result: Record<string, string[]> = {};
+  for (const page of sourcePages.values())
+    for (const attachmentId of page.referencedAttachmentIds)
+      (result[attachmentId] ??= []).push(page.pageId);
+  for (const pageIds of Object.values(result)) pageIds.sort();
+  return result;
+}
+
+function resolvedPagePlan(pages: TreePageV3[]): PageMergePlan {
+  return {
+    resolved: pages.map((page) => ({
+      pageId: page.pageId,
+      folderId: page.folderId,
+      filename: page.path.split("/").at(-1) ?? "",
+      title: page.title,
+      body: page.body,
+      contentHash: page.contentHash,
+      updatedAt: page.updatedAt,
+    })),
+    conflicts: [],
+  };
+}
+
+function attachmentActions(
+  local: LocalTreeScanV3,
+  plan: AttachmentMergePlan,
+  conflictIds: Set<string>,
+): TreePullActionV3[] {
+  const actions: TreePullActionV3[] = [];
+  const localById = new Map(
+    local.attachments.map((attachment) => [
+      plan.identityAliases[attachment.attachmentId] ?? attachment.attachmentId,
+      {
+        ...attachment,
+        attachmentId:
+          plan.identityAliases[attachment.attachmentId] ??
+          attachment.attachmentId,
+      },
+    ]),
+  );
+  for (const attachment of plan.attachments) {
+    if (conflictIds.has(attachment.attachmentId)) continue;
+    const before = localById.get(attachment.attachmentId);
+    const source =
+      plan.sourceByAttachmentId[attachment.attachmentId] ?? "remote";
+    if (!before || pathKey(before.path) !== pathKey(attachment.path))
+      actions.push({ kind: "create_attachment", attachment, source });
+    else if (before.contentHash !== attachment.contentHash)
+      actions.push({ kind: "write_attachment", attachment, source });
+    if (before && pathKey(before.path) !== pathKey(attachment.path))
+      actions.push({
+        kind: "remove_attachment_path",
+        attachmentId: attachment.attachmentId,
+        path: before.path,
+      });
+  }
+  for (const attachmentId of plan.detachedAttachmentIds)
+    actions.push({ kind: "detach_attachment", attachmentId });
+  return actions;
+}
+
+async function computePreviewV3(
+  base: TreeSnapshotV3,
+  local: LocalTreeScanV3,
+  remote: TreeSnapshotV3,
+  pagePlan: PageMergePlan,
+  folderConflictResolutions: Record<string, FolderConflictResolution>,
+  pageConflictResolutions: Record<string, PageConflictResolution>,
+  attachmentConflictResolutions: Record<string, AttachmentConflictResolution>,
+): Promise<TreePullPreviewV3> {
+  const baseLegacy = legacySnapshot(base);
+  const localLegacy = legacyScan(local);
+  const remoteLegacy = legacySnapshot(remote);
+  const legacy = computePreview(
+    baseLegacy,
+    localLegacy,
+    remoteLegacy,
+    pagePlan,
+    folderConflictResolutions,
+    pageConflictResolutions,
+  );
+  const sourcePages = attachmentReferencesByPage(
+    legacy.resolvedPages,
+    base,
+    local,
+    remote,
+  );
+  const attachmentPlan = mergeAttachmentsById({
+    base: base.attachments,
+    local: local.attachments,
+    remote: remote.attachments,
+    affectedPageIdsByAttachment: affectedPagesByAttachment(sourcePages),
+    resolutions: attachmentConflictResolutions,
+  });
+  const aliases = attachmentPlan.identityAliases;
+  const sourceAttachments = [
+    ...local.attachments,
+    ...remote.attachments,
+    ...base.attachments,
+  ].map((attachment) => ({
+    ...attachment,
+    attachmentId: aliases[attachment.attachmentId] ?? attachment.attachmentId,
+  }));
+  const conflictedPages = new Set(
+    legacy.pageConflicts.map((conflict) => conflict.pageId),
+  );
+  const attachmentConflictIds = new Set(
+    attachmentPlan.conflicts.map((conflict) => conflict.attachmentId),
+  );
+  const rewriteBlockers: AttachmentRewriteBlocker[] = [];
+  const resolvedPages: TreePageV3[] = [];
+  for (const page of legacy.resolvedPages) {
+    const source = sourcePages.get(page.pageId);
+    const sourceIds = (source?.referencedAttachmentIds ?? []).map(
+      (id) => aliases[id] ?? id,
+    );
+    const candidate: TreePageV3 = {
+      ...page,
+      referencedAttachmentIds: [...new Set(sourceIds)].sort(),
+    };
+    if (!source || conflictedPages.has(page.pageId)) {
+      resolvedPages.push(candidate);
+      continue;
+    }
+    if (
+      candidate.referencedAttachmentIds.some((id) =>
+        attachmentConflictIds.has(id),
+      )
+    ) {
+      resolvedPages.push(candidate);
+      continue;
+    }
+    const rewritten = await rewriteAttachmentPageReferences({
+      page: candidate,
+      sourcePath: source.path,
+      sourceAttachments,
+      finalPath: page.path,
+      finalAttachments: attachmentPlan.attachments,
+      redirects: attachmentPlan.pageAttachmentRedirects[page.pageId] ?? {},
+    });
+    rewriteBlockers.push(...rewritten.blockers);
+    resolvedPages.push(rewritten.page);
+  }
+
+  const rewrittenLegacy = computePreview(
+    baseLegacy,
+    localLegacy,
+    remoteLegacy,
+    resolvedPagePlan(resolvedPages),
+    folderConflictResolutions,
+    {},
+  );
+  const unresolvedPageIds = new Set(
+    legacy.pageConflicts.map((item) => item.pageId),
+  );
+  if (
+    local.blockers.length === 0 &&
+    rewriteBlockers.length === 0 &&
+    legacy.folderConflicts.length === 0 &&
+    legacy.pageConflicts.length === 0 &&
+    attachmentPlan.conflicts.length === 0
+  )
+    validateTreeSnapshotV3({
+      protocolVersion: "3",
+      spaceId: remote.spaceId,
+      revision: remote.revision,
+      revisionContentHash: remote.revisionContentHash,
+      folders: legacy.resolvedFolders,
+      pages: resolvedPages,
+      attachments: attachmentPlan.attachments,
+    });
+  const legacyActions = rewrittenLegacy.actions.filter((action) => {
+    if (
+      action.kind === "create_page" ||
+      action.kind === "write_page" ||
+      action.kind === "move_page" ||
+      action.kind === "trash_page"
+    )
+      return !unresolvedPageIds.has(action.pageId);
+    return true;
+  });
+  const attachment = attachmentActions(
+    local,
+    attachmentPlan,
+    attachmentConflictIds,
+  );
+  return {
+    revision: remote.revision,
+    actions: sortTreePullActionsV3([...attachment, ...legacyActions]),
+    blockers: [...local.blockers, ...rewriteBlockers],
+    attachmentConflicts: attachmentPlan.conflicts,
+    attachmentConflictResolutions,
+    folderConflicts: legacy.folderConflicts,
+    folderConflictResolutions,
+    pageConflicts: legacy.pageConflicts,
+    pageConflictResolutions,
+    base,
+    local,
+    remote,
+    pagePlan,
+    attachmentPlan,
+    resolvedFolders: legacy.resolvedFolders,
+    resolvedPages,
+    resolvedAttachments: attachmentPlan.attachments,
+  };
+}
+
+export async function buildTreePullPreviewV3(
+  base: TreeSnapshotV3,
+  local: LocalTreeScanV3,
+  remote: TreeSnapshotV3,
+): Promise<TreePullPreviewV3> {
+  const pagePlan = await mergePagesById(base.pages, local.pages, remote.pages);
+  return computePreviewV3(base, local, remote, pagePlan, {}, {}, {});
+}
+
+export async function resolveAttachmentConflict(
+  preview: TreePullPreviewV3,
+  conflictId: string,
+  resolution: AttachmentConflictResolution,
+): Promise<void> {
+  const conflict = preview.attachmentConflicts.find(
+    (item) => item.conflictId === conflictId,
+  );
+  if (!conflict)
+    throw new TypeError(
+      "ATTACHMENT_CONFLICT_NOT_FOUND: Attachment conflict does not exist",
+    );
+  const resolutions = {
+    ...preview.attachmentConflictResolutions,
+    [conflictId]: resolution,
+  };
+  const next = await computePreviewV3(
+    preview.base,
+    preview.local,
+    preview.remote,
+    preview.pagePlan,
+    preview.folderConflictResolutions,
+    preview.pageConflictResolutions,
+    resolutions,
+  );
+  preview.actions = next.actions;
+  preview.blockers = next.blockers;
+  preview.attachmentConflicts = next.attachmentConflicts;
+  preview.attachmentConflictResolutions = resolutions;
+  preview.folderConflicts = next.folderConflicts;
+  preview.pageConflicts = next.pageConflicts;
+  preview.resolvedFolders = next.resolvedFolders;
+  preview.resolvedPages = next.resolvedPages;
+  preview.resolvedAttachments = next.resolvedAttachments;
+  preview.attachmentPlan = next.attachmentPlan;
+}
+
+function applyPreviewV3(
+  preview: TreePullPreviewV3,
+  next: TreePullPreviewV3,
+): void {
+  preview.actions = next.actions;
+  preview.blockers = next.blockers;
+  preview.attachmentConflicts = next.attachmentConflicts;
+  preview.attachmentConflictResolutions = next.attachmentConflictResolutions;
+  preview.folderConflicts = next.folderConflicts;
+  preview.folderConflictResolutions = next.folderConflictResolutions;
+  preview.pageConflicts = next.pageConflicts;
+  preview.pageConflictResolutions = next.pageConflictResolutions;
+  preview.pagePlan = next.pagePlan;
+  preview.attachmentPlan = next.attachmentPlan;
+  preview.resolvedFolders = next.resolvedFolders;
+  preview.resolvedPages = next.resolvedPages;
+  preview.resolvedAttachments = next.resolvedAttachments;
+}
+
+export async function resolvePageConflictV3(
+  preview: TreePullPreviewV3,
+  conflictId: string,
+  resolution: PageConflictResolution,
+): Promise<void> {
+  if (!preview.pageConflicts.some((item) => item.conflictId === conflictId))
+    throw new TypeError("PAGE_CONFLICT_NOT_FOUND: 页面冲突不存在");
+  const resolutions = {
+    ...preview.pageConflictResolutions,
+    [conflictId]: resolution,
+  };
+  const pagePlan = await resolvePagePlan(
+    preview.pagePlan,
+    resolutions,
+    legacySnapshot(preview.base),
+    legacyScan(preview.local),
+    legacySnapshot(preview.remote),
+  );
+  const next = await computePreviewV3(
+    preview.base,
+    preview.local,
+    preview.remote,
+    pagePlan,
+    preview.folderConflictResolutions,
+    resolutions,
+    preview.attachmentConflictResolutions,
+  );
+  applyPreviewV3(preview, next);
+}
+
+export async function resolveFolderConflictV3(
+  preview: TreePullPreviewV3,
+  conflictId: string,
+  resolution: FolderConflictResolution,
+): Promise<void> {
+  const legacy = computePreview(
+    legacySnapshot(preview.base),
+    legacyScan(preview.local),
+    legacySnapshot(preview.remote),
+    preview.pagePlan,
+    preview.folderConflictResolutions,
+    preview.pageConflictResolutions,
+  );
+  resolveFolderConflict(legacy, conflictId, resolution);
+  const next = await computePreviewV3(
+    preview.base,
+    preview.local,
+    preview.remote,
+    preview.pagePlan,
+    legacy.folderConflictResolutions,
+    preview.pageConflictResolutions,
+    preview.attachmentConflictResolutions,
+  );
+  applyPreviewV3(preview, next);
+}
+
 export async function resolvePageConflict(
   preview: TreePullPreview,
   conflictId: string,
@@ -698,12 +1176,22 @@ export function resolveFolderConflict(
   preview.resolvedPages = next.resolvedPages;
 }
 
-export function pendingTreeDecisionCount(preview: TreePullPreview): number {
+export function pendingTreeDecisionCount(
+  preview: TreePullPreview | TreePullPreviewV3,
+): number {
   const unresolvedFolders = preview.folderConflicts.filter(
     (conflict) => !preview.folderConflictResolutions[conflict.conflictId],
   ).length;
   const unresolvedPages = preview.pageConflicts.filter(
     (conflict) => !preview.pageConflictResolutions[conflict.conflictId],
   ).length;
-  return unresolvedFolders + unresolvedPages;
+  if (!("attachmentConflicts" in preview))
+    return unresolvedFolders + unresolvedPages;
+  const unresolvedAttachments = preview.attachmentConflicts.length;
+  return (
+    unresolvedFolders +
+    unresolvedPages +
+    unresolvedAttachments +
+    preview.blockers.length
+  );
 }

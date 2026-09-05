@@ -3,12 +3,16 @@ import { describe, expect, it } from "vitest";
 import {
   sortTreeChanges,
   validateTreeSnapshot,
+  validateTreeSnapshotV3,
 } from "../../src/core/tree-validation";
 import type {
+  TreeAttachment,
   TreeFolder,
   TreePage,
+  TreePageV3,
   TreePushChange,
   TreeSnapshot,
+  TreeSnapshotV3,
 } from "../../src/core/tree-model";
 
 function folder(
@@ -248,5 +252,95 @@ describe("sortTreeChanges", () => {
       "upsert_folder:uf-deep",
       "upsert_page:up",
     ]);
+  });
+});
+
+describe("validateTreeSnapshotV3", () => {
+  const image: TreeAttachment = {
+    attachmentId: "a",
+    path: "assets/a.png",
+    mimeType: "image/png",
+    sizeBytes: "1",
+    width: 1,
+    height: 1,
+    contentHash: "a".repeat(64),
+    updatedAt: "2026-09-04T00:00:00Z",
+  };
+  const imagePage: TreePageV3 = {
+    ...page("p", null, "pages/P.md", { body: "![[assets/a.png]]" }),
+    referencedAttachmentIds: ["a"],
+  };
+  const v3 = (overrides: Partial<TreeSnapshotV3> = {}): TreeSnapshotV3 => ({
+    protocolVersion: "3",
+    spaceId: "space-1",
+    revision: "rev-3",
+    revisionContentHash: "0".repeat(64),
+    folders: [],
+    pages: [imagePage],
+    attachments: [image],
+    ...overrides,
+  });
+
+  it("accepts a referenced attachment and preserves the strict v3 shape", () => {
+    expect(validateTreeSnapshotV3(v3())).toEqual(v3());
+  });
+
+  it("rejects duplicate attachment IDs and pathKeys", () => {
+    expect(() =>
+      validateTreeSnapshotV3(
+        v3({ attachments: [image, { ...image, path: "assets/b.png" }] }),
+      ),
+    ).toThrow(/DUPLICATE_ATTACHMENT_ID/);
+    expect(() =>
+      validateTreeSnapshotV3(
+        v3({
+          attachments: [
+            image,
+            { ...image, attachmentId: "b", path: "assets/A.png" },
+          ],
+        }),
+      ),
+    ).toThrow(/ATTACHMENT_PATH_COLLISION/);
+  });
+
+  it("rejects reference manifests that are unsorted, missing, or not derived from Markdown", () => {
+    expect(() =>
+      validateTreeSnapshotV3(
+        v3({ pages: [{ ...imagePage, referencedAttachmentIds: ["a", "a"] }] }),
+      ),
+    ).toThrow(/ATTACHMENT_REFERENCES_INVALID/);
+    expect(() =>
+      validateTreeSnapshotV3(
+        v3({ pages: [{ ...imagePage, referencedAttachmentIds: ["missing"] }] }),
+      ),
+    ).toThrow(/ATTACHMENT_REFERENCES_INVALID/);
+    expect(() =>
+      validateTreeSnapshotV3(
+        v3({ pages: [{ ...imagePage, body: "no image" }] }),
+      ),
+    ).toThrow(/ATTACHMENT_REFERENCES_INVALID/);
+  });
+
+  it("rejects an attachment that is not referenced by any Page", () => {
+    expect(() => validateTreeSnapshotV3(v3({ pages: [] }))).toThrow(
+      /ATTACHMENT_REFERENCES_INVALID/,
+    );
+  });
+
+  it("rejects an invalid local image reference even when the declared set is empty", () => {
+    expect(() =>
+      validateTreeSnapshotV3(
+        v3({
+          pages: [
+            {
+              ...imagePage,
+              body: "![[../outside.png]]",
+              referencedAttachmentIds: [],
+            },
+          ],
+          attachments: [],
+        }),
+      ),
+    ).toThrow(/ATTACHMENT_REFERENCES_INVALID/);
   });
 });
