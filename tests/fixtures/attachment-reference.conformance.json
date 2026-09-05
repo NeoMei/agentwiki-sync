@@ -357,5 +357,70 @@
         "resolvedPath": "assets/real.png"
       }
     ]
+  },
+  {
+    "name": "empty-unordered-list-continuation-fence-exit",
+    "body": "-\n  ```md\n  ![[assets/hidden.png]]\n\n![[assets/real.png]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "managed",
+        "rawTarget": "assets/real.png",
+        "resolvedPath": "assets/real.png"
+      }
+    ]
+  },
+  {
+    "name": "empty-ordered-list-continuation-fence-exit",
+    "body": "1.\r\n   ```md\r\n   ![[assets/hidden.png]]\r\n\r\n![[assets/real.png]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "managed",
+        "rawTarget": "assets/real.png",
+        "resolvedPath": "assets/real.png"
+      }
+    ]
+  },
+  {
+    "name": "empty-list-trailing-whitespace-continuation-fence-exit",
+    "body": "-   \n  ```md\n  ![[assets/hidden.png]]\n\n![[assets/real.png]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "managed",
+        "rawTarget": "assets/real.png",
+        "resolvedPath": "assets/real.png"
+      }
+    ]
+  },
+  {
+    "name": "empty-list-extra-initial-blank-ends-container",
+    "body": "-\n\n  ```md\n  ![[assets/hidden.png]]\n\n![[assets/also-hidden.png]]",
+    "expected": []
+  },
+  {
+    "name": "nonempty-list-multiple-blanks-preserve-container",
+    "body": "- example\n\n\n  ```md\n  ![[assets/hidden.png]]\n\n![[assets/real.png]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "managed",
+        "rawTarget": "assets/real.png",
+        "resolvedPath": "assets/real.png"
+      }
+    ]
+  },
+  {
+    "name": "nested-empty-list-continuation-fence-exit",
+    "body": "-\n  -\n    child\n  ```md\n  ![[assets/hidden.png]]\n\n![[assets/real.png]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "managed",
+        "rawTarget": "assets/real.png",
+        "resolvedPath": "assets/real.png"
+      }
+    ]
   }
 ]

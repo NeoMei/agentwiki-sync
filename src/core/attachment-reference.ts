@@ -29,7 +29,12 @@ function mark(mask: Uint8Array, start: number, end: number): void {
 }
 
 type FenceContainerToken =
-  { kind: "quote" } | { kind: "list"; contentIndent: number };
+  | { kind: "quote" }
+  | {
+      kind: "list";
+      contentIndent: number;
+      awaitingFirstBlock: boolean;
+    };
 
 function quotePrefixEnd(line: string, start: number): number | null {
   const match = line.slice(start).match(/^ {0,3}>[ \t]?/u);
@@ -39,12 +44,24 @@ function quotePrefixEnd(line: string, start: number): number | null {
 function listMarker(
   line: string,
   start: number,
-): { end: number; contentIndent: number } | null {
+): {
+  end: number;
+  contentIndent: number;
+  awaitingFirstBlock: boolean;
+} | null {
   const match = line
     .slice(start)
-    .match(/^( {0,3})([-+*]|\d{1,9}[.)])([ \t]+)/u);
+    .match(/^( {0,3})([-+*]|\d{1,9}[.)])([ \t]*)(.*)/u);
   if (!match) return null;
   const beforeWhitespace = match[1]!.length + match[2]!.length;
+  const awaitingFirstBlock = match[4]!.trim().length === 0;
+  if (match[3]!.length === 0 && !awaitingFirstBlock) return null;
+  if (awaitingFirstBlock)
+    return {
+      end: line.length,
+      contentIndent: beforeWhitespace + 1,
+      awaitingFirstBlock: true,
+    };
   let paddingLength = 0;
   let contentIndent = beforeWhitespace;
   for (const character of match[3]!) {
@@ -66,6 +83,7 @@ function listMarker(
   return {
     end: start + match[1]!.length + match[2]!.length + paddingLength,
     contentIndent,
+    awaitingFirstBlock: false,
   };
 }
 
@@ -98,15 +116,24 @@ function containerTokenEnd(
 function lineContainer(
   line: string,
   inheritedListContainer: readonly FenceContainerToken[],
-): { content: string; container: FenceContainerToken[] } {
+): {
+  content: string;
+  inheritedContent: string;
+  container: FenceContainerToken[];
+} {
   let cursor = 0;
   const container: FenceContainerToken[] = [];
   for (const token of inheritedListContainer) {
     const end = containerTokenEnd(line, cursor, token);
     if (end === null) break;
-    container.push(token);
+    container.push(
+      token.kind === "list" && token.awaitingFirstBlock
+        ? { ...token, awaitingFirstBlock: false }
+        : token,
+    );
     cursor = end;
   }
+  const inheritedContent = line.slice(cursor);
   for (;;) {
     const quoteEnd = quotePrefixEnd(line, cursor);
     if (quoteEnd !== null) {
@@ -116,13 +143,17 @@ function lineContainer(
     }
     const list = listMarker(line, cursor);
     if (list !== null) {
-      container.push({ kind: "list", contentIndent: list.contentIndent });
+      container.push({
+        kind: "list",
+        contentIndent: list.contentIndent,
+        awaitingFirstBlock: list.awaitingFirstBlock,
+      });
       cursor = list.end;
       continue;
     }
     break;
   }
-  return { content: line.slice(cursor), container };
+  return { content: line.slice(cursor), inheritedContent, container };
 }
 
 function inheritedListContainer(
@@ -182,7 +213,16 @@ function excludedMask(body: string): Uint8Array {
         continue;
       }
     }
-    const opening = lineContainer(line, listContainer);
+    let opening = lineContainer(line, listContainer);
+    const pendingList = listContainer.findIndex(
+      (token) => token.kind === "list" && token.awaitingFirstBlock,
+    );
+    if (pendingList >= 0 && opening.inheritedContent.trim().length === 0) {
+      listContainer = inheritedListContainer(
+        listContainer.slice(0, pendingList),
+      );
+      opening = lineContainer(line, listContainer);
+    }
     if (line.trim().length > 0)
       listContainer = inheritedListContainer(opening.container);
     const fenceMatch = opening.content.match(/^ {0,3}(`{3,}|~{3,})/u);
