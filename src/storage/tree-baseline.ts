@@ -318,6 +318,16 @@ export class TreeBaselineRepository {
     return (await this.journal.read())?.payload.transactionId === transactionId;
   }
 
+  async inspectJournal(): Promise<Pick<
+    TreeBaselineJournal,
+    "transactionId" | "kind" | "phase"
+  > | null> {
+    const current = await this.journal.read();
+    if (!current) return null;
+    const { transactionId, kind, phase } = current.payload;
+    return { transactionId, kind, phase };
+  }
+
   async commit(): Promise<void> {
     const current = await this.journal.read();
     if (!current) throw new Error("基线日志缺失");

@@ -1252,17 +1252,26 @@ export class SyncRuntime {
     );
     const tree = await treeTx.inspect();
     const v3After = await this.v3PullControlAfter.read();
-    if (
-      tree &&
-      v3After?.payload.transactionId === tree.transactionId &&
-      (tree.state === "verified" || tree.state === "committed")
-    ) {
-      if (tree.state === "verified") await treeTx.assertApplied();
-      const hasBaselineTransaction = await this.treeBaseline.hasTransaction(
-        tree.transactionId,
-      );
-      if (!hasBaselineTransaction) {
-        if (tree.state === "verified") {
+    if (tree?.schemaVersion === 3) {
+      if ((tree.state === "verified" || tree.state === "committed") && !v3After)
+        throw new Error("V3_PULL_CONTROL_RECOVERY_EVIDENCE_MISSING");
+      if (
+        (tree.state === "verified" || tree.state === "committed") &&
+        v3After?.payload.transactionId !== tree.transactionId
+      )
+        throw new Error("V3_PULL_CONTROL_STATE_INCONSISTENT");
+      if (tree.state === "committed" && v3After?.payload.phase !== "applied")
+        throw new Error("V3_PULL_CONTROL_STATE_INCONSISTENT");
+      if (tree.state === "verified") {
+        await treeTx.assertApplied();
+        const baselineJournal = await this.treeBaseline.inspectJournal();
+        const currentBaseline = await this.treeBaseline.readOptional();
+        if (baselineJournal?.transactionId !== tree.transactionId) {
+          if (
+            currentBaseline &&
+            currentBaseline.baseRevision !== tree.baseRevision
+          )
+            throw new Error("V3_BASELINE_RECOVERY_EVIDENCE_MISSING");
           await this.withoutRenameHints(() => treeTx.rollbackVerified());
           await new BlobStagingRepository(
             this.control,
@@ -1270,12 +1279,31 @@ export class SyncRuntime {
           ).cleanup();
           return;
         }
-        throw new Error("V3_BASELINE_RECOVERY_EVIDENCE_MISSING");
-      }
-      await this.treeBaseline.recover(tree.transactionId);
-      if (tree.state === "verified") {
+        await this.treeBaseline.recover(tree.transactionId);
+        const recoveredBaselineJournal =
+          await this.treeBaseline.inspectJournal();
+        if (recoveredBaselineJournal?.phase !== "committed")
+          throw new Error("V3_BASELINE_RECOVERY_STATE_INCONSISTENT");
+        const baseline = await this.treeBaseline.readOptional();
+        if (!baseline || baseline.schemaVersion !== 3)
+          throw new Error("V3_BASELINE_RECOVERY_EVIDENCE_MISSING");
         await this.applyV3ControlAfter(tree.transactionId);
         await treeTx.markCommitted();
+      } else if (tree.state === "committed") {
+        const baselineJournal = await this.treeBaseline.inspectJournal();
+        if (
+          baselineJournal?.transactionId === tree.transactionId &&
+          baselineJournal.phase !== "committed"
+        )
+          throw new Error("V3_BASELINE_RECOVERY_STATE_INCONSISTENT");
+        const baseline = await this.treeBaseline.readOptional();
+        if (!baseline || baseline.schemaVersion !== 3)
+          throw new Error("V3_BASELINE_RECOVERY_EVIDENCE_MISSING");
+        if (!baselineJournal && baseline.baseRevision !== tree.targetRevision)
+          throw new Error("V3_BASELINE_RECOVERY_EVIDENCE_MISSING");
+      } else {
+        await this.withoutRenameHints(() => treeTx.recover());
+        await this.treeBaseline.recover(null);
       }
       await new BlobStagingRepository(
         this.control,

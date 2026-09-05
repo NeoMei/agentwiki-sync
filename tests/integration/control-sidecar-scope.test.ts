@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { SyncRuntime } from "../../src/application/sync-runtime";
-import { contentHash, sha256Hex } from "../../src/agentwiki/protocol";
+import {
+  canonicalBytes,
+  contentHash,
+  sha256Hex,
+} from "../../src/agentwiki/protocol";
 import type { TreeAttachment, TreePageV3 } from "../../src/core/tree-model";
 import type { ControlStorePort } from "../../src/ports/control-store";
 import { FakeTreeRemote, FakeTreeRemoteV3 } from "../fakes/fake-tree-remote";
@@ -117,6 +121,107 @@ describe("Pull preview control sidecars", () => {
     expect(vault.text("Wiki/pages/Note.md")).toBe("local edit");
     expect(status.local.modified).toHaveLength(1);
     expect(push.changes).toHaveLength(1);
+  });
+
+  it("treats a completed Pull as terminal after a Push replaces the baseline journal", async () => {
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({ pages: [await page("remote")] });
+    const vault = new MemoryVault({});
+    const control = new StrictControlStore();
+    const first = SyncRuntime.v3(vault, control, remote, mapping());
+    await first.applyPullV3(await first.previewPullV3());
+    vault.seedMarkdown("Wiki/pages/Note.md", "first local edit");
+    await first.applyPushV3(await first.previewPushV3());
+
+    const restarted = SyncRuntime.v3(vault, control, remote, mapping());
+    await restarted.recover();
+    expect((await restarted.previewPushV3()).changes).toEqual([]);
+    vault.seedMarkdown("Wiki/pages/Note.md", "second local edit");
+    await restarted.applyPushV3(await restarted.previewPushV3());
+
+    const follower = SyncRuntime.v3(
+      new MemoryVault({}),
+      new StrictControlStore(),
+      remote,
+      mapping(),
+      "follower",
+    );
+    const preview = await follower.previewPullV3();
+    expect(preview.remote.pages[0]?.body).toBe("second local edit");
+  });
+
+  it("fails closed when a committed v3 Pull still has pending control evidence", async () => {
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({ pages: [await page("remote")] });
+    const vault = new MemoryVault({});
+    const control = new StrictControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    await runtime.applyPullV3(await runtime.previewPullV3());
+    const path =
+      ".agentwiki/devices/d-local/spaces/s-space/v3-pull-control-after.json";
+    const envelope = JSON.parse(control.backing.files.get(path)!) as {
+      payloadHash: string;
+      payload: { phase: string };
+    };
+    envelope.payload.phase = "pending";
+    envelope.payloadHash = await sha256Hex(canonicalBytes(envelope.payload));
+    control.backing.files.set(path, JSON.stringify(envelope));
+
+    await expect(
+      SyncRuntime.v3(vault, control, remote, mapping()).recover(),
+    ).rejects.toThrow(/V3_PULL_CONTROL_STATE_INCONSISTENT/);
+  });
+
+  it("fails closed when a schema-v3 Pull loses its control-after evidence", async () => {
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({ pages: [await page("remote")] });
+    const vault = new MemoryVault({});
+    const control = new StrictControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    await runtime.applyPullV3(await runtime.previewPullV3());
+    const path =
+      ".agentwiki/devices/d-local/spaces/s-space/v3-pull-control-after.json";
+    await Promise.all(
+      [path, `${path}.prev`, `${path}.next`].map((candidate) =>
+        control.remove(candidate),
+      ),
+    );
+
+    await expect(
+      SyncRuntime.v3(vault, control, remote, mapping()).recover(),
+    ).rejects.toThrow(/V3_PULL_CONTROL_RECOVERY_EVIDENCE_MISSING/);
+  });
+
+  it("rolls back a non-first verified Pull when baseline preparation never starts", async () => {
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({
+      revision: "rev-before",
+      pages: [await page("before")],
+    });
+    const vault = new MemoryVault({});
+    const control = new StrictControlStore();
+    const first = SyncRuntime.v3(vault, control, remote, mapping());
+    await first.applyPullV3(await first.previewPullV3());
+    await remote.seedTree({
+      revision: "rev-after",
+      pages: [await page("after")],
+    });
+    let crashed = false;
+    control.backing.onTextWrite = (path) => {
+      const value = control.backing.files.get(path) ?? "";
+      if (!crashed && value.includes('"state":"verified"')) {
+        crashed = true;
+        throw new Error("simulated process stop before baseline prepare");
+      }
+    };
+
+    await expect(
+      first.applyPullV3(await first.previewPullV3()),
+    ).rejects.toThrow(/simulated process stop/);
+    control.backing.onTextWrite = undefined;
+    await SyncRuntime.v3(vault, control, remote, mapping()).recover();
+
+    expect(vault.text("Wiki/pages/Note.md")).toBe("before");
   });
 
   it("keeps v3 sidecars inside .agentwiki for the strict Obsidian control boundary", async () => {

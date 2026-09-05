@@ -243,14 +243,20 @@ export class TreeTransaction {
   }
 
   async inspect(): Promise<{
+    schemaVersion: TreeTransactionJournal["schemaVersion"];
     state: TreeTransactionJournal["state"];
     transactionId: string;
+    baseRevision: string;
+    targetRevision: string;
   } | null> {
     const value = await this.journal.read();
     return value
       ? {
+          schemaVersion: value.payload.schemaVersion,
           state: value.payload.state,
           transactionId: value.payload.transactionId,
+          baseRevision: value.payload.baseRevision,
+          targetRevision: value.payload.targetRevision,
         }
       : null;
   }
