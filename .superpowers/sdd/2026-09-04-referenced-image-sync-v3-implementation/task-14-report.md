@@ -65,3 +65,60 @@
 - `requestUrl` necessarily allocates one response body before the adapter can inspect its actual ArrayBuffer/text length. Declared binary length is rejected first when present; actual length is still checked before exposing/copying into transfer logic. This is the bounded single-Blob constraint accepted by the brief, not streaming fetch.
 - Task17 owns the durable upload journal schema. Its `receiptFor` and `persistReceipt` implementations must serialize with that journal and enforce the exact session binding described above. Task14 intentionally does not create a second receipt repository or derive an undocumented receipt digest.
 - Full lint retains 21 existing warnings in unrelated files; Task14 adds zero lint errors or warnings.
+
+## Fix round 1
+
+### Status and commit
+
+- Status: DONE
+- Fix BASE: `c5f5fc9f0fa9752a73088bc1c6b109f4226962db`
+- Atomic implementation commit: `36594cd065bbc7fce4aedd5cd7a37e37d6c93137` (`fix(sync): enforce v3 remote transfer bounds`)
+
+### Four Important findings repaired
+
+- Removed the incorrect 100 MiB new-transfer cap from full Snapshot and Delta target Revision attachment-byte metrics. Snapshot still recomputes and compares the complete manifest/count/body/attachment metrics and Revision hash. The public Delta schema and fixed metadata checks still validate its target metrics. Upload transfer budgeting remains over only the unique `missingContentHashes`; download budgeting remains over the unique missing attachment input supplied to `downloadMissing`.
+- Enforced negotiated `maxPageItems` on every parsed Snapshot response's combined Folder/Page/Attachment count and every Delta response's item count, before any entity is retained or yielded.
+- Added `BlobStagingIntegrityError` with `retryable: false` for repository-detected missing/chunk-conflict/chunk-hash/chunk-verification/incomplete/size/complete-hash/complete-verification states. Exceptions thrown by underlying control-store reads and writes remain ordinary transient errors. `BlobTransfer` cleans its fixed staging root only for these typed integrity failures and the previously classified deterministic transfer/remote failures, after bounded workers settle.
+- Bound Head, Snapshot and Delta response `spaceId` to the configured Space. A non-`current` Snapshot now rejects a first response whose Revision differs from the requested fixed Revision. Delta continues to bind `fromRevision`; metadata signature pinning still protects subsequent pages.
+
+### TDD evidence
+
+RED adapter command:
+
+`npx vitest run tests/integration/v3-tree-remote.test.ts`
+
+Result before production repair: 1 test file failed; 8 failed and 11 passed. The failures specifically showed large valid Snapshot/Delta metrics rejected, over-`maxPageItems` responses accepted, and wrong Space/fixed Revision responses accepted.
+
+RED staging/transfer command:
+
+`npx vitest run tests/integration/blob-transfer.test.ts tests/integration/blob-staging.test.ts`
+
+Result before production repair: 2 test files failed; 2 failed and 23 passed. The storage assertion had no exported typed integrity constructor, and the real repository's complete-time verification failure left the staging tree present. The test-only corrupting store was tightened before production edits so the corruption occurs during `BlobStagingRepository.complete()` rather than during remote-byte validation.
+
+GREEN focused command:
+
+`npx vitest run tests/integration/v3-tree-remote.test.ts tests/integration/blob-transfer.test.ts tests/integration/blob-staging.test.ts`
+
+Result: 3 test files passed; 44/44 tests passed. Coverage includes a valid 110 MiB full Revision, low unique missing transfer under a reduced budget despite larger complete requirements, reduced Snapshot/Delta `maxPageItems`, wrong target responses, actual repository complete-time integrity cleanup, and transient staging I/O preservation.
+
+Fresh full command:
+
+`npm run check`
+
+Result: exit 0; format PASS; lint PASS with 0 errors and the same 21 pre-existing warnings; typecheck PASS; 47 test files and 518/518 tests PASS; build PASS; bundle safety PASS (1,271,916 bytes); release metadata PASS (0.3.0).
+
+### Fix files changed
+
+- `src/agentwiki/v3-tree-remote.ts`
+- `src/application/blob-transfer.ts`
+- `src/storage/blob-staging.ts`
+- `tests/integration/v3-tree-remote.test.ts`
+- `tests/integration/blob-transfer.test.ts`
+- `tests/integration/blob-staging.test.ts`
+
+### Fix self-review and caller contracts
+
+- Re-read all four review findings against the changed control flow and confirmed per-response limits and target binding happen after strict schema parsing but before retention/yield.
+- Confirmed the staging type change does not change the journal schema, integrity rules, fixed private root, locking, or cleanup scope and does not classify arbitrary underlying I/O by message text.
+- Confirmed legacy v1/v2 behavior, the v3 runtime gate, parser, server, user Vault, publish and deploy remain untouched.
+- Task16 must fully exhaust Snapshot iteration and terminal metric/hash validation before any download, merge, preview, or persistent effect. Task17 must supply `downloadMissing` only the locally absent unique hashes and bind recovered upload receipts to the exact persisted session journal; neither caller responsibility was moved into this fix.
