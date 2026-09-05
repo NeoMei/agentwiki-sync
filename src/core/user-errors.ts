@@ -48,6 +48,7 @@ const errorMessages: Record<string, string> = {
     "图片超出同步限制。请压缩图片、缩小尺寸或减少本次引用数量。",
   PUSH_CONFIRMATION_REQUIRED:
     "预览后内容或服务端能力已变化。请重新预览并明确确认。",
+  V3_PUSH_BLOCKED: "推送预览包含未处理的图片阻塞项。请按预览定位修复后重试。",
   FOLDER_ID_CONFLICT: "目录标识冲突。请重新预览后重试。",
 };
 

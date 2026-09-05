@@ -8,6 +8,7 @@ import {
   sha256Hex,
 } from "../../src/agentwiki/protocol";
 import { FakeTreeRemote, FakeTreeRemoteV3 } from "../fakes/fake-tree-remote";
+import type { TreeDeltaV3 } from "../../src/ports/tree-remote";
 import { FakeAgentWiki } from "../fakes/fake-agentwiki";
 import { MemoryControlStore } from "../fakes/memory-control-store";
 import { MemoryVault } from "../fakes/memory-vault";
@@ -98,6 +99,87 @@ const mapping = (status: "pending" | "active" = "pending") => ({
 });
 
 describe("SyncRuntime", () => {
+  it("returns structured local image blockers in a non-publishable Push preview", async () => {
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({ revision: "rev-empty" });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    await runtime.applyPullV3(await runtime.previewPullV3());
+    vault.seedMarkdown("Wiki/pages/note.md", "![[assets/missing.png]]");
+
+    const preview = await runtime.previewPushV3();
+
+    expect(preview).toMatchObject({
+      protocolVersion: "3",
+      publishable: false,
+      changes: [],
+      blockers: [
+        expect.objectContaining({
+          code: "ATTACHMENT_MISSING",
+          pagePath: "pages/note.md",
+          path: "assets/missing.png",
+        }),
+      ],
+    });
+    await expect(runtime.applyPushV3(preview)).rejects.toThrow(
+      /V3_PUSH_BLOCKED/u,
+    );
+    expect(remote.createInputs).toEqual([]);
+  });
+
+  it("honors cancellation while reading the v3 bootstrap preview", async () => {
+    const remote = new FakeTreeRemoteV3();
+    const runtime = SyncRuntime.v3(
+      new MemoryVault({}),
+      new MemoryControlStore(),
+      remote,
+      mapping(),
+    );
+    const operation = new AbortController();
+    operation.abort();
+
+    await expect(
+      runtime.previewBootstrapPullV3({ signal: operation.signal }),
+    ).rejects.toThrow("同步已取消");
+  });
+
+  it("finishes a committed bootstrap into a fresh Pull preview after late cancellation", async () => {
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({ revision: "bootstrap-revision" });
+    const runtime = SyncRuntime.v3(
+      new MemoryVault({}),
+      new MemoryControlStore(),
+      remote,
+      mapping(),
+    );
+    const bootstrap = await runtime.previewBootstrapPullV3();
+    const operation = new AbortController();
+    const progress: Array<{
+      cancellable: boolean;
+      nonCancellableReason?: string;
+    }> = [];
+    const originalConfirm = remote.bootstrapConfirmed.bind(remote);
+    remote.bootstrapConfirmed = async (input) => {
+      const result = await originalConfirm(input);
+      operation.abort();
+      return result;
+    };
+
+    const preview = await runtime.confirmBootstrapPullV3(bootstrap, {
+      signal: operation.signal,
+      onProgress: (value) => progress.push(value),
+    });
+
+    expect(preview.revision).toBe("bootstrap-revision");
+    expect(
+      progress.some(
+        (value) =>
+          !value.cancellable && value.nonCancellableReason?.includes("已提交"),
+      ),
+    ).toBe(true);
+  });
+
   it("reports referenced-image status through the strict v3 branch without publishing", async () => {
     const remote = new FakeTreeRemoteV3();
     await remote.seedTree({ revision: "rev-empty" });
@@ -125,6 +207,62 @@ describe("SyncRuntime", () => {
       items: [],
     });
     expect(remote.createInputs).toEqual([]);
+  });
+
+  it("projects unchanged Page references onto the exact remote delta revision", async () => {
+    const attachmentId = "11111111-1111-4111-8111-111111111111";
+    const pageId = "22222222-2222-4222-8222-222222222222";
+    const before = await v3Attachment(attachmentId, "assets/image.png");
+    const unchangedPage = await v3Page(
+      pageId,
+      "pages/note.md",
+      "![[assets/image.png]]",
+      [attachmentId],
+    );
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({
+      revision: "rev-before",
+      pages: [unchangedPage],
+      attachments: [before],
+      blobs: { [attachmentId]: PNG_2X3 },
+    });
+    const runtime = SyncRuntime.v3(
+      new MemoryVault({}),
+      new MemoryControlStore(),
+      remote,
+      mapping(),
+    );
+    await runtime.applyPullV3(await runtime.previewPullV3());
+    remote.downloads.length = 0;
+    const replacement = { ...before, contentHash: "b".repeat(64) };
+    await remote.seedTree({
+      revision: "rev-after",
+      pages: [unchangedPage],
+      attachments: [replacement],
+    });
+    (remote as unknown as { delta: () => Promise<TreeDeltaV3> }).delta =
+      async (): Promise<TreeDeltaV3> => ({
+        toRevision: "rev-after",
+        items: [
+          {
+            operation: "upsert_attachment" as const,
+            attachment: replacement,
+          },
+        ],
+      });
+    remote.failAfterSnapshot = true;
+
+    const delta = await runtime.remoteDeltaV3();
+
+    expect(delta.remoteRevision).toBe("rev-after");
+    expect(delta.resultingPages).toEqual([
+      {
+        pageId,
+        path: "pages/note.md",
+        referencedAttachmentIds: [attachmentId],
+      },
+    ]);
+    expect(remote.downloads).toEqual([]);
   });
 
   it("fully verifies a v3 snapshot before downloading any Blob or persisting preview effects", async () => {

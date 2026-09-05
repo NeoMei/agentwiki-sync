@@ -17,6 +17,7 @@ import { PreviewModal } from "../../src/obsidian/preview-modal";
 import type { PullPreviewV3 } from "../../src/application/sync-runtime";
 import type { ModalTransition } from "../../src/obsidian/modal-handoff";
 import { requestUrlState } from "../fakes/obsidian-mock";
+import type { MockElement } from "../fakes/obsidian-mock";
 import { V3_CAPABILITIES } from "../fakes/fake-tree-remote";
 import { FakeHttp } from "../fakes/fake-http";
 import { treeCapabilitiesHashV3 } from "@neomei/agentwiki-sync-protocol";
@@ -116,6 +117,12 @@ async function makePlugin(input: {
     author: "NeoMei",
   });
   return { plugin, app, local, adapter };
+}
+
+function modalButton(modal: PreviewModal, label: string): MockElement {
+  return (modal.contentEl as unknown as MockElement).queryAll(
+    (item) => item.tag === "button" && item.text === label,
+  )[0]!;
 }
 
 describe("plugin settings lifecycle", () => {
@@ -460,9 +467,19 @@ describe("plugin settings lifecycle", () => {
           listed: true,
           items: [
             {
-              operation: "detach_attachment" as const,
-              attachmentId: "a2",
-              previousPath: "assets/remote.png",
+              operation: "upsert_attachment" as const,
+              attachment: {
+                ...attachment,
+                attachmentId: "a2",
+                path: "assets/remote.png",
+              },
+            },
+          ],
+          resultingPages: [
+            {
+              pageId: "remote-page",
+              path: "pages/unchanged.md",
+              referencedAttachmentIds: ["a2"],
             },
           ],
         };
@@ -518,7 +535,7 @@ describe("plugin settings lifecycle", () => {
     expect(diff.protocolLabel).toBe("Sync v3");
     expect(diff.attachmentChanges).toMatchObject({
       uploads: 1,
-      detached: 1,
+      downloads: 1,
       uploadBytes: 4096,
     });
     expect(diff.attachmentChanges.items).toEqual([
@@ -528,7 +545,7 @@ describe("plugin settings lifecycle", () => {
       }),
       expect.objectContaining({
         path: "assets/remote.png",
-        affectedPageCount: 0,
+        affectedPageCount: 1,
       }),
     ]);
     expect(calls).toEqual(["recover", "status-v3", "delta-v3"]);
@@ -581,6 +598,79 @@ describe("plugin settings lifecycle", () => {
     expect(harness.plugin.settings.mappings).toHaveLength(1);
   });
 
+  it("hands a structured blocked Push preview to the rendered unified modal", async () => {
+    const harness = await makePlugin({
+      data: {
+        schemaVersion: 2,
+        serverUrl: "https://wiki.example.com",
+        mappings: legacyWithMapping.mappings,
+      },
+    });
+    await harness.plugin.onload();
+    const blocked = {
+      protocolVersion: "3" as const,
+      publishable: false as const,
+      spaceId: "s1",
+      baseRevision: "r1",
+      changes: [] as [],
+      blockers: [
+        {
+          code: "ATTACHMENT_MISSING" as const,
+          pagePath: "pages/Missing.md",
+          path: "assets/missing.png",
+          detail: "not rendered",
+        },
+      ],
+      capabilities: V3_CAPABILITIES,
+      capabilitiesHash: "capabilities",
+    };
+    const runtime = {
+      protocolVersion: "3" as const,
+      recover: async () => undefined,
+      remoteDeltaV3: async () => ({
+        protocolVersion: "3" as const,
+        baseRevision: "r1",
+        remoteRevision: "r1",
+        ahead: false,
+        listed: false,
+        items: [],
+        resultingPages: [],
+      }),
+      previewPushV3: async () => blocked,
+      applyPushV3: vi.fn(),
+      discardPushPreviewV3: async () => undefined,
+    };
+    const subject = harness.plugin as unknown as {
+      runtime: () => Promise<typeof runtime>;
+      runSyncStrategy: (
+        spaceId: string,
+        strategy: "local",
+        options: unknown,
+      ) => Promise<ModalTransition | void>;
+    };
+    subject.runtime = async () => runtime;
+    let opened: PreviewModal | null = null;
+    const open = vi
+      .spyOn(PreviewModal.prototype, "open")
+      .mockImplementation(function (this: PreviewModal) {
+        this.onOpen();
+      });
+
+    const transition = await subject.runSyncStrategy("s1", "local", {});
+    transition?.();
+    opened = open.mock.instances.at(-1) ?? null;
+
+    const content = (opened as unknown as { contentEl: MockElement }).contentEl;
+    expect(content.textContent).toContain("pages/Missing.md");
+    const confirm = content.queryAll(
+      (item) => item.tag === "button" && item.text === "确认执行",
+    )[0]!;
+    expect(confirm.disabled).toBe(true);
+    confirm.dispatchEvent({ type: "click" });
+    expect(runtime.applyPushV3).not.toHaveBeenCalled();
+    open.mockRestore();
+  });
+
   it("drives the real auto strategy from v3 Pull preview confirmation to a fresh Push preview", async () => {
     const harness = await makePlugin({
       data: {
@@ -603,6 +693,7 @@ describe("plugin settings lifecycle", () => {
     } as unknown as PullPreviewV3;
     const pushPreview = {
       protocolVersion: "3" as const,
+      publishable: true as const,
       spaceId: "s1",
       baseRevision: "r1",
       changes: [
@@ -615,6 +706,7 @@ describe("plugin settings lifecycle", () => {
       capabilities: V3_CAPABILITIES,
       capabilitiesHash: "cap",
       confirmationHash: "confirm",
+      blockers: [] as [],
     } as never;
     const calls: string[] = [];
     const runtime = {
@@ -662,7 +754,9 @@ describe("plugin settings lifecycle", () => {
     let opened: PreviewModal | null = null;
     const open = vi
       .spyOn(PreviewModal.prototype, "open")
-      .mockImplementation(() => undefined);
+      .mockImplementation(function (this: PreviewModal) {
+        this.onOpen();
+      });
 
     const pullTransition = await subject.runSyncStrategy("s1", "auto", {});
     expect(pullTransition).toBeTypeOf("function");
@@ -671,29 +765,17 @@ describe("plugin settings lifecycle", () => {
     expect((opened as unknown as { preview: unknown } | null)?.preview).toBe(
       pullPreview,
     );
-    const pushTransition = await (
-      opened as unknown as {
-        confirm: (options: unknown) => Promise<ModalTransition | void>;
-      }
-    ).confirm({});
-    expect(pushTransition).toBeTypeOf("function");
-    (
-      opened as unknown as {
-        release: () => void;
-      }
-    ).release();
-    await Promise.resolve();
-    await expect(subject.runSyncStrategy("s1", "auto", {})).rejects.toThrow(
-      /\u6d3b\u8dc3\u64cd\u4f5c/u,
-    );
-    pushTransition?.();
+    modalButton(opened!, "确认执行").dispatchEvent({ type: "click" });
+    await vi.waitFor(() => expect(open).toHaveBeenCalledTimes(2));
     opened = open.mock.instances.at(-1) ?? null;
     expect((opened as unknown as { preview: unknown } | null)?.preview).toBe(
       pushPreview,
     );
-    await (
-      opened as unknown as { confirm: (options: unknown) => Promise<void> }
-    ).confirm({});
+    await expect(subject.runSyncStrategy("s1", "auto", {})).rejects.toThrow(
+      /\u6d3b\u8dc3\u64cd\u4f5c/u,
+    );
+    modalButton(opened!, "确认执行").dispatchEvent({ type: "click" });
+    await vi.waitFor(() => expect(calls).toContain("apply-push-v3"));
 
     expect(calls).toEqual([
       "recover",
@@ -779,7 +861,9 @@ describe("plugin settings lifecycle", () => {
     let opened: PreviewModal | null = null;
     const open = vi
       .spyOn(PreviewModal.prototype, "open")
-      .mockImplementation(() => undefined);
+      .mockImplementation(function (this: PreviewModal) {
+        this.onOpen();
+      });
 
     const bootstrapTransition = await subject.runSyncStrategy(
       "s1",
@@ -792,20 +876,15 @@ describe("plugin settings lifecycle", () => {
       bootstrap,
     );
     expect(calls).not.toContain("apply-pull-v3");
-    const pullTransition = await (
-      opened as unknown as {
-        confirm: (options: unknown) => Promise<ModalTransition | void>;
-      }
-    ).confirm({});
-    expect(calls).not.toContain("apply-pull-v3");
-    pullTransition?.();
+    modalButton(opened!, "确认执行").dispatchEvent({ type: "click" });
+    await vi.waitFor(() => expect(open).toHaveBeenCalledTimes(2));
     opened = open.mock.instances.at(-1) ?? null;
     expect((opened as unknown as { preview: unknown } | null)?.preview).toBe(
       pullPreview,
     );
-    await (
-      opened as unknown as { confirm: (options: unknown) => Promise<void> }
-    ).confirm({});
+    expect(calls).not.toContain("apply-pull-v3");
+    modalButton(opened!, "确认执行").dispatchEvent({ type: "click" });
+    await vi.waitFor(() => expect(calls).toContain("apply-pull-v3"));
     expect(calls).toEqual([
       "recover",
       "preview-pull-v3",

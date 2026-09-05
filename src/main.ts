@@ -59,8 +59,7 @@ import {
   preferLocalPull,
   protocolLabel,
 } from "./obsidian/preview-logic";
-import type { TreePushPreviewV3 } from "./application/tree-push-service-v3";
-import type { PullPreviewV3 } from "./application/sync-runtime";
+import type { PullPreviewV3, PushPreviewV3 } from "./application/sync-runtime";
 import type { SyncOperationOptions } from "./application/progress";
 import type { ModalTransition } from "./obsidian/modal-handoff";
 import {
@@ -666,6 +665,13 @@ export default class AgentWikiSyncPlugin extends Plugin {
       operation: "upsert_attachment" | "detach_attachment";
     }> = [];
     const remoteAttachmentPageCounts = new Map<string, number>();
+    if ("resultingPages" in delta)
+      for (const page of delta.resultingPages)
+        for (const attachmentId of page.referencedAttachmentIds)
+          remoteAttachmentPageCounts.set(
+            attachmentId,
+            (remoteAttachmentPageCounts.get(attachmentId) ?? 0) + 1,
+          );
     for (const item of delta.items) {
       if (item.operation === "upsert_attachment")
         remoteAttachments.push({
@@ -682,6 +688,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
           operation: item.operation,
         });
       else if (
+        !("resultingPages" in delta) &&
         item.operation === "upsert_page" &&
         "referencedAttachmentIds" in item.page
       )
@@ -1172,7 +1179,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       )
         throw error;
     }
-    const bootstrap = await runtime.previewBootstrapPullV3();
+    const bootstrap = await runtime.previewBootstrapPullV3(options);
     return () =>
       new PreviewModal(
         this.app,
@@ -1215,7 +1222,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
   ): Promise<ModalTransition | void> {
     try {
       const preview = await runtime.previewPushV3(options);
-      if (!preview.changes.length) {
+      if (preview.publishable && !preview.changes.length) {
         new Notice("本地没有待推送的变更。");
         flow.finish();
         return;
@@ -1254,7 +1261,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
     }
   }
 
-  private v3PushLines(preview: TreePushPreviewV3): string[] {
+  private v3PushLines(preview: PushPreviewV3): string[] {
     const transferBytes = preview.changes
       .filter((item) => item.operation === "upsert_attachment")
       .reduce(
@@ -1267,6 +1274,10 @@ export default class AgentWikiSyncPlugin extends Plugin {
       );
     return [
       `图片上传：${transferBytes} B · 单次上限 ${preview.capabilities.maxTransferBlobBytes} B`,
+      ...preview.blockers.map(
+        (blocker) =>
+          `阻塞：${blocker.pagePath ?? blocker.path ?? "Page"}: ${userErrorMessage(new Error(blocker.code))}`,
+      ),
       ...preview.changes.map((item) => {
         if (item.operation === "upsert_attachment")
           return `${attachmentOperationLabel(item.operation)}: ${item.attachment.path} · ${item.attachment.sizeBytes} B`;

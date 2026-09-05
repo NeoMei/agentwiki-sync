@@ -157,6 +157,25 @@ export interface RuntimeStatusV3 {
   capabilities: TreeSyncCapabilitiesV3;
 }
 
+export type PublishablePushPreviewV3 = TreePushPreviewV3 & {
+  publishable: true;
+  blockers: [];
+};
+
+export interface BlockedPushPreviewV3 {
+  protocolVersion: "3";
+  publishable: false;
+  spaceId: string;
+  baseRevision: string;
+  changes: [];
+  blockers: LocalTreeScanV3["blockers"];
+  capabilities: TreeSyncCapabilitiesV3;
+  capabilitiesHash: string;
+  credentialId?: string | null;
+}
+
+export type PushPreviewV3 = PublishablePushPreviewV3 | BlockedPushPreviewV3;
+
 export interface RemoteDelta {
   baseRevision: string;
   remoteRevision: string;
@@ -172,6 +191,11 @@ export interface RemoteDeltaV3 {
   ahead: boolean;
   listed: boolean;
   items: TreeDeltaItemV3[];
+  resultingPages: Array<{
+    pageId: string;
+    path: string;
+    referencedAttachmentIds: string[];
+  }>;
 }
 
 export interface PullPreview extends TreePullPreview {
@@ -1507,9 +1531,30 @@ export class SyncRuntime {
         ahead,
         items: [],
         listed: false,
+        resultingPages: [],
       };
     try {
       const delta = await remote.delta(baseRevision);
+      const resultingPages = new Map(
+        base.pages.map((page) => [
+          page.pageId,
+          {
+            pageId: page.pageId,
+            path: page.path,
+            referencedAttachmentIds: [...page.referencedAttachmentIds],
+          },
+        ]),
+      );
+      for (const item of delta.items) {
+        if (item.operation === "upsert_page")
+          resultingPages.set(item.page.pageId, {
+            pageId: item.page.pageId,
+            path: item.page.path,
+            referencedAttachmentIds: [...item.page.referencedAttachmentIds],
+          });
+        else if (item.operation === "archive_page")
+          resultingPages.delete(item.pageId);
+      }
       return {
         protocolVersion: "3",
         baseRevision,
@@ -1517,6 +1562,11 @@ export class SyncRuntime {
         ahead: true,
         items: delta.items,
         listed: true,
+        resultingPages: [...resultingPages.values()].sort(
+          (left, right) =>
+            left.path.localeCompare(right.path) ||
+            left.pageId.localeCompare(right.pageId),
+        ),
       };
     } catch {
       return {
@@ -1526,6 +1576,7 @@ export class SyncRuntime {
         ahead: true,
         items: [],
         listed: false,
+        resultingPages: [],
       };
     }
   }
@@ -1570,8 +1621,21 @@ export class SyncRuntime {
     );
   }
 
-  async previewBootstrapPullV3() {
-    return this.requireV3Remote().bootstrapPreview();
+  async previewBootstrapPullV3(options?: SyncOperationOptions) {
+    await progressCheckpoint(options, {
+      phase: "download",
+      completed: 0,
+      total: 1,
+      cancellable: true,
+    });
+    const preview = await this.requireV3Remote().bootstrapPreview();
+    await progressCheckpoint(options, {
+      phase: "download",
+      completed: 1,
+      total: 1,
+      cancellable: true,
+    });
+    return preview;
   }
 
   async confirmBootstrapPullV3(
@@ -1579,12 +1643,32 @@ export class SyncRuntime {
     options?: SyncOperationOptions,
   ): Promise<PullPreviewV3> {
     if (preview.blockers.length > 0) throw new Error("V3_BOOTSTRAP_BLOCKED");
+    cancellationCheckpoint(options, true);
+    reportProgress(options, {
+      phase: "finalize",
+      completed: 0,
+      total: 1,
+      cancellable: false,
+      nonCancellableReason:
+        "首次启用确认正在服务端原子提交，完成后将继续生成 Pull 预览。",
+    });
     await this.requireV3Remote().bootstrapConfirmed({
       baseRevision: preview.baseRevision,
       confirmationHash: preview.candidateHash,
       userConfirmed: true,
     });
-    return this.previewPullV3(options);
+    const handoffOptions: SyncOperationOptions | undefined = options
+      ? {
+          onProgress: (progress) =>
+            options.onProgress?.({
+              ...progress,
+              cancellable: false,
+              nonCancellableReason:
+                "首次启用已提交，正在生成必须再次确认的 Pull 预览。",
+            }),
+        }
+      : undefined;
+    return this.previewPullV3(handoffOptions);
   }
 
   private async assertNoActiveV3PullTransaction(): Promise<void> {
@@ -2041,8 +2125,8 @@ export class SyncRuntime {
       ).cleanup();
   }
 
-  async discardPushPreviewV3(preview: TreePushPreviewV3): Promise<void> {
-    if (preview.previewId)
+  async discardPushPreviewV3(preview: PushPreviewV3): Promise<void> {
+    if ("previewId" in preview && preview.previewId)
       await this.control.removeTree?.(
         this.root + "/push-preview/" + safeKey(preview.previewId),
       );
@@ -2220,9 +2304,7 @@ export class SyncRuntime {
     return prepared;
   }
 
-  async previewPushV3(
-    options?: SyncOperationOptions,
-  ): Promise<TreePushPreviewV3> {
+  async previewPushV3(options?: SyncOperationOptions): Promise<PushPreviewV3> {
     const remote = this.requireV3Remote();
     const base = await this.readBaseSnapshotV3();
     if (!base) throw new Error("INITIAL_PULL_REQUIRED");
@@ -2233,6 +2315,18 @@ export class SyncRuntime {
     if (capabilitiesHash !== (await remote.capabilitiesHash))
       throw new Error("CAPABILITIES_CHANGED");
     const local = await this.scanV3(base, capabilities, options);
+    if (local.blockers.length > 0)
+      return {
+        protocolVersion: "3",
+        publishable: false,
+        spaceId: this.mapping.spaceId,
+        baseRevision: base.revision,
+        changes: [],
+        blockers: structuredClone(local.blockers),
+        capabilities,
+        capabilitiesHash,
+        credentialId: this.credentialId,
+      };
     const changes = await this.preparePushChangesV3(base, local, options);
     const confirmationHash = await treeConfirmationHashV3({
       protocolVersion: "3",
@@ -2243,6 +2337,8 @@ export class SyncRuntime {
     });
     return {
       protocolVersion: "3",
+      publishable: true,
+      blockers: [],
       spaceId: this.mapping.spaceId,
       baseRevision: base.revision,
       changes,
@@ -2361,9 +2457,11 @@ export class SyncRuntime {
   }
 
   async applyPushV3(
-    preview: TreePushPreviewV3,
+    preview: PushPreviewV3,
     options?: SyncOperationOptions,
   ): Promise<void> {
+    if (!preview.publishable || preview.blockers.length > 0)
+      throw new Error("V3_PUSH_BLOCKED");
     if (!preview.changes.length) return;
     const service = this.v3PushService();
     let effectivePreview = preview;
@@ -2374,6 +2472,7 @@ export class SyncRuntime {
       if (syncErrorCodeV3(error) !== "CAPABILITIES_CHANGED") throw error;
       await service.supersede();
       const rebuilt = await this.previewPushV3(options);
+      if (!rebuilt.publishable) throw new Error("PUSH_CONFIRMATION_REQUIRED");
       if (
         (await this.pushSemanticHashV3(rebuilt.changes)) !==
         (await this.pushSemanticHashV3(preview.changes))

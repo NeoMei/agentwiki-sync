@@ -5,6 +5,10 @@ import {
   attachmentOperationLabel,
   attachmentTransferSummary,
   canRunSyncStrategy,
+  clampPage,
+  pageCount,
+  pageSlice,
+  PREVIEW_PAGE_SIZE,
 } from "./preview-logic";
 import {
   progressLabel,
@@ -124,6 +128,7 @@ export class SyncCenterModal extends Modal {
   private operation: AbortController | null = null;
   private progress: SyncProgress | null = null;
   private refreshGeneration = 0;
+  private attachmentPage = 0;
 
   constructor(
     app: App,
@@ -231,10 +236,39 @@ export class SyncCenterModal extends Modal {
       if (diff.attachmentChanges.items.length > 0) {
         new Setting(this.contentEl).setName("图片变更").setHeading();
         const list = this.contentEl.createEl("ul");
-        for (const item of diff.attachmentChanges.items)
+        const items = [...diff.attachmentChanges.items].sort((left, right) =>
+          left.path.localeCompare(right.path),
+        );
+        this.attachmentPage = clampPage(this.attachmentPage, items.length);
+        for (const item of pageSlice(items, this.attachmentPage))
           list.createEl("li", {
             text: `${attachmentOperationLabel(item.operation)}: ${item.path} · ${item.affectedPageCount} 个 Page`,
           });
+        if (items.length > PREVIEW_PAGE_SIZE)
+          new Setting(this.contentEl)
+            .setDesc(
+              `第 ${this.attachmentPage + 1} / ${pageCount(items.length)} 页 · 共 ${items.length} 项`,
+            )
+            .addButton((button) =>
+              button
+                .setButtonText("上一页")
+                .setDisabled(this.attachmentPage === 0)
+                .onClick(() => {
+                  this.attachmentPage -= 1;
+                  this.render();
+                }),
+            )
+            .addButton((button) =>
+              button
+                .setButtonText("下一页")
+                .setDisabled(
+                  (this.attachmentPage + 1) * PREVIEW_PAGE_SIZE >= items.length,
+                )
+                .onClick(() => {
+                  this.attachmentPage += 1;
+                  this.render();
+                }),
+            );
       }
     }
     if (this.progress)

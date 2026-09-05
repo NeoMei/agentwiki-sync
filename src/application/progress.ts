@@ -13,6 +13,7 @@ export interface SyncProgress {
   completed: number;
   total?: number;
   cancellable: boolean;
+  nonCancellableReason?: string;
 }
 
 export interface SyncOperationOptions {
@@ -37,7 +38,11 @@ export function progressLabel(progress: SyncProgress): string {
     finalize: "服务器原子发布",
     apply: "本地原子应用",
   };
-  return `${phases[progress.phase]} ${progress.completed}${progress.total === undefined ? "" : ` / ${progress.total}`}`;
+  const reason =
+    !progress.cancellable && progress.nonCancellableReason
+      ? ` · ${progress.nonCancellableReason}`
+      : "";
+  return `${phases[progress.phase]} ${progress.completed}${progress.total === undefined ? "" : ` / ${progress.total}`}${reason}`;
 }
 
 export function cancellationCheckpoint(

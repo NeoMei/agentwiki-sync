@@ -11,6 +11,7 @@ import type {
   InitialBindingChoice,
   PullPreview,
   PullPreviewV3,
+  PushPreviewV3,
 } from "../application/sync-runtime";
 import type {
   AttachmentConflict,
@@ -18,7 +19,6 @@ import type {
   StructuredConflict,
 } from "../core/merge";
 import type { TreeBootstrapPreviewV3 } from "../ports/tree-remote";
-import type { TreePushPreviewV3 } from "../application/tree-push-service-v3";
 import {
   resolveAttachmentConflict,
   resolveFolderConflictV3,
@@ -48,11 +48,7 @@ import {
 import { completeModalAction, type ModalTransition } from "./modal-handoff";
 
 type PreviewState =
-  | PullPreview
-  | PullPreviewV3
-  | TreeBootstrapPreviewV3
-  | TreePushPreviewV3
-  | null;
+  PullPreview | PullPreviewV3 | TreeBootstrapPreviewV3 | PushPreviewV3 | null;
 
 interface AttachmentResolutionDraft {
   mode: "" | "local" | "remote" | "keep_both";
@@ -72,6 +68,12 @@ function isPullPreviewV3(preview: PreviewState): preview is PullPreviewV3 {
   return isPullPreview(preview) && "attachmentConflicts" in preview;
 }
 
+function isBlockedPushPreview(
+  preview: PreviewState,
+): preview is Extract<PushPreviewV3, { publishable: false }> {
+  return !!preview && "publishable" in preview && !preview.publishable;
+}
+
 export class PreviewModal extends Modal {
   private released = false;
   private linePage = 0;
@@ -85,6 +87,10 @@ export class PreviewModal extends Modal {
     string,
     AttachmentResolutionDraft
   >();
+  private readonly decisionGenerations = new Map<string, number>();
+  private readonly unsettledDecisions = new Set<string>();
+  private readonly resolutionSourcePreview: PullPreviewV3 | null;
+  private resolutionQueue: Promise<void> = Promise.resolve();
   private operation: AbortController | null = null;
   private running = false;
   private closeRequested = false;
@@ -100,6 +106,9 @@ export class PreviewModal extends Modal {
     private readonly preview: PreviewState = null,
   ) {
     super(app);
+    this.resolutionSourcePreview = isPullPreviewV3(preview)
+      ? structuredClone(preview)
+      : null;
     this.modalEl.addClass("agentwiki-sync-modal");
   }
   onClose(): void {
@@ -146,6 +155,95 @@ export class PreviewModal extends Modal {
           }),
       );
   }
+  private clearDecision(
+    key: string,
+    clearResolution: () => void,
+    refreshActionState: () => void,
+  ): number {
+    const generation = (this.decisionGenerations.get(key) ?? 0) + 1;
+    this.decisionGenerations.set(key, generation);
+    this.unsettledDecisions.add(key);
+    clearResolution();
+    refreshActionState();
+    return generation;
+  }
+  private queueDecision(
+    key: string,
+    clearResolution: () => void,
+    resolve: (candidate: PullPreviewV3) => Promise<void>,
+    refreshActionState: () => void,
+  ): void {
+    const generation = this.clearDecision(
+      key,
+      clearResolution,
+      refreshActionState,
+    );
+    const work = this.resolutionQueue.then(async () => {
+      if (this.decisionGenerations.get(key) !== generation) return;
+      if (!isPullPreviewV3(this.preview) || !this.resolutionSourcePreview)
+        return;
+      const candidate = structuredClone(this.resolutionSourcePreview);
+      candidate.pageConflictResolutions = structuredClone(
+        this.preview.pageConflictResolutions,
+      );
+      candidate.folderConflictResolutions = structuredClone(
+        this.preview.folderConflictResolutions,
+      );
+      candidate.attachmentConflictResolutions = structuredClone(
+        this.preview.attachmentConflictResolutions,
+      );
+      await resolve(candidate);
+      if (this.decisionGenerations.get(key) === generation) {
+        this.installResolvedPreview(candidate);
+        this.unsettledDecisions.delete(key);
+      }
+    });
+    this.resolutionQueue = work.catch(() => undefined);
+    void work
+      .catch((error) => new Notice(userErrorMessage(error)))
+      .finally(refreshActionState);
+  }
+  private installResolvedPreview(candidate: PullPreviewV3): void {
+    if (!isPullPreviewV3(this.preview)) return;
+    this.preview.actions = candidate.actions;
+    this.preview.blockers = candidate.blockers;
+    this.preview.attachmentConflicts = candidate.attachmentConflicts;
+    this.preview.attachmentConflictResolutions =
+      candidate.attachmentConflictResolutions;
+    this.preview.folderConflicts = candidate.folderConflicts;
+    this.preview.folderConflictResolutions =
+      candidate.folderConflictResolutions;
+    this.preview.pageConflicts = candidate.pageConflicts;
+    this.preview.pageConflictResolutions = candidate.pageConflictResolutions;
+    this.preview.pagePlan = candidate.pagePlan;
+    this.preview.attachmentPlan = candidate.attachmentPlan;
+    this.preview.resolvedFolders = candidate.resolvedFolders;
+    this.preview.resolvedPages = candidate.resolvedPages;
+    this.preview.resolvedAttachments = candidate.resolvedAttachments;
+  }
+  private unsettledDecisionCount(): number {
+    if (!isPullPreviewV3(this.preview)) return 0;
+    let count = 0;
+    for (const key of this.unsettledDecisions) {
+      const separator = key.indexOf(":");
+      const kind = key.slice(0, separator);
+      const conflictId = key.slice(separator + 1);
+      const alreadyCounted =
+        kind === "page"
+          ? this.preview.pageConflicts.some(
+              (conflict) => conflict.conflictId === conflictId,
+            ) && !this.preview.pageConflictResolutions[conflictId]
+          : kind === "folder"
+            ? this.preview.folderConflicts.some(
+                (conflict) => conflict.conflictId === conflictId,
+              ) && !this.preview.folderConflictResolutions[conflictId]
+            : this.preview.attachmentConflicts.some(
+                (conflict) => conflict.conflictId === conflictId,
+              ) && !this.preview.attachmentConflictResolutions[conflictId];
+      if (!alreadyCounted) count += 1;
+    }
+    return count;
+  }
   private render(): void {
     this.contentEl.empty();
     this.contentEl.createEl("h2", { text: this.title });
@@ -159,10 +257,13 @@ export class PreviewModal extends Modal {
     });
     const pendingDecisionCount = () =>
       isPullPreview(this.preview)
-        ? pendingPreviewDecisionCount(this.bindings, this.preview)
-        : this.preview && "mode" in this.preview
+        ? pendingPreviewDecisionCount(this.bindings, this.preview) +
+          this.unsettledDecisionCount()
+        : isBlockedPushPreview(this.preview)
           ? this.preview.blockers.length
-          : 0;
+          : this.preview && "mode" in this.preview
+            ? this.preview.blockers.length
+            : 0;
     const actionDescription = () => {
       const pending = pendingDecisionCount();
       return pending > 0
@@ -279,6 +380,18 @@ export class PreviewModal extends Modal {
   }
 
   private renderBlockers(): void {
+    if (isBlockedPushPreview(this.preview)) {
+      const blockers = this.contentEl.createDiv({
+        cls: "agentwiki-sync-blockers",
+      });
+      blockers.createEl("h3", { text: "图片阻塞项" });
+      const list = blockers.createEl("ul");
+      for (const blocker of this.preview.blockers)
+        list.createEl("li", {
+          text: `${blocker.pagePath ?? blocker.path ?? "Page"}: ${userErrorMessage(new Error(blocker.code))}`,
+        });
+      return;
+    }
     if (
       this.preview &&
       "mode" in this.preview &&
@@ -428,21 +541,39 @@ export class PreviewModal extends Modal {
         .onChange((value) => {
           if (!isPullPreview(this.preview)) return;
           if ("attachmentConflicts" in this.preview) {
+            const preview = this.preview;
+            const key = `page:${conflict.conflictId}`;
             if (value === "manual") {
               this.pageManualDrafts.set(
                 conflict.conflictId,
                 this.pageManualDrafts.get(conflict.conflictId) ?? "",
               );
-              delete this.preview.pageConflictResolutions[conflict.conflictId];
-              refreshActionState();
+              this.clearDecision(
+                key,
+                () =>
+                  delete preview.pageConflictResolutions[conflict.conflictId],
+                refreshActionState,
+              );
             } else if (value !== "local" && value !== "remote")
-              delete this.preview.pageConflictResolutions[conflict.conflictId];
-            else
-              void resolvePageConflictV3(this.preview, conflict.conflictId, {
-                choice: value,
-              })
-                .catch((error) => new Notice(userErrorMessage(error)))
-                .finally(refreshActionState);
+              this.clearDecision(
+                key,
+                () =>
+                  delete preview.pageConflictResolutions[conflict.conflictId],
+                refreshActionState,
+              );
+            else {
+              const choice = value;
+              this.queueDecision(
+                key,
+                () =>
+                  delete preview.pageConflictResolutions[conflict.conflictId],
+                (candidate) =>
+                  resolvePageConflictV3(candidate, conflict.conflictId, {
+                    choice,
+                  }),
+                refreshActionState,
+              );
+            }
           } else {
             applyConflictResolution(
               this.preview,
@@ -468,8 +599,13 @@ export class PreviewModal extends Modal {
           if (isPullPreview(this.preview)) {
             if ("attachmentConflicts" in this.preview) {
               this.pageManualDrafts.set(conflict.conflictId, value);
-              delete this.preview.pageConflictResolutions[conflict.conflictId];
-              refreshActionState();
+              const preview = this.preview;
+              this.clearDecision(
+                `page:${conflict.conflictId}`,
+                () =>
+                  delete preview.pageConflictResolutions[conflict.conflictId],
+                refreshActionState,
+              );
               return;
             }
             applyConflictResolution(
@@ -486,12 +622,19 @@ export class PreviewModal extends Modal {
       setting.addButton((button) =>
         button.setButtonText("应用手动内容").onClick(() => {
           if (!isPullPreviewV3(this.preview)) return;
-          void resolvePageConflictV3(this.preview, conflict.conflictId, {
-            choice: "manual",
-            manualValue: this.pageManualDrafts.get(conflict.conflictId) ?? "",
-          })
-            .catch((error) => new Notice(userErrorMessage(error)))
-            .finally(refreshActionState);
+          const preview = this.preview;
+          const manualValue =
+            this.pageManualDrafts.get(conflict.conflictId) ?? "";
+          this.queueDecision(
+            `page:${conflict.conflictId}`,
+            () => delete preview.pageConflictResolutions[conflict.conflictId],
+            (candidate) =>
+              resolvePageConflictV3(candidate, conflict.conflictId, {
+                choice: "manual",
+                manualValue,
+              }),
+            refreshActionState,
+          );
         }),
       );
   }
@@ -546,7 +689,12 @@ export class PreviewModal extends Modal {
             const current = draftValue();
             this.folderManualDrafts.set(conflict.conflictId, current);
             if ("attachmentConflicts" in preview) {
-              delete preview.folderConflictResolutions[conflict.conflictId];
+              this.clearDecision(
+                `folder:${conflict.conflictId}`,
+                () =>
+                  delete preview.folderConflictResolutions[conflict.conflictId],
+                refreshActionState,
+              );
             } else
               applyFolderConflictResolution(
                 preview,
@@ -561,13 +709,19 @@ export class PreviewModal extends Modal {
             if (
               "attachmentConflicts" in preview &&
               (value === "local" || value === "remote")
-            )
-              void resolveFolderConflictV3(preview, conflict.conflictId, {
-                choice: value,
-              })
-                .catch((error) => new Notice(userErrorMessage(error)))
-                .finally(refreshActionState);
-            else if (!("attachmentConflicts" in preview))
+            ) {
+              const choice = value;
+              this.queueDecision(
+                `folder:${conflict.conflictId}`,
+                () =>
+                  delete preview.folderConflictResolutions[conflict.conflictId],
+                (candidate) =>
+                  resolveFolderConflictV3(candidate, conflict.conflictId, {
+                    choice,
+                  }),
+                refreshActionState,
+              );
+            } else if (!("attachmentConflicts" in preview))
               applyFolderConflictResolution(
                 preview,
                 conflict.conflictId,
@@ -591,7 +745,12 @@ export class PreviewModal extends Modal {
         .onChange((value) => {
           this.folderManualDrafts.set(conflict.conflictId, value);
           if ("attachmentConflicts" in preview) {
-            delete preview.folderConflictResolutions[conflict.conflictId];
+            this.clearDecision(
+              `folder:${conflict.conflictId}`,
+              () =>
+                delete preview.folderConflictResolutions[conflict.conflictId],
+              refreshActionState,
+            );
           } else
             applyFolderConflictResolution(
               preview,
@@ -611,12 +770,16 @@ export class PreviewModal extends Modal {
             showValidation(value);
             return;
           }
-          void resolveFolderConflictV3(preview, conflict.conflictId, {
-            choice: "manual",
-            manualPath: value,
-          })
-            .catch((error) => new Notice(userErrorMessage(error)))
-            .finally(refreshActionState);
+          this.queueDecision(
+            `folder:${conflict.conflictId}`,
+            () => delete preview.folderConflictResolutions[conflict.conflictId],
+            (candidate) =>
+              resolveFolderConflictV3(candidate, conflict.conflictId, {
+                choice: "manual",
+                manualPath: value,
+              }),
+            refreshActionState,
+          );
         }),
       );
   }
@@ -627,14 +790,22 @@ export class PreviewModal extends Modal {
   ): void {
     if (!isPullPreviewV3(this.preview)) return;
     const preview = this.preview;
+    const applied =
+      preview.attachmentConflictResolutions[conflict.conflictId] ?? null;
     const draft =
       this.attachmentDrafts.get(conflict.conflictId) ??
       ({
-        mode: "",
-        primary: "local",
-        secondaryAttachmentId: crypto.randomUUID(),
-        secondaryPath: "",
-        redirectPageIds: new Set<string>(),
+        mode: applied?.choice ?? "",
+        primary: applied?.choice === "keep_both" ? applied.primary : "local",
+        secondaryAttachmentId:
+          applied?.choice === "keep_both"
+            ? applied.secondaryAttachmentId
+            : crypto.randomUUID(),
+        secondaryPath:
+          applied?.choice === "keep_both" ? applied.secondaryPath : "",
+        redirectPageIds: new Set(
+          applied?.choice === "keep_both" ? applied.redirectPageIds : [],
+        ),
       } satisfies AttachmentResolutionDraft);
     this.attachmentDrafts.set(conflict.conflictId, draft);
     const setting = new Setting(this.contentEl)
@@ -648,11 +819,19 @@ export class PreviewModal extends Modal {
     setting.settingEl.addClass("agentwiki-sync-attachment-setting");
     setting.controlEl?.addClass("agentwiki-sync-resolution-controls");
 
-    const applyDraft = async (): Promise<void> => {
+    const applyDraft = (): void => {
       if (draft.mode === "local" || draft.mode === "remote") {
-        await resolveAttachmentConflict(preview, conflict.conflictId, {
-          choice: draft.mode,
-        });
+        const choice = draft.mode;
+        this.queueDecision(
+          `attachment:${conflict.conflictId}`,
+          () =>
+            delete preview.attachmentConflictResolutions[conflict.conflictId],
+          (candidate) =>
+            resolveAttachmentConflict(candidate, conflict.conflictId, {
+              choice,
+            }),
+          refreshActionState,
+        );
       } else if (draft.mode === "keep_both") {
         const resolution = {
           choice: "keep_both" as const,
@@ -662,19 +841,20 @@ export class PreviewModal extends Modal {
           redirectPageIds: [...draft.redirectPageIds].sort(),
         };
         if (!attachmentConflictResolutionComplete(conflict, resolution)) return;
-        await resolveAttachmentConflict(
-          preview,
-          conflict.conflictId,
-          resolution,
+        this.queueDecision(
+          `attachment:${conflict.conflictId}`,
+          () =>
+            delete preview.attachmentConflictResolutions[conflict.conflictId],
+          (candidate) =>
+            resolveAttachmentConflict(
+              candidate,
+              conflict.conflictId,
+              resolution,
+            ),
+          refreshActionState,
         );
       }
-      refreshActionState();
     };
-    const safelyApply = () =>
-      void applyDraft().catch((error) => {
-        new Notice(userErrorMessage(error));
-        refreshActionState();
-      });
 
     setting.addDropdown((dropdown) =>
       dropdown
@@ -688,8 +868,16 @@ export class PreviewModal extends Modal {
             value === "local" || value === "remote" || value === "keep_both"
               ? value
               : "";
-          if (draft.mode === "local" || draft.mode === "remote") safelyApply();
-          else refreshActionState();
+          if (draft.mode === "local" || draft.mode === "remote") applyDraft();
+          else
+            this.clearDecision(
+              `attachment:${conflict.conflictId}`,
+              () =>
+                delete preview.attachmentConflictResolutions[
+                  conflict.conflictId
+                ],
+              refreshActionState,
+            );
         }),
     );
     setting.addDropdown((dropdown) =>
@@ -699,7 +887,12 @@ export class PreviewModal extends Modal {
         .setValue(draft.primary)
         .onChange((value) => {
           draft.primary = value === "remote" ? "remote" : "local";
-          refreshActionState();
+          this.clearDecision(
+            `attachment:${conflict.conflictId}`,
+            () =>
+              delete preview.attachmentConflictResolutions[conflict.conflictId],
+            refreshActionState,
+          );
         }),
     );
     setting.addText((text) =>
@@ -708,7 +901,12 @@ export class PreviewModal extends Modal {
         .setValue(draft.secondaryPath)
         .onChange((value) => {
           draft.secondaryPath = value;
-          refreshActionState();
+          this.clearDecision(
+            `attachment:${conflict.conflictId}`,
+            () =>
+              delete preview.attachmentConflictResolutions[conflict.conflictId],
+            refreshActionState,
+          );
         }),
     );
     const redirects = this.contentEl.createEl("fieldset", {
@@ -722,25 +920,38 @@ export class PreviewModal extends Modal {
       input.addEventListener("change", () => {
         if (input.checked) draft.redirectPageIds.add(pageId);
         else draft.redirectPageIds.delete(pageId);
-        refreshActionState();
+        this.clearDecision(
+          `attachment:${conflict.conflictId}`,
+          () =>
+            delete preview.attachmentConflictResolutions[conflict.conflictId],
+          refreshActionState,
+        );
       });
-      label.appendText(pageId);
+      const pagePath =
+        preview.resolvedPages.find((page) => page.pageId === pageId)?.path ??
+        preview.local.pages.find((page) => page.pageId === pageId)?.path ??
+        preview.remote.pages.find((page) => page.pageId === pageId)?.path ??
+        preview.base.pages.find((page) => page.pageId === pageId)?.path ??
+        pageId;
+      label.appendText(pagePath);
     }
     setting.addButton((button) =>
       button.setButtonText("应用图片选择").onClick(() => {
-        if (draft.mode !== "keep_both") return;
-        const resolution = {
-          choice: "keep_both" as const,
-          primary: draft.primary,
-          secondaryAttachmentId: draft.secondaryAttachmentId,
-          secondaryPath: draft.secondaryPath.trim(),
-          redirectPageIds: [...draft.redirectPageIds].sort(),
-        };
-        if (!attachmentConflictResolutionComplete(conflict, resolution)) {
-          new Notice("请选择主版本、填写副本路径，并显式勾选部分页面。");
-          return;
+        if (!draft.mode) return;
+        if (draft.mode === "keep_both") {
+          const resolution = {
+            choice: "keep_both" as const,
+            primary: draft.primary,
+            secondaryAttachmentId: draft.secondaryAttachmentId,
+            secondaryPath: draft.secondaryPath.trim(),
+            redirectPageIds: [...draft.redirectPageIds].sort(),
+          };
+          if (!attachmentConflictResolutionComplete(conflict, resolution)) {
+            new Notice("请选择主版本、填写副本路径，并显式勾选部分页面。");
+            return;
+          }
         }
-        safelyApply();
+        applyDraft();
       }),
     );
   }
