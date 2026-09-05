@@ -45,7 +45,9 @@ export interface UploadMissingInput {
   receiptFor?(
     contentHash: string,
     chunkIndex: number,
+    chunkHash: string,
   ): Promise<BlobChunkReceiptV3 | null>;
+  releaseBlob?(contentHash: string): Promise<void> | void;
   persistReceipt(receipt: BlobChunkReceiptV3): Promise<void>;
   signal?: AbortSignal;
 }
@@ -237,43 +239,56 @@ export class BlobTransfer {
       assertNotAborted(input.signal);
       const expected = requirements.get(hash)!;
       const bytes = await input.readBlob(expected);
-      if (
-        !bytes ||
-        bytes.byteLength !== Number(expected.sizeBytes) ||
-        (await blobContentHashV3(bytes)) !== expected.contentHash
-      )
-        throw new BlobTransferDeterministicError("UPLOAD_BLOB_MISMATCH");
-      const chunkCount = Math.ceil(bytes.byteLength / this.chunkBytes);
-      for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
-        assertNotAborted(input.signal);
-        const start = chunkIndex * this.chunkBytes;
-        const chunk = bytes.subarray(
-          start,
-          Math.min(bytes.byteLength, start + this.chunkBytes),
-        );
-        const chunkHash = await blobChunkHashV3(chunk);
-        const recovered = await input.receiptFor?.(hash, chunkIndex);
-        if (recovered) {
-          const existing = BlobChunkReceiptV3Schema.parse(recovered);
-          if (
-            existing.contentHash !== hash ||
-            existing.chunkIndex !== chunkIndex ||
-            existing.chunkHash !== chunkHash
-          )
-            throw new BlobTransferDeterministicError(
-              "BLOB_RECEIPT_RESUME_MISMATCH",
-            );
-          continue;
+      try {
+        if (
+          !bytes ||
+          bytes.byteLength !== Number(expected.sizeBytes) ||
+          (await blobContentHashV3(bytes)) !== expected.contentHash
+        )
+          throw new BlobTransferDeterministicError("UPLOAD_BLOB_MISMATCH");
+        const chunkCount = Math.ceil(bytes.byteLength / this.chunkBytes);
+        for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
+          assertNotAborted(input.signal);
+          const start = chunkIndex * this.chunkBytes;
+          const chunk = bytes.subarray(
+            start,
+            Math.min(bytes.byteLength, start + this.chunkBytes),
+          );
+          const chunkHash = await blobChunkHashV3(chunk);
+          const recovered = await input.receiptFor?.(
+            hash,
+            chunkIndex,
+            chunkHash,
+          );
+          if (recovered) {
+            const existing = BlobChunkReceiptV3Schema.parse(recovered);
+            if (
+              existing.contentHash !== hash ||
+              existing.chunkIndex !== chunkIndex ||
+              existing.chunkHash !== chunkHash
+            )
+              throw new BlobTransferDeterministicError(
+                "BLOB_RECEIPT_RESUME_MISMATCH",
+              );
+            continue;
+          }
+          const receipt = await this.retry(() =>
+            this.remote.uploadBlobChunk(
+              input.sessionId,
+              hash,
+              chunkIndex,
+              chunk,
+            ),
+          );
+          await input.persistReceipt(receipt);
         }
-        const receipt = await this.retry(() =>
-          this.remote.uploadBlobChunk(input.sessionId, hash, chunkIndex, chunk),
+        assertNotAborted(input.signal);
+        await this.retry(() =>
+          this.remote.completeBlob(input.sessionId, expected, chunkCount),
         );
-        await input.persistReceipt(receipt);
+      } finally {
+        if (bytes) await input.releaseBlob?.(hash);
       }
-      assertNotAborted(input.signal);
-      await this.retry(() =>
-        this.remote.completeBlob(input.sessionId, expected, chunkCount),
-      );
     });
   }
 

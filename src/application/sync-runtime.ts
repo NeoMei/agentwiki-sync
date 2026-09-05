@@ -1987,6 +1987,42 @@ export class SyncRuntime {
     }
   }
 
+  private pushSemanticChangeV3(change: PreparedTreePushChangeV3): unknown {
+    switch (change.operation) {
+      case "upsert_folder": {
+        const { updatedAt: _updatedAt, ...folder } = change.folder;
+        return { operation: change.operation, folder };
+      }
+      case "upsert_attachment": {
+        const { updatedAt: _updatedAt, ...attachment } = change.attachment;
+        return { operation: change.operation, attachment };
+      }
+      case "upsert_page": {
+        const {
+          payloadPath: _payloadPath,
+          bodyBytes: _bodyBytes,
+          updatedAt: _updatedAt,
+          ...page
+        } = change.page;
+        return { operation: change.operation, page };
+      }
+      case "archive_folder":
+      case "archive_page":
+      case "detach_attachment":
+        return { ...change };
+    }
+  }
+
+  private async pushSemanticHashV3(
+    changes: PreparedTreePushChangeV3[],
+  ): Promise<string> {
+    return sha256Hex(
+      canonicalBytes(
+        changes.map((change) => this.pushSemanticChangeV3(change)),
+      ),
+    );
+  }
+
   private async preparePushChangesV3(
     base: TreeSnapshotV3,
     local: LocalTreeScanV3,
@@ -2145,9 +2181,15 @@ export class SyncRuntime {
     options?: SyncOperationOptions,
   ): Promise<void> {
     if (!result) throw new Error("PUSH_TERMINAL_RESULT_MISSING");
+    const terminalOptions: SyncOperationOptions | undefined = options
+      ? {
+          onProgress: (progress) =>
+            options.onProgress?.({ ...progress, cancellable: false }),
+        }
+      : undefined;
     const snapshot = await this.downloadRemoteSnapshotV3(
       result.revision,
-      options,
+      terminalOptions,
     );
     if (
       snapshot.revisionContentHash !== result.revisionContentHash ||
@@ -2245,7 +2287,18 @@ export class SyncRuntime {
     } catch (error) {
       if (syncErrorCodeV3(error) !== "CAPABILITIES_CHANGED") throw error;
       await service.supersede();
-      effectivePreview = await this.previewPushV3(options);
+      const rebuilt = await this.previewPushV3(options);
+      if (
+        (await this.pushSemanticHashV3(rebuilt.changes)) !==
+        (await this.pushSemanticHashV3(preview.changes))
+      ) {
+        if (rebuilt.previewId)
+          await this.control.removeTree?.(
+            this.root + "/push-preview/" + safeKey(rebuilt.previewId),
+          );
+        throw new Error("PUSH_CONFIRMATION_REQUIRED");
+      }
+      effectivePreview = rebuilt;
       result = await service.publishPrepared(effectivePreview, options);
     }
     reportProgress(options, {
@@ -2638,6 +2691,11 @@ export class SyncRuntime {
 }
 
 function syncErrorCodeV3(error: unknown): string | null {
+  if (
+    error instanceof Error &&
+    (error.message === "CAPABILITIES_CHANGED" || error.message === "BASE_STALE")
+  )
+    return error.message;
   if (!(error instanceof AgentWikiHttpError)) return null;
   const body = error.body;
   if (!body || typeof body !== "object") return null;

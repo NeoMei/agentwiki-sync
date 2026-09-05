@@ -6,7 +6,6 @@ import {
   TreePushChangeV3Schema,
   TreePushManifestChangeV3Schema,
   TreeSyncCapabilitiesV3Schema,
-  blobChunkHashV3,
   canonicalTreeDeltaItemsV3,
   treeBatchHashV3,
   treeCapabilitiesHashV3,
@@ -328,6 +327,7 @@ function v3Manifest(
 /** Strict v3 coordinator; the frozen v1/v2 TreePushService stays unchanged. */
 export class TreePushServiceV3 {
   private readonly journal: MutableControlRepository<TreePushJournalV3>;
+  private receiptWriteQueue: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly remote: TreeRemotePortV3,
@@ -343,7 +343,22 @@ export class TreePushServiceV3 {
   }
 
   private async save(journal: TreePushJournalV3): Promise<void> {
-    await this.journal.write(journal);
+    await this.journal.write(structuredClone(journal));
+  }
+
+  private async persistReceipt(
+    journal: TreePushJournalV3,
+    raw: unknown,
+  ): Promise<void> {
+    const receipt = BlobChunkReceiptV3Schema.parse(raw);
+    const operation = this.receiptWriteQueue.then(async () => {
+      const entry = journal.requiredBlobs[receipt.contentHash];
+      if (!entry) throw new Error("BLOB_RECEIPT_RESUME_MISMATCH");
+      entry.chunkReceipts[String(receipt.chunkIndex)] = receipt.receipt;
+      await this.save(journal);
+    });
+    this.receiptWriteQueue = operation.catch(() => undefined);
+    await operation;
   }
 
   private async load(): Promise<TreePushJournalV3> {
@@ -431,6 +446,12 @@ export class TreePushServiceV3 {
   }
 
   private async stage(input: TreePushPreviewV3): Promise<TreePushJournalV3> {
+    const capabilityDigest = await treeCapabilitiesHashV3(input.capabilities);
+    if (
+      capabilityDigest !== input.capabilitiesHash ||
+      capabilityDigest !== (await this.remote.capabilitiesHash)
+    )
+      throw new Error("CAPABILITIES_CHANGED");
     const changes: PreparedTreePushChangeV3[] = [];
     let totalBodyBytes = 0;
     for (const change of input.changes) {
@@ -464,12 +485,6 @@ export class TreePushServiceV3 {
         },
       });
     }
-    const capabilityDigest = await treeCapabilitiesHashV3(input.capabilities);
-    if (
-      capabilityDigest !== input.capabilitiesHash ||
-      capabilityDigest !== (await this.remote.capabilitiesHash)
-    )
-      throw new Error("CAPABILITIES_CHANGED");
     const blob = this.requirements(changes);
     if (
       changes.length > input.capabilities.maxChangeCount ||
@@ -623,7 +638,6 @@ export class TreePushServiceV3 {
     missing: string[],
     options?: SyncOperationOptions,
   ): Promise<void> {
-    const bytesByHash = new Map<string, Uint8Array>();
     const transfer = new BlobTransfer(
       this.remote,
       new BlobStagingRepository(this.store, `${this.root}/blob-staging`),
@@ -639,37 +653,21 @@ export class TreePushServiceV3 {
       readBlob: async (requirement) => {
         const entry = journal.requiredBlobs[requirement.contentHash];
         if (!entry) return null;
-        const bytes = await this.local.readBlob(entry.vaultPath);
-        if (bytes) bytesByHash.set(requirement.contentHash, bytes);
-        return bytes;
+        return this.local.readBlob(entry.vaultPath);
       },
-      receiptFor: async (hash, chunkIndex) => {
+      receiptFor: async (hash, chunkIndex, chunkHash) => {
         const receipt =
           journal.requiredBlobs[hash]?.chunkReceipts[String(chunkIndex)];
         if (!receipt) return null;
-        const bytes = bytesByHash.get(hash);
-        if (!bytes) return null;
-        const start = chunkIndex * journal.capabilities.blobChunkBytes;
-        const chunk = bytes.subarray(
-          start,
-          Math.min(
-            bytes.byteLength,
-            start + journal.capabilities.blobChunkBytes,
-          ),
-        );
         return {
           contentHash: hash,
           chunkIndex,
-          chunkHash: await blobChunkHashV3(chunk),
+          chunkHash,
           receipt,
         };
       },
       persistReceipt: async (raw) => {
-        const receipt = BlobChunkReceiptV3Schema.parse(raw);
-        const entry = journal.requiredBlobs[receipt.contentHash];
-        if (!entry) throw new Error("BLOB_RECEIPT_RESUME_MISMATCH");
-        entry.chunkReceipts[String(receipt.chunkIndex)] = receipt.receipt;
-        await this.save(journal);
+        await this.persistReceipt(journal, raw);
         await progressCheckpoint(options, {
           phase: "upload_blob",
           completed: Object.values(journal.requiredBlobs).reduce(
@@ -811,6 +809,11 @@ export class TreePushServiceV3 {
       ) {
         journal.remoteState = "finalizing";
         await this.save(journal);
+        reportProgress(options, {
+          phase: "finalize",
+          completed: 0,
+          cancellable: false,
+        });
         return this.commitResult(
           journal,
           await this.remote.finalize(
@@ -910,9 +913,17 @@ export class TreePushServiceV3 {
   }
 
   async supersede(): Promise<void> {
-    const journal = await this.load();
+    const existing = await this.journal.read();
+    if (!existing) return;
+    const journal = existing.payload;
+    if (
+      journal.remoteState === "published" &&
+      journal.localCommitPhase === "verified"
+    )
+      return;
     if (journal.remoteState === "published")
       throw new Error("已发布的推送无法被替代");
+    if (journal.remoteState === "superseded") return;
     await this.cancelBeforeFinalize(journal, false);
   }
 }

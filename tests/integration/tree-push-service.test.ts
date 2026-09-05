@@ -471,7 +471,7 @@ const V3_CAPABILITIES: TreeSyncCapabilitiesV3 = {
   maxTransferBlobBytes: 100 * 1024 * 1024,
   blobChunkBytes: 4,
   maxBlobChunks: 10,
-  maxConcurrentBlobs: 1,
+  maxConcurrentBlobs: 2,
   maxImageDimension: 10000,
   maxDecodedPixels: 40000000,
   allowedMimeTypes: ["image/png"],
@@ -934,6 +934,92 @@ describe("TreePushServiceV3", () => {
     expect(await store.read(".agentwiki/tree/req/journal.json")).not.toContain(
       JSON.stringify([...blob]),
     );
+  });
+
+  it("serializes overlapping receipt journal writes for two Blob workers", async () => {
+    store = new MemoryControlStore();
+    const firstBlob = Uint8Array.from({ length: 10 }, (_, index) => index);
+    const secondBlob = Uint8Array.from(
+      { length: 10 },
+      (_, index) => index + 10,
+    );
+    const { preview, currentHash } = await v3Prepared(firstBlob);
+    const original = preview.changes[0]!;
+    if (original.operation !== "upsert_attachment") throw new Error("fixture");
+    const second = structuredClone(original);
+    second.attachment.attachmentId = "33333333-3333-4333-8333-333333333333";
+    second.attachment.path = "assets/second.png";
+    second.attachment.contentHash = await blobContentHashV3(secondBlob);
+    second.vaultPath = "Wiki/assets/second.png";
+    preview.changes.splice(1, 0, second);
+    preview.confirmationHash = await treeConfirmationHashV3({
+      protocolVersion: "3",
+      spaceId: preview.spaceId,
+      baseRevision: preview.baseRevision,
+      capabilitiesHash: preview.capabilitiesHash,
+      changes: preview.changes.map(manifestChange),
+    });
+    currentHash.value = preview.confirmationHash;
+    const remote = new StrictV3PushRemote();
+    const nextPath = ".agentwiki/tree/concurrent/journal.json.next";
+    let activeReceiptWrites = 0;
+    let maxActiveReceiptWrites = 0;
+    store.onTextWrite = async (path) => {
+      if (path !== nextPath || remote.uploadedChunkIndexes.length < 2) return;
+      activeReceiptWrites += 1;
+      maxActiveReceiptWrites = Math.max(
+        maxActiveReceiptWrites,
+        activeReceiptWrites,
+      );
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+      activeReceiptWrites -= 1;
+    };
+    const service = new TreePushServiceV3(
+      remote,
+      store,
+      ".agentwiki/tree/concurrent",
+      {
+        readBlob: async (path) =>
+          path.endsWith("second.png") ? secondBlob : firstBlob,
+        revalidateConfirmation: async () => currentHash.value,
+      },
+    );
+
+    await expect(service.publishPrepared(preview)).resolves.toMatchObject({
+      revision: "r2",
+    });
+
+    expect(maxActiveReceiptWrites).toBe(1);
+    const rawJournal = await store.read(nextPath.replace(/\.next$/u, ""));
+    if (!rawJournal) throw new Error("missing durable journal");
+    const envelope = JSON.parse(rawJournal) as {
+      payload: {
+        requiredBlobs: Record<
+          string,
+          { chunkReceipts: Record<string, string> }
+        >;
+      };
+    };
+    const receipts = envelope.payload.requiredBlobs;
+    expect(
+      Object.values(receipts).map((item) => Object.keys(item.chunkReceipts)),
+    ).toEqual([
+      ["0", "1", "2"],
+      ["0", "1", "2"],
+    ]);
+    const resumed = new TreePushServiceV3(
+      remote,
+      store,
+      ".agentwiki/tree/concurrent",
+      {
+        readBlob: async () => null,
+        revalidateConfirmation: async () => currentHash.value,
+      },
+    );
+    await expect(resumed.resumePending()).resolves.toMatchObject({
+      revision: "r2",
+    });
+    expect(remote.createInputs).toHaveLength(1);
   });
 
   it("fails closed when one content hash declares conflicting metadata", async () => {

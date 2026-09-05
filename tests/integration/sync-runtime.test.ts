@@ -251,6 +251,160 @@ describe("SyncRuntime", () => {
     expect(remote.finalizeCalls).toBe(1);
   });
 
+  it("rebuilds after a locally detected stage capability change without requiring a journal", async () => {
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({ revision: "rev-empty" });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    await runtime.applyPullV3(await runtime.previewPullV3());
+    vault.seedMarkdown("Wiki/pages/note.md", "body");
+    const preview = await runtime.previewPushV3();
+    remote.setCapabilities({
+      ...(await remote.capabilities()),
+      maxBatchItems: 99,
+    });
+
+    await runtime.applyPushV3(preview);
+
+    expect(remote.createInputs).toHaveLength(1);
+    expect(remote.createInputs[0]?.capabilitiesHash).not.toBe(
+      preview.capabilitiesHash,
+    );
+    expect(remote.finalizeCalls).toBe(1);
+  });
+
+  it("does not supersede an earlier verified terminal journal during capability rebuild", async () => {
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({ revision: "rev-empty" });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    await runtime.applyPullV3(await runtime.previewPullV3());
+    vault.seedMarkdown("Wiki/pages/note.md", "first");
+    await runtime.applyPushV3(await runtime.previewPushV3());
+    vault.seedMarkdown("Wiki/pages/note.md", "second");
+    const preview = await runtime.previewPushV3();
+    remote.setCapabilities({
+      ...(await remote.capabilities()),
+      maxBatchItems: 99,
+    });
+
+    await runtime.applyPushV3(preview);
+
+    expect(remote.createInputs).toHaveLength(2);
+    expect(remote.finalizeCalls).toBe(2);
+  });
+
+  it("requires a new explicit preview when capability rebuild sees new local content", async () => {
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({ revision: "rev-empty" });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    await runtime.applyPullV3(await runtime.previewPullV3());
+    vault.seedMarkdown("Wiki/pages/note.md", "approved");
+    const preview = await runtime.previewPushV3();
+    remote.setCapabilities({
+      ...(await remote.capabilities()),
+      maxBatchItems: 99,
+    });
+    vault.seedMarkdown("Wiki/pages/note.md", "not approved");
+
+    await expect(runtime.applyPushV3(preview)).rejects.toThrow(
+      /PUSH_CONFIRMATION_REQUIRED/,
+    );
+
+    expect(remote.createInputs).toEqual([]);
+    expect(
+      await control.read(
+        ".agentwiki/devices/d-local/spaces/s-space/push/journal.json",
+      ),
+    ).toBeNull();
+    expect(
+      [...control.files.keys()].some((path) => path.includes("/push/payload/")),
+    ).toBe(false);
+  });
+
+  it("aborts and rebuilds after a locally detected pre-finalize capability change", async () => {
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({ revision: "rev-empty" });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    await runtime.applyPullV3(await runtime.previewPullV3());
+    vault.seedMarkdown("Wiki/pages/note.md", "body");
+    let changed = false;
+    remote.onUploadBatch = async () => {
+      if (changed) return;
+      changed = true;
+      remote.setCapabilities({
+        ...(await remote.capabilities()),
+        maxBatchItems: 99,
+      });
+    };
+
+    await runtime.applyPushV3(await runtime.previewPushV3());
+
+    expect(remote.abortCalls).toBe(1);
+    expect(remote.createInputs).toHaveLength(2);
+    expect(remote.finalizeCalls).toBe(1);
+  });
+
+  it("rejects a second locally detected capability change", async () => {
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({ revision: "rev-empty" });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    await runtime.applyPullV3(await runtime.previewPullV3());
+    vault.seedMarkdown("Wiki/pages/note.md", "body");
+    remote.onUploadBatch = async () => {
+      const current = await remote.capabilities();
+      remote.setCapabilities({
+        ...current,
+        maxBatchItems: current.maxBatchItems - 1,
+      });
+    };
+
+    await expect(
+      runtime.applyPushV3(await runtime.previewPushV3()),
+    ).rejects.toThrow(/CAPABILITIES_CHANGED/);
+
+    expect(remote.abortCalls).toBe(2);
+    expect(remote.createInputs).toHaveLength(2);
+    expect(remote.finalizeCalls).toBe(0);
+  });
+
+  it("keeps terminal snapshot verification and local commit non-cancellable", async () => {
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({ revision: "rev-empty" });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    await runtime.applyPullV3(await runtime.previewPullV3());
+    vault.seedMarkdown("Wiki/pages/note.md", "body");
+    const controller = new AbortController();
+    const progress: Array<{ phase: string; cancellable: boolean }> = [];
+
+    await runtime.applyPushV3(await runtime.previewPushV3(), {
+      signal: controller.signal,
+      onProgress: (event) => {
+        progress.push({ phase: event.phase, cancellable: event.cancellable });
+        if (event.phase === "finalize") controller.abort();
+      },
+    });
+
+    expect(remote.createInputs).toHaveLength(1);
+    expect(remote.uploadedBatches).toHaveLength(1);
+    expect(remote.finalizeCalls).toBe(1);
+    expect(
+      progress.slice(progress.findIndex((event) => event.phase === "finalize")),
+    ).not.toContainEqual(expect.objectContaining({ cancellable: true }));
+    expect((await runtime.previewPushV3()).changes).toEqual([]);
+    expect(await runtime.hasUnfinishedPush()).toBe(false);
+  });
+
   it("aborts before finalize when a local image or page drifts during upload", async () => {
     for (const drift of ["image", "page"] as const) {
       const remote = new FakeTreeRemoteV3();

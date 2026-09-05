@@ -169,6 +169,49 @@ function transfer(
 }
 
 describe("BlobTransfer", () => {
+  it("passes the verified chunk hash to resume lookup without retaining prior Blob bytes", async () => {
+    const remote = new FakeV3Remote();
+    remote.firstResponseLost = false;
+    remote.transientSecondChunk = false;
+    const blobs = Array.from(
+      { length: 5 },
+      (_, index) => new Uint8Array([index + 1, index + 11]),
+    );
+    const requirements = await Promise.all(blobs.map(requirement));
+    const bytesByHash = new Map(
+      requirements.map((item, index) => [item.contentHash, blobs[index]!]),
+    );
+    let liveReads = 0;
+    let maxLiveReads = 0;
+    const released: string[] = [];
+
+    await transfer(remote).subject.uploadMissing({
+      sessionId: "session-1",
+      missingContentHashes: requirements.map((item) => item.contentHash),
+      requirements,
+      readBlob: async (expected) => {
+        liveReads += 1;
+        maxLiveReads = Math.max(maxLiveReads, liveReads);
+        return bytesByHash.get(expected.contentHash)!;
+      },
+      receiptFor: async (contentHash, chunkIndex, chunkHash) => {
+        expect(chunkHash).toMatch(/^[a-f0-9]{64}$/u);
+        return null;
+      },
+      releaseBlob: async (contentHash) => {
+        liveReads -= 1;
+        released.push(contentHash);
+      },
+      persistReceipt: async () => undefined,
+    });
+
+    expect(maxLiveReads).toBe(2);
+    expect(liveReads).toBe(0);
+    expect(released.sort()).toEqual(
+      requirements.map((item) => item.contentHash).sort(),
+    );
+  });
+
   it("retries identical chunk bytes after a lost response and durably records each receipt", async () => {
     const remote = new FakeV3Remote();
     const bytes = new Uint8Array([1, 2, 3, 4, 5, 6]);
