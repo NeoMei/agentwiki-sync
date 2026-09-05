@@ -72,21 +72,25 @@ function jpeg(bytes: Uint8Array): ImageMetadata | null {
   if (bytes[0] !== 0xff || bytes[1] !== 0xd8) return null;
   let offset = 2;
   while (offset < bytes.byteLength) {
+    if (bytes[offset] !== 0xff) invalid("malformed JPEG marker framing");
     while (bytes[offset] === 0xff) offset += 1;
     const marker = bytes[offset++];
     if (marker === undefined || marker === 0xd9 || marker === 0xda) break;
-    if (
-      marker === 0x00 ||
-      marker === 0x01 ||
-      (marker >= 0xd0 && marker <= 0xd7)
-    )
-      continue;
+    if (marker === 0x00) invalid("stuffed JPEG marker outside scan data");
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+    if (marker === 0xd8) invalid("unexpected JPEG start marker");
     if (offset + 2 > bytes.byteLength) invalid("truncated JPEG segment");
     const length = be16(bytes, offset);
     if (length < 2 || offset + length > bytes.byteLength)
       invalid("malformed JPEG segment");
     if (JPEG_SOF_MARKERS.has(marker)) {
-      if (length < 7) invalid("malformed JPEG frame");
+      const componentCount = bytes[offset + 7];
+      if (
+        componentCount === undefined ||
+        componentCount < 1 ||
+        length !== 8 + 3 * componentCount
+      )
+        invalid("malformed JPEG frame");
       return {
         mimeType: "image/jpeg",
         width: be16(bytes, offset + 5),

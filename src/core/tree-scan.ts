@@ -34,10 +34,81 @@ export interface TreeScanLimits {
   maxPageBytes: number;
 }
 
-export interface TreeScanLimitsV3 extends TreeScanLimits, ImageMetadataLimits {
+export interface TreeScanLimitsV3 extends TreeScanLimits {
+  maxAttachmentBytes?: number;
+  maxRevisionAttachments?: number;
+  maxTransferBlobBytes?: number;
+  maxImageDimension?: number;
+  maxDecodedPixels?: number;
+  allowedMimeTypes?: readonly ImageMimeType[];
+}
+
+interface EffectiveTreeScanLimitsV3
+  extends TreeScanLimits, ImageMetadataLimits {
   maxAttachmentBytes: number;
   maxRevisionAttachments: number;
   maxTransferBlobBytes: number;
+}
+
+const LOCAL_TREE_SCAN_LIMITS_V3 = Object.freeze({
+  maxAttachmentBytes: 10 * 1024 * 1024,
+  maxRevisionAttachments: 1_000,
+  maxTransferBlobBytes: 100 * 1024 * 1024,
+  maxImageDimension: 10_000,
+  maxDecodedPixels: 40_000_000,
+  allowedMimeTypes: [
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+  ] as const,
+});
+
+function boundedPositiveInteger(
+  advertised: number | undefined,
+  localMaximum: number,
+  name: string,
+): number {
+  if (advertised === undefined) return localMaximum;
+  if (!Number.isSafeInteger(advertised) || advertised <= 0)
+    throw new TypeError(`invalid v3 scan limit: ${name}`);
+  return Math.min(advertised, localMaximum);
+}
+
+export function deriveEffectiveTreeScanLimitsV3(
+  limits: TreeScanLimitsV3 | TreeScanLimits,
+): EffectiveTreeScanLimitsV3 {
+  const advertised = limits as TreeScanLimitsV3;
+  return {
+    ...limits,
+    maxAttachmentBytes: boundedPositiveInteger(
+      advertised.maxAttachmentBytes,
+      LOCAL_TREE_SCAN_LIMITS_V3.maxAttachmentBytes,
+      "maxAttachmentBytes",
+    ),
+    maxRevisionAttachments: boundedPositiveInteger(
+      advertised.maxRevisionAttachments,
+      LOCAL_TREE_SCAN_LIMITS_V3.maxRevisionAttachments,
+      "maxRevisionAttachments",
+    ),
+    maxTransferBlobBytes: boundedPositiveInteger(
+      advertised.maxTransferBlobBytes,
+      LOCAL_TREE_SCAN_LIMITS_V3.maxTransferBlobBytes,
+      "maxTransferBlobBytes",
+    ),
+    maxImageDimension: boundedPositiveInteger(
+      advertised.maxImageDimension,
+      LOCAL_TREE_SCAN_LIMITS_V3.maxImageDimension,
+      "maxImageDimension",
+    ),
+    maxDecodedPixels: boundedPositiveInteger(
+      advertised.maxDecodedPixels,
+      LOCAL_TREE_SCAN_LIMITS_V3.maxDecodedPixels,
+      "maxDecodedPixels",
+    ),
+    allowedMimeTypes:
+      advertised.allowedMimeTypes ?? LOCAL_TREE_SCAN_LIMITS_V3.allowedMimeTypes,
+  };
 }
 
 export interface LocalTreeScan {
@@ -346,7 +417,7 @@ export async function scanLocalTree(
 
   if (base.protocolVersion !== "3") return { rootPath, folders, pages };
 
-  const v3Limits = limits as TreeScanLimitsV3;
+  const v3Limits = deriveEffectiveTreeScanLimitsV3(limits);
   const blockers: AttachmentScanBlocker[] = [];
   const assetEntriesByKey = new Map<string, VaultTreeEntry[]>();
   for (const [relativePath, entry] of files) {
@@ -441,29 +512,15 @@ export async function scanLocalTree(
       detail: "attachment count exceeds the revision limit",
     });
     referencedPaths.clear();
-  } else {
-    let listedTotal = 0;
-    let allSizesKnown = true;
-    for (const key of referencedPaths.keys()) {
-      const byteLength = assetEntriesByKey.get(key)?.[0]?.byteLength;
-      if (byteLength === undefined) {
-        allSizesKnown = false;
-        break;
-      }
-      listedTotal += byteLength;
-    }
-    if (allSizesKnown && listedTotal > v3Limits.maxTransferBlobBytes) {
-      blockers.push({
-        code: "ATTACHMENT_QUOTA_EXCEEDED",
-        detail: "listed attachment bytes exceed the transfer limit",
-      });
-      referencedPaths.clear();
-    }
   }
 
   const attachments: TreeAttachment[] = [];
   const attachmentIdByKey = new Map<string, string>();
-  let totalAttachmentBytes = 0;
+  const baseContentHashes = new Set(
+    base.attachments.map((attachment) => attachment.contentHash),
+  );
+  const chargedContentHashes = new Set<string>();
+  let transferBlobBytes = 0;
   for (const [key, path] of [...referencedPaths].sort((left, right) =>
     comparePathKeys(left[1], right[1]),
   )) {
@@ -516,16 +573,24 @@ export async function scanLocalTree(
       });
       continue;
     }
-    totalAttachmentBytes += bytes.byteLength;
-    if (totalAttachmentBytes > v3Limits.maxTransferBlobBytes) {
+    const hash = await sha256Hex(bytes);
+    const needsTransfer =
+      !baseContentHashes.has(hash) && !chargedContentHashes.has(hash);
+    if (
+      needsTransfer &&
+      transferBlobBytes + bytes.byteLength > v3Limits.maxTransferBlobBytes
+    ) {
       blockers.push({
         code: "ATTACHMENT_QUOTA_EXCEEDED",
         path,
-        detail: "referenced attachment bytes exceed the transfer limit",
+        detail: "new attachment blob bytes exceed the transfer limit",
       });
       continue;
     }
-    const hash = await sha256Hex(bytes);
+    if (needsTransfer) {
+      chargedContentHashes.add(hash);
+      transferBlobBytes += bytes.byteLength;
+    }
     let attachmentId = resolveKnownAttachmentId(key, candidates);
     if (attachmentId === undefined) {
       const detachedMatches = Object.values(

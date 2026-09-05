@@ -8,7 +8,10 @@ import type {
   TreeScanLimits,
   TreeScanLimitsV3,
 } from "../../src/core/tree-scan";
-import { scanLocalTree } from "../../src/core/tree-scan";
+import {
+  deriveEffectiveTreeScanLimitsV3,
+  scanLocalTree,
+} from "../../src/core/tree-scan";
 import type {
   TreeAttachment,
   TreeFolder,
@@ -191,6 +194,44 @@ describe("scanLocalTree", () => {
     expect(scan.blockers).toEqual([]);
   });
 
+  it("leaves a previously tracked image untouched after its last reference disappears", async () => {
+    const hash = await sha256Hex(pngBytes);
+    const vault = new MemoryVault({});
+    vault.seedFile("assets/kept.png", pngBytes);
+    vault.seedMarkdown("pages/note.md", "reference removed");
+    const identities = identityState({
+      attachments: {
+        kept: {
+          attachmentId: "kept",
+          path: "assets/kept.png",
+          pathKey: pathKey("assets/kept.png"),
+          baseContentHash: hash,
+          active: true,
+        },
+      },
+    });
+    const base = snapshotV3({
+      pages: [
+        {
+          ...page("note", null, "pages/note.md"),
+          referencedAttachmentIds: ["kept"],
+        },
+      ],
+      attachments: [
+        attachment("kept", "assets/kept.png", { contentHash: hash }),
+      ],
+    });
+
+    const scan = await scanLocalTree(vault, "", base, identities, imageLimits);
+
+    expect(vault.readPaths).not.toContain("assets/kept.png");
+    expect(vault.operations).toBe(0);
+    expect(vault.exists("assets/kept.png")).toBe(true);
+    expect(scan.attachments).toEqual([]);
+    expect(scan.pages[0]?.referencedAttachmentIds).toEqual([]);
+    expect(identities.attachments?.kept?.active).toBe(true);
+  });
+
   it("reads one referenced image once across pages and emits sorted unique IDs", async () => {
     const vault = new MemoryVault({});
     vault.seedFile("Wiki/assets/a.png", pngBytes);
@@ -353,6 +394,117 @@ describe("scanLocalTree", () => {
     );
   });
 
+  it("charges transfer bytes once per new content hash and excludes blobs proven in base", async () => {
+    const existingHash = await sha256Hex(pngBytes);
+    const newBytes = Uint8Array.from([...pngBytes, 1]);
+    const newHash = await sha256Hex(newBytes);
+    const base = snapshotV3({
+      attachments: [
+        attachment("existing", "assets/existing.png", {
+          contentHash: existingHash,
+        }),
+      ],
+    });
+    const makeVault = () => {
+      const vault = new MemoryVault({});
+      vault.seedFile("assets/existing.png", pngBytes);
+      vault.seedFile("assets/new.png", newBytes);
+      vault.seedFile("assets/new-copy.png", newBytes);
+      vault.seedMarkdown(
+        "pages/note.md",
+        ["existing", "new", "new-copy"]
+          .map((name) => `![[assets/${name}.png]]`)
+          .join(" "),
+      );
+      return vault;
+    };
+
+    const boundaryScan = await scanLocalTree(
+      makeVault(),
+      "",
+      base,
+      identityState(),
+      { ...imageLimits, maxTransferBlobBytes: newBytes.byteLength },
+    );
+
+    expect(boundaryScan.blockers).toEqual([]);
+    expect(boundaryScan.attachments.map((item) => item.path)).toEqual([
+      "assets/existing.png",
+      "assets/new-copy.png",
+      "assets/new.png",
+    ]);
+    expect(
+      boundaryScan.attachments.filter((item) => item.contentHash === newHash),
+    ).toHaveLength(2);
+
+    const overBoundaryScan = await scanLocalTree(
+      makeVault(),
+      "",
+      base,
+      identityState(),
+      { ...imageLimits, maxTransferBlobBytes: newBytes.byteLength - 1 },
+    );
+
+    expect(overBoundaryScan.attachments.map((item) => item.path)).toEqual([
+      "assets/existing.png",
+    ]);
+    expect(overBoundaryScan.blockers.map((item) => item.code)).toContain(
+      "ATTACHMENT_QUOTA_EXCEEDED",
+    );
+  });
+
+  it("uses immutable local defaults and only accepts stricter numeric v3 limits", () => {
+    const localDefaults = {
+      maxAttachmentBytes: 10 * 1024 * 1024,
+      maxRevisionAttachments: 1_000,
+      maxTransferBlobBytes: 100 * 1024 * 1024,
+      maxImageDimension: 10_000,
+      maxDecodedPixels: 40_000_000,
+    };
+    const numericKeys = Object.keys(localDefaults) as Array<
+      keyof typeof localDefaults
+    >;
+
+    expect(deriveEffectiveTreeScanLimitsV3(limits)).toMatchObject(
+      localDefaults,
+    );
+    expect(
+      deriveEffectiveTreeScanLimitsV3({
+        ...limits,
+        maxAttachmentBytes: Number.MAX_SAFE_INTEGER,
+        maxRevisionAttachments: Number.MAX_SAFE_INTEGER,
+        maxTransferBlobBytes: Number.MAX_SAFE_INTEGER,
+        maxImageDimension: Number.MAX_SAFE_INTEGER,
+        maxDecodedPixels: Number.MAX_SAFE_INTEGER,
+      }),
+    ).toMatchObject(localDefaults);
+    expect(
+      deriveEffectiveTreeScanLimitsV3({
+        ...limits,
+        maxAttachmentBytes: 5,
+        maxRevisionAttachments: 6,
+        maxTransferBlobBytes: 7,
+        maxImageDimension: 8,
+        maxDecodedPixels: 9,
+      }),
+    ).toMatchObject({
+      maxAttachmentBytes: 5,
+      maxRevisionAttachments: 6,
+      maxTransferBlobBytes: 7,
+      maxImageDimension: 8,
+      maxDecodedPixels: 9,
+    });
+
+    for (const key of numericKeys)
+      for (const invalid of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])
+        expect(() =>
+          deriveEffectiveTreeScanLimitsV3({
+            ...limits,
+            [key]: invalid,
+          }),
+        ).toThrow(/invalid v3 scan limit/);
+  });
+
   it("blocks corrupt bytes and extension-to-magic mismatches", async () => {
     const vault = new MemoryVault({});
     vault.seedFile("assets/corrupt.png", Uint8Array.from([1, 2, 3]));
@@ -446,7 +598,7 @@ describe("scanLocalTree", () => {
     );
   });
 
-  it("stops before reads when listed attachment count or bytes exceed capability", async () => {
+  it("stops before reads when listed attachment count exceeds capability", async () => {
     const vault = new MemoryVault({});
     vault.seedFile("assets/a.png", pngBytes);
     vault.seedFile("assets/b.png", pngBytes);
@@ -463,25 +615,6 @@ describe("scanLocalTree", () => {
       "ATTACHMENT_QUOTA_EXCEEDED",
     );
     expect(vault.readPaths).toEqual([]);
-
-    const bytesVault = new MemoryVault({});
-    bytesVault.seedFile("assets/a.png", pngBytes);
-    bytesVault.seedFile("assets/b.png", pngBytes);
-    bytesVault.seedMarkdown(
-      "pages/note.md",
-      "![[assets/a.png]] ![[assets/b.png]]",
-    );
-    const bytesBlock = await scanLocalTree(
-      bytesVault,
-      "",
-      snapshotV3(),
-      identityState(),
-      { ...imageLimits, maxTransferBlobBytes: pngBytes.byteLength * 2 - 1 },
-    );
-    expect(bytesBlock.blockers.map((item) => item.code)).toContain(
-      "ATTACHMENT_QUOTA_EXCEEDED",
-    );
-    expect(bytesVault.readPaths).toEqual([]);
   });
 
   it("blocks path-to-multiple-ID and ID-to-multiple-path collisions", async () => {

@@ -52,6 +52,39 @@ describe("inspectImageMetadata", () => {
     ).toThrow(/ATTACHMENT_CONTENT_INVALID/);
   });
 
+  it("requires JPEG marker framing and an exact SOF component payload", () => {
+    const unframedSof = Uint8Array.from([
+      0xff, 0xd8, 0xc0, 0, 11, 8, 0, 5, 0, 4, 1, 1, 0x11, 0, 0xff, 0xd9,
+    ]);
+    const wrongComponentLength = Uint8Array.from([
+      0xff, 0xd8, 0xff, 0xc0, 0, 12, 8, 0, 5, 0, 4, 1, 1, 0x11, 0, 0, 0xff,
+      0xd9,
+    ]);
+    const stuffedMarkerOutsideScan = Uint8Array.from([
+      0xff, 0xd8, 0xff, 0, 0xff, 0xc0, 0, 11, 8, 0, 5, 0, 4, 1, 1, 0x11, 0,
+      0xff, 0xd9,
+    ]);
+
+    expect(() => inspectImageMetadata(unframedSof, limits)).toThrow(
+      /ATTACHMENT_CONTENT_INVALID/,
+    );
+    expect(() => inspectImageMetadata(wrongComponentLength, limits)).toThrow(
+      /ATTACHMENT_CONTENT_INVALID/,
+    );
+    expect(() =>
+      inspectImageMetadata(stuffedMarkerOutsideScan, limits),
+    ).toThrow(/ATTACHMENT_CONTENT_INVALID/);
+    expect(
+      inspectImageMetadata(
+        Uint8Array.from([
+          0xff, 0xd8, 0xff, 0xff, 0x01, 0xff, 0xc0, 0, 11, 8, 0, 5, 0, 4, 1, 1,
+          0x11, 0, 0xff, 0xd9,
+        ]),
+        limits,
+      ),
+    ).toMatchObject({ mimeType: "image/jpeg", width: 4, height: 5 });
+  });
+
   it("enforces MIME, dimension and decoded-pixel limits", () => {
     expect(() =>
       inspectImageMetadata(PNG_2X3, {
