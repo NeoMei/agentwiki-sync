@@ -256,6 +256,123 @@ describe("mergeAttachmentsById", () => {
     });
   });
 
+  it.each(["local", "remote"] as const)(
+    "lets a later path-occupied %s choice replace an earlier keep-both proposal",
+    (choice) => {
+      const base = attachment("a", "assets/a.png");
+      const local = attachment("a", "assets/a.png", HASH_B);
+      const remote = attachment("a", "assets/a.png", HASH_C);
+      const occupied = attachment("b", "assets/occupied.png");
+      const resolutions: Record<string, AttachmentConflictResolution> = {
+        "attachment:a:content": {
+          choice: "keep_both",
+          primary: "local",
+          secondaryAttachmentId: "22222222-2222-4222-8222-222222222222",
+          secondaryPath: "assets/occupied.png",
+          redirectPageIds: ["p2"],
+        },
+        "attachment:a:path_occupied": { choice },
+      };
+
+      const plan = mergeAttachmentsById({
+        base: [base, occupied],
+        local: [local, occupied],
+        remote: [remote, occupied],
+        affectedPageIdsByAttachment: { a: ["p1", "p2"], b: ["q"] },
+        resolutions,
+      });
+
+      const selected = choice === "local" ? local : remote;
+      expect(plan.conflicts).toEqual([]);
+      expect(plan.attachments).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            attachmentId: "a",
+            path: selected.path,
+            contentHash: selected.contentHash,
+          }),
+          expect.objectContaining({ attachmentId: "b" }),
+        ]),
+      );
+      expect(plan.pageAttachmentRedirects).toEqual({});
+    },
+  );
+
+  it("preserves a path choice when a later path-occupied choice replaces the content keep-both proposal", () => {
+    const occupied = attachment("b", "assets/occupied.png");
+    const input = {
+      base: [attachment("a", "assets/a.png"), occupied],
+      local: [attachment("a", "assets/local.png", HASH_B), occupied],
+      remote: [attachment("a", "assets/remote.png", HASH_C), occupied],
+      affectedPageIdsByAttachment: { a: ["p1", "p2"], b: ["q"] },
+    };
+    const keepBoth: AttachmentConflictResolution = {
+      choice: "keep_both",
+      primary: "local",
+      secondaryAttachmentId: "22222222-2222-4222-8222-222222222222",
+      secondaryPath: "assets/occupied.png",
+      redirectPageIds: ["p2"],
+    };
+    const blocked = mergeAttachmentsById({
+      ...input,
+      resolutions: {
+        "attachment:a:path": { choice: "local" },
+        "attachment:a:content": keepBoth,
+      },
+    });
+    expect(blocked.conflicts).toContainEqual(
+      expect.objectContaining({
+        attachmentId: "a",
+        kind: "path_occupied",
+      }),
+    );
+
+    const resolved = mergeAttachmentsById({
+      ...input,
+      resolutions: {
+        "attachment:a:path": { choice: "local" },
+        "attachment:a:content": keepBoth,
+        "attachment:a:path_occupied": { choice: "remote" },
+      },
+    });
+
+    expect(resolved.conflicts).toEqual([]);
+    expect(resolved.attachments).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          attachmentId: "a",
+          path: "assets/local.png",
+          contentHash: HASH_C,
+        }),
+        expect.objectContaining({ attachmentId: "b" }),
+      ]),
+    );
+    expect(resolved.pageAttachmentRedirects).toEqual({});
+  });
+
+  it("reapplies explicit path and content choices independently", () => {
+    const input = {
+      base: [attachment("a", "assets/a.png")],
+      local: [attachment("a", "assets/local.png", HASH_B)],
+      remote: [attachment("a", "assets/remote.png", HASH_C)],
+      affectedPageIdsByAttachment: { a: ["p"] },
+    };
+    const repeated = mergeAttachmentsById({
+      ...input,
+      resolutions: {
+        "attachment:a:path": { choice: "remote" },
+        "attachment:a:content": { choice: "local" },
+      },
+    });
+
+    expect(repeated.attachments).toEqual([
+      expect.objectContaining({
+        path: "assets/remote.png",
+        contentHash: HASH_B,
+      }),
+    ]);
+  });
+
   it("detaches the identity when the final reference set is empty without a Vault delete action", () => {
     const plan = mergeAttachmentsById({
       base: [attachment("a", "assets/a.png")],

@@ -343,4 +343,43 @@ describe("validateTreeSnapshotV3", () => {
       ),
     ).toThrow(/ATTACHMENT_REFERENCES_INVALID/);
   });
+
+  it.each([
+    ["canonical Obsidian", "![[assets/missing.png]]"],
+    ["standard relative Markdown", "![missing](../assets/missing.png)"],
+    ["legacy Obsidian bare name", "![[missing.png]]"],
+  ])(
+    "rejects a missing managed %s reference even when the manifest is empty",
+    (_syntax, body) => {
+      expect(() =>
+        validateTreeSnapshotV3(
+          v3({
+            pages: [
+              {
+                ...imagePage,
+                body,
+                referencedAttachmentIds: [],
+              },
+            ],
+            attachments: [],
+          }),
+        ),
+      ).toThrow(/ATTACHMENT_REFERENCES_INVALID/);
+    },
+  );
+
+  it("keeps external image references outside the managed attachment invariant", () => {
+    const external = v3({
+      pages: [
+        {
+          ...imagePage,
+          body: "![external](https://example.com/image.png)",
+          referencedAttachmentIds: [],
+        },
+      ],
+      attachments: [],
+    });
+
+    expect(validateTreeSnapshotV3(external)).toEqual(external);
+  });
 });

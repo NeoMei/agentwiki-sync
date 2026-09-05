@@ -131,6 +131,45 @@ function localScanV3(
   return { rootPath: "Wiki", folders: [], pages, attachments, blockers };
 }
 
+function keepBothCollisionPreview(): Promise<TreePullPreviewV3> {
+  const firstBody = "![[assets/a.png]]";
+  const pages = [
+    pageV3("p1", "pages/P1.md", firstBody),
+    pageV3("p2", "pages/P2.md", firstBody),
+    pageV3("q", "pages/Q.md", "![[assets/occupied.png]]", ["b"]),
+  ];
+  return buildTreePullPreviewV3(
+    snapshotV3(pages, [
+      attachment("a", "assets/a.png"),
+      attachment("b", "assets/occupied.png"),
+    ]),
+    localScanV3(pages, [
+      attachment("a", "assets/a.png", "b".repeat(64)),
+      attachment("b", "assets/occupied.png"),
+    ]),
+    snapshotV3(pages, [
+      attachment("a", "assets/a.png", "c".repeat(64)),
+      attachment("b", "assets/occupied.png"),
+    ]),
+  );
+}
+
+async function proposeOccupiedKeepBoth(preview: TreePullPreviewV3) {
+  const contentConflict = preview.attachmentConflicts.find(
+    (item) => item.attachmentId === "a" && item.kind === "content",
+  )!;
+  await resolveAttachmentConflict(preview, contentConflict.conflictId, {
+    choice: "keep_both",
+    primary: "remote",
+    secondaryAttachmentId: "22222222-2222-4222-8222-222222222222",
+    secondaryPath: "assets/occupied.png",
+    redirectPageIds: ["p2"],
+  });
+  return preview.attachmentConflicts.find(
+    (item) => item.attachmentId === "a" && item.kind === "path_occupied",
+  );
+}
+
 function moveConflictPreview(): Promise<TreePullPreview> {
   const base = snapshot({
     folders: [
@@ -534,6 +573,86 @@ describe("buildTreePullPreviewV3", () => {
       referencedAttachmentIds: ["22222222-2222-4222-8222-222222222222"],
     });
   });
+
+  it("lets an occupied keep-both proposal be explicitly replaced through the public resolver", async () => {
+    const preview = await keepBothCollisionPreview();
+    const occupiedConflict = await proposeOccupiedKeepBoth(preview);
+
+    expect(pendingTreeDecisionCount(preview)).toBeGreaterThan(0);
+    expect(occupiedConflict).toBeDefined();
+
+    await resolveAttachmentConflict(preview, occupiedConflict!.conflictId, {
+      choice: "keep_both",
+      primary: "remote",
+      secondaryAttachmentId: "33333333-3333-4333-8333-333333333333",
+      secondaryPath: "assets/a (2).png",
+      redirectPageIds: ["p2"],
+    });
+
+    expect(pendingTreeDecisionCount(preview)).toBe(0);
+    expect(
+      preview.resolvedAttachments
+        .map((item) => item.attachmentId)
+        .sort((left, right) => left.localeCompare(right)),
+    ).toEqual(["33333333-3333-4333-8333-333333333333", "a", "b"]);
+    expect(
+      preview.resolvedAttachments.find(
+        (item) => item.attachmentId === "33333333-3333-4333-8333-333333333333",
+      ),
+    ).toMatchObject({
+      path: "assets/a (2).png",
+      contentHash: "b".repeat(64),
+    });
+    expect(
+      preview.resolvedPages.map((page) => ({
+        pageId: page.pageId,
+        body: page.body,
+        referencedAttachmentIds: page.referencedAttachmentIds,
+      })),
+    ).toEqual([
+      {
+        pageId: "p1",
+        body: "![[assets/a.png]]",
+        referencedAttachmentIds: ["a"],
+      },
+      {
+        pageId: "p2",
+        body: "![[assets/a (2).png]]",
+        referencedAttachmentIds: ["33333333-3333-4333-8333-333333333333"],
+      },
+      {
+        pageId: "q",
+        body: "![[assets/occupied.png]]",
+        referencedAttachmentIds: ["b"],
+      },
+    ]);
+  });
+
+  it.each(["local", "remote"] as const)(
+    "lets the public resolver replace an occupied keep-both proposal with %s",
+    async (choice) => {
+      const preview = await keepBothCollisionPreview();
+      const occupiedConflict = await proposeOccupiedKeepBoth(preview);
+
+      await resolveAttachmentConflict(preview, occupiedConflict!.conflictId, {
+        choice,
+      });
+
+      expect(pendingTreeDecisionCount(preview)).toBe(0);
+      expect(
+        preview.resolvedAttachments.find((item) => item.attachmentId === "a"),
+      ).toMatchObject({
+        path: "assets/a.png",
+        contentHash: (choice === "local" ? "b" : "c").repeat(64),
+      });
+      expect(
+        preview.resolvedAttachments.map((item) => item.attachmentId).sort(),
+      ).toEqual(["a", "b"]);
+      expect(
+        preview.resolvedPages.map((page) => page.referencedAttachmentIds),
+      ).toEqual([["a"], ["a"], ["b"]]);
+    },
+  );
 
   it("detaches after the last reference without scheduling removal of the local image", async () => {
     const base = snapshotV3(

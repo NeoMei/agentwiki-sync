@@ -314,6 +314,7 @@ export function mergeAttachmentsById(
   const detachedAttachmentIds: string[] = [];
   const pageAttachmentRedirects: Record<string, Record<string, string>> = {};
   const sourceByAttachmentId: Record<string, "base" | "local" | "remote"> = {};
+  const secondaryProposalOwnerById = new Map<string, string>();
 
   for (const id of [...knownIds].sort()) {
     const base = byBase.get(id);
@@ -340,8 +341,20 @@ export function mergeAttachmentsById(
     const keepBothEntry = idConflicts
       .map((item) => [item, input.resolutions?.[item.conflictId]] as const)
       .find((entry) => entry[1]?.choice === "keep_both");
-    if (keepBothEntry?.[1]?.choice === "keep_both") {
-      const resolution = keepBothEntry[1];
+    const occupiedResolution =
+      input.resolutions?.[`attachment:${id}:path_occupied`];
+    // A path-occupied decision addresses the rejected proposal and is newer
+    // than the original conflict choice, including when it abandons keep-both.
+    const keepBothResolution =
+      occupiedResolution !== undefined
+        ? occupiedResolution.choice === "keep_both"
+          ? occupiedResolution
+          : undefined
+        : keepBothEntry?.[1]?.choice === "keep_both"
+          ? keepBothEntry[1]
+          : undefined;
+    if (keepBothResolution) {
+      const resolution = keepBothResolution;
       const secondaryPath = validateKeepBoth(
         resolution,
         id,
@@ -370,6 +383,9 @@ export function mergeAttachmentsById(
         attachmentId: resolution.secondaryAttachmentId,
         path: secondaryPath,
       });
+      // Collision conflicts must remain addressable by the originating ID;
+      // the proposed secondary ID has no base/local/remote merge dimension.
+      secondaryProposalOwnerById.set(resolution.secondaryAttachmentId, id);
       sourceByAttachmentId[id] = resolution.primary;
       sourceByAttachmentId[resolution.secondaryAttachmentId] =
         resolution.primary === "local" ? "remote" : "local";
@@ -385,15 +401,21 @@ export function mergeAttachmentsById(
       : local;
     let contentSource: TreeAttachment =
       value.contentHash === remote.contentHash ? remote : local;
-    const occupiedResolution =
-      input.resolutions?.[`attachment:${id}:path_occupied`];
+    const supersededKeepBothConflictId =
+      occupiedResolution && occupiedResolution.choice !== "keep_both"
+        ? keepBothEntry?.[0].conflictId
+        : undefined;
     if (
-      occupiedResolution?.choice === "local" ||
-      occupiedResolution?.choice === "remote"
+      (occupiedResolution?.choice === "local" ||
+        occupiedResolution?.choice === "remote") &&
+      supersededKeepBothConflictId === undefined
     )
       pathSource = occupiedResolution.choice === "local" ? local : remote;
     for (const item of idConflicts) {
-      const resolution = input.resolutions?.[item.conflictId];
+      const resolution =
+        item.conflictId === supersededKeepBothConflictId
+          ? occupiedResolution
+          : input.resolutions?.[item.conflictId];
       if (!resolution) {
         conflicts.push(item);
         continue;
@@ -417,22 +439,24 @@ export function mergeAttachmentsById(
   for (const items of byPath.values()) {
     if (new Set(items.map((item) => item.attachmentId)).size < 2) continue;
     for (const item of items) {
+      const conflictAttachmentId =
+        secondaryProposalOwnerById.get(item.attachmentId) ?? item.attachmentId;
       if (
         conflicts.some(
           (entry) =>
-            entry.attachmentId === item.attachmentId &&
+            entry.attachmentId === conflictAttachmentId &&
             entry.kind === "path_occupied",
         )
       )
         continue;
       conflicts.push(
         conflict(
-          item.attachmentId,
+          conflictAttachmentId,
           "path_occupied",
-          byBase.get(item.attachmentId),
-          byLocal.get(item.attachmentId),
-          byRemote.get(item.attachmentId),
-          affected.get(item.attachmentId) ?? [],
+          byBase.get(conflictAttachmentId),
+          byLocal.get(conflictAttachmentId),
+          byRemote.get(conflictAttachmentId),
+          affected.get(conflictAttachmentId) ?? [],
         ),
       );
     }
@@ -441,6 +465,8 @@ export function mergeAttachmentsById(
     attachments.map((item) => [item.attachmentId, item]),
   );
   for (const item of attachments) {
+    const conflictAttachmentId =
+      secondaryProposalOwnerById.get(item.attachmentId) ?? item.attachmentId;
     const occupiedByDetachedIdentity = [
       ...input.base,
       ...canonicalLocal,
@@ -460,18 +486,18 @@ export function mergeAttachmentsById(
       occupiedByDetachedIdentity &&
       !conflicts.some(
         (entry) =>
-          entry.attachmentId === item.attachmentId &&
+          entry.attachmentId === conflictAttachmentId &&
           entry.kind === "path_occupied",
       )
     )
       conflicts.push(
         conflict(
-          item.attachmentId,
+          conflictAttachmentId,
           "path_occupied",
-          byBase.get(item.attachmentId),
-          byLocal.get(item.attachmentId),
-          byRemote.get(item.attachmentId),
-          affected.get(item.attachmentId) ?? [],
+          byBase.get(conflictAttachmentId),
+          byLocal.get(conflictAttachmentId),
+          byRemote.get(conflictAttachmentId),
+          affected.get(conflictAttachmentId) ?? [],
         ),
       );
   }

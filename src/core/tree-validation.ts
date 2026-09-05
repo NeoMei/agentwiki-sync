@@ -239,7 +239,11 @@ function validateAttachmentReferences(
           ? `assets/${reference.target}`
           : reference.resolvedPath!;
       const id = idByPath.get(pathKey(resolved));
-      if (id) parsed.add(id);
+      if (!id)
+        throw new TypeError(
+          `ATTACHMENT_REFERENCES_INVALID: Page ${page.pageId} references a missing managed attachment`,
+        );
+      parsed.add(id);
     }
     const parsedIds = [...parsed].sort();
     if (
