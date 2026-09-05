@@ -92,6 +92,106 @@ export class AgentWikiClient {
     return response;
   }
 
+  private async checked(
+    method: string,
+    path: string,
+    options: {
+      body?: unknown;
+      canonicalBody?: Uint8Array;
+      binaryBody?: Uint8Array;
+      contentType?: string;
+      responseType: "bounded-json" | "binary" | "empty";
+      maxResponseBytes: number;
+    },
+  ): Promise<HttpResponse> {
+    const headers: Record<string, string> = {
+      "Content-Type": options.contentType ?? "application/json; charset=utf-8",
+    };
+    const secret = this.credential();
+    if (secret) headers.Authorization = `Bearer ${secret}`;
+    const response = await this.http.request({
+      method,
+      url: `${this.serverUrl}${path}`,
+      body: options.body,
+      canonicalBody: options.canonicalBody,
+      binaryBody: options.binaryBody,
+      headers,
+      responseType: options.responseType,
+      maxResponseBytes: options.maxResponseBytes,
+    });
+    if (response.status >= 300 && response.status < 400)
+      throw new AgentWikiHttpError(
+        response.status,
+        response.json,
+        response.headers,
+        "AgentWiki routes must not redirect",
+      );
+    if (response.status >= 400)
+      throw new AgentWikiHttpError(
+        response.status,
+        response.json,
+        response.headers,
+      );
+    return response;
+  }
+
+  async boundedJson(
+    method: string,
+    path: string,
+    maxResponseBytes: number,
+    body?: unknown,
+    canonical = false,
+  ): Promise<HttpResponse> {
+    return this.checked(method, path, {
+      body,
+      canonicalBody:
+        canonical && body !== undefined
+          ? (await import("./protocol")).canonicalBytes(body)
+          : undefined,
+      responseType: "bounded-json",
+      maxResponseBytes,
+    });
+  }
+
+  async uploadBinary(
+    method: string,
+    path: string,
+    bytes: Uint8Array,
+    maxResponseBytes: number,
+  ): Promise<HttpResponse> {
+    return this.checked(method, path, {
+      binaryBody: bytes,
+      contentType: "application/octet-stream",
+      responseType: "bounded-json",
+      maxResponseBytes,
+    });
+  }
+
+  async downloadBinary(
+    path: string,
+    maxResponseBytes: number,
+  ): Promise<Uint8Array> {
+    const response = await this.checked("GET", path, {
+      responseType: "binary",
+      maxResponseBytes,
+    });
+    if (!response.bytes) throw new Error("BINARY_RESPONSE_MISSING");
+    return response.bytes;
+  }
+
+  async noContent(
+    method: string,
+    path: string,
+    maxResponseBytes: number,
+  ): Promise<number> {
+    return (
+      await this.checked(method, path, {
+        responseType: "empty",
+        maxResponseBytes,
+      })
+    ).status;
+  }
+
   async head(spaceId: string): Promise<RevisionHeadResponse> {
     return retryRead(async () =>
       RevisionHeadResponseSchema.parse(

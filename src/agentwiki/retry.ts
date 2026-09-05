@@ -1,4 +1,5 @@
 import { AgentWikiHttpError } from "./client";
+import { SyncV3ErrorEnvelopeSchema } from "@neomei/agentwiki-sync-protocol";
 
 export interface RetryPolicy {
   maxAttempts: number;
@@ -13,10 +14,22 @@ export const DEFAULT_RETRY_POLICY: RetryPolicy = {
   maxDelayMs: 8_000,
 };
 export function isRetryableReadError(error: unknown): boolean {
-  if (error instanceof AgentWikiHttpError)
+  if (error instanceof AgentWikiHttpError) {
+    const v3 = SyncV3ErrorEnvelopeSchema.safeParse(error.body);
+    if (v3.success)
+      return (
+        error.status !== 401 && error.status !== 403 && v3.data.error.retryable
+      );
     return error.status === 429 || error.status >= 500;
+  }
   if (
     error instanceof TypeError ||
+    error instanceof RangeError ||
+    error instanceof SyntaxError ||
+    (typeof error === "object" &&
+      error !== null &&
+      "retryable" in error &&
+      (error as { retryable?: unknown }).retryable === false) ||
     (error instanceof Error && error.name === "ZodError")
   )
     return false;

@@ -1,4 +1,9 @@
 import type { HttpPort, HttpResponse } from "../../src/ports/http";
+import {
+  HttpResponseParseError,
+  HttpResponseTooLargeError,
+  type HttpResponseType,
+} from "../../src/ports/http";
 export class FakeHttp implements HttpPort {
   static capabilities = {
     maxPageBytes: 1048576,
@@ -19,9 +24,15 @@ export class FakeHttp implements HttpPort {
     body?: unknown;
     authorization?: string;
     canonicalBody?: Uint8Array;
+    binaryBody?: Uint8Array;
+    responseType?: HttpResponseType;
+    maxResponseBytes?: number;
   }> = [];
   readonly responses: HttpResponse[] = [];
   private readonly routes = new Map<string, HttpResponse>();
+  enqueue(response: HttpResponse): void {
+    this.responses.push(response);
+  }
   route(method: string, path: string, response: HttpResponse): void {
     this.routes.set(`${method} ${path}`, response);
   }
@@ -30,7 +41,10 @@ export class FakeHttp implements HttpPort {
     url: string;
     body?: unknown;
     canonicalBody?: Uint8Array;
+    binaryBody?: Uint8Array;
     headers?: Record<string, string>;
+    responseType?: HttpResponseType;
+    maxResponseBytes?: number;
   }): Promise<HttpResponse> {
     const url = new URL(request.url);
     this.calls.push({
@@ -39,9 +53,11 @@ export class FakeHttp implements HttpPort {
       body: request.body,
       authorization: request.headers?.Authorization,
       canonicalBody: request.canonicalBody,
+      binaryBody: request.binaryBody?.slice(),
+      responseType: request.responseType,
+      maxResponseBytes: request.maxResponseBytes,
     });
-    return (
-      this.responses.shift() ??
+    const response = this.responses.shift() ??
       this.routes.get(`${request.method} ${url.pathname}`) ?? {
         status: 404,
         json: {
@@ -52,7 +68,32 @@ export class FakeHttp implements HttpPort {
             retryable: false,
           },
         },
-      }
-    );
+      };
+    if (request.responseType === "empty" && response.status < 400)
+      return {
+        status: response.status,
+        json: undefined,
+        headers: response.headers,
+      };
+    if (request.responseType === "binary" && response.status < 400) {
+      const bytes = response.bytes ?? new Uint8Array();
+      if (
+        request.maxResponseBytes !== undefined &&
+        bytes.byteLength > request.maxResponseBytes
+      )
+        throw new HttpResponseTooLargeError(request.maxResponseBytes);
+      return { ...response, json: undefined, bytes: bytes.slice() };
+    }
+    if (request.responseType === "bounded-json" || response.status >= 400) {
+      const text = JSON.stringify(response.json);
+      if (text === undefined) throw new HttpResponseParseError();
+      if (
+        request.maxResponseBytes !== undefined &&
+        new TextEncoder().encode(text).byteLength > request.maxResponseBytes
+      )
+        throw new HttpResponseTooLargeError(request.maxResponseBytes);
+      return { ...response, json: JSON.parse(text) as unknown };
+    }
+    return response;
   }
 }

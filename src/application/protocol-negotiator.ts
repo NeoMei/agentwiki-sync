@@ -45,19 +45,8 @@ function syncErrorCode(error: unknown): string | null {
   return typeof code === "string" ? code : null;
 }
 
-function assertDiscoveryResponseSize(value: unknown): void {
-  const encoded = JSON.stringify(value);
-  if (
-    encoded === undefined ||
-    new TextEncoder().encode(encoded).byteLength >
-      TREE_SYNC_V2_LIMITS.capabilitiesDiscoveryBytes
-  )
-    throw new Error("Sync capabilities response exceeds discovery size limit");
-}
-
 function isExplicitlyUnsupported(error: unknown): boolean {
   if (!(error instanceof AgentWikiHttpError)) return false;
-  assertDiscoveryResponseSize(error.body);
   return (
     error.status === 404 ||
     (error.status === 400 && syncErrorCode(error) === "PROTOCOL_UNSUPPORTED")
@@ -91,9 +80,12 @@ export class ProtocolNegotiator {
     }
     try {
       const response = (
-        await this.client.raw("GET", "/api/sync/v3/capabilities")
+        await this.client.boundedJson(
+          "GET",
+          "/api/sync/v3/capabilities",
+          TREE_SYNC_V2_LIMITS.capabilitiesDiscoveryBytes,
+        )
       ).json;
-      assertDiscoveryResponseSize(response);
       const parsed = TreeCapabilitiesResponseV3Schema.parse(response);
       if (
         (await treeCapabilitiesHashV3(parsed.capabilities)) !==
@@ -112,9 +104,12 @@ export class ProtocolNegotiator {
     }
     try {
       const response = (
-        await this.client.raw("GET", "/api/sync/v2/capabilities")
+        await this.client.boundedJson(
+          "GET",
+          "/api/sync/v2/capabilities",
+          TREE_SYNC_V2_LIMITS.capabilitiesDiscoveryBytes,
+        )
       ).json;
-      assertDiscoveryResponseSize(response);
       const parsed = TreeCapabilitiesResponseV2Schema.parse(response);
       if (
         (await capabilitiesHash(parsed.capabilities)) !==

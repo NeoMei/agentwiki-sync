@@ -110,6 +110,8 @@ export class Setting {
 export interface MockRequestUrlResponse {
   status: number;
   json: unknown;
+  text?: string;
+  arrayBuffer?: ArrayBuffer;
   headers?: Record<string, string>;
 }
 

@@ -9,7 +9,13 @@ import {
   type Vault,
 } from "obsidian";
 import type { ControlStorePort } from "../ports/control-store";
-import type { HttpPort, HttpResponse } from "../ports/http";
+import {
+  HttpResponseParseError,
+  HttpResponseTooLargeError,
+  type HttpPort,
+  type HttpResponse,
+  type HttpResponseType,
+} from "../ports/http";
 import type { SecretPort } from "../ports/secrets";
 import type { VaultPort, VaultTreeEntry } from "../ports/vault";
 
@@ -118,20 +124,71 @@ export class RequestUrlHttp implements HttpPort {
     url: string;
     body?: unknown;
     canonicalBody?: Uint8Array;
+    binaryBody?: Uint8Array;
     headers?: Record<string, string>;
+    responseType?: HttpResponseType;
+    maxResponseBytes?: number;
   }): Promise<HttpResponse> {
+    if (input.binaryBody && (input.body !== undefined || input.canonicalBody))
+      throw new TypeError("HTTP request body modes are mutually exclusive");
+    const binaryBody = input.binaryBody
+      ? (input.binaryBody.buffer.slice(
+          input.binaryBody.byteOffset,
+          input.binaryBody.byteOffset + input.binaryBody.byteLength,
+        ) as ArrayBuffer)
+      : undefined;
     const response = await requestUrl({
       url: input.url,
       method: input.method,
       body:
-        input.canonicalBody === undefined
+        binaryBody ??
+        (input.canonicalBody === undefined
           ? input.body === undefined
             ? undefined
             : JSON.stringify(input.body)
-          : new TextDecoder().decode(input.canonicalBody),
+          : new TextDecoder().decode(input.canonicalBody)),
       headers: input.headers,
       throw: false,
     });
+    const responseType = input.responseType ?? "json";
+    const maxBytes = input.maxResponseBytes;
+    const withinBound = (byteLength: number): void => {
+      if (maxBytes !== undefined && byteLength > maxBytes)
+        throw new HttpResponseTooLargeError(maxBytes);
+    };
+    if (responseType === "empty" && response.status < 400)
+      return {
+        status: response.status,
+        json: undefined,
+        headers: response.headers,
+      };
+    if (responseType === "binary" && response.status < 400) {
+      const declared = Object.entries(response.headers).find(
+        ([name]) => name.toLowerCase() === "content-length",
+      )?.[1];
+      if (declared && /^(?:0|[1-9][0-9]*)$/u.test(declared))
+        withinBound(Number(declared));
+      withinBound(response.arrayBuffer.byteLength);
+      return {
+        status: response.status,
+        json: undefined,
+        bytes: new Uint8Array(response.arrayBuffer),
+        headers: response.headers,
+      };
+    }
+    if (responseType === "bounded-json" || response.status >= 400) {
+      const text =
+        response.text ??
+        (response.json === undefined ? "" : JSON.stringify(response.json));
+      withinBound(new TextEncoder().encode(text).byteLength);
+      let json: unknown;
+      try {
+        json = JSON.parse(text) as unknown;
+      } catch {
+        throw new HttpResponseParseError();
+      }
+      return { status: response.status, json, headers: response.headers };
+    }
     return {
       status: response.status,
       json: response.json,

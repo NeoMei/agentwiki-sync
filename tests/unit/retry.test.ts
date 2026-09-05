@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { retryRead } from "../../src/agentwiki/retry";
+import { isRetryableReadError, retryRead } from "../../src/agentwiki/retry";
 import { AgentWikiHttpError } from "../../src/agentwiki/client";
 describe("endpoint retry", () => {
   it("retries transient reads with a bounded budget", async () => {
@@ -29,5 +29,33 @@ describe("endpoint retry", () => {
       ),
     ).rejects.toThrow();
     expect(calls).toBe(1);
+  });
+  it("honors strict v3 retryable=false even for HTTP 503", () => {
+    expect(
+      isRetryableReadError(
+        new AgentWikiHttpError(503, {
+          protocolVersion: "3",
+          error: { code: "INTERNAL_ERROR", retryable: false },
+        }),
+      ),
+    ).toBe(false);
+  });
+  it("retries only strict v3 transient envelopes", () => {
+    expect(
+      isRetryableReadError(
+        new AgentWikiHttpError(503, {
+          protocolVersion: "3",
+          error: { code: "INTERNAL_ERROR", retryable: true },
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      isRetryableReadError(
+        new AgentWikiHttpError(401, {
+          protocolVersion: "3",
+          error: { code: "AUTHENTICATION_REQUIRED", retryable: true },
+        }),
+      ),
+    ).toBe(false);
   });
 });

@@ -7,6 +7,7 @@ import {
   ObsidianVaultPort,
   RequestUrlHttp,
 } from "../../src/obsidian/adapters";
+import { HttpResponseTooLargeError } from "../../src/ports/http";
 import { TFile, TFolder, requestUrlState } from "../fakes/obsidian-mock";
 
 class FakeDataAdapter {
@@ -480,5 +481,67 @@ describe("RequestUrlHttp", () => {
       canonicalBody: encoder.encode('{"a":1}'),
     });
     expect(canonicalResponse.status).toBe(200);
+  });
+
+  it("sends raw binary bodies and never reads JSON for binary success", async () => {
+    let request: unknown;
+    const bytes = new Uint8Array([0, 255, 1]);
+    requestUrlState.impl = async (input) => {
+      request = input;
+      return {
+        status: 200,
+        get json(): unknown {
+          throw new Error("json must not be read");
+        },
+        text: "",
+        arrayBuffer: bytes.buffer,
+        headers: { "content-length": "3" },
+      };
+    };
+    const response = await new RequestUrlHttp().request({
+      method: "PUT",
+      url: "https://example.test/blob",
+      binaryBody: bytes,
+      responseType: "binary",
+      maxResponseBytes: 3,
+    });
+    expect(response.bytes).toEqual(bytes);
+    expect((request as { body?: unknown }).body).toBeInstanceOf(ArrayBuffer);
+  });
+
+  it("bounds JSON from response text before parsing", async () => {
+    requestUrlState.impl = async () => ({
+      status: 200,
+      json: { tiny: true },
+      text: '{"oversized":"1234567890"}',
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+    });
+    await expect(
+      new RequestUrlHttp().request({
+        method: "GET",
+        url: "https://example.test/json",
+        responseType: "bounded-json",
+        maxResponseBytes: 8,
+      }),
+    ).rejects.toBeInstanceOf(HttpResponseTooLargeError);
+  });
+
+  it("rejects declared binary overflow before exposing response bytes", async () => {
+    requestUrlState.impl = async () => ({
+      status: 200,
+      json: undefined,
+      text: "",
+      arrayBuffer: new Uint8Array([1]).buffer,
+      headers: { "content-length": "999" },
+    });
+    await expect(
+      new RequestUrlHttp().request({
+        method: "GET",
+        url: "https://example.test/blob",
+        responseType: "binary",
+        maxResponseBytes: 10,
+      }),
+    ).rejects.toBeInstanceOf(HttpResponseTooLargeError);
   });
 });

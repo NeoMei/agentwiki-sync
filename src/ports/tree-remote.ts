@@ -1,4 +1,17 @@
 import type {
+  BlobChunkReceiptV3,
+  BlobRequirementV3,
+  CompletedBlobV3,
+  CreateTreePushSessionRequestV3,
+  SyncAttachmentV3,
+  SyncFolderV3,
+  SyncPageV3,
+  SyncV3ErrorCode,
+  TreeDeltaItemV3,
+  TreePushBatchV3,
+  TreeSyncCapabilitiesV3,
+} from "@neomei/agentwiki-sync-protocol";
+import type {
   TreeDeltaItem,
   TreeFolder,
   TreePage,
@@ -136,6 +149,129 @@ export interface TreeRemotePort {
   ): Promise<TreeFinalizeResult>;
   getSession(sessionId: string): Promise<TreePushSessionStatus>;
   abort(sessionId: string): Promise<void>;
+}
+
+export interface TreeHeadV3 {
+  protocolVersion: "3";
+  spaceId: string;
+  revision: string;
+  sequence: number;
+  revisionContentHash: string;
+  folderCount: string;
+  pageCount: string;
+  attachmentCount: string;
+  revisionManifestByteLength: string;
+  revisionBodyBytes: string;
+  revisionAttachmentBytes: string;
+  publishedAt: string | null;
+}
+
+export interface TreeSnapshotSegmentV3 extends Omit<TreeHeadV3, "publishedAt"> {
+  folders: SyncFolderV3[];
+  pages: SyncPageV3[];
+  attachments: SyncAttachmentV3[];
+}
+
+export interface TreeDeltaV3 {
+  toRevision: string;
+  items: TreeDeltaItemV3[];
+}
+
+export interface TreeSpaceSummaryV3 {
+  spaceId: string;
+  displayName: string;
+  role: "viewer" | "editor" | "admin" | "owner";
+  canRead: true;
+  canPublish: boolean;
+  syncMode: "native_v3" | "bootstrap_required" | "legacy_v2";
+  currentRevision: string;
+  folderCount: string;
+  pageCount: string;
+  attachmentCount: string;
+  revisionManifestByteLength: string;
+  revisionBodyBytes: string;
+  revisionAttachmentBytes: string;
+}
+
+export interface TreeBootstrapPreviewV3 {
+  protocolVersion: "3";
+  mode: "bootstrap_required";
+  baseRevision: string;
+  candidateHash: string;
+  attachmentCount: string;
+  transferBytes: string;
+  blockers: Array<{ pageId: string; code: SyncV3ErrorCode }>;
+}
+
+export type TreeCreatePushSessionV3 = CreateTreePushSessionRequestV3;
+
+export interface TreePushSessionV3 {
+  sessionId: string;
+  status:
+    | "uploading"
+    | "ready_to_finalize"
+    | "finalizing"
+    | "published"
+    | "aborted"
+    | "expired";
+  expiresAt: string;
+  missingContentHashes: string[];
+}
+
+export interface TreeFinalizeResultV3 extends Omit<TreeHeadV3, "spaceId"> {
+  status: "published" | "noop";
+  changeSetId: string | null;
+}
+
+export interface TreePushSessionStatusV3 extends TreePushSessionV3 {
+  completedContentHashes: string[];
+  receivedBatchIndexes: number[];
+  result: TreeFinalizeResultV3 | null;
+}
+
+/** Strict v3 is independent of the frozen v1/v2 TreeRemotePort. */
+export interface TreeRemotePortV3 {
+  readonly protocolVersion: "3";
+  readonly capabilitiesHash: Promise<string>;
+  capabilities(): Promise<TreeSyncCapabilitiesV3>;
+  refreshCapabilities(): Promise<TreeSyncCapabilitiesV3>;
+  spaces(): Promise<TreeSpaceSummaryV3[]>;
+  head(): Promise<TreeHeadV3>;
+  snapshotPages(revision?: string): AsyncIterable<TreeSnapshotSegmentV3>;
+  delta(fromRevision: string): Promise<TreeDeltaV3>;
+  bootstrapPreview(): Promise<TreeBootstrapPreviewV3>;
+  bootstrapConfirmed(input: {
+    baseRevision: string;
+    confirmationHash: string;
+    userConfirmed: true;
+  }): Promise<TreeFinalizeResultV3>;
+  createPushSession(input: TreeCreatePushSessionV3): Promise<TreePushSessionV3>;
+  uploadBatch(
+    sessionId: string,
+    batch: TreePushBatchV3,
+  ): Promise<{ receipt: string }>;
+  finalize(
+    sessionId: string,
+    confirmationHash: string,
+  ): Promise<TreeFinalizeResultV3>;
+  getSession(sessionId: string): Promise<TreePushSessionStatusV3>;
+  abort(sessionId: string): Promise<void>;
+  uploadBlobChunk(
+    sessionId: string,
+    contentHash: string,
+    chunkIndex: number,
+    bytes: Uint8Array,
+  ): Promise<BlobChunkReceiptV3>;
+  completeBlob(
+    sessionId: string,
+    requirement: BlobRequirementV3,
+    chunkCount: number,
+  ): Promise<CompletedBlobV3>;
+  downloadBlob(input: {
+    revision: string;
+    attachmentId: string;
+    contentHash: string;
+  }): Promise<Uint8Array>;
 }
 
 export class TreeRuntimeProtocolUnavailableError extends Error {
