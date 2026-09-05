@@ -422,5 +422,39 @@
         "resolvedPath": "assets/real.png"
       }
     ]
+  },
+  {
+    "name": "tab-indented-list-fence-content",
+    "body": "- item\n  ```md\n\t![hidden](../assets/hidden-1.png)\n  ![hidden](../assets/hidden-2.png)",
+    "expected": []
+  },
+  {
+    "name": "tab-padded-list-followed-by-top-level-fence",
+    "body": "-\titem\n  ```md\n  ![hidden](../assets/hidden.png)\n![real](../assets/real.png)",
+    "expected": []
+  },
+  {
+    "name": "non-commonmark-space-after-list-marker-is-content",
+    "body": "-  \n\n  ```md\n  ![[assets/hidden.png]]\n\n![[assets/real.png]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "managed",
+        "rawTarget": "assets/real.png",
+        "resolvedPath": "assets/real.png"
+      }
+    ]
+  },
+  {
+    "name": "form-feed-after-list-marker-is-content",
+    "body": "- \f\n\n  ```md\n  ![[assets/hidden.png]]\n\n![[assets/real.png]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "managed",
+        "rawTarget": "assets/real.png",
+        "resolvedPath": "assets/real.png"
+      }
+    ]
   }
 ]

@@ -41,6 +41,10 @@ function quotePrefixEnd(line: string, start: number): number | null {
   return match ? start + match[0].length : null;
 }
 
+function isBlankListContent(value: string): boolean {
+  return /^[ \t]*\r?$/u.test(value);
+}
+
 function listMarker(
   line: string,
   start: number,
@@ -54,7 +58,7 @@ function listMarker(
     .match(/^( {0,3})([-+*]|\d{1,9}[.)])([ \t]*)(.*)/u);
   if (!match) return null;
   const beforeWhitespace = match[1]!.length + match[2]!.length;
-  const awaitingFirstBlock = match[4]!.trim().length === 0;
+  const awaitingFirstBlock = isBlankListContent(match[4]!);
   if (match[3]!.length === 0 && !awaitingFirstBlock) return null;
   if (awaitingFirstBlock)
     return {
@@ -217,7 +221,7 @@ function excludedMask(body: string): Uint8Array {
     const pendingList = listContainer.findIndex(
       (token) => token.kind === "list" && token.awaitingFirstBlock,
     );
-    if (pendingList >= 0 && opening.inheritedContent.trim().length === 0) {
+    if (pendingList >= 0 && isBlankListContent(opening.inheritedContent)) {
       listContainer = inheritedListContainer(
         listContainer.slice(0, pendingList),
       );
