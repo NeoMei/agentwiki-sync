@@ -1853,18 +1853,27 @@ export class SyncRuntime {
         : action.source === "base"
           ? preview.base.attachments
           : preview.remote.attachments;
-    const candidatePool = remappedSourceAttachmentId
-      ? selected
-      : [
-          ...selected,
-          ...preview.local.attachments,
-          ...preview.base.attachments,
-          ...preview.remote.attachments,
-        ];
+    if (
+      remappedSourceAttachmentId &&
+      !selected.some(
+        (item) =>
+          item.attachmentId === sourceAttachmentId &&
+          item.contentHash === action.attachment.contentHash,
+      )
+    )
+      return null;
+    const candidatePool = [
+      ...selected,
+      ...preview.local.attachments,
+      ...preview.base.attachments,
+      ...preview.remote.attachments,
+    ];
     const candidates = candidatePool.filter(
       (item, index, all) =>
-        (aliases[item.attachmentId] ?? item.attachmentId) ===
-          sourceAttachmentId &&
+        (remappedSourceAttachmentId
+          ? item.attachmentId === sourceAttachmentId
+          : (aliases[item.attachmentId] ?? item.attachmentId) ===
+            sourceAttachmentId) &&
         item.contentHash === action.attachment.contentHash &&
         all.findIndex(
           (candidate) =>

@@ -652,6 +652,124 @@ describe("referenced image sync v3 end to end", () => {
       );
     },
   );
+
+  it("reuses local bytes for a zero-download keep-both of same-hash dual renames", async () => {
+    const secondPageId = "33333333-3333-4333-8333-333333333333";
+    const secondaryAttachmentId = "44444444-4444-4444-8444-444444444444";
+    const makePage = async (
+      pageId: string,
+      path: string,
+      imagePath: string,
+    ) => ({
+      ...(await page(`![[${imagePath}]]`, [ATTACHMENT_ID])),
+      pageId,
+      path,
+      title: path.endsWith("One.md") ? "One" : "Two",
+    });
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({
+      revision: "base",
+      pages: [
+        await makePage(PAGE_ID, "pages/One.md", "assets/image.png"),
+        await makePage(secondPageId, "pages/Two.md", "assets/image.png"),
+      ],
+      attachments: [await attachment(IMAGE, "assets/image.png")],
+      blobs: { [ATTACHMENT_ID]: IMAGE },
+    });
+    const vault = new MemoryVault({});
+    const runtime = SyncRuntime.v3(
+      vault,
+      new MemoryControlStore(),
+      remote,
+      mapping(),
+    );
+    await runtime.applyPullV3(await runtime.previewPullV3());
+    await vault.rename("Wiki/assets/image.png", "Wiki/assets/local.png");
+    await runtime.recordRename(
+      "Wiki/assets/image.png",
+      "Wiki/assets/local.png",
+    );
+    vault.seedMarkdown("Wiki/pages/One.md", "![[assets/local.png]]");
+    vault.seedMarkdown("Wiki/pages/Two.md", "![[assets/local.png]]");
+    await remote.seedTree({
+      revision: "remote-rename",
+      pages: [
+        await makePage(PAGE_ID, "pages/One.md", "assets/remote.png"),
+        await makePage(secondPageId, "pages/Two.md", "assets/remote.png"),
+      ],
+      attachments: [await attachment(IMAGE, "assets/remote.png")],
+      blobs: { [ATTACHMENT_ID]: IMAGE },
+    });
+
+    const downloadsBefore = remote.downloads.length;
+    const preview = await runtime.previewPullV3();
+    expect(preview.transferId).toBeNull();
+    expect(remote.downloads).toHaveLength(downloadsBefore);
+    for (const conflict of preview.pageConflicts)
+      await resolvePageConflictV3(preview, conflict.conflictId, {
+        choice: "local",
+      });
+    const conflict = preview.attachmentConflicts.find(
+      (item) => item.kind === "path",
+    )!;
+    expect(conflict.remote).toMatchObject({
+      attachmentId: ATTACHMENT_ID,
+      path: "assets/remote.png",
+      contentHash: await sha256Hex(IMAGE),
+    });
+    await resolveAttachmentConflict(preview, conflict.conflictId, {
+      choice: "keep_both",
+      primary: "local",
+      secondaryAttachmentId,
+      secondaryPath: "assets/remote-copy.png",
+      redirectPageIds: [secondPageId],
+    });
+    expect(
+      preview.actions.find(
+        (action) =>
+          action.kind === "create_attachment" &&
+          action.attachment.attachmentId === secondaryAttachmentId,
+      ),
+    ).toMatchObject({ source: "remote" });
+
+    for (const mutation of ["different-id", "different-hash"] as const) {
+      const invalid = structuredClone(preview);
+      invalid.remote.attachments = invalid.remote.attachments.map((item) =>
+        mutation === "different-id"
+          ? {
+              ...item,
+              attachmentId: "55555555-5555-4555-8555-555555555555",
+            }
+          : { ...item, contentHash: "f".repeat(64) },
+      );
+      await expect(runtime.applyPullV3(invalid)).rejects.toThrow(
+        /ATTACHMENT_SOURCE_MISMATCH/,
+      );
+      expect(remote.downloads).toHaveLength(downloadsBefore);
+    }
+
+    await runtime.applyPullV3(preview);
+
+    expect(remote.downloads).toHaveLength(downloadsBefore);
+    expect(await vault.read("Wiki/assets/local.png")).toEqual(IMAGE);
+    expect(await vault.read("Wiki/assets/remote-copy.png")).toEqual(IMAGE);
+    expect(vault.text("Wiki/pages/One.md")).toBe("![[assets/local.png]]");
+    expect(vault.text("Wiki/pages/Two.md")).toBe("![[assets/remote-copy.png]]");
+    await runtime.applyPushV3(await runtime.previewPushV3());
+    const followerVault = new MemoryVault({});
+    const follower = SyncRuntime.v3(
+      followerVault,
+      new MemoryControlStore(),
+      remote,
+      mapping(),
+      "same-hash-follower",
+    );
+    await follower.applyPullV3(await follower.previewPullV3());
+    expect(await followerVault.read("Wiki/assets/local.png")).toEqual(IMAGE);
+    expect(await followerVault.read("Wiki/assets/remote-copy.png")).toEqual(
+      IMAGE,
+    );
+  });
 });
 
 describe("referenced image sync v3 fault recovery", () => {
