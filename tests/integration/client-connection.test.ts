@@ -5,6 +5,7 @@ import {
   normalizeServerUrl,
 } from "../../src/agentwiki/client";
 import { ConnectionService } from "../../src/application/connection-service";
+import { ProtocolSelectionRepository } from "../../src/storage/protocol-selection";
 import { MemorySecrets } from "../fakes/memory-secrets";
 import { FakeHttp } from "../fakes/fake-http";
 import { MemoryControlStore } from "../fakes/memory-control-store";
@@ -131,6 +132,15 @@ describe("AgentWiki connection", () => {
     );
     const secrets = new MemorySecrets();
     const control = new MemoryControlStore();
+    const cachedProtocols = new ProtocolSelectionRepository(control);
+    await cachedProtocols.write(
+      {
+        serverOrigin: "https://wiki.example.com",
+        serverInstanceId: "11111111-1111-4111-8111-111111111111",
+        pluginVersion: "0.1.0",
+      },
+      { version: "1", reason: "endpoint_missing" },
+    );
     const service = new ConnectionService(http, secrets, control);
     const result = await service.connect({
       serverUrl: "https://wiki.example.com",
@@ -151,12 +161,19 @@ describe("AgentWiki connection", () => {
       "/api/integrations/obsidian/session",
     ]);
     expect(http.calls[0]?.body).toMatchObject({
-      supportedProtocolVersions: ["2", "1"],
+      supportedProtocolVersions: ["3", "2", "1"],
     });
     expect(await control.read("connection-journal.json")).toBeNull();
     expect(await control.read("connection-state.json")).toContain(
       result.credentialId,
     );
+    await expect(
+      cachedProtocols.readFor({
+        serverOrigin: "https://wiki.example.com",
+        serverInstanceId: result.serverInstanceId,
+        pluginVersion: "0.1.0",
+      }),
+    ).resolves.toBeNull();
   });
 
   it("keeps the code and rotates credential material on an explicit collision", async () => {

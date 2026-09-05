@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 import * as local from "../../src/agentwiki/protocol";
 import * as published from "@neomei/agentwiki-sync-protocol";
 import {
+  SYNC_PROTOCOL_V3,
+  TreeCapabilitiesResponseV3Schema,
   SYNC_PROTOCOL_V2,
   TreeCapabilitiesResponseV2Schema,
+  treeCapabilitiesHashV3,
   treeRevisionContentHashV2,
 } from "@neomei/agentwiki-sync-protocol";
 import {
@@ -12,6 +15,43 @@ import {
 } from "../../src/core/portable-path";
 
 describe("protocol conformance against the published package", () => {
+  it("loads the exact published v3 capabilities contract", async () => {
+    const capabilities = {
+      maxPageBytes: 1,
+      maxBatchBytes: 1,
+      maxBatchItems: 1,
+      maxChangeCount: 1,
+      maxConfirmationBytes: 1,
+      maxClientSpacePages: 1,
+      maxClientSpaceFolders: 1,
+      maxSnapshotObjects: 2,
+      maxClientManifestBytes: 1,
+      maxClientTotalBodyBytes: 1,
+      maxDeltaItems: 1,
+      maxResponseBytes: 1,
+      maxPageItems: 1,
+      pushSessionTtlSeconds: 1,
+      maxAttachmentBytes: 1,
+      maxRevisionAttachments: 1,
+      maxTransferBlobBytes: 1,
+      blobChunkBytes: 1,
+      maxBlobChunks: 1,
+      maxConcurrentBlobs: 1,
+      maxImageDimension: 1,
+      maxDecodedPixels: 1,
+      allowedMimeTypes: ["image/png"] as Array<"image/png">,
+      blobStagingTtlSeconds: 1,
+      downloadAuthorizationTtlSeconds: 1,
+    };
+    const parsed = TreeCapabilitiesResponseV3Schema.parse({
+      protocolVersion: SYNC_PROTOCOL_V3,
+      capabilities,
+      capabilitiesHash: await treeCapabilitiesHashV3(capabilities),
+    });
+    expect(parsed.protocolVersion).toBe("3");
+    expect(parsed.capabilitiesHash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
   it("loads the published v2 tree contract", async () => {
     expect(SYNC_PROTOCOL_V2).toBe("2");
     expect(

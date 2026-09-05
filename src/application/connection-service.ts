@@ -14,6 +14,7 @@ import {
   SessionResponseSchema,
 } from "../agentwiki/protocol";
 import { MutableControlRepository } from "../storage/envelope";
+import { ProtocolSelectionRepository } from "../storage/protocol-selection";
 
 interface ConnectInput {
   serverUrl: string;
@@ -143,6 +144,13 @@ export class ConnectionService {
     return envelope?.payload ?? null;
   }
   private async commitConnection(value: ConnectionState): Promise<void> {
+    const previous = await this.connectionState.read();
+    if (
+      !previous ||
+      previous.payload.credentialId !== value.credentialId ||
+      previous.payload.credentialSecretId !== value.credentialSecretId
+    )
+      await new ProtocolSelectionRepository(this.state).clear();
     await this.connectionState.write(value);
     await this.journal.clear();
   }
@@ -240,7 +248,7 @@ export class ConnectionService {
         deviceName: input.deviceName,
         vaultId: input.vaultId,
         pluginVersion: input.pluginVersion,
-        supportedProtocolVersions: ["2", "1"],
+        supportedProtocolVersions: ["3", "2", "1"],
       });
       try {
         const value = ExchangeResponseSchema.parse(
@@ -420,7 +428,7 @@ export class ConnectionService {
           deviceName: prepared.deviceName,
           vaultId: prepared.vaultId,
           pluginVersion: prepared.pluginVersion,
-          supportedProtocolVersions: ["2", "1"],
+          supportedProtocolVersions: ["3", "2", "1"],
         });
         try {
           const value = ExchangeResponseSchema.parse(

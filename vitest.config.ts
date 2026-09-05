@@ -12,6 +12,7 @@ export default defineConfig({
   test: {
     environment: "node",
     setupFiles: ["./tests/setup.ts"],
+    include: ["tests/**/*.{test,spec}.?(c|m)[jt]s?(x)"],
     exclude: ["**/node_modules/**", "**/.git/**", "**/.worktrees/**"],
   },
 });

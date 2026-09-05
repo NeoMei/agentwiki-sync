@@ -137,3 +137,16 @@ export interface TreeRemotePort {
   getSession(sessionId: string): Promise<TreePushSessionStatus>;
   abort(sessionId: string): Promise<void>;
 }
+
+export class TreeRuntimeProtocolUnavailableError extends Error {
+  readonly code = "SYNC_PROTOCOL_UPGRADE_REQUIRED" as const;
+  constructor(readonly protocolVersion: "3") {
+    super("Sync v3 was selected, but its runtime adapter is not available");
+  }
+}
+
+export function assertTreeRuntimeProtocolVersion(
+  version: "1" | "2" | "3",
+): asserts version is "1" | "2" {
+  if (version === "3") throw new TreeRuntimeProtocolUnavailableError("3");
+}

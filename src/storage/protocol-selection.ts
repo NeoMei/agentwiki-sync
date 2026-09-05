@@ -1,4 +1,7 @@
-import { TreeSyncCapabilitiesV2Schema } from "@neomei/agentwiki-sync-protocol";
+import {
+  TreeSyncCapabilitiesV2Schema,
+  TreeSyncCapabilitiesV3Schema,
+} from "@neomei/agentwiki-sync-protocol";
 import type {
   ProtocolProbeIdentity,
   SyncProtocolSelection,
@@ -21,6 +24,12 @@ function isSyncProtocolSelection(
 ): value is SyncProtocolSelection {
   if (!value || typeof value !== "object") return false;
   const item = value as Record<string, unknown>;
+  if (item.version === "3") {
+    return (
+      typeof item.capabilitiesHash === "string" &&
+      TreeSyncCapabilitiesV3Schema.safeParse(item.capabilities).success
+    );
+  }
   if (item.version === "2") {
     return (
       typeof item.capabilitiesHash === "string" &&
@@ -34,6 +43,19 @@ function isSyncProtocolSelection(
     );
   }
   return false;
+}
+
+function normalizeOrigin(origin: string): string {
+  const url = new URL(origin);
+  if (
+    url.username ||
+    url.password ||
+    url.pathname !== "/" ||
+    url.search ||
+    url.hash
+  )
+    throw new TypeError("Protocol selection identity must use a server origin");
+  return url.origin;
 }
 
 function isProtocolSelectionRecord(
@@ -71,7 +93,7 @@ export class ProtocolSelectionRepository {
     if (record.schemaVersion !== 1)
       throw new Error("不支持同步协议选择存储版本");
     if (
-      record.serverOrigin !== identity.serverOrigin ||
+      record.serverOrigin !== normalizeOrigin(identity.serverOrigin) ||
       record.serverInstanceId !== identity.serverInstanceId ||
       record.pluginVersion !== identity.pluginVersion
     )
@@ -85,10 +107,14 @@ export class ProtocolSelectionRepository {
   ): Promise<void> {
     await this.repository.write({
       schemaVersion: 1,
-      serverOrigin: identity.serverOrigin,
+      serverOrigin: normalizeOrigin(identity.serverOrigin),
       serverInstanceId: identity.serverInstanceId,
       pluginVersion: identity.pluginVersion,
       selection,
     });
+  }
+
+  async clear(): Promise<void> {
+    await this.repository.clear();
   }
 }

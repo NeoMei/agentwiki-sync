@@ -48,7 +48,10 @@ import {
 } from "./agentwiki/protocol";
 import { userErrorMessage } from "./core/user-errors";
 import type { SyncSpaceSummary } from "./agentwiki/protocol";
-import type { TreeRemotePort } from "./ports/tree-remote";
+import {
+  assertTreeRuntimeProtocolVersion,
+  type TreeRemotePort,
+} from "./ports/tree-remote";
 import { MutableControlRepository } from "./storage/envelope";
 import { DeviceStateRepository } from "./storage/device-state";
 import { StorageMigration } from "./storage/migration";
@@ -295,6 +298,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       client,
       state!.payload.serverInstanceId,
     );
+    assertTreeRuntimeProtocolVersion(selection.version);
     const remote: TreeRemotePort =
       selection.version === "2"
         ? new V2TreeRemote(client, "", selection)
@@ -449,6 +453,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
     )
       throw new Error("认证会话身份不匹配");
     const selection = await this.negotiate(client, state.serverInstanceId);
+    assertTreeRuntimeProtocolVersion(selection.version);
     const protocolSuffix =
       selection.version === "2" ? "2\0" + selection.capabilitiesHash : "1";
     const runtimeKey =

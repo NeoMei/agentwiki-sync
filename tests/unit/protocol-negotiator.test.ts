@@ -8,6 +8,7 @@ import {
   capabilitiesHash,
   sha256Hex,
 } from "../../src/agentwiki/protocol";
+import { treeCapabilitiesHashV3 } from "@neomei/agentwiki-sync-protocol";
 import type { HttpPort } from "../../src/ports/http";
 import { MemoryControlStore } from "../fakes/memory-control-store";
 import { FakeHttp } from "../fakes/fake-http";
@@ -16,6 +17,10 @@ import {
   type ProtocolProbeIdentity,
 } from "../../src/application/protocol-negotiator";
 import { ProtocolSelectionRepository } from "../../src/storage/protocol-selection";
+import {
+  assertTreeRuntimeProtocolVersion,
+  TreeRuntimeProtocolUnavailableError,
+} from "../../src/ports/tree-remote";
 
 const identity: ProtocolProbeIdentity = {
   serverOrigin: "https://wiki.example.com",
@@ -32,12 +37,9 @@ function fakeClientRejecting(error: unknown): AgentWikiClient {
   return new AgentWikiClient("https://wiki.example.com", http, () => "secret");
 }
 
-function fakeClientReturning(json: unknown): AgentWikiClient {
-  const http: HttpPort = {
-    async request() {
-      return { status: 200, json };
-    },
-  };
+function fakeClientReturningV2(json: unknown): AgentWikiClient {
+  const http = new FakeHttp();
+  http.responses.push(newResponse(404, {}), newResponse(200, json));
   return new AgentWikiClient("https://wiki.example.com", http, () => "secret");
 }
 
@@ -72,7 +74,195 @@ const validCapabilities = {
   pushSessionTtlSeconds: 900,
 };
 
+const validV3Capabilities = {
+  ...validCapabilities,
+  maxAttachmentBytes: 10 * 1024 * 1024,
+  maxRevisionAttachments: 1000,
+  maxTransferBlobBytes: 100 * 1024 * 1024,
+  blobChunkBytes: 1024 * 1024,
+  maxBlobChunks: 10,
+  maxConcurrentBlobs: 2,
+  maxImageDimension: 10_000,
+  maxDecodedPixels: 40_000_000,
+  allowedMimeTypes: [
+    "image/gif",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+  ] as Array<"image/gif" | "image/jpeg" | "image/png" | "image/webp">,
+  blobStagingTtlSeconds: 900,
+  downloadAuthorizationTtlSeconds: 300,
+};
+
 describe("ProtocolNegotiator", () => {
+  it("selects v3 before probing v2", async () => {
+    const http = new FakeHttp();
+    const capabilitiesHashValue =
+      await treeCapabilitiesHashV3(validV3Capabilities);
+    http.route("GET", "/api/sync/v3/capabilities", {
+      status: 200,
+      json: {
+        protocolVersion: "3",
+        capabilities: validV3Capabilities,
+        capabilitiesHash: capabilitiesHashValue,
+      },
+    });
+    const subject = negotiator(
+      new AgentWikiClient("https://wiki.example.com", http, () => "secret"),
+    );
+
+    await expect(subject.select(identity)).resolves.toEqual({
+      version: "3",
+      capabilities: validV3Capabilities,
+      capabilitiesHash: capabilitiesHashValue,
+    });
+    expect(http.calls.map((call) => call.path)).toEqual([
+      "/api/sync/v3/capabilities",
+    ]);
+  });
+
+  it.each([401, 403, 409, 429, 500])(
+    "does not hide a real v3 failure by downgrading (%s)",
+    async (status) => {
+      const http = new FakeHttp();
+      http.responses.push(newResponse(status, {}));
+      await expect(
+        negotiator(
+          new AgentWikiClient("https://wiki.example.com", http, () => "secret"),
+        ).select(identity),
+      ).rejects.toMatchObject({ status });
+      expect(http.calls.map((call) => call.path)).toEqual([
+        "/api/sync/v3/capabilities",
+      ]);
+    },
+  );
+
+  it("does not hide a v3 schema failure by downgrading", async () => {
+    const http = new FakeHttp();
+    http.responses.push(newResponse(200, { protocolVersion: "3" }));
+    await expect(
+      negotiator(
+        new AgentWikiClient("https://wiki.example.com", http, () => "secret"),
+      ).select(identity),
+    ).rejects.toThrow();
+    expect(http.calls.map((call) => call.path)).toEqual([
+      "/api/sync/v3/capabilities",
+    ]);
+  });
+
+  it.each([
+    new TypeError("network unavailable"),
+    new SyntaxError("malformed JSON"),
+  ])(
+    "does not hide a v3 transport or JSON failure by downgrading",
+    async (error) => {
+      await expect(
+        negotiator(fakeClientRejecting(error)).select(identity),
+      ).rejects.toBe(error);
+    },
+  );
+
+  it("probes v2 only after v3 is explicitly unsupported", async () => {
+    const http = new FakeHttp();
+    const capabilitiesHashValue = await capabilitiesHash(validCapabilities);
+    http.responses.push(
+      newResponse(400, {
+        protocolVersion: "3",
+        error: { code: "PROTOCOL_UNSUPPORTED", retryable: false },
+      }),
+      newResponse(200, {
+        protocolVersion: "2",
+        capabilities: validCapabilities,
+        capabilitiesHash: capabilitiesHashValue,
+      }),
+    );
+    await expect(
+      negotiator(
+        new AgentWikiClient("https://wiki.example.com", http, () => "secret"),
+      ).select(identity),
+    ).resolves.toMatchObject({ version: "2" });
+    expect(http.calls.map((call) => call.path)).toEqual([
+      "/api/sync/v3/capabilities",
+      "/api/sync/v2/capabilities",
+    ]);
+  });
+
+  it("reaches v1 only after both discovery endpoints are unsupported", async () => {
+    const http = new FakeHttp();
+    http.responses.push(newResponse(404, {}), newResponse(404, {}));
+    await expect(
+      negotiator(
+        new AgentWikiClient("https://wiki.example.com", http, () => "secret"),
+      ).select(identity),
+    ).resolves.toEqual({ version: "1", reason: "endpoint_missing" });
+    expect(http.calls.map((call) => call.path)).toEqual([
+      "/api/sync/v3/capabilities",
+      "/api/sync/v2/capabilities",
+    ]);
+  });
+
+  it("fails closed when the server requires a newer protocol", async () => {
+    const http = new FakeHttp();
+    http.responses.push(
+      newResponse(409, {
+        protocolVersion: "3",
+        error: {
+          code: "SYNC_PROTOCOL_UPGRADE_REQUIRED",
+          retryable: false,
+        },
+      }),
+    );
+    await expect(
+      negotiator(
+        new AgentWikiClient("https://wiki.example.com", http, () => "secret"),
+      ).select(identity),
+    ).rejects.toMatchObject({ status: 409 });
+    expect(http.calls).toHaveLength(1);
+  });
+
+  it("rejects unknown v3 capability fields and hash mismatches", async () => {
+    const validHash = await treeCapabilitiesHashV3(validV3Capabilities);
+    for (const json of [
+      {
+        protocolVersion: "3",
+        capabilities: { ...validV3Capabilities, futureLimit: 1 },
+        capabilitiesHash: validHash,
+      },
+      {
+        protocolVersion: "3",
+        capabilities: validV3Capabilities,
+        capabilitiesHash: "0".repeat(64),
+      },
+    ]) {
+      const http = new FakeHttp();
+      http.responses.push(newResponse(200, json));
+      await expect(
+        negotiator(
+          new AgentWikiClient("https://wiki.example.com", http, () => "secret"),
+        ).select(identity),
+      ).rejects.toThrow();
+      expect(http.calls).toHaveLength(1);
+    }
+  });
+
+  it("rejects an oversized capabilities response without downgrading", async () => {
+    const http = new FakeHttp();
+    http.responses.push(
+      newResponse(200, {
+        protocolVersion: "3",
+        capabilities: validV3Capabilities,
+        capabilitiesHash: await treeCapabilitiesHashV3(validV3Capabilities),
+        padding: "x".repeat(65 * 1024),
+      }),
+    );
+    await expect(
+      negotiator(
+        new AgentWikiClient("https://wiki.example.com", http, () => "secret"),
+      ).select(identity),
+    ).rejects.toThrow(/response|size|large|limit/i);
+    expect(http.calls).toHaveLength(1);
+  });
+
   it("uses v1 only when the v2 endpoint is absent", async () => {
     const client = fakeClientRejecting(new AgentWikiHttpError(404, {}));
     await expect(negotiator(client).select(identity)).resolves.toEqual({
@@ -91,18 +281,28 @@ describe("ProtocolNegotiator", () => {
     });
   });
 
-  it.each([401, 403, 409, 500])(
+  it.each([401, 403, 409, 429, 500])(
     "does not downgrade a real v2 failure (%s)",
     async (status) => {
-      const client = fakeClientRejecting(new AgentWikiHttpError(status, {}));
+      const http = new FakeHttp();
+      http.responses.push(newResponse(404, {}), newResponse(status, {}));
+      const client = new AgentWikiClient(
+        "https://wiki.example.com",
+        http,
+        () => "secret",
+      );
       await expect(negotiator(client).select(identity)).rejects.toMatchObject({
         status,
       });
+      expect(http.calls.map((call) => call.path)).toEqual([
+        "/api/sync/v3/capabilities",
+        "/api/sync/v2/capabilities",
+      ]);
     },
   );
 
   it("does not downgrade malformed capabilities", async () => {
-    const client = fakeClientReturning({
+    const client = fakeClientReturningV2({
       protocolVersion: "2",
       capabilities: {},
     });
@@ -111,7 +311,7 @@ describe("ProtocolNegotiator", () => {
 
   it("selects v2 when capabilities are valid and hashed consistently", async () => {
     const capabilitiesHashValue = await capabilitiesHash(validCapabilities);
-    const client = fakeClientReturning({
+    const client = fakeClientReturningV2({
       protocolVersion: "2",
       capabilities: validCapabilities,
       capabilitiesHash: capabilitiesHashValue,
@@ -124,7 +324,7 @@ describe("ProtocolNegotiator", () => {
   });
 
   it("rejects a v2 response whose capabilities hash does not match", async () => {
-    const client = fakeClientReturning({
+    const client = fakeClientReturningV2({
       protocolVersion: "2",
       capabilities: validCapabilities,
       capabilitiesHash: "0".repeat(64),
@@ -163,6 +363,29 @@ describe("ProtocolNegotiator", () => {
 });
 
 describe("ProtocolSelectionRepository", () => {
+  it("normalizes the server origin before matching the cache", async () => {
+    const store = new MemoryControlStore();
+    const repository = new ProtocolSelectionRepository(store);
+    await repository.write(
+      { ...identity, serverOrigin: "https://WIKI.example.com:443" },
+      { version: "1", reason: "endpoint_missing" },
+    );
+    await expect(repository.readFor(identity)).resolves.toEqual({
+      version: "1",
+      reason: "endpoint_missing",
+    });
+  });
+
+  it("rejects legacy selection when a committed v3 generation exists", async () => {
+    const http = new FakeHttp();
+    http.responses.push(newResponse(404, {}), newResponse(404, {}));
+    await expect(
+      negotiator(
+        new AgentWikiClient("https://wiki.example.com", http, () => "secret"),
+      ).select(identity, "3"),
+    ).rejects.toMatchObject({ code: "SYNC_PROTOCOL_UPGRADE_REQUIRED" });
+  });
+
   it("returns null when the cached server identity differs", async () => {
     const store = new MemoryControlStore();
     const repository = new ProtocolSelectionRepository(store);
@@ -223,3 +446,22 @@ describe("ProtocolSelectionRepository", () => {
     await expect(repository.readFor(identity)).rejects.toThrow();
   });
 });
+
+describe("tree runtime protocol boundary", () => {
+  it("fails explicitly instead of routing selected v3 through a legacy adapter", () => {
+    expect(() => assertTreeRuntimeProtocolVersion("3")).toThrowError(
+      TreeRuntimeProtocolUnavailableError,
+    );
+    try {
+      assertTreeRuntimeProtocolVersion("3");
+    } catch (error) {
+      expect(error).toMatchObject({ code: "SYNC_PROTOCOL_UPGRADE_REQUIRED" });
+    }
+    expect(() => assertTreeRuntimeProtocolVersion("2")).not.toThrow();
+    expect(() => assertTreeRuntimeProtocolVersion("1")).not.toThrow();
+  });
+});
+
+function newResponse(status: number, json: unknown) {
+  return { status, json };
+}
