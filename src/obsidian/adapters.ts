@@ -136,6 +136,7 @@ export class ObsidianVaultPort implements VaultPort {
   }
   private safe(path: string): string {
     const normalized = normalizePath(path);
+    if (this.root === "") return normalized;
     if (normalized !== this.root && !normalized.startsWith(`${this.root}/`))
       throw new TypeError("Vault target escapes the mapping root");
     return normalized;
@@ -178,7 +179,9 @@ export class ObsidianVaultPort implements VaultPort {
     const root = this.vault.getAbstractFileByPath(this.safe(rootPath));
     if (!(root instanceof TFolder)) return;
     const vault = this.vault;
-    const prefix = `${normalizePath(rootPath)}/`;
+    const normalizedRoot = normalizePath(rootPath);
+    const isMappingRoot = normalizedRoot === this.root;
+    const prefix = normalizedRoot ? `${normalizedRoot}/` : "";
     const relative = (path: string): string => path.slice(prefix.length);
     const visit = async function* (
       folder: TFolder,
@@ -192,10 +195,18 @@ export class ObsidianVaultPort implements VaultPort {
           yield { kind: "directory", relativePath };
           yield* visit(child);
         } else if (child instanceof TFile) {
-          const bytes = new Uint8Array(await vault.readBinary(child));
-          if (child.extension.toLowerCase() === "md")
-            yield { kind: "markdown", relativePath, bytes };
-          else yield { kind: "file", relativePath, bytes };
+          if (child.extension.toLowerCase() === "md") {
+            if (isMappingRoot && relativePath.startsWith("pages/")) {
+              const bytes = new Uint8Array(await vault.readBinary(child));
+              yield { kind: "markdown", relativePath, bytes };
+            } else yield { kind: "markdown", relativePath };
+          } else
+            yield {
+              kind: "file",
+              relativePath,
+              byteLength: child.stat.size,
+              updatedAt: new Date(child.stat.mtime).toISOString(),
+            };
         }
       }
     };

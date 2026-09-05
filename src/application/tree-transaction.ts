@@ -484,7 +484,8 @@ export class TreeTransaction {
           after: { kind: "directory", hash: null },
         });
       } else {
-        const bytes = entry.bytes ?? new Uint8Array();
+        const bytes = entry.bytes ?? (await this.vault.read(source));
+        if (bytes === null) throw new Error("目录中的文件在读取时消失");
         const hash = await sha256Hex(bytes);
         paths.push({
           path: source,
@@ -523,11 +524,13 @@ export class TreeTransaction {
           after: { kind: "missing", hash: null },
         });
       } else {
+        const bytes = entry.bytes ?? (await this.vault.read(child));
+        if (bytes === null) throw new Error("目录中的文件在读取时消失");
         paths.push({
           path: child,
           before: {
             kind: "file",
-            hash: await sha256Hex(entry.bytes ?? new Uint8Array()),
+            hash: await sha256Hex(bytes),
           },
           after: { kind: "missing", hash: null },
         });

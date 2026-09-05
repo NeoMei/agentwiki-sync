@@ -17,6 +17,21 @@ export interface TreePage {
   updatedAt: string;
 }
 
+export interface TreePageV3 extends TreePage {
+  referencedAttachmentIds: string[];
+}
+
+export interface TreeAttachment {
+  attachmentId: string;
+  path: string;
+  mimeType: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+  sizeBytes: string;
+  width: number;
+  height: number;
+  contentHash: string;
+  updatedAt: string;
+}
+
 export interface TreeSnapshot {
   protocolVersion: "1" | "2";
   spaceId: string;
@@ -24,6 +39,17 @@ export interface TreeSnapshot {
   revisionContentHash: string;
   folders: TreeFolder[];
   pages: TreePage[];
+}
+
+/** Scan-only v3 shape. Durable v3 generation persistence is introduced later. */
+export interface TreeSnapshotV3 {
+  protocolVersion: "3";
+  spaceId: string;
+  revision: string;
+  revisionContentHash: string;
+  folders: TreeFolder[];
+  pages: TreePageV3[];
+  attachments: TreeAttachment[];
 }
 
 export type TreeDeltaItem =

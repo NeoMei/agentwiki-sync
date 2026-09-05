@@ -1,15 +1,32 @@
 import {
+  FlatAttachmentPathSchema,
   pathKey,
   validatePortableDirectoryPath,
   validatePortableMarkdownPath,
 } from "@neomei/agentwiki-sync-protocol";
 
-import { contentHash } from "../agentwiki/protocol";
-import type { VaultPort } from "../ports/vault";
+import { contentHash, sha256Hex } from "../agentwiki/protocol";
+import type { VaultPort, VaultTreeEntry } from "../ports/vault";
 import type { TreeIdentityState } from "../storage/tree-identities";
+import {
+  parseAttachmentReferences,
+  type AttachmentReference,
+} from "./attachment-reference";
+import {
+  inspectImageMetadata,
+  type ImageMetadataLimits,
+  type ImageMimeType,
+} from "./image-metadata";
 import { decodeVaultMarkdown } from "./markdown";
 import { titleFromPath } from "./portable-path";
-import type { TreeFolder, TreePage, TreeSnapshot } from "./tree-model";
+import type {
+  TreeAttachment,
+  TreeFolder,
+  TreePage,
+  TreePageV3,
+  TreeSnapshot,
+  TreeSnapshotV3,
+} from "./tree-model";
 
 export interface TreeScanLimits {
   maxFolders: number;
@@ -17,10 +34,39 @@ export interface TreeScanLimits {
   maxPageBytes: number;
 }
 
+export interface TreeScanLimitsV3 extends TreeScanLimits, ImageMetadataLimits {
+  maxAttachmentBytes: number;
+  maxRevisionAttachments: number;
+  maxTransferBlobBytes: number;
+}
+
 export interface LocalTreeScan {
   rootPath: string;
   folders: TreeFolder[];
   pages: TreePage[];
+}
+
+export interface AttachmentScanBlocker {
+  code:
+    | "ATTACHMENT_REFERENCE_INVALID"
+    | "ATTACHMENT_MISSING"
+    | "ATTACHMENT_CONTENT_INVALID"
+    | "ATTACHMENT_NAME_CONFLICT"
+    | "ATTACHMENT_QUOTA_EXCEEDED";
+  pagePath?: string;
+  target?: string;
+  targetStart?: number;
+  targetEnd?: number;
+  path?: string;
+  detail: string;
+}
+
+export interface LocalTreeScanV3 {
+  rootPath: string;
+  folders: TreeFolder[];
+  pages: TreePageV3[];
+  attachments: TreeAttachment[];
+  blockers: AttachmentScanBlocker[];
 }
 
 const MANAGED_ROOT = "pages";
@@ -34,25 +80,145 @@ function comparePathKeys(left: string, right: string): number {
   return 0;
 }
 
-export async function scanLocalTree(
+function joinRoot(rootPath: string, path: string): string {
+  return rootPath ? `${rootPath}/${path}` : path;
+}
+
+function extensionMatches(path: string, mimeType: ImageMimeType): boolean {
+  const extension = path.slice(path.lastIndexOf(".") + 1).toLowerCase();
+  return mimeType === "image/jpeg"
+    ? extension === "jpg" || extension === "jpeg"
+    : extension === mimeType.slice("image/".length);
+}
+
+function referenceBlocker(
+  reference: AttachmentReference,
+  pagePath: string,
+  code: AttachmentScanBlocker["code"],
+  detail: string,
+  path?: string,
+): AttachmentScanBlocker {
+  return {
+    code,
+    pagePath,
+    target: reference.target,
+    targetStart: reference.targetStart,
+    targetEnd: reference.targetEnd,
+    path,
+    detail,
+  };
+}
+
+function errorCode(error: unknown): AttachmentScanBlocker["code"] {
+  return error instanceof RangeError
+    ? "ATTACHMENT_QUOTA_EXCEEDED"
+    : "ATTACHMENT_CONTENT_INVALID";
+}
+
+interface IdentityCandidate {
+  id: string;
+  key: string;
+  path: string;
+  precedence: number;
+}
+
+function attachmentIdentityCandidates(
+  identities: TreeIdentityState,
+  base: TreeSnapshotV3,
+): IdentityCandidate[] {
+  const candidates: IdentityCandidate[] = [];
+  for (const identity of Object.values(identities.attachments ?? {}))
+    if (identity.active)
+      candidates.push({
+        id: identity.attachmentId,
+        key: identity.pathKey,
+        path: identity.path,
+        precedence: 0,
+      });
+  for (const identity of Object.values(identities.pendingAttachments ?? {}))
+    candidates.push({
+      id: identity.attachmentId,
+      key: identity.pathKey,
+      path: identity.path,
+      precedence: 1,
+    });
+  for (const attachment of base.attachments)
+    candidates.push({
+      id: attachment.attachmentId,
+      key: pathKey(attachment.path),
+      path: attachment.path,
+      precedence: 2,
+    });
+  return candidates;
+}
+
+function collisionKeys(candidates: IdentityCandidate[]): Set<string> {
+  const idsByKey = new Map<string, Set<string>>();
+  const keysById = new Map<string, Set<string>>();
+  for (const candidate of candidates) {
+    const ids = idsByKey.get(candidate.key) ?? new Set<string>();
+    ids.add(candidate.id);
+    idsByKey.set(candidate.key, ids);
+    const keys = keysById.get(candidate.id) ?? new Set<string>();
+    keys.add(candidate.key);
+    keysById.set(candidate.id, keys);
+  }
+  const collisions = new Set<string>();
+  for (const [key, ids] of idsByKey) if (ids.size > 1) collisions.add(key);
+  for (const keys of keysById.values())
+    if (keys.size > 1) for (const key of keys) collisions.add(key);
+  return collisions;
+}
+
+function resolveKnownAttachmentId(
+  key: string,
+  candidates: IdentityCandidate[],
+): string | undefined {
+  return candidates
+    .filter((candidate) => candidate.key === key)
+    .sort((left, right) => left.precedence - right.precedence)[0]?.id;
+}
+
+export function scanLocalTree(
+  vault: VaultPort,
+  rootPath: string,
+  base: TreeSnapshotV3,
+  identities: TreeIdentityState,
+  limits: TreeScanLimitsV3,
+  onProgress?: (completed: number) => Promise<void>,
+): Promise<LocalTreeScanV3>;
+export function scanLocalTree(
   vault: VaultPort,
   rootPath: string,
   base: TreeSnapshot,
   identities: TreeIdentityState,
   limits: TreeScanLimits,
   onProgress?: (completed: number) => Promise<void>,
-): Promise<LocalTreeScan> {
+): Promise<LocalTreeScan>;
+
+export async function scanLocalTree(
+  vault: VaultPort,
+  rootPath: string,
+  base: TreeSnapshot | TreeSnapshotV3,
+  identities: TreeIdentityState,
+  limits: TreeScanLimits,
+  onProgress?: (completed: number) => Promise<void>,
+): Promise<LocalTreeScan | LocalTreeScanV3> {
   const directories: string[] = [];
   const markdown = new Map<string, Uint8Array>();
+  const files = new Map<string, VaultTreeEntry>();
   let scanned = 0;
   for await (const entry of vault.listTree(rootPath)) {
-    if (entry.relativePath === MANAGED_ROOT) continue;
-    if (!entry.relativePath.startsWith(MANAGED_PREFIX)) continue;
     scanned += 1;
     if (scanned % 50 === 0) await onProgress?.(scanned);
+    if (entry.kind === "file") {
+      files.set(entry.relativePath, entry);
+      continue;
+    }
+    if (entry.relativePath === MANAGED_ROOT) continue;
+    if (!entry.relativePath.startsWith(MANAGED_PREFIX)) continue;
     if (entry.kind === "directory") directories.push(entry.relativePath);
-    else if (entry.kind === "markdown")
-      markdown.set(entry.relativePath, entry.bytes ?? new Uint8Array());
+    else markdown.set(entry.relativePath, entry.bytes ?? new Uint8Array());
   }
 
   // Stable ID resolution is pathKey-first. Committed local identity wins, then
@@ -139,6 +305,7 @@ export async function scanLocalTree(
     throw new RangeError("SPACE_TOO_LARGE: page count");
 
   const pages: TreePage[] = [];
+  const pageReferences = new Map<string, AttachmentReference[]>();
   let totalBodyBytes = 0;
   for (const rawPath of sortedPages) {
     const bytes = markdown.get(rawPath) ?? new Uint8Array();
@@ -173,7 +340,281 @@ export async function scanLocalTree(
       contentHash: hash,
       updatedAt: now,
     });
+    if (base.protocolVersion === "3")
+      pageReferences.set(path, parseAttachmentReferences(body, path));
   }
 
-  return { rootPath, folders, pages };
+  if (base.protocolVersion !== "3") return { rootPath, folders, pages };
+
+  const v3Limits = limits as TreeScanLimitsV3;
+  const blockers: AttachmentScanBlocker[] = [];
+  const assetEntriesByKey = new Map<string, VaultTreeEntry[]>();
+  for (const [relativePath, entry] of files) {
+    if (!relativePath.startsWith("assets/")) continue;
+    const parsed = FlatAttachmentPathSchema.safeParse(relativePath);
+    if (!parsed.success) continue;
+    const key = pathKey(parsed.data);
+    const entries = assetEntriesByKey.get(key) ?? [];
+    entries.push({ ...entry, relativePath: parsed.data });
+    assetEntriesByKey.set(key, entries);
+  }
+
+  const candidates = attachmentIdentityCandidates(identities, base);
+  const identityCollisionKeys = collisionKeys(candidates);
+  const resolvedPathByPage = new Map<string, Map<number, string>>();
+  const referencedPaths = new Map<string, string>();
+  for (const page of pages) {
+    const resolvedByIndex = new Map<number, string>();
+    resolvedPathByPage.set(page.path, resolvedByIndex);
+    for (const [index, reference] of (
+      pageReferences.get(page.path) ?? []
+    ).entries()) {
+      if (reference.classification === "external") continue;
+      if (reference.classification === "invalid") {
+        blockers.push(
+          referenceBlocker(
+            reference,
+            page.path,
+            "ATTACHMENT_REFERENCE_INVALID",
+            reference.reason ?? "invalid local image reference",
+          ),
+        );
+        continue;
+      }
+      let key: string;
+      if (reference.classification === "legacy") {
+        key = pathKey(`assets/${reference.target}`);
+        const matches = assetEntriesByKey.get(key) ?? [];
+        if (matches.length !== 1) {
+          blockers.push(
+            referenceBlocker(
+              reference,
+              page.path,
+              matches.length === 0
+                ? "ATTACHMENT_MISSING"
+                : "ATTACHMENT_NAME_CONFLICT",
+              matches.length === 0
+                ? "historical bare-name image is missing"
+                : "historical bare-name image is ambiguous",
+            ),
+          );
+          continue;
+        }
+      } else key = pathKey(reference.resolvedPath!);
+
+      const entries = assetEntriesByKey.get(key) ?? [];
+      if (entries.length === 0) {
+        blockers.push(
+          referenceBlocker(
+            reference,
+            page.path,
+            "ATTACHMENT_MISSING",
+            "referenced image is missing",
+            reference.resolvedPath,
+          ),
+        );
+        continue;
+      }
+      if (entries.length > 1 || identityCollisionKeys.has(key)) {
+        blockers.push(
+          referenceBlocker(
+            reference,
+            page.path,
+            "ATTACHMENT_NAME_CONFLICT",
+            entries.length > 1
+              ? "multiple asset paths share one portable path key"
+              : "attachment identity collision",
+            entries[0]?.relativePath,
+          ),
+        );
+        continue;
+      }
+      const resolvedPath = entries[0]!.relativePath;
+      resolvedByIndex.set(index, resolvedPath);
+      referencedPaths.set(key, resolvedPath);
+    }
+  }
+
+  if (referencedPaths.size > v3Limits.maxRevisionAttachments) {
+    blockers.push({
+      code: "ATTACHMENT_QUOTA_EXCEEDED",
+      detail: "attachment count exceeds the revision limit",
+    });
+    referencedPaths.clear();
+  } else {
+    let listedTotal = 0;
+    let allSizesKnown = true;
+    for (const key of referencedPaths.keys()) {
+      const byteLength = assetEntriesByKey.get(key)?.[0]?.byteLength;
+      if (byteLength === undefined) {
+        allSizesKnown = false;
+        break;
+      }
+      listedTotal += byteLength;
+    }
+    if (allSizesKnown && listedTotal > v3Limits.maxTransferBlobBytes) {
+      blockers.push({
+        code: "ATTACHMENT_QUOTA_EXCEEDED",
+        detail: "listed attachment bytes exceed the transfer limit",
+      });
+      referencedPaths.clear();
+    }
+  }
+
+  const attachments: TreeAttachment[] = [];
+  const attachmentIdByKey = new Map<string, string>();
+  let totalAttachmentBytes = 0;
+  for (const [key, path] of [...referencedPaths].sort((left, right) =>
+    comparePathKeys(left[1], right[1]),
+  )) {
+    const entry = assetEntriesByKey.get(key)?.[0];
+    if (!entry) continue;
+    if (
+      entry.byteLength !== undefined &&
+      entry.byteLength > v3Limits.maxAttachmentBytes
+    ) {
+      blockers.push({
+        code: "ATTACHMENT_QUOTA_EXCEEDED",
+        path,
+        detail: "listed attachment bytes exceed the per-image limit",
+      });
+      continue;
+    }
+    const bytes = await vault.read(joinRoot(rootPath, path));
+    if (bytes === null) {
+      blockers.push({
+        code: "ATTACHMENT_MISSING",
+        path,
+        detail: "referenced image disappeared during scan",
+      });
+      continue;
+    }
+    if (bytes.byteLength > v3Limits.maxAttachmentBytes) {
+      blockers.push({
+        code: "ATTACHMENT_QUOTA_EXCEEDED",
+        path,
+        detail: "actual attachment bytes exceed the per-image limit",
+      });
+      continue;
+    }
+    let metadata;
+    try {
+      metadata = inspectImageMetadata(bytes, v3Limits);
+    } catch (error) {
+      blockers.push({
+        code: errorCode(error),
+        path,
+        detail: error instanceof Error ? error.message : "invalid image",
+      });
+      continue;
+    }
+    if (!extensionMatches(path, metadata.mimeType)) {
+      blockers.push({
+        code: "ATTACHMENT_CONTENT_INVALID",
+        path,
+        detail: "image magic does not match its path extension",
+      });
+      continue;
+    }
+    totalAttachmentBytes += bytes.byteLength;
+    if (totalAttachmentBytes > v3Limits.maxTransferBlobBytes) {
+      blockers.push({
+        code: "ATTACHMENT_QUOTA_EXCEEDED",
+        path,
+        detail: "referenced attachment bytes exceed the transfer limit",
+      });
+      continue;
+    }
+    const hash = await sha256Hex(bytes);
+    let attachmentId = resolveKnownAttachmentId(key, candidates);
+    if (attachmentId === undefined) {
+      const detachedMatches = Object.values(
+        identities.attachments ?? {},
+      ).filter(
+        (identity) =>
+          !identity.active &&
+          identity.pathKey === key &&
+          identity.baseContentHash === hash,
+      );
+      if (
+        new Set(detachedMatches.map((identity) => identity.attachmentId)).size >
+        1
+      ) {
+        blockers.push({
+          code: "ATTACHMENT_NAME_CONFLICT",
+          path,
+          detail: "multiple detached identities exactly match the image",
+        });
+        continue;
+      }
+      const detachedMatch = detachedMatches[0];
+      if (detachedMatch) {
+        const keysForId = new Set([
+          ...candidates
+            .filter((candidate) => candidate.id === detachedMatch.attachmentId)
+            .map((candidate) => candidate.key),
+          ...Object.values(identities.attachments ?? {})
+            .filter(
+              (identity) =>
+                identity.attachmentId === detachedMatch.attachmentId,
+            )
+            .map((identity) => identity.pathKey),
+        ]);
+        if (keysForId.size > 1) {
+          blockers.push({
+            code: "ATTACHMENT_NAME_CONFLICT",
+            path,
+            detail: "detached attachment ID is bound to another path",
+          });
+          continue;
+        }
+        attachmentId = detachedMatch.attachmentId;
+        detachedMatch.active = true;
+      }
+    }
+    if (attachmentId === undefined) {
+      attachmentId = crypto.randomUUID();
+      const pendingAttachments = (identities.pendingAttachments ??= {});
+      pendingAttachments[attachmentId] = {
+        attachmentId,
+        path,
+        pathKey: key,
+        contentHash: hash,
+      };
+    }
+    attachmentIdByKey.set(key, attachmentId);
+    attachments.push({
+      attachmentId,
+      path,
+      mimeType: metadata.mimeType,
+      sizeBytes: String(bytes.byteLength),
+      width: metadata.width,
+      height: metadata.height,
+      contentHash: hash,
+      updatedAt: entry.updatedAt ?? now,
+    });
+  }
+
+  const v3Pages: TreePageV3[] = pages.map((page) => {
+    const ids = new Set<string>();
+    for (const path of resolvedPathByPage.get(page.path)?.values() ?? []) {
+      const id = attachmentIdByKey.get(pathKey(path));
+      if (id) ids.add(id);
+    }
+    return { ...page, referencedAttachmentIds: [...ids].sort() };
+  });
+  attachments.sort((left, right) => comparePathKeys(left.path, right.path));
+  blockers.sort((left, right) =>
+    [left.pagePath ?? "", left.targetStart ?? -1, left.path ?? "", left.code]
+      .join("\0")
+      .localeCompare(
+        [
+          right.pagePath ?? "",
+          right.targetStart ?? -1,
+          right.path ?? "",
+          right.code,
+        ].join("\0"),
+      ),
+  );
+  return { rootPath, folders, pages: v3Pages, attachments, blockers };
 }

@@ -2,6 +2,8 @@ import type { VaultPort, VaultTreeEntry } from "../../src/ports/vault";
 
 export class MemoryVault implements VaultPort {
   private readonly files = new Map<string, Uint8Array>();
+  readonly readPaths: string[] = [];
+  private readonly listedByteLengths = new Map<string, number>();
   readonly folders = new Set<string>();
   readonly trash = new Map<string, Uint8Array>();
   readonly trashedDirectories = new Set<string>();
@@ -14,6 +16,16 @@ export class MemoryVault implements VaultPort {
       this.files.set(path, new TextEncoder().encode(body));
       this.deriveParents(path);
     }
+  }
+  seedFile(path: string, bytes: Uint8Array): void {
+    this.files.set(path, bytes.slice());
+    this.deriveParents(path);
+  }
+  seedMarkdown(path: string, body: string): void {
+    this.seedFile(path, new TextEncoder().encode(body));
+  }
+  setListedByteLength(path: string, byteLength: number): void {
+    this.listedByteLengths.set(path, byteLength);
   }
   private deriveParents(path: string): void {
     const segments = path.split("/");
@@ -67,8 +79,20 @@ export class MemoryVault implements VaultPort {
       const relativePath = path.slice(prefix.length);
       if (relativePath.split("/").includes(".agentwiki")) continue;
       if (relativePath.toLowerCase().endsWith(".md"))
-        entries.push({ kind: "markdown", relativePath, bytes: bytes.slice() });
-      else entries.push({ kind: "file", relativePath, bytes: bytes.slice() });
+        entries.push({
+          kind: "markdown",
+          relativePath,
+          ...(relativePath.startsWith("pages/")
+            ? { bytes: bytes.slice() }
+            : {}),
+        });
+      else
+        entries.push({
+          kind: "file",
+          relativePath,
+          byteLength: this.listedByteLengths.get(path) ?? bytes.byteLength,
+          updatedAt: "2026-09-04T00:00:00.000Z",
+        });
     }
     entries.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
     yield* entries;
@@ -118,6 +142,7 @@ export class MemoryVault implements VaultPort {
     return value ? new TextDecoder().decode(value) : null;
   }
   async read(path: string): Promise<Uint8Array | null> {
+    this.readPaths.push(path);
     return this.files.get(path)?.slice() ?? null;
   }
   async write(path: string, bytes: Uint8Array): Promise<void> {

@@ -10,11 +10,29 @@ export interface TreePendingPageIdentity {
   contentHash: string;
 }
 
+/** Minimal in-memory v3 shape; strict durable schema arrives with v3 storage. */
+export interface TreeAttachmentIdentity {
+  attachmentId: string;
+  path: string;
+  pathKey: string;
+  baseContentHash: string;
+  active: boolean;
+}
+
+export interface TreePendingAttachmentIdentity {
+  attachmentId: string;
+  path: string;
+  pathKey: string;
+  contentHash: string;
+}
+
 export interface TreeIdentityState {
   schemaVersion: 1;
   folders: Record<string, TreeFolderIdentity>;
   pendingFolders: Record<string, TreeFolderIdentity>;
   pendingPages: Record<string, TreePendingPageIdentity>;
+  attachments?: Record<string, TreeAttachmentIdentity>;
+  pendingAttachments?: Record<string, TreePendingAttachmentIdentity>;
 }
 
 export function emptyTreeIdentityState(): TreeIdentityState {

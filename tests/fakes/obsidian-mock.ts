@@ -8,7 +8,10 @@ export function normalizePath(path: string): string {
 }
 
 export class TFile {
-  constructor(public readonly path: string) {}
+  constructor(
+    public readonly path: string,
+    public readonly stat = { size: 0, mtime: 0 },
+  ) {}
   get extension(): string {
     const name = this.path.slice(this.path.lastIndexOf("/") + 1);
     const dot = name.lastIndexOf(".");

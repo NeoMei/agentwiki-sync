@@ -2,6 +2,9 @@ export interface VaultTreeEntry {
   relativePath: string;
   kind: "directory" | "markdown" | "file";
   bytes?: Uint8Array;
+  /** Available without loading file bytes. */
+  byteLength?: number;
+  updatedAt?: string;
 }
 
 export interface VaultPort {

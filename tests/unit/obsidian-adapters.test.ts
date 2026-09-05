@@ -59,6 +59,7 @@ class FakeLocalApp {
 class FakeVault {
   readonly files = new Map<string, string>();
   readonly folders = new Set<string>();
+  readonly readPaths: string[] = [];
   constructor(initial: Record<string, string> = {}) {
     for (const [path, body] of Object.entries(initial)) {
       this.files.set(path, body);
@@ -72,7 +73,13 @@ class FakeVault {
     }
   }
   getFileByPath(path: string): TFile | null {
-    return this.files.has(path) ? new TFile(path) : null;
+    const body = this.files.get(path);
+    return body === undefined
+      ? null
+      : new TFile(path, {
+          size: new TextEncoder().encode(body).byteLength,
+          mtime: Date.parse("2026-09-04T00:00:00.000Z"),
+        });
   }
   private allFolders(): Set<string> {
     const result = new Set<string>(this.folders);
@@ -100,7 +107,7 @@ class FakeVault {
         children.push(this.folderNode(folder, folders));
     }
     for (const file of this.files.keys())
-      if (direct(file) !== null) children.push(new TFile(file));
+      if (direct(file) !== null) children.push(this.getFileByPath(file)!);
     return new TFolder(path, children);
   }
   getAbstractFileByPath(path: string): TFile | TFolder | null {
@@ -111,9 +118,10 @@ class FakeVault {
   getMarkdownFiles(): TFile[] {
     return [...this.files.keys()]
       .filter((path) => path.endsWith(".md"))
-      .map((path) => new TFile(path));
+      .map((path) => this.getFileByPath(path)!);
   }
   async readBinary(file: TFile): Promise<ArrayBuffer> {
+    this.readPaths.push(file.path);
     return new TextEncoder().encode(this.files.get(file.path) ?? "").buffer;
   }
   async createFolder(path: string): Promise<void> {
@@ -341,6 +349,29 @@ describe("ObsidianVaultPort", () => {
       },
       { kind: "directory", relativePath: "pages/Empty" },
     ]);
+  });
+
+  it("does not read non-Markdown bytes while listing the tree", async () => {
+    const vault = new FakeVault({
+      "Wiki/pages/A.md": "a",
+      "Wiki/assets/unreferenced.png": "not loaded",
+      "Wiki/notes.md": "also not loaded",
+    });
+    const port = new ObsidianVaultPort(
+      vault as unknown as Vault,
+      {} as unknown as FileManager,
+      "Wiki",
+    );
+
+    const entries = await collect(port.listTree("Wiki"));
+
+    expect(vault.readPaths).toEqual(["Wiki/pages/A.md"]);
+    expect(entries).toContainEqual({
+      kind: "file",
+      relativePath: "assets/unreferenced.png",
+      byteLength: 10,
+      updatedAt: "2026-09-04T00:00:00.000Z",
+    });
   });
 
   it("skips .agentwiki directories and files anywhere under the root", async () => {
