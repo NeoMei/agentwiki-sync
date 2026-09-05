@@ -1257,7 +1257,7 @@ export class SyncRuntime {
       v3After?.payload.transactionId === tree.transactionId &&
       (tree.state === "verified" || tree.state === "committed")
     ) {
-      await treeTx.assertApplied();
+      if (tree.state === "verified") await treeTx.assertApplied();
       const hasBaselineTransaction = await this.treeBaseline.hasTransaction(
         tree.transactionId,
       );
@@ -1273,8 +1273,10 @@ export class SyncRuntime {
         throw new Error("V3_BASELINE_RECOVERY_EVIDENCE_MISSING");
       }
       await this.treeBaseline.recover(tree.transactionId);
-      await this.applyV3ControlAfter(tree.transactionId);
-      await treeTx.markCommitted();
+      if (tree.state === "verified") {
+        await this.applyV3ControlAfter(tree.transactionId);
+        await treeTx.markCommitted();
+      }
       await new BlobStagingRepository(
         this.control,
         this.root + "/pull-staging",

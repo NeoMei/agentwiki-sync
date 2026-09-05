@@ -100,6 +100,25 @@ async function page(
 }
 
 describe("Pull preview control sidecars", () => {
+  it("preserves a local edit when recovering after a completed v3 Pull", async () => {
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({ pages: [await page("remote")] });
+    const vault = new MemoryVault({});
+    const control = new StrictControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    await runtime.applyPullV3(await runtime.previewPullV3());
+    vault.seedMarkdown("Wiki/pages/Note.md", "local edit");
+
+    const restarted = SyncRuntime.v3(vault, control, remote, mapping());
+    await restarted.recover();
+    const status = await restarted.statusV3();
+    const push = await restarted.previewPushV3();
+
+    expect(vault.text("Wiki/pages/Note.md")).toBe("local edit");
+    expect(status.local.modified).toHaveLength(1);
+    expect(push.changes).toHaveLength(1);
+  });
+
   it("keeps v3 sidecars inside .agentwiki for the strict Obsidian control boundary", async () => {
     const remote = new FakeTreeRemoteV3();
     const image = await attachment();
