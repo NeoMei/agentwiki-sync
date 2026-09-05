@@ -137,6 +137,25 @@ describe("ProtocolNegotiator", () => {
     },
   );
 
+  it.each([401, 403, 409, 429, 500])(
+    "does not trust a v3 PROTOCOL_UNSUPPORTED body on status %s",
+    async (status) => {
+      const http = new FakeHttp();
+      http.responses.push(
+        newResponse(status, {
+          protocolVersion: "3",
+          error: { code: "PROTOCOL_UNSUPPORTED", retryable: false },
+        }),
+      );
+      await expect(
+        negotiator(
+          new AgentWikiClient("https://wiki.example.com", http, () => "secret"),
+        ).select(identity),
+      ).rejects.toMatchObject({ status });
+      expect(http.calls).toHaveLength(1);
+    },
+  );
+
   it("does not hide a v3 schema failure by downgrading", async () => {
     const http = new FakeHttp();
     http.responses.push(newResponse(200, { protocolVersion: "3" }));
@@ -298,6 +317,26 @@ describe("ProtocolNegotiator", () => {
         "/api/sync/v3/capabilities",
         "/api/sync/v2/capabilities",
       ]);
+    },
+  );
+
+  it.each([401, 403, 409, 429, 500])(
+    "does not trust a v2 PROTOCOL_UNSUPPORTED body on status %s",
+    async (status) => {
+      const http = new FakeHttp();
+      http.responses.push(
+        newResponse(404, {}),
+        newResponse(status, {
+          protocolVersion: "2",
+          error: { code: "PROTOCOL_UNSUPPORTED", retryable: false },
+        }),
+      );
+      await expect(
+        negotiator(
+          new AgentWikiClient("https://wiki.example.com", http, () => "secret"),
+        ).select(identity),
+      ).rejects.toMatchObject({ status });
+      expect(http.calls).toHaveLength(2);
     },
   );
 

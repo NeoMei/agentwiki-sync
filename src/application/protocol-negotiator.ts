@@ -59,7 +59,8 @@ function isExplicitlyUnsupported(error: unknown): boolean {
   if (!(error instanceof AgentWikiHttpError)) return false;
   assertDiscoveryResponseSize(error.body);
   return (
-    error.status === 404 || syncErrorCode(error) === "PROTOCOL_UNSUPPORTED"
+    error.status === 404 ||
+    (error.status === 400 && syncErrorCode(error) === "PROTOCOL_UNSUPPORTED")
   );
 }
 
