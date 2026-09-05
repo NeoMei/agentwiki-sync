@@ -285,5 +285,77 @@
         "resolvedPath": "assets/a(b).png"
       }
     ]
+  },
+  {
+    "name": "list-continuation-fence-exit",
+    "body": "- example\n  ```md\n  ![[assets/hidden.png]]\n\n![[assets/real.png]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "managed",
+        "rawTarget": "assets/real.png",
+        "resolvedPath": "assets/real.png"
+      }
+    ]
+  },
+  {
+    "name": "ordered-list-continuation-fence-exit",
+    "body": "1. example\r\n   ```md\r\n   ![[assets/hidden.png]]\r\n\r\n![[assets/real.png]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "managed",
+        "rawTarget": "assets/real.png",
+        "resolvedPath": "assets/real.png"
+      }
+    ]
+  },
+  {
+    "name": "spaced-list-continuation-fence-exit",
+    "body": "-   example\n    ```md\n    ![[assets/hidden.png]]\n  ![[assets/real.png]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "managed",
+        "rawTarget": "assets/real.png",
+        "resolvedPath": "assets/real.png"
+      }
+    ]
+  },
+  {
+    "name": "quote-list-continuation-fence-exit",
+    "body": "> - example\n>   ```md\n>   ![[assets/hidden.png]]\n> ![[assets/real.png]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "managed",
+        "rawTarget": "assets/real.png",
+        "resolvedPath": "assets/real.png"
+      }
+    ]
+  },
+  {
+    "name": "list-quote-fence-exit",
+    "body": "- > ```md\n  > ![[assets/hidden.png]]\n\n![[assets/real.png]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "managed",
+        "rawTarget": "assets/real.png",
+        "resolvedPath": "assets/real.png"
+      }
+    ]
+  },
+  {
+    "name": "list-quote-fence-close",
+    "body": "- > ~~~md\n  > ![[assets/hidden.png]]\n  > ~~~\n![[assets/real.png]]",
+    "expected": [
+      {
+        "syntax": "obsidian",
+        "classification": "managed",
+        "rawTarget": "assets/real.png",
+        "resolvedPath": "assets/real.png"
+      }
+    ]
   }
 ]

@@ -28,89 +28,124 @@ function mark(mask: Uint8Array, start: number, end: number): void {
   mask.fill(1, start, end);
 }
 
-function stripContainers(line: string): string {
-  let rest = line;
-  for (;;) {
-    const quote = rest.match(/^ {0,3}> ?/u);
-    if (quote) {
-      rest = rest.slice(quote[0].length);
-      continue;
-    }
-    const list = rest.match(/^ {0,3}(?:[-+*]|\d{1,9}[.)])[ \t]/u);
-    if (list) {
-      rest = rest.slice(list[0].length);
-      continue;
-    }
-    return rest;
-  }
+type FenceContainerToken =
+  { kind: "quote" } | { kind: "list"; contentIndent: number };
+
+function quotePrefixEnd(line: string, start: number): number | null {
+  const match = line.slice(start).match(/^ {0,3}>[ \t]?/u);
+  return match ? start + match[0].length : null;
 }
 
-interface FenceContainer {
-  quoteDepth: number;
-  listContentIndent: number | null;
-}
-
-function quotePrefixEnd(
+function listMarker(
   line: string,
-  requiredDepth?: number,
-): { cursor: number; depth: number; complete: boolean } {
-  let cursor = 0;
-  let depth = 0;
-  while (requiredDepth === undefined || depth < requiredDepth) {
-    const match = line.slice(cursor).match(/^ {0,3}>[ \t]?/u);
-    if (!match) break;
-    cursor += match[0].length;
-    depth += 1;
+  start: number,
+): { end: number; contentIndent: number } | null {
+  const match = line
+    .slice(start)
+    .match(/^( {0,3})([-+*]|\d{1,9}[.)])([ \t]+)/u);
+  if (!match) return null;
+  const beforeWhitespace = match[1]!.length + match[2]!.length;
+  let paddingLength = 0;
+  let contentIndent = beforeWhitespace;
+  for (const character of match[3]!) {
+    const nextIndent =
+      character === "\t"
+        ? contentIndent + 4 - (contentIndent % 4)
+        : contentIndent + 1;
+    if (nextIndent - beforeWhitespace > 4) break;
+    contentIndent = nextIndent;
+    paddingLength += 1;
+  }
+  if (paddingLength < match[3]!.length) {
+    paddingLength = 1;
+    contentIndent =
+      match[3]![0] === "\t"
+        ? beforeWhitespace + 4 - (beforeWhitespace % 4)
+        : beforeWhitespace + 1;
   }
   return {
-    cursor,
-    depth,
-    complete: requiredDepth === undefined || depth === requiredDepth,
+    end: start + match[1]!.length + match[2]!.length + paddingLength,
+    contentIndent,
   };
 }
 
-function openingFenceContext(line: string): {
-  content: string;
-  container: FenceContainer;
-} {
-  const quote = quotePrefixEnd(line);
-  let cursor = quote.cursor;
-  let listContentIndent: number | null = null;
-  for (;;) {
-    const match = line
-      .slice(cursor)
-      .match(/^ {0,3}(?:[-+*]|\d{1,9}[.)])[ \t]/u);
-    if (!match) break;
-    cursor += match[0].length;
-    listContentIndent = cursor - quote.cursor;
+function listContinuationEnd(
+  line: string,
+  start: number,
+  requiredIndent: number,
+): number | null {
+  let cursor = start;
+  let width = 0;
+  while (cursor < line.length && width < requiredIndent) {
+    if (line[cursor] === " ") width += 1;
+    else if (line[cursor] === "\t") width += 4 - (width % 4);
+    else break;
+    cursor += 1;
   }
-  return {
-    content: line.slice(cursor),
-    container: { quoteDepth: quote.depth, listContentIndent },
-  };
+  return width >= requiredIndent ? cursor : null;
+}
+
+function containerTokenEnd(
+  line: string,
+  start: number,
+  token: FenceContainerToken,
+): number | null {
+  return token.kind === "quote"
+    ? quotePrefixEnd(line, start)
+    : listContinuationEnd(line, start, token.contentIndent);
+}
+
+function lineContainer(
+  line: string,
+  inheritedListContainer: readonly FenceContainerToken[],
+): { content: string; container: FenceContainerToken[] } {
+  let cursor = 0;
+  const container: FenceContainerToken[] = [];
+  for (const token of inheritedListContainer) {
+    const end = containerTokenEnd(line, cursor, token);
+    if (end === null) break;
+    container.push(token);
+    cursor = end;
+  }
+  for (;;) {
+    const quoteEnd = quotePrefixEnd(line, cursor);
+    if (quoteEnd !== null) {
+      container.push({ kind: "quote" });
+      cursor = quoteEnd;
+      continue;
+    }
+    const list = listMarker(line, cursor);
+    if (list !== null) {
+      container.push({ kind: "list", contentIndent: list.contentIndent });
+      cursor = list.end;
+      continue;
+    }
+    break;
+  }
+  return { content: line.slice(cursor), container };
+}
+
+function inheritedListContainer(
+  container: readonly FenceContainerToken[],
+): FenceContainerToken[] {
+  let lastList = -1;
+  for (let index = 0; index < container.length; index += 1)
+    if (container[index]?.kind === "list") lastList = index;
+  return lastList < 0 ? [] : container.slice(0, lastList + 1);
 }
 
 function activeFenceContent(
   line: string,
-  container: FenceContainer,
+  container: readonly FenceContainerToken[],
 ): { inside: boolean; content: string } {
-  const quote = quotePrefixEnd(line, container.quoteDepth);
-  if (!quote.complete) {
-    return { inside: line.trim().length === 0, content: "" };
+  if (line.trim().length === 0) return { inside: true, content: "" };
+  let cursor = 0;
+  for (const token of container) {
+    const end = containerTokenEnd(line, cursor, token);
+    if (end === null) return { inside: false, content: line };
+    cursor = end;
   }
-  const rest = line.slice(quote.cursor);
-  if (container.listContentIndent === null)
-    return { inside: true, content: rest };
-  if (rest.trim().length === 0) return { inside: true, content: "" };
-  let indent = 0;
-  while (rest[indent] === " ") indent += 1;
-  return {
-    inside: indent >= container.listContentIndent,
-    content:
-      indent >= container.listContentIndent
-        ? rest.slice(container.listContentIndent)
-        : rest,
-  };
+  return { inside: true, content: line.slice(cursor) };
 }
 
 function excludedMask(body: string): Uint8Array {
@@ -118,8 +153,12 @@ function excludedMask(body: string): Uint8Array {
   for (const match of body.matchAll(/<!--[\s\S]*?(?:-->|$)/gu))
     mark(mask, match.index, match.index + match[0].length);
 
-  let fence: ({ marker: "`" | "~"; length: number } & FenceContainer) | null =
-    null;
+  let fence: {
+    marker: "`" | "~";
+    length: number;
+    container: FenceContainerToken[];
+  } | null = null;
+  let listContainer: FenceContainerToken[] = [];
   let offset = 0;
   for (const lineWithBreak of body.match(/[^\n]*(?:\n|$)/gu) ?? []) {
     if (lineWithBreak.length === 0) continue;
@@ -127,7 +166,7 @@ function excludedMask(body: string): Uint8Array {
       ? lineWithBreak.slice(0, -1)
       : lineWithBreak;
     if (fence) {
-      const active = activeFenceContent(line, fence);
+      const active = activeFenceContent(line, fence.container);
       if (!active.inside) fence = null;
       else {
         const fenceMatch = active.content.match(/^ {0,3}(`{3,}|~{3,})/u);
@@ -143,18 +182,19 @@ function excludedMask(body: string): Uint8Array {
         continue;
       }
     }
-    const opening = openingFenceContext(line);
+    const opening = lineContainer(line, listContainer);
+    if (line.trim().length > 0)
+      listContainer = inheritedListContainer(opening.container);
     const fenceMatch = opening.content.match(/^ {0,3}(`{3,}|~{3,})/u);
     if (fenceMatch) {
       fence = {
         marker: fenceMatch[1]![0] as "`" | "~",
         length: fenceMatch[1]!.length,
-        ...opening.container,
+        container: opening.container,
       };
       mark(mask, offset, offset + lineWithBreak.length);
     } else {
-      const content = stripContainers(line);
-      if (/^(?: {4}|\t)/u.test(content))
+      if (/^(?: {4}|\t)/u.test(opening.content))
         mark(mask, offset, offset + lineWithBreak.length);
     }
     offset += lineWithBreak.length;
