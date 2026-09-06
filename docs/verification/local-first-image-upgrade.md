@@ -2,7 +2,21 @@
 
 Date: 2026-09-06
 
-Status: **cross-protocol publish contract passed; public Space-mode list gate failed**. This is a bounded U1 checkpoint, not authorization to continue U2+, release, deploy, or claim full acceptance.
+Status: **U1 public contract gate passed after the independently authorized server hotfix**. U2–U7 may now proceed. This is not completed plugin implementation, release or real-device acceptance. Earlier failed runs below remain historical evidence.
+
+## Server correction and final U1 reproof
+
+The separately authorized main-project hotfix `4a824e74d69b7c149a608db08b943f28149f38c3` preserves root null and converts Prisma Folder timestamps to RFC3339. It was reviewed independently (C0/I0), merged through [AgentWiki PR #9](https://github.com/NeoMei/AgentWiki/pull/9) at `ef9f20dae4937941e5ba9579dccd0091657ca02b`, and deployed on 2026-09-06. No schema/protocol/package version change was required. The deployed source SHA-256 matches the candidate, all three services are active, and public health reports all checks ok.
+
+Before the switch, the actual new legacy pair reproduced list500. After the switch, the same pair returned strict list200, retained exact source revisions and `legacy_v2`, with owner/read/publish bindings intact. Reads did not publish an upgrade.
+
+The unchanged strict plugin verifier at `40db5bc` then passed **4/4**, exit0:
+
+- Populated source R `cmtp6620x024x2jx0dapa9c1v`, sequence4 → R3 `cmtp6v0kv006bbktfvelsn8f1`, sequence5; candidate and fixed-published hash `af365f4ef81e6eef196a50b2c68093e27303dbce2c984c44beb0b6bfc3e0f277`.
+- Strict empty source R `0`, sequence0 → R3 `cmtp6v1qc006obktflo5pvivl`, sequence1; candidate and fixed-published hash `b60db33064a60cb6bcf621e4e2b6e267610e5b71c2dc67ccfc0cb1a699a72203`.
+- Exact canonical candidate/full tree, unchanged Page/folder metadata, fixed R3, attachment metadata and downloaded PNG bytes passed the existing strict assertions.
+
+Seven controller-owned synthetic Spaces are retained across all U1 attempts; earlier fixtures were not deleted or repurposed. The two final fixtures are now native and must not be reused as fresh legacy sources for U7. Android is currently absent from ADB; its actual acceptance remains NOT_RUN. No main Vault was modified and plugin0.4.0 remains unreleased.
 
 ## Scope and transport
 
