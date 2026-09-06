@@ -284,8 +284,12 @@ export class LocalImageUpgradeCoordinator {
       return;
     }
     await this.confirmed(intent);
+    const child = await this.push.inspect();
+    if (child?.remoteState === "superseded") {
+      await this.repository.write({ ...intent, phase: "superseded" });
+      return;
+    }
     if (intent.phase === "confirmed") {
-      const child = await this.push.inspect();
       if (!child) {
         const preview = await this.confirmed(intent);
         await this.push.publishPrepared(preview.push, options);
@@ -296,14 +300,14 @@ export class LocalImageUpgradeCoordinator {
     } else {
       await this.push.resumePending();
     }
-    const child = await this.push.inspect();
+    const recoveredChild = await this.push.inspect();
     const current = await this.repository.read();
     if (!current) throw new Error("UPGRADE_PARENT_INTENT_MISSING");
-    if (child?.remoteState === "superseded") {
+    if (recoveredChild?.remoteState === "superseded") {
       await this.repository.write({ ...current, phase: "superseded" });
       return;
     }
-    if (child?.remoteState !== "published" || !child.result)
+    if (recoveredChild?.remoteState !== "published" || !recoveredChild.result)
       throw new Error("UPGRADE_PUBLICATION_PENDING");
     await this.advancePublished(current);
   }

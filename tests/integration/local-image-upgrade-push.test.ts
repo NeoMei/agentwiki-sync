@@ -25,6 +25,7 @@ import {
   type UpgradeCoordinatorPort,
 } from "../../src/application/local-image-upgrade";
 import {
+  isTreePushJournalV3,
   TreePushServiceV3,
   type PreparedTreePushChangeV3,
 } from "../../src/application/tree-push-service-v3";
@@ -34,6 +35,7 @@ import {
   type UpgradeBinding,
   type UpgradeIntent,
 } from "../../src/storage/local-image-upgrade";
+import { MutableControlRepository } from "../../src/storage/envelope";
 import { FakeHttp } from "../fakes/fake-http";
 import { MemoryControlStore } from "../fakes/memory-control-store";
 
@@ -442,6 +444,22 @@ async function batchResponse(preview: UpgradePreview) {
   };
 }
 
+async function forceOwnedChildSuperseded(store: MemoryControlStore) {
+  const journal = new MutableControlRepository(
+    store,
+    `${ROOT}/local-image-upgrade/${OPERATION}/push/journal.json`,
+    isTreePushJournalV3,
+  );
+  const current = await journal.read();
+  if (!current) throw new Error("fixture child missing");
+  await journal.write({
+    ...current.payload,
+    remoteState: "superseded",
+    result: null,
+    localCommitPhase: "not_started",
+  });
+}
+
 describe("LocalImageUpgradeCoordinator owned Push", () => {
   it("rejects a mismatched authorization before persistence or session creation", async () => {
     const fixture = await harness();
@@ -488,7 +506,6 @@ describe("LocalImageUpgradeCoordinator owned Push", () => {
   it.each([
     ["permission", "PERMISSION_REVOKED"],
     ["capabilities", "CAPABILITIES_CHANGED"],
-    ["local input", "CONFIRMATION_MISMATCH"],
   ])(
     "rejects fresh %s drift before create without any remote write",
     async (_kind, code) => {
@@ -529,6 +546,23 @@ describe("LocalImageUpgradeCoordinator owned Push", () => {
       ).resolves.not.toBeNull();
     },
   );
+
+  it("rejects a changed local confirmation before the initial create", async () => {
+    const fixture = await harness();
+    fixture.local.hashes.push("f".repeat(64));
+    await expect(
+      fixture.coordinator.confirm(
+        fixture.preview,
+        fixture.preview.authorizationHash,
+      ),
+    ).rejects.toThrow("CONFIRMATION_MISMATCH");
+    expect(fixture.local.calls).toBe(1);
+    expect(fixture.http.calls).toEqual([]);
+    expect(await fixture.push.inspect()).toMatchObject({
+      remoteState: "not_created",
+    });
+    expect((await fixture.repository.read())?.phase).toBe("remote_pending");
+  });
 
   it("leaves a confirmed parent and staged child recoverable when onStaged fails", async () => {
     const fixture = await harness();
@@ -691,6 +725,35 @@ describe("LocalImageUpgradeCoordinator owned Push", () => {
       (call) => call.method === "POST" && call.path.endsWith("/push-sessions"),
     );
     expect(createBodies).toHaveLength(1);
+  });
+
+  it("rejects changed local confirmation before replaying a lost create", async () => {
+    const fixture = await harness();
+    fixture.http.enqueue({
+      status: 503,
+      json: {
+        protocolVersion: "3",
+        error: { code: "INTERNAL_ERROR", retryable: true },
+      },
+    });
+    await expect(
+      fixture.coordinator.confirm(
+        fixture.preview,
+        fixture.preview.authorizationHash,
+      ),
+    ).rejects.toThrow();
+    const callsBeforeRecovery = fixture.http.calls.length;
+    const restarted = await harness(fixture.store, fixture.http);
+    restarted.local.hashes.push("f".repeat(64));
+    await expect(restarted.coordinator.recover()).rejects.toThrow(
+      "CONFIRMATION_MISMATCH",
+    );
+    expect(restarted.local.calls).toBe(1);
+    expect(fixture.http.calls).toHaveLength(callsBeforeRecovery);
+    expect(await restarted.push.inspect()).toMatchObject({
+      remoteState: "not_created",
+    });
+    expect((await restarted.repository.read())?.phase).toBe("remote_pending");
   });
 
   it("treats cancellation before create as proven superseded without HTTP", async () => {
@@ -926,6 +989,48 @@ describe("LocalImageUpgradeCoordinator owned Push", () => {
         remoteState: "superseded",
       });
       expect((await restarted.repository.read())?.phase).toBe("superseded");
+    },
+  );
+
+  it.each(["confirmed", "remote_pending"] as const)(
+    "reconciles an authoritative superseded child after a %s parent crash point",
+    async (parentPhase) => {
+      const fixture = await harness();
+      if (parentPhase === "confirmed") {
+        fixture.store.onTextWrite = (path) => {
+          if (path.endsWith(`/${OPERATION}/push/journal.json.next`))
+            fixture.store.failNextTextWriteAt = `${ROOT}/local-image-upgrade/journal.json.next`;
+        };
+        await expect(
+          fixture.coordinator.confirm(
+            fixture.preview,
+            fixture.preview.authorizationHash,
+          ),
+        ).rejects.toThrow("injected text write failure");
+        fixture.store.onTextWrite = undefined;
+      } else {
+        fixture.http.enqueue({
+          status: 503,
+          json: {
+            protocolVersion: "3",
+            error: { code: "INTERNAL_ERROR", retryable: true },
+          },
+        });
+        await expect(
+          fixture.coordinator.confirm(
+            fixture.preview,
+            fixture.preview.authorizationHash,
+          ),
+        ).rejects.toThrow();
+      }
+      expect((await fixture.repository.read())?.phase).toBe(parentPhase);
+      await forceOwnedChildSuperseded(fixture.store);
+      const callsBeforeRecovery = fixture.http.calls.length;
+
+      const restarted = await harness(fixture.store, fixture.http);
+      await expect(restarted.coordinator.recover()).resolves.toBeUndefined();
+      expect((await restarted.repository.read())?.phase).toBe("superseded");
+      expect(fixture.http.calls).toHaveLength(callsBeforeRecovery);
     },
   );
 
