@@ -47,7 +47,7 @@
 
 依赖顺序：U1 契约/读取 → U2 私有状态 → U3 预览 → U4 远端协调 → U5 本地恢复 → U6 入口/UI → U7 验收收尾。U1 公开契约门失败时不继续 U2–U6 生产实现。每项只提交其准确路径，保留其他任务改动。
 
-## U1：固定旧快照读取与公开跨协议契约门
+## Task 1: U1 固定旧快照读取与公开跨协议契约门
 
 **Files:** Create `src/application/tree-snapshot-reader.ts`, `src/application/local-image-upgrade-plan.ts`, `tests/fakes/local-image-upgrade-fixture.ts`, `tests/integration/local-image-upgrade-contract.test.ts`, `verification/local-image-upgrade.live.ts`, `vitest.live.config.ts`, `docs/verification/local-first-image-upgrade.md`; Modify `src/application/sync-runtime.ts`。
 
@@ -147,7 +147,7 @@ expect(published.attachments.map((a) => a.attachmentId)).toEqual([
 - [ ] 新配置 `defineConfig({test:{include:["verification/**/*.live.ts"],testTimeout:60000}})`；live 文件缺少安全测试上下文直接报错，不使用静默 skip。Run `npx vitest run --config vitest.live.config.ts`。报告脱敏的 server 标识、候选 SHA、前后 Revision/sequence、公开契约结果与清理归属；不输出 HTTP headers 或整个异常请求对象。
 - [ ] 单元/reader 回归与 `npm run typecheck` 通过后，准确暂存本任务文件，commit `test(sync): verify public legacy-to-v3 upgrade contract`。如果真实契约失败，记录具体缺失字段/不一致公开响应并停止后续实现，不修改 fake 迎合结果。
 
-## U2：严格私有意图与子事务归属
+## Task 2: U2 严格私有意图与子事务归属
 
 **Files:** Create `src/storage/local-image-upgrade.ts`, `tests/integration/local-image-upgrade-storage.test.ts`。
 
@@ -220,7 +220,7 @@ expect(await store.read(unrelatedPath)).toBe(unrelatedContents);
 - [ ] 当前意图固定存放 `${root}/local-image-upgrade/journal.json`，使启动路由不用先知道 operation ID 即可通过 `inspectLocalImageUpgrade` 严格读取；每个 payload/子事务根固定为 `${root}/local-image-upgrade/${operationId}`。Push 与 local transaction 使用确定的子根，operation ID 在生成意图时确定。仅 complete/superseded 且权威子日志满足终态才清理本操作暂存；保留终态意图/关联证明，未知、pending、关联缺失不清理。每次写入先验证 binding、schema、路径，再 `MutableControlRepository.write(structuredClone(intent))`。同 Space 未终态时拒绝第二个操作。
 - [ ] 添加每个 envelope 写/rename 边界中断后重建的恢复测试，以及禁止 journal 嵌入秘密字段/原始正文的测试；Run 上述测试及 `npm run typecheck`，commit `feat(sync): persist owned local image upgrade intent`。
 
-## U3：固定输入的合并预览和精确授权
+## Task 3: U3 固定输入的合并预览和精确授权
 
 **Files:** Modify `src/application/local-image-upgrade-plan.ts`; Modify only the needed calculation boundary in `src/application/tree-diff.ts`, `src/core/tree-scan.ts`; Create `tests/integration/local-image-upgrade-plan.test.ts`。
 
@@ -299,7 +299,7 @@ expect(
 
 - [ ] Run `npx vitest run tests/integration/local-image-upgrade-plan.test.ts`、原合并/扫描测试、`npm run typecheck`；commit `feat(sync): compute confirmed local-first image upgrade preview`。
 
-## U4：复用 Push 的一次发布与远端恢复
+## Task 4: U4 复用 Push 的一次发布与远端恢复
 
 **Files:** Create `src/application/local-image-upgrade.ts`, `tests/integration/local-image-upgrade-push.test.ts`; Modify `src/application/tree-push-service-v3.ts`。
 
@@ -365,7 +365,7 @@ expect((await repository.read())?.phase).not.toBe("complete");
 
 - [ ] Run 新传输测试、现有 v3 push 测试及 `npm run typecheck`；commit `feat(sync): coordinate atomic first-image publication`。
 
-## U5：固定 R3 本地应用、身份和断电恢复
+## Task 5: U5 固定 R3 本地应用、身份和断电恢复
 
 **Files:** Create `src/application/local-image-upgrade-local.ts`, `tests/integration/local-image-upgrade-local.test.ts`; Modify narrow shared helpers in `src/application/sync-runtime.ts` and `src/storage/tree-baseline.ts` only if required for shared verified local-apply orchestration。
 
@@ -415,7 +415,7 @@ expect((await repository.read())?.phase).toBe("complete");
 
 - [ ] 回归 `6e4510e` 的 terminal sidecar 清理、inactive ID 重引用、同名不同 hash 与 Finalize race；Run 新本地测试、tree-transaction、tree-baseline、sync-runtime 对应测试及 `npm run typecheck`；commit `feat(sync): recover local application of first-image upgrade`。
 
-## U6：真实插件入口按 Space 模式分流与单次确认
+## Task 6: U6 真实插件入口按 Space 模式分流与单次确认
 
 **Files:** Create `src/application/space-sync-route.ts`, `tests/fakes/plugin-harness.ts`, `tests/integration/local-image-upgrade-entry.test.ts`; Modify `src/main.ts`, `src/ports/tree-remote.ts`, `src/agentwiki/v3-tree-remote.ts`, `src/application/protocol-negotiator.ts`, `src/obsidian/preview-modal.ts`, `tests/integration/plugin-settings-lifecycle.test.ts`。
 
@@ -464,7 +464,7 @@ return input.localImageCandidate ? "upgrade" : "legacy";
 - [ ] 实际模拟点击验证一次确认成功；在点击前断言 session/chunk/batch/finalize/Vault业务写入为零。覆盖 modal close/cancel、窄屏滚动、冲突重算后按钮状态及晚编辑 local_pending 文案；刷新后从持久日志恢复，不需原 modal 内存。原 Task19 I1 必须以这些真实入口断言替换假成功矩阵。
 - [ ] Run 入口与既有 UI/生命周期/negotiation 测试、`npm run typecheck`；commit `feat(obsidian): route first local image through one confirmed upgrade`。
 
-## U7：故障矩阵、Task19 复审与真实双端收尾
+## Task 7: U7 故障矩阵、Task19 复审与真实双端收尾
 
 **Files:** Modify `docs/verification/local-first-image-upgrade.md`; Modify exact defect-owning test/source files only if fresh failures require reviewed fixes。复用原 Task19 的 `.superpowers/sdd` 证据与 review briefs，不提交凭据或私有现场。
 
