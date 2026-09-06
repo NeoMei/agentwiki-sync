@@ -12,6 +12,7 @@ import {
 } from "@neomei/agentwiki-sync-protocol";
 
 import { parseAttachmentReferences } from "../core/attachment-reference";
+import { opaqueFileKey } from "../core/identity-key";
 import type { TreePullActionV3 } from "../core/merge";
 import type { LocalTreeScanV3 } from "../core/tree-scan";
 import type { TreeSnapshot, TreeSnapshotV3 } from "../core/tree-model";
@@ -63,9 +64,18 @@ export interface UpgradePreview {
   candidateHash: string;
   localActions: TreePullActionV3[];
   expectedPathStates: Record<string, TreeTransactionPathState>;
+  localPlanEvidence: UpgradeLocalPlanEvidence;
   localPlanHash: string;
   push: TreePushPreviewV3;
   authorizationHash: string;
+}
+
+export interface UpgradeLocalPlanEvidence {
+  actions: TreePullActionV3[];
+  rawPathStates: LocalTreeScanV3["rawPathStates"];
+  expectedPathStates: Record<string, TreeTransactionPathState>;
+  scanEpoch: number;
+  identities: TreeIdentityStateV2;
 }
 
 export interface UpgradeMergeInput {
@@ -87,7 +97,7 @@ export interface PrepareLegacyUpgradePreviewInput extends UpgradeMergeInput {
   options?: SyncOperationOptions;
 }
 
-interface PrepareTreePushChangesV3Input {
+export interface PrepareTreePushChangesV3Input {
   base: UpgradeTree;
   candidate: UpgradeTree;
   vaultRoot: string;
@@ -102,8 +112,12 @@ const HASH = /^[a-f0-9]{64}$/u;
 const joinRoot = (root: string, relative: string): string =>
   root ? `${root}/${relative}` : relative;
 
-const safeKey = (value: string): string =>
-  value.replace(/[^A-Za-z0-9_-]/gu, "_");
+function deepFreeze<T>(value: T): T {
+  if (typeof value !== "object" || value === null || Object.isFrozen(value))
+    return value;
+  for (const nested of Object.values(value)) deepFreeze(nested);
+  return Object.freeze(value);
+}
 
 function sameFolderMetadata(
   left: UpgradeTree["folders"][number],
@@ -216,7 +230,7 @@ export async function prepareTreePushChangesV3(
     for (const change of changes) {
       cancellationCheckpoint(input.options, true);
       if (change.operation === "upsert_page") {
-        const payloadPath = `${input.payloadRoot}/${safeKey(change.page.pageId)}.md`;
+        const payloadPath = `${input.payloadRoot}/${await opaqueFileKey(change.page.pageId)}.md`;
         if (input.stagePages !== false) {
           await input.control.write(payloadPath, change.page.body);
           stagedPayloads.push(payloadPath);
@@ -351,15 +365,19 @@ function assertFirstBindingIsExplicit(input: UpgradeMergeInput): void {
 export async function mergeLegacyUpgrade(
   input: UpgradeMergeInput,
 ): Promise<TreePullPreviewV3<UpgradeTree>> {
-  if (input.base.projected.spaceId !== input.remote.projected.spaceId)
-    throw new Error("UPGRADE_SPACE_MISMATCH");
-  assertFirstBindingIsExplicit(input);
+  assertLegacyMergeInput(input);
   return buildTreeCalculationPreviewV3(
     input.base.projected,
     input.local,
     input.remote.projected,
     input.remote.sourceRevision,
   );
+}
+
+function assertLegacyMergeInput(input: UpgradeMergeInput): void {
+  if (input.base.projected.spaceId !== input.remote.projected.spaceId)
+    throw new Error("UPGRADE_SPACE_MISMATCH");
+  assertFirstBindingIsExplicit(input);
 }
 
 export async function hashUpgradeAuthorization(input: {
@@ -373,6 +391,12 @@ export async function hashUpgradeAuthorization(input: {
   confirmationHash: string;
 }): Promise<string> {
   return sha256Hex(canonicalBytes(input));
+}
+
+export async function hashUpgradeLocalPlan(
+  evidence: UpgradeLocalPlanEvidence,
+): Promise<string> {
+  return sha256Hex(canonicalBytes(evidence));
 }
 
 function sameFixedMerge(
@@ -392,11 +416,17 @@ function sameFixedMerge(
 
 function mergeResultEvidence(merge: TreePullPreviewV3<UpgradeTree>): unknown {
   return {
+    revision: merge.revision,
     actions: merge.actions,
     blockers: merge.blockers,
     attachmentConflicts: merge.attachmentConflicts,
+    attachmentConflictResolutions: merge.attachmentConflictResolutions,
     folderConflicts: merge.folderConflicts,
+    folderConflictResolutions: merge.folderConflictResolutions,
     pageConflicts: merge.pageConflicts,
+    pageConflictResolutions: merge.pageConflictResolutions,
+    pagePlan: merge.pagePlan,
+    attachmentPlan: merge.attachmentPlan,
     resolvedFolders: merge.resolvedFolders,
     resolvedPages: merge.resolvedPages,
     resolvedAttachments: merge.resolvedAttachments,
@@ -406,25 +436,41 @@ function mergeResultEvidence(merge: TreePullPreviewV3<UpgradeTree>): unknown {
 export async function prepareLegacyUpgradePreview(
   input: PrepareLegacyUpgradePreviewInput,
 ): Promise<UpgradePreview> {
-  const parsedBinding = UpgradeBindingSchema.parse(input.binding);
+  const control = input.control;
+  const options = input.options;
+  const frozen = structuredClone({
+    binding: input.binding,
+    base: input.base,
+    remote: input.remote,
+    local: input.local,
+    identities: input.identities,
+    scanEpoch: input.scanEpoch,
+    oldBaselineEvidenceHash: input.oldBaselineEvidenceHash,
+    capabilities: input.capabilities,
+    capabilitiesHash: input.capabilitiesHash,
+    controlRoot: input.controlRoot,
+    merge: input.merge,
+  });
+  const parsedBinding = UpgradeBindingSchema.parse(frozen.binding);
+  assertLegacyMergeInput(frozen);
   if (
-    parsedBinding.spaceId !== input.remote.projected.spaceId ||
-    !Number.isSafeInteger(input.scanEpoch) ||
-    input.scanEpoch < 0 ||
-    !HASH.test(input.oldBaselineEvidenceHash)
+    parsedBinding.spaceId !== frozen.remote.projected.spaceId ||
+    !Number.isSafeInteger(frozen.scanEpoch) ||
+    frozen.scanEpoch < 0 ||
+    !HASH.test(frozen.oldBaselineEvidenceHash)
   )
     throw new TypeError("INVALID_UPGRADE_PREVIEW_INPUT");
   if (
-    (await treeCapabilitiesHashV3(input.capabilities)) !==
-    input.capabilitiesHash
+    (await treeCapabilitiesHashV3(frozen.capabilities)) !==
+    frozen.capabilitiesHash
   )
     throw new Error("CAPABILITIES_CHANGED");
-  const resolved = input.merge
-    ? structuredClone(input.merge)
-    : await mergeLegacyUpgrade(input);
-  if (input.merge && !sameFixedMerge(resolved, input))
+  const resolved = frozen.merge
+    ? frozen.merge
+    : await mergeLegacyUpgrade(frozen);
+  if (frozen.merge && !sameFixedMerge(resolved, frozen))
     throw new Error("STALE_UPGRADE_MERGE");
-  if (input.merge) {
+  if (frozen.merge) {
     const rebuilt = await rebuildTreeCalculationPreviewV3(resolved);
     if (
       canonicalBytes(mergeResultEvidence(rebuilt)).toString() !==
@@ -436,80 +482,82 @@ export async function prepareLegacyUpgradePreview(
     throw new Error("UPGRADE_PREVIEW_DECISION_REQUIRED");
   const rawCandidate: UpgradeTree = {
     protocolVersion: "3",
-    spaceId: input.remote.projected.spaceId,
+    spaceId: frozen.remote.projected.spaceId,
     folders: structuredClone(resolved.resolvedFolders),
     pages: structuredClone(resolved.resolvedPages),
     attachments: structuredClone(resolved.resolvedAttachments),
   };
   if (rawCandidate.attachments.length === 0)
     throw new Error("UPGRADE_PREVIEW_NO_IMAGES_RECONFIRM_TEXT");
-  const payloadRoot = `${input.controlRoot}/local-image-upgrade/${safeKey(parsedBinding.operationId)}/payload`;
+  const payloadRoot = `${frozen.controlRoot}/local-image-upgrade/${parsedBinding.operationId}/payload`;
   try {
     const prepared = await prepareTreePushChangesV3({
-      base: input.remote.projected,
+      base: frozen.remote.projected,
       candidate: rawCandidate,
-      vaultRoot: input.local.rootPath,
-      control: input.control,
+      vaultRoot: frozen.local.rootPath,
+      control,
       payloadRoot,
-      options: input.options,
+      options,
     });
     if (prepared.changes.length === 0) throw new Error("UPGRADE_PREVIEW_EMPTY");
     const candidateHash = await treeRevisionContentHashV3(prepared.candidate);
     const localActions = structuredClone(resolved.actions);
-    const expectedPathStates = expectedV3PathStates(input.local, localActions);
-    const localPlanHash = await sha256Hex(
-      canonicalBytes({
+    const expectedPathStates = expectedV3PathStates(frozen.local, localActions);
+    const localPlanEvidence = deepFreeze(
+      structuredClone({
         actions: localActions,
-        rawPathStates: input.local.rawPathStates,
+        rawPathStates: frozen.local.rawPathStates,
         expectedPathStates,
-        scanEpoch: input.scanEpoch,
-        identities: input.identities,
+        scanEpoch: frozen.scanEpoch,
+        identities: frozen.identities,
       }),
     );
+    const localPlanHash = await hashUpgradeLocalPlan(localPlanEvidence);
     const confirmationHash = await treeConfirmationHashV3({
       protocolVersion: "3",
       spaceId: prepared.candidate.spaceId,
-      baseRevision: input.remote.sourceRevision,
-      capabilitiesHash: input.capabilitiesHash,
+      baseRevision: frozen.remote.sourceRevision,
+      capabilitiesHash: frozen.capabilitiesHash,
       changes: prepared.changes.map(manifestChange),
     });
     const push: TreePushPreviewV3 = {
       protocolVersion: "3",
       spaceId: prepared.candidate.spaceId,
-      baseRevision: input.remote.sourceRevision,
+      baseRevision: frozen.remote.sourceRevision,
       changes: prepared.changes,
-      capabilities: structuredClone(input.capabilities),
-      capabilitiesHash: input.capabilitiesHash,
+      capabilities: structuredClone(frozen.capabilities),
+      capabilitiesHash: frozen.capabilitiesHash,
       confirmationHash,
       credentialId: parsedBinding.credentialId,
       previewId: parsedBinding.operationId,
     };
     const authorizationHash = await hashUpgradeAuthorization({
       binding: parsedBinding,
-      sourceRevision: input.remote.sourceRevision,
-      sourceV2RevisionHash: input.remote.sourceV2RevisionHash,
-      projectedV3BaseHash: input.remote.projectedV3BaseHash,
-      oldBaselineEvidenceHash: input.oldBaselineEvidenceHash,
+      sourceRevision: frozen.remote.sourceRevision,
+      sourceV2RevisionHash: frozen.remote.sourceV2RevisionHash,
+      projectedV3BaseHash: frozen.remote.projectedV3BaseHash,
+      oldBaselineEvidenceHash: frozen.oldBaselineEvidenceHash,
       candidateHash,
       localPlanHash,
       confirmationHash,
     });
     return {
       binding: parsedBinding,
-      remoteBase: structuredClone(input.remote),
-      oldBaselineEvidenceHash: input.oldBaselineEvidenceHash,
+      remoteBase: structuredClone(frozen.remote),
+      oldBaselineEvidenceHash: frozen.oldBaselineEvidenceHash,
       merge: resolved,
       candidate: prepared.candidate,
       candidateHash,
       localActions,
       expectedPathStates,
+      localPlanEvidence,
       localPlanHash,
       push,
       authorizationHash,
     };
   } catch (error) {
     try {
-      await input.control.removeTree?.(payloadRoot);
+      await control.removeTree?.(payloadRoot);
     } catch {
       // Preview payloads are inert, but the original failure remains authoritative.
     }

@@ -1031,20 +1031,29 @@ export async function buildTreeCalculationPreviewV3<
 export async function rebuildTreeCalculationPreviewV3<
   TTree extends TreeContentV3,
 >(preview: TreePullPreviewV3<TTree>): Promise<TreePullPreviewV3<TTree>> {
-  return computePreviewV3(
+  const rebuilt = await buildTreeCalculationPreviewV3(
     preview.base,
     preview.local,
     preview.remote,
     preview.revision,
-    preview.pagePlan,
-    preview.folderConflictResolutions,
-    preview.pageConflictResolutions,
-    preview.attachmentConflictResolutions,
   );
+  for (const [conflictId, resolution] of Object.entries(
+    preview.folderConflictResolutions,
+  ).sort(([left], [right]) => left.localeCompare(right)))
+    await resolveFolderConflictV3(rebuilt, conflictId, resolution);
+  for (const [conflictId, resolution] of Object.entries(
+    preview.pageConflictResolutions,
+  ).sort(([left], [right]) => left.localeCompare(right)))
+    await resolvePageConflictV3(rebuilt, conflictId, resolution);
+  for (const [conflictId, resolution] of Object.entries(
+    preview.attachmentConflictResolutions,
+  ).sort(([left], [right]) => left.localeCompare(right)))
+    await resolveAttachmentConflict(rebuilt, conflictId, resolution);
+  return rebuilt;
 }
 
-export async function resolveAttachmentConflict(
-  preview: TreePullPreviewV3,
+export async function resolveAttachmentConflict<TTree extends TreeContentV3>(
+  preview: TreePullPreviewV3<TTree>,
   conflictId: string,
   resolution: AttachmentConflictResolution,
 ): Promise<void> {
@@ -1081,9 +1090,9 @@ export async function resolveAttachmentConflict(
   preview.attachmentPlan = next.attachmentPlan;
 }
 
-function applyPreviewV3(
-  preview: TreePullPreviewV3,
-  next: TreePullPreviewV3,
+function applyPreviewV3<TTree extends TreeContentV3>(
+  preview: TreePullPreviewV3<TTree>,
+  next: TreePullPreviewV3<TTree>,
 ): void {
   preview.actions = next.actions;
   preview.blockers = next.blockers;
@@ -1100,8 +1109,8 @@ function applyPreviewV3(
   preview.resolvedAttachments = next.resolvedAttachments;
 }
 
-export async function resolvePageConflictV3(
-  preview: TreePullPreviewV3,
+export async function resolvePageConflictV3<TTree extends TreeContentV3>(
+  preview: TreePullPreviewV3<TTree>,
   conflictId: string,
   resolution: PageConflictResolution,
 ): Promise<void> {
@@ -1124,8 +1133,8 @@ export async function resolvePageConflictV3(
   applyPreviewV3(preview, next);
 }
 
-export async function resolveFolderConflictV3(
-  preview: TreePullPreviewV3,
+export async function resolveFolderConflictV3<TTree extends TreeContentV3>(
+  preview: TreePullPreviewV3<TTree>,
   conflictId: string,
   resolution: FolderConflictResolution,
 ): Promise<void> {

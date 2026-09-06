@@ -9,10 +9,13 @@ import { describe, expect, it } from "vitest";
 import { contentHash, sha256Hex } from "../../src/agentwiki/protocol";
 import {
   hashUpgradeAuthorization,
+  hashUpgradeLocalPlan,
   mergeLegacyUpgrade,
   prepareLegacyUpgradePreview,
+  prepareTreePushChangesV3,
   projectLegacyBase,
   type LegacyUpgradeBase,
+  type UpgradeTree,
 } from "../../src/application/local-image-upgrade-plan";
 import { scanLocalTree } from "../../src/core/tree-scan";
 import type {
@@ -466,7 +469,25 @@ describe("local-first image upgrade preview", () => {
     expect(second.authorizationHash).not.toBe(first.authorizationHash);
 
     const stale = structuredClone(first.merge);
-    stale.resolvedPages[0]!.body = "tampered candidate\n";
+    const tamperedBody = "tampered candidate\n";
+    const tamperedHash = await contentHash(tamperedBody);
+    const plannedPage = stale.pagePlan.resolved.find(
+      (page) => page.pageId === "page-stable",
+    )!;
+    plannedPage.body = tamperedBody;
+    plannedPage.contentHash = tamperedHash;
+    const resolvedPage = stale.resolvedPages.find(
+      (page) => page.pageId === "page-stable",
+    )!;
+    resolvedPage.body = tamperedBody;
+    resolvedPage.contentHash = tamperedHash;
+    stale.actions.push({
+      kind: "write_page",
+      pageId: "page-stable",
+      path: "pages/renamed/stable.md",
+      bodyPath: "tree-preview-body/page-stable.md",
+      beforePath: "pages/docs/stable.md",
+    });
     await expect(
       prepareLegacyUpgradePreview({
         binding,
@@ -483,6 +504,167 @@ describe("local-first image upgrade preview", () => {
         merge: stale,
       }),
     ).rejects.toThrow("STALE_UPGRADE_MERGE");
+  });
+
+  it("freezes every calculation input before its first asynchronous yield", async () => {
+    const {
+      base,
+      remote,
+      local,
+      identities: identityState,
+    } = await fixedInputs();
+    const selected = await mergeLegacyUpgrade({ base, remote, local });
+    const originalRevision = remote.sourceRevision;
+    const originalMaxBatchItems = capabilities.maxBatchItems;
+    const pending = prepareLegacyUpgradePreview({
+      binding,
+      base,
+      remote,
+      local,
+      identities: identityState,
+      scanEpoch: 11,
+      oldBaselineEvidenceHash: "a".repeat(64),
+      capabilities,
+      capabilitiesHash: await treeCapabilitiesHashV3(capabilities),
+      control: new MemoryControlStore(),
+      controlRoot: ".agentwiki/tree/space",
+      merge: selected,
+    });
+
+    remote.sourceRevision = "mutated-revision";
+    remote.projected.pages[0]!.body = "mutated remote\n";
+    local.rawPathStates["pages/docs/local.md"] = {
+      kind: "missing",
+      hash: null,
+    };
+    identityState.pendingPages.mutated = {
+      pageId: "mutated",
+      path: "pages/mutated.md",
+      contentHash: "f".repeat(64),
+    };
+    capabilities.maxBatchItems = originalMaxBatchItems - 1;
+    selected.resolvedPages[0]!.body = "mutated selection\n";
+
+    let preview: Awaited<ReturnType<typeof prepareLegacyUpgradePreview>>;
+    try {
+      preview = await pending;
+    } finally {
+      capabilities.maxBatchItems = originalMaxBatchItems;
+    }
+    expect(preview.push.baseRevision).toBe(originalRevision);
+    expect(preview.push.capabilities.maxBatchItems).toBe(originalMaxBatchItems);
+    expect(preview.candidate.pages[0]!.body).not.toContain("mutated");
+    expect(preview.localPlanEvidence.rawPathStates).not.toEqual(
+      local.rawPathStates,
+    );
+    expect(preview.localPlanEvidence.identities.pendingPages).toEqual({});
+  });
+
+  it("uses collision-free page payload names and exact operation roots", async () => {
+    const control = new MemoryControlStore();
+    const empty: UpgradeTree = {
+      protocolVersion: "3",
+      spaceId: SPACE_ID,
+      folders: [],
+      pages: [],
+      attachments: [],
+    };
+    const dottedBody = "dotted\n";
+    const underscoredBody = "underscored\n";
+    const prepared = await prepareTreePushChangesV3({
+      base: empty,
+      candidate: {
+        ...empty,
+        pages: [
+          {
+            ...(await page("a.b", "pages/dotted.md", dottedBody)),
+            referencedAttachmentIds: [],
+          },
+          {
+            ...(await page("a_b", "pages/underscored.md", underscoredBody)),
+            referencedAttachmentIds: [],
+          },
+        ],
+      },
+      vaultRoot: "Wiki",
+      control,
+      payloadRoot: ".agentwiki/tree/space/payload",
+    });
+    const payloadPaths = prepared.changes
+      .filter((change) => change.operation === "upsert_page")
+      .map((change) => change.page.payloadPath);
+    expect(new Set(payloadPaths).size).toBe(2);
+    expect(
+      new Set(
+        await Promise.all(payloadPaths.map((path) => control.read(path))),
+      ),
+    ).toEqual(new Set([dottedBody, underscoredBody]));
+
+    const inputs = await fixedInputs();
+    const capabilitiesHash = await treeCapabilitiesHashV3(capabilities);
+    const dotted = await prepareLegacyUpgradePreview({
+      binding: { ...binding, operationId: "a.b" },
+      ...inputs,
+      scanEpoch: 1,
+      oldBaselineEvidenceHash: "a".repeat(64),
+      capabilities,
+      capabilitiesHash,
+      control,
+      controlRoot: ".agentwiki/tree/space",
+    });
+    const dottedPayload = dotted.push.changes.find(
+      (change) => change.operation === "upsert_page",
+    )!.page.payloadPath;
+    expect(dottedPayload).toContain("/local-image-upgrade/a.b/payload/");
+
+    const abort = new AbortController();
+    control.onTextWrite = (path) => {
+      if (path.includes("/local-image-upgrade/a_b/payload/")) abort.abort();
+    };
+    await expect(
+      prepareLegacyUpgradePreview({
+        binding: { ...binding, operationId: "a_b" },
+        ...inputs,
+        scanEpoch: 1,
+        oldBaselineEvidenceHash: "a".repeat(64),
+        capabilities,
+        capabilitiesHash,
+        control,
+        controlRoot: ".agentwiki/tree/space",
+        options: { signal: abort.signal },
+      }),
+    ).rejects.toThrow("同步已取消");
+    expect(await control.read(dottedPayload)).not.toBeNull();
+  });
+
+  it("returns immutable evidence that independently recomputes the local plan hash", async () => {
+    const inputs = await fixedInputs();
+    const preview = await prepareLegacyUpgradePreview({
+      binding,
+      ...inputs,
+      scanEpoch: 17,
+      oldBaselineEvidenceHash: "a".repeat(64),
+      capabilities,
+      capabilitiesHash: await treeCapabilitiesHashV3(capabilities),
+      control: new MemoryControlStore(),
+      controlRoot: ".agentwiki/tree/space",
+    });
+
+    expect(preview.localPlanEvidence).toMatchObject({
+      actions: preview.localActions,
+      expectedPathStates: preview.expectedPathStates,
+      scanEpoch: 17,
+      identities: inputs.identities,
+    });
+    expect(preview.localPlanEvidence.rawPathStates).toEqual(
+      inputs.local.rawPathStates,
+    );
+    expect(await hashUpgradeLocalPlan(preview.localPlanEvidence)).toBe(
+      preview.localPlanHash,
+    );
+    expect(Object.isFrozen(preview.localPlanEvidence)).toBe(true);
+    expect(Object.isFrozen(preview.localPlanEvidence.identities)).toBe(true);
+    expect(Object.isFrozen(preview.localPlanEvidence.actions)).toBe(true);
   });
 
   it("removes only its scoped payloads when cancellation follows staging", async () => {
