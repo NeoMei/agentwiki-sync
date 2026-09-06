@@ -736,9 +736,7 @@ export class TreePushServiceV3 {
     return result;
   }
 
-  private rejectionError(
-    code: "ATTACHMENT_NAME_CONFLICT",
-  ): AgentWikiHttpError {
+  private rejectionError(code: "ATTACHMENT_NAME_CONFLICT"): AgentWikiHttpError {
     return new AgentWikiHttpError(409, {
       protocolVersion: "3",
       error: { code, retryable: false },
@@ -757,7 +755,8 @@ export class TreePushServiceV3 {
       status.result ? this.commitResult(journal, status.result) : null;
     let status: Awaited<ReturnType<TreeRemotePortV3["getSession"]>>;
     try {
-      status = knownStatus ?? (await this.remote.getSession(journal.sessionId!));
+      status =
+        knownStatus ?? (await this.remote.getSession(journal.sessionId!));
     } catch {
       throw error;
     }
@@ -955,8 +954,7 @@ export class TreePushServiceV3 {
       await this.save(journal);
     }
     const status = await this.remote.getSession(journal.sessionId);
-    if (status.result)
-      return this.commitResult(journal, status.result);
+    if (status.result) return this.commitResult(journal, status.result);
     if (journal.finalizeRejectionCode)
       return this.resolveFinalizeRejection(
         journal,

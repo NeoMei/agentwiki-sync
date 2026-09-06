@@ -866,7 +866,9 @@ describe("TreePushServiceV3", () => {
     expect(remote.finalizeCalls).toBe(1);
 
     const second = await v3Prepared(blob);
-    await expect(service.publishPrepared(second.preview)).resolves.toMatchObject({
+    await expect(
+      service.publishPrepared(second.preview),
+    ).resolves.toMatchObject({
       revision: "r2",
     });
     expect(remote.createInputs).toHaveLength(2);
@@ -896,7 +898,9 @@ describe("TreePushServiceV3", () => {
     await expect(service.publishPrepared(preview)).rejects.toMatchObject({
       body: { error: { code: "ATTACHMENT_NAME_CONFLICT" } },
     });
-    expect(await service.inspect()).toMatchObject({ remoteState: "finalizing" });
+    expect(await service.inspect()).toMatchObject({
+      remoteState: "finalizing",
+    });
     expect(remote.finalizeCalls).toBe(1);
 
     await expect(service.resumePending()).resolves.toBeNull();
@@ -957,7 +961,9 @@ describe("TreePushServiceV3", () => {
     await expect(service.publishPrepared(preview)).rejects.toMatchObject({
       body: { error: { code: "INTERNAL_ERROR" } },
     });
-    expect(await service.inspect()).toMatchObject({ remoteState: "finalizing" });
+    expect(await service.inspect()).toMatchObject({
+      remoteState: "finalizing",
+    });
     expect(remote.abortCalls).toBe(0);
     await expect(service.resumePending()).resolves.toMatchObject({
       revision: "r2",

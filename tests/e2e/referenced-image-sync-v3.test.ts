@@ -387,7 +387,10 @@ describe("referenced image sync v3 end to end", () => {
     const runtime = SyncRuntime.v3(vault, control, remote, mapping());
     await runtime.applyPullV3(await runtime.previewPullV3());
 
-    await vault.rename("Wiki/assets/image.png", "Wiki/assets/local-renamed.png");
+    await vault.rename(
+      "Wiki/assets/image.png",
+      "Wiki/assets/local-renamed.png",
+    );
     await runtime.recordRename(
       "Wiki/assets/image.png",
       "Wiki/assets/local-renamed.png",
