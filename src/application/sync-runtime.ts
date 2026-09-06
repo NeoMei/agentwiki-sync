@@ -2308,7 +2308,7 @@ export class SyncRuntime {
     const projectedAttachmentIds = new Set(
       snapshot.attachments.map((attachment) => attachment.attachmentId),
     );
-    identities.attachments = Object.fromEntries([
+    identities.attachments = Object.fromEntries<TreeAttachmentIdentity>([
       ...snapshot.attachments.map(
         (attachment) =>
           [
