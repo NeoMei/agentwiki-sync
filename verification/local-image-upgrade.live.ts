@@ -27,10 +27,16 @@ import {
   readTreeSnapshotV3,
 } from "../src/application/tree-snapshot-reader";
 import type { HttpPort, HttpResponseType } from "../src/ports/http";
+import type { ControlStorePort } from "../src/ports/control-store";
+import type { VaultPort } from "../src/ports/vault";
 import {
   parseOwnedLegacySpaces,
   verifyPublishedCandidate,
 } from "./local-image-upgrade-assertions";
+import {
+  verifyLocalImageUpgradeResponseLoss,
+  type LocalImageUpgradeRecoveryCase,
+} from "./local-image-upgrade-recovery";
 
 interface LiveRequest {
   method: string;
@@ -44,6 +50,25 @@ interface LiveRequest {
 interface LiveContext {
   serverLabel: string;
   spaceIds: { populated: string; empty: string };
+  serverOrigin: string;
+  recoveryCases: {
+    create: {
+      spaceId: string;
+      rootPath: string;
+      controlRoot: string;
+      authority: LocalImageUpgradeRecoveryCase["authority"];
+      control: ControlStorePort;
+      vault: VaultPort;
+    };
+    finalize: {
+      spaceId: string;
+      rootPath: string;
+      controlRoot: string;
+      authority: LocalImageUpgradeRecoveryCase["authority"];
+      control: ControlStorePort;
+      vault: VaultPort;
+    };
+  };
   cleanupOwner: string;
   request(input: LiveRequest): Promise<{
     status: number;
@@ -66,6 +91,12 @@ const provider = (await import(/* @vite-ignore */ providerPath)) as {
 const create = provider.createLiveContext ?? provider.default;
 if (!create) throw new Error("LIVE_CONTEXT_PROVIDER_INVALID");
 const live = await create();
+if (
+  !live.serverOrigin ||
+  !live.recoveryCases?.create ||
+  !live.recoveryCases.finalize
+)
+  throw new Error("U7_LIVE_RECOVERY_CONTEXT_REQUIRED");
 
 const http: HttpPort = {
   async request(request) {
@@ -424,4 +455,34 @@ describe("public local-first legacy-to-v3 contract", () => {
       evidenceCase: "empty",
     });
   });
+
+  it.each(["create", "finalize"] as const)(
+    "recovers a genuinely successful %s response loss through a restarted production upgrade entry",
+    async (kind) => {
+      const scoped = live.recoveryCases[kind];
+      const evidence = await verifyLocalImageUpgradeResponseLoss(
+        {
+          serverOrigin: live.serverOrigin,
+          http,
+          control: scoped.control,
+          vault: scoped.vault,
+          controlRoot: scoped.controlRoot,
+          mapping: {
+            spaceId: scoped.spaceId,
+            rootPath: scoped.rootPath,
+            status: "active",
+          },
+          authority: scoped.authority,
+        },
+        kind,
+      );
+      process.stdout.write(
+        `U7_PUBLIC_RECOVERY_EVIDENCE ${JSON.stringify({
+          ...evidence,
+          server: live.serverLabel,
+          cleanupOwner: live.cleanupOwner,
+        })}\n`,
+      );
+    },
+  );
 });
