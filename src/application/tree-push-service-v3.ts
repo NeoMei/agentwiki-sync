@@ -216,7 +216,9 @@ function isPreparedTreePushChangeV3(
   return TreePushManifestChangeV3Schema.safeParse(change).success;
 }
 
-function isTreePushJournalV3(value: unknown): value is TreePushJournalV3 {
+export function isTreePushJournalV3(
+  value: unknown,
+): value is TreePushJournalV3 {
   if (
     !recordWithOnlyKeys(value, [
       "schemaVersion",

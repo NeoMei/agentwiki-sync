@@ -115,7 +115,7 @@ function isJournalOperation(value: unknown): value is JournalOperation {
   );
 }
 
-function isTreeTransactionJournal(
+export function isTreeTransactionJournal(
   value: unknown,
 ): value is TreeTransactionJournal {
   if (!value || typeof value !== "object") return false;
