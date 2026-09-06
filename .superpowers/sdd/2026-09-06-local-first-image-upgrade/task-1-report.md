@@ -11,6 +11,8 @@
 - Created `tests/fakes/local-image-upgrade-fixture.ts`: exact required stable source fixture.
 - Created `tests/integration/local-image-upgrade-contract.test.ts`: reader/projection regression contract.
 - Created `verification/local-image-upgrade.live.ts` and `vitest.live.config.ts`: opt-in credential-free live public-contract runner.
+- Created `verification/local-image-upgrade-assertions.ts`: strict, testable live assertions for public Space rows and exact candidate publication.
+- Created `tests/integration/local-image-upgrade-verifier.test.ts`: negative coverage for the live verifier's schema and candidate bindings.
 - Created `docs/verification/local-first-image-upgrade.md`: redacted evidence and blocker boundary.
 - Modified `src/application/sync-runtime.ts`: ordinary v2/v3 paths delegate to shared readers.
 - Modified `tests/fakes/fake-tree-remote.ts`: derive canonical public v1/v2 manifest metadata instead of the old placeholder byte count, including the strict empty-genesis convention.
@@ -61,3 +63,34 @@ Observed: 3 passed, 1 failed, exit 1. The actual empty read and both atomic upgr
 - No main-server source/config/DB/deploy, primary Vault, publish, push, or U2+ change.
 
 Concern: public Space-mode discovery cannot currently represent legacy folder Spaces and fails the U1 route gate. Read-only source/schema comparison suggests root parent null and Date serialization are lost in the legacy list projection. This is source-supported diagnosis, not a production stack trace. It requires a separate server fix and release gate; the plugin must not work around it by error-based downgrade.
+
+## Independent review fix round 1
+
+Review found that the first live runner proved only that fixed R3 was internally self-consistent, not that it was exactly candidate C, and that the pre-upgrade Space-list probe checked only owned IDs after an unsafe cast. Both findings were reproduced with test-only negative cases before changing the verifier.
+
+RED command:
+
+```text
+npx vitest run tests/integration/local-image-upgrade-verifier.test.ts
+```
+
+Observed: 3/3 failed for the intended reasons. A different changed Page with its own self-consistent published hash resolved instead of rejecting; a schema-invalid `canRead: false` row and a row with wrong mode/revision/role/publish permission were both accepted.
+
+The separate full-calculation-tree guard was mutation-checked by temporarily removing only its canonical byte comparison and running `npx vitest run tests/integration/local-image-upgrade-verifier.test.ts -t "rejects a fixed published calculation tree"`; it failed because the mismatching tree resolved instead of rejecting. The guard was restored before GREEN.
+
+GREEN command:
+
+```text
+npx vitest run tests/integration/local-image-upgrade-verifier.test.ts tests/integration/local-image-upgrade-contract.test.ts
+```
+
+Observed after adding separate full-tree and exact-contract cases: 12/12 passed. The verifier now caches `candidateHash` before any public write, requires fixed `published.revisionContentHash` to equal it, compares the full canonical calculation tree, and separately compares the changed Page. The list verifier parses `TreeSyncSpaceListResponseV3Schema` and binds each current owned fixture to `legacy_v2`, its exact v2 source revision, `owner`, `canRead: true`, and `canPublish: true`.
+
+One fresh public run used only the two controller-created review fixtures and again finished 3 passed / 1 failed: the strict pre-upgrade list gate returned HTTP 500, while strict-empty read and both independently executing atomic publication cases passed.
+
+- Populated review case: `cmtp5atjy022p2jx0xlfzuwwq` sequence 4 → `cmtp5eulj023d2jx0hgpkmb71` sequence 5; precomputed candidate and fixed published SHA `ccd5162a38233aa3b895dee0ba392588282676cca59f3a07a3d58fab00f6a4b6`.
+- Empty review case: revision `0` sequence 0 → `cmtp5evqu023q2jx0zepcitqd` sequence 1; precomputed candidate and fixed published SHA `999cdc8e954f8c4bf04e75378192c434a894de2109ba5fa4161478a9a2e8ac79`.
+
+The provider owns five preserved U1 fixture IDs in total across the initial and review runs, but this review run selected and published only the two fresh legacy fixtures. The mandatory public list gate remains the sole U1 blocker; this round does not claim U1 DONE or authorize U2+.
+
+Review-round verification: scoped Prettier and ESLint passed; `npm run typecheck` passed; the complete local suite passed at 54 files / 717 tests. The known full-repository `SyncRuntime` lint finding at the unchanged baseline line remains outside this review-fix scope and was not modified.

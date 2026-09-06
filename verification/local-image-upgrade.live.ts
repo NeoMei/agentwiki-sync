@@ -27,6 +27,10 @@ import {
   readTreeSnapshotV3,
 } from "../src/application/tree-snapshot-reader";
 import type { HttpPort, HttpResponseType } from "../src/ports/http";
+import {
+  parseOwnedLegacySpaces,
+  verifyPublishedCandidate,
+} from "./local-image-upgrade-assertions";
 
 interface LiveRequest {
   method: string;
@@ -184,6 +188,7 @@ async function publishUpgrade(input: {
     ),
     attachments: [added],
   };
+  const candidateHash = await treeRevisionContentHashV3(candidate);
   const changes = canonicalTreeDeltaItemsV3(
     treeRevisionDeltaV3(base.projected, candidate),
   );
@@ -266,23 +271,16 @@ async function publishUpgrade(input: {
     input.spaceId,
     finalized.revision,
   );
-  const publishedTree: UpgradeTree = {
-    protocolVersion: "3",
-    spaceId: published.spaceId,
-    folders: published.folders,
-    pages: published.pages,
-    attachments: published.attachments,
-  };
   expect(after.sequence).toBe(input.beforeSequence + 1);
   expect(after.revision).toBe(finalized.revision);
   if (input.unchanged)
     expect(
       published.pages.find((page) => page.pageId === input.unchanged!.pageId),
     ).toEqual(input.unchanged);
-  expect(published.folders).toEqual(candidate.folders);
-  expect(await treeRevisionContentHashV3(publishedTree)).toBe(
-    published.revisionContentHash,
-  );
+  expect(
+    published.pages.find((page) => page.pageId === changedPage.pageId),
+  ).toEqual(changedPage);
+  await verifyPublishedCandidate(candidate, candidateHash, published);
   expect(
     published.attachments.map((attachment) => attachment.attachmentId),
   ).toEqual([added.attachmentId]);
@@ -297,7 +295,7 @@ async function publishUpgrade(input: {
     `U1_PUBLIC_EVIDENCE ${JSON.stringify({
       case: input.evidenceCase,
       server: live.serverLabel,
-      candidateSha: await treeRevisionContentHashV3(candidate),
+      candidateSha: candidateHash,
       before: {
         revision: input.source.revision,
         sequence: input.beforeSequence,
@@ -312,6 +310,10 @@ async function publishUpgrade(input: {
 
 describe("public local-first legacy-to-v3 contract", () => {
   it("exposes the owned legacy Spaces through the public v3 mode list", async () => {
+    const [populatedHead, emptyHead] = await Promise.all([
+      remotes(live.spaceIds.populated).then(({ v2 }) => v2.head()),
+      remotes(live.spaceIds.empty).then(({ v2 }) => v2.head()),
+    ]);
     const response = await live.request({
       method: "GET",
       path: "/api/sync/v3/spaces",
@@ -319,11 +321,22 @@ describe("public local-first legacy-to-v3 contract", () => {
       maxResponseBytes: 2_097_152,
     });
     expect(response.status).toBe(200);
-    const rows =
-      (response.json as { spaces?: Array<{ spaceId: string }> }).spaces ?? [];
-    expect(rows.map((row) => row.spaceId)).toEqual(
-      expect.arrayContaining([live.spaceIds.populated, live.spaceIds.empty]),
-    );
+    parseOwnedLegacySpaces(response.json, [
+      {
+        spaceId: live.spaceIds.populated,
+        currentRevision: populatedHead.revision,
+        role: "owner",
+        canRead: true,
+        canPublish: true,
+      },
+      {
+        spaceId: live.spaceIds.empty,
+        currentRevision: emptyHead.revision,
+        role: "owner",
+        canRead: true,
+        canPublish: true,
+      },
+    ]);
   });
 
   it("requires literal zero evidence for the public empty legacy Space", async () => {
