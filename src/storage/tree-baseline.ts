@@ -328,6 +328,31 @@ export class TreeBaselineRepository {
     return { transactionId, kind, phase };
   }
 
+  async assertPreparedPull(
+    snapshot: TreeSnapshotV3,
+    transactionId: string,
+  ): Promise<void> {
+    const current = await this.journal.read();
+    if (
+      !current ||
+      current.payload.transactionId !== transactionId ||
+      current.payload.kind !== "pull"
+    )
+      throw new Error("TREE_BASELINE_OWNERSHIP_MISMATCH");
+    const generation = await this.generations.verify(
+      current.payload.newGenerationId,
+    );
+    if (
+      generation.schemaVersion !== 3 ||
+      generation.protocolVersion !== "3" ||
+      generation.spaceId !== this.spaceId ||
+      generation.rootPath !== this.rootPath ||
+      generation.baseRevision !== snapshot.revision ||
+      generation.baseRevisionContentHash !== snapshot.revisionContentHash
+    )
+      throw new Error("TREE_BASELINE_OWNERSHIP_MISMATCH");
+  }
+
   async commit(): Promise<void> {
     const current = await this.journal.read();
     if (!current) throw new Error("基线日志缺失");

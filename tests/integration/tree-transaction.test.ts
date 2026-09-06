@@ -135,6 +135,59 @@ function seededControl(): MemoryControlStore {
 }
 
 describe("TreeTransaction", () => {
+  it("validates persisted ordered operation evidence without recapturing a partially applied Vault", async () => {
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    control.files.set("confirmed/page.md", "confirmed");
+    const tx = new TreeTransaction(vault, control, ".agentwiki/tx/owned-plan");
+    const input = {
+      baseRevision: "base",
+      targetRevision: "target",
+      targetTreeHash: "0".repeat(64),
+      actions: [
+        {
+          kind: "create_page" as const,
+          pageId: "p1",
+          path: "pages/P.md",
+          bodyPath: "confirmed/page.md",
+        },
+      ],
+      expectedPathStates: {
+        "pages/P.md": { kind: "missing" as const, hash: null },
+      },
+      deferCommit: true,
+    };
+    await tx.prepare(input, "owned-tx");
+    await tx.apply();
+
+    await expect(
+      tx.assertPreparedOwnership(input, "owned-tx"),
+    ).resolves.toBeUndefined();
+    await expect(
+      tx.assertPreparedOwnership(
+        {
+          ...input,
+          actions: [
+            ...input.actions,
+            {
+              kind: "remove_attachment_path" as const,
+              attachmentId: "a1",
+              path: "assets/unconfirmed.png",
+            },
+          ],
+          expectedPathStates: {
+            ...input.expectedPathStates,
+            "assets/unconfirmed.png": {
+              kind: "file" as const,
+              hash: "a".repeat(64),
+            },
+          },
+        },
+        "owned-tx",
+      ),
+    ).rejects.toThrow("TREE_TRANSACTION_OWNERSHIP_MISMATCH");
+  });
+
   it("preserves a new child added after preparing a directory trash", async () => {
     const vault = new MemoryVault({ "pages/Doomed/known.md": "known" });
     const tx = new TreeTransaction(

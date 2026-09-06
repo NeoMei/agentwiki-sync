@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { treeRevisionContentHashV3 } from "@neomei/agentwiki-sync-protocol";
 
 import { contentHash } from "../../src/agentwiki/protocol";
 import type {
@@ -72,6 +73,67 @@ function attachment(): TreeAttachment {
 }
 
 describe("v2 tree baseline upgrade", () => {
+  it("rejects a same-id staged generation that is not the fixed R3 before pointer mutation", async () => {
+    const store = new MemoryControlStore();
+    const repository = new TreeBaselineRepository(
+      store,
+      ROOT,
+      "space-1",
+      "Wiki",
+    );
+    const fixed = snapshotV3({ revision: "fixed-r3" });
+    fixed.revisionContentHash = await treeRevisionContentHashV3({
+      protocolVersion: "3",
+      spaceId: fixed.spaceId,
+      folders: fixed.folders,
+      pages: fixed.pages,
+      attachments: fixed.attachments,
+    });
+    const foreign = snapshotV3({ revision: "foreign-r3" });
+    foreign.revisionContentHash = await treeRevisionContentHashV3({
+      protocolVersion: "3",
+      spaceId: foreign.spaceId,
+      folders: foreign.folders,
+      pages: foreign.pages,
+      attachments: foreign.attachments,
+    });
+    await repository.prepare(foreign, "pull", "same-tx");
+
+    await expect(
+      repository.assertPreparedPull(fixed, "same-tx"),
+    ).rejects.toThrow("TREE_BASELINE_OWNERSHIP_MISMATCH");
+    await expect(repository.readOptional()).resolves.toBeNull();
+    expect((await repository.inspectJournal())?.phase).toBe("prepared");
+  });
+
+  it("rejects a same-id staged generation whose operation kind is not pull", async () => {
+    const store = new MemoryControlStore();
+    const repository = new TreeBaselineRepository(
+      store,
+      ROOT,
+      "space-1",
+      "Wiki",
+    );
+    const fixed = snapshotV3({ revision: "fixed-r3" });
+    fixed.revisionContentHash = await treeRevisionContentHashV3({
+      protocolVersion: "3",
+      spaceId: fixed.spaceId,
+      folders: fixed.folders,
+      pages: fixed.pages,
+      attachments: fixed.attachments,
+    });
+    await repository.prepare(fixed, "pull", "initial-pull");
+    await repository.commit();
+    const committed = await repository.read();
+    await repository.prepare(fixed, "push", "same-tx");
+
+    await expect(
+      repository.assertPreparedPull(fixed, "same-tx"),
+    ).rejects.toThrow("TREE_BASELINE_OWNERSHIP_MISMATCH");
+    expect((await repository.read()).generationId).toBe(committed.generationId);
+    expect((await repository.inspectJournal())?.phase).toBe("prepared");
+  });
+
   it("does not require a newer protocol before a tree baseline exists", async () => {
     const repository = new TreeBaselineRepository(
       new MemoryControlStore(),

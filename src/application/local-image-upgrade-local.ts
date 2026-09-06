@@ -15,7 +15,7 @@ import { BlobTransfer } from "./blob-transfer";
 import type { UpgradePreview } from "./local-image-upgrade-plan";
 import type { TreePushServiceV3 } from "./tree-push-service-v3";
 import { readTreeSnapshotV3 } from "./tree-snapshot-reader";
-import { isTreeTransactionJournal, TreeTransaction } from "./tree-transaction";
+import { TreeTransaction, type TreeTransactionInput } from "./tree-transaction";
 import {
   applyV3ControlAfter,
   desiredV3Identities,
@@ -150,11 +150,6 @@ export class UpgradeLocalApply {
       localRoot,
       (action) => staging.readComplete(action.attachment.contentHash),
     );
-    const transactionJournal = await new MutableControlRepository(
-      this.control,
-      `${localRoot}/journal.json`,
-      isTreeTransactionJournal,
-    ).read();
     const identitiesBefore =
       (await this.identities.read())?.payload ?? emptyTreeIdentityState();
     const resolved = {
@@ -165,21 +160,53 @@ export class UpgradeLocalApply {
       resolvedPages: snapshot.pages,
       resolvedAttachments: snapshot.attachments,
     };
+    const bodyPaths = new Map(
+      preview.push.changes.flatMap((change) =>
+        change.operation === "upsert_page"
+          ? [[change.page.pageId, change.page.payloadPath] as const]
+          : [],
+      ),
+    );
+    const transactionInput: TreeTransactionInput = {
+      baseRevision: intent.sourceRevision,
+      targetRevision: snapshot.revision,
+      targetTreeHash: snapshot.revisionContentHash,
+      actions: preview.localPlanEvidence.actions.map((action) =>
+        prefixTreePullActionV3(
+          action,
+          preview.merge.local.rootPath,
+          localRoot,
+          (pageId) => {
+            const path = bodyPaths.get(pageId);
+            if (!path) throw new Error("UPGRADE_PAGE_PAYLOAD_MISSING");
+            return path;
+          },
+        ),
+      ),
+      expectedPathStates: preview.localPlanEvidence.expectedPathStates,
+      deferCommit: true,
+    };
     const transaction = await tx.inspect();
     const after = await controlAfter.read();
+    if (transaction)
+      try {
+        await tx.assertPreparedOwnership(
+          transactionInput,
+          intent.localTransactionId,
+        );
+      } catch {
+        throw new Error("UPGRADE_LOCAL_TRANSACTION_OWNERSHIP_MISMATCH");
+      }
+    const expectedIdentities = desiredV3Identities(
+      preview.localPlanEvidence.identities,
+      resolved,
+    );
     if (
-      transactionJournal &&
-      (transactionJournal.payload.schemaVersion !== 3 ||
-        transactionJournal.payload.transactionId !==
-          intent.localTransactionId ||
-        transactionJournal.payload.baseRevision !== intent.sourceRevision ||
-        transactionJournal.payload.targetRevision !== snapshot.revision ||
-        transactionJournal.payload.targetTreeHash !==
-          snapshot.revisionContentHash ||
-        transactionJournal.payload.deferCommit !== true)
+      after &&
+      (after.payload.transactionId !== intent.localTransactionId ||
+        JSON.stringify(after.payload.identities) !==
+          JSON.stringify(expectedIdentities))
     )
-      throw new Error("UPGRADE_LOCAL_TRANSACTION_OWNERSHIP_MISMATCH");
-    if (after && after.payload.transactionId !== intent.localTransactionId)
       throw new Error("UPGRADE_LOCAL_CONTROL_OWNERSHIP_MISMATCH");
     if (
       !after &&
@@ -187,9 +214,7 @@ export class UpgradeLocalApply {
         JSON.stringify(preview.localPlanEvidence.identities)
     )
       throw new Error("UPGRADE_REMOTE_PUBLISHED_LOCAL_PENDING");
-    const desired =
-      after?.payload.identities ??
-      desiredV3Identities(preview.localPlanEvidence.identities, resolved);
+    const desired = expectedIdentities;
 
     if (
       transaction &&
@@ -211,36 +236,8 @@ export class UpgradeLocalApply {
     }
 
     if (!tree || tree.state === "rolled_back") {
-      const bodyPaths = new Map(
-        preview.push.changes.flatMap((change) =>
-          change.operation === "upsert_page"
-            ? [[change.page.pageId, change.page.payloadPath] as const]
-            : [],
-        ),
-      );
       try {
-        await tx.prepare(
-          {
-            baseRevision: intent.sourceRevision,
-            targetRevision: snapshot.revision,
-            targetTreeHash: snapshot.revisionContentHash,
-            actions: preview.localPlanEvidence.actions.map((action) =>
-              prefixTreePullActionV3(
-                action,
-                preview.merge.local.rootPath,
-                localRoot,
-                (pageId) => {
-                  const path = bodyPaths.get(pageId);
-                  if (!path) throw new Error("UPGRADE_PAGE_PAYLOAD_MISSING");
-                  return path;
-                },
-              ),
-            ),
-            expectedPathStates: preview.localPlanEvidence.expectedPathStates,
-            deferCommit: true,
-          },
-          intent.localTransactionId,
-        );
+        await tx.prepare(transactionInput, intent.localTransactionId);
       } catch (error) {
         if (error instanceof Error && error.message === "STALE_PULL_PREVIEW")
           throw new Error("UPGRADE_REMOTE_PUBLISHED_LOCAL_PENDING");
@@ -286,6 +283,7 @@ export class UpgradeLocalApply {
     )
       await this.baseline.prepare(snapshot, "pull", intent.localTransactionId);
     const ownedBaseline = await this.baseline.inspectJournal();
+    await this.baseline.assertPreparedPull(snapshot, intent.localTransactionId);
     if (ownedBaseline?.phase === "prepared")
       await this.baseline.setPhase("applying");
     await tx.assertApplied();

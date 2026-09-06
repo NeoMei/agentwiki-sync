@@ -19,7 +19,10 @@ import {
   type UpgradeCoordinatorPort,
 } from "../../src/application/local-image-upgrade";
 import { buildTreeCalculationPreviewV3 } from "../../src/application/tree-diff";
-import { desiredV3Identities } from "../../src/application/tree-local-apply-v3";
+import {
+  desiredV3Identities,
+  isV3PullControlAfterState,
+} from "../../src/application/tree-local-apply-v3";
 import {
   isTreePushJournalV3,
   TreePushServiceV3,
@@ -31,6 +34,7 @@ import { TreeBaselineRepository } from "../../src/storage/tree-baseline";
 import { MutableControlRepository } from "../../src/storage/envelope";
 import {
   TreeIdentityRepository,
+  emptyTreeIdentityState,
   emptyTreeIdentityStateV2,
 } from "../../src/storage/tree-identities";
 import type { UpgradeIntent } from "../../src/storage/local-image-upgrade";
@@ -51,6 +55,18 @@ class FaultStore extends MemoryControlStore {
   failRemoveTreePath: string | null = null;
   failRemoveTreeOnCall = 1;
   removeTreeCalls = new Map<string, number>();
+  failTextPath: string | null = null;
+  failTextOnCall = 1;
+  textWriteCalls = new Map<string, number>();
+  override async write(path: string, value: string): Promise<void> {
+    const calls = (this.textWriteCalls.get(path) ?? 0) + 1;
+    this.textWriteCalls.set(path, calls);
+    if (path === this.failTextPath && calls === this.failTextOnCall) {
+      this.failTextPath = null;
+      throw new Error("injected identity write failure");
+    }
+    await super.write(path, value);
+  }
   override async remove(path: string): Promise<void> {
     if (path === this.failRemovePath) {
       this.failRemovePath = null;
@@ -357,6 +373,82 @@ describe("UpgradeLocalApply", () => {
     );
   });
 
+  it("rejects same-id staged identities that differ from confirmed plan and fixed R3 before writes", async () => {
+    const { local, intent, snapshot, store, vault } = await fixture();
+    await local.verifyPublished(intent);
+    const wrong = emptyTreeIdentityStateV2();
+    wrong.pendingPages["poison"] = {
+      pageId: "poison",
+      path: "pages/Poison.md",
+      contentHash: "a".repeat(64),
+    };
+    await new MutableControlRepository(
+      store,
+      `${ROOT}/local-image-upgrade/${OPERATION}/local/control-after.json`,
+      isV3PullControlAfterState,
+    ).write({
+      schemaVersion: 2,
+      transactionId: intent.localTransactionId,
+      phase: "pending",
+      identities: wrong,
+    });
+
+    await expect(local.applyPublished(intent, snapshot)).rejects.toThrow(
+      "UPGRADE_LOCAL_CONTROL_OWNERSHIP_MISMATCH",
+    );
+    expect(vault.operationLog).toEqual([]);
+    expect(
+      await new TreeIdentityRepository(
+        store,
+        `${ROOT}/tree-identities.json`,
+      ).read(),
+    ).toBeNull();
+  });
+
+  it("rejects same-id different ordered operations before any Vault write", async () => {
+    const { local, intent, snapshot, store, vault } = await fixture();
+    await local.verifyPublished(intent);
+    await new MutableControlRepository(
+      store,
+      `${ROOT}/local-image-upgrade/${OPERATION}/local/journal.json`,
+      isTreeTransactionJournal,
+    ).write({
+      schemaVersion: 3,
+      transactionId: intent.localTransactionId,
+      baseRevision: intent.sourceRevision,
+      targetRevision: snapshot.revision,
+      targetTreeHash: snapshot.revisionContentHash,
+      state: "prepared",
+      nextOperation: 0,
+      operations: [
+        {
+          action: {
+            kind: "remove_attachment_path",
+            attachmentId: "unconfirmed",
+            path: "Wiki/assets/unused.png",
+          },
+          paths: [
+            {
+              path: "Wiki/assets/unused.png",
+              before: {
+                kind: "file",
+                hash: await sha256Hex(new TextEncoder().encode("keep")),
+              },
+              after: { kind: "missing", hash: null },
+            },
+          ],
+        },
+      ],
+      deferCommit: true,
+    });
+
+    await expect(local.applyPublished(intent, snapshot)).rejects.toThrow(
+      "UPGRADE_LOCAL_TRANSACTION_OWNERSHIP_MISMATCH",
+    );
+    expect(vault.operationLog).toEqual([]);
+    expect(vault.text("Wiki/assets/unused.png")).toBe("keep");
+  });
+
   it.each([
     { boundary: "image Vault write", vaultFailureAt: 1 },
     { boundary: "page Vault write", vaultFailureAt: 2 },
@@ -364,7 +456,7 @@ describe("UpgradeLocalApply", () => {
     {
       boundary: "late edit after image write",
       lateEdit: true,
-      vaultFailureAt: 1,
+      vaultFailureAt: 2,
     },
     {
       boundary: "transaction journal",
@@ -379,8 +471,12 @@ describe("UpgradeLocalApply", () => {
       storagePath: "/tree-v2/baseline-journal.json.next",
     },
     {
-      boundary: "identity commit",
-      storagePath: "/tree-identities.json.next",
+      boundary: "identity activation",
+      identityWriteAt: 1,
+    },
+    {
+      boundary: "desired identity write",
+      identityWriteAt: 2,
     },
     { boundary: "baseline pointer", storagePath: "/tree-v2/current.json.next" },
     { boundary: "parent terminal cleanup", cleanupFailure: true },
@@ -396,6 +492,7 @@ describe("UpgradeLocalApply", () => {
         cleanupFailure?: boolean;
         blobCleanupFailure?: boolean;
         rename?: boolean;
+        identityWriteAt?: number;
       }) => {
         const store = new FaultStore();
         const vault = new MemoryVault({
@@ -419,8 +516,7 @@ describe("UpgradeLocalApply", () => {
           store,
           `${ROOT}/tree-identities.json`,
         );
-        await seededIdentities.commitConfirmedV3Activation();
-        await seededIdentities.write(identities);
+        await seededIdentities.write(emptyTreeIdentityState());
         const localScan = await scanLocalTree(
           vault,
           "Wiki",
@@ -677,7 +773,14 @@ describe("UpgradeLocalApply", () => {
           return { coordinator, repository };
         };
 
-        if (options.storagePath)
+        if (options.identityWriteAt)
+          remote.onFinalize = () => {
+            const path = `${ROOT}/tree-identities.json.next`;
+            store.textWriteCalls.set(path, 0);
+            store.failTextPath = path;
+            store.failTextOnCall = options.identityWriteAt!;
+          };
+        else if (options.storagePath)
           remote.onFinalize = () => {
             store.failWhenTextPathIncludes = options.storagePath!;
           };
@@ -694,6 +797,12 @@ describe("UpgradeLocalApply", () => {
         await expect(
           build().coordinator.confirm(preview, preview.authorizationHash),
         ).rejects.toThrow(/injected/);
+        if (options.identityWriteAt)
+          expect(
+            store.textWriteCalls.get(`${ROOT}/tree-identities.json.next`),
+          ).toBe(options.identityWriteAt);
+        if (options.lateEdit)
+          expect(vault.operationLog).toContain("write:Wiki/assets/used.png");
         if (options.boundary === "image Vault write")
           expect(vault.operationLog).not.toContain(
             "write:Wiki/assets/used.png",
@@ -762,6 +871,20 @@ describe("UpgradeLocalApply", () => {
           state: "committed",
           transactionId: interrupted?.localTransactionId,
         });
+        const finalIdentities = await new TreeIdentityRepository(
+          store,
+          `${ROOT}/tree-identities.json`,
+        ).read();
+        expect(finalIdentities?.payload).toEqual(
+          desiredV3Identities(identities, {
+            revision: "published-r3",
+            base: merge.base,
+            remote: candidate,
+            resolvedFolders: merge.resolvedFolders,
+            resolvedPages: merge.resolvedPages,
+            resolvedAttachments: merge.resolvedAttachments,
+          }),
+        );
         if (options.cleanupFailure || options.blobCleanupFailure)
           expect(vault.operationLog).toEqual(vaultOperationsBeforeRestart);
         if (options.rename)

@@ -67,6 +67,11 @@ export interface TreeTransactionInput {
   expectedPathStates?: Record<string, TreeTransactionPathState>;
 }
 
+interface MaterializationSource {
+  pathState(path: string): Promise<TreeTransactionPathState>;
+  directoryEntries(path: string): Promise<Array<[string, PathKind]>>;
+}
+
 function isPathState(value: unknown): value is TreeTransactionPathState {
   if (!value || typeof value !== "object") return false;
   const item = value as Partial<TreeTransactionPathState>;
@@ -263,6 +268,30 @@ export class TreeTransaction {
       : null;
   }
 
+  async assertPreparedOwnership(
+    input: TreeTransactionInput,
+    transactionId: string,
+  ): Promise<void> {
+    const current = await this.journal.read();
+    if (!current) throw new Error("TREE_TRANSACTION_OWNERSHIP_MISMATCH");
+    const expected = await this.materializeOperations(
+      input,
+      this.confirmedMaterializationSource(input.expectedPathStates),
+      false,
+    );
+    const payload = current.payload;
+    if (
+      payload.schemaVersion !== 3 ||
+      payload.transactionId !== transactionId ||
+      payload.baseRevision !== input.baseRevision ||
+      payload.targetRevision !== input.targetRevision ||
+      payload.targetTreeHash !== input.targetTreeHash ||
+      payload.deferCommit !== (input.deferCommit ?? false) ||
+      JSON.stringify(payload.operations) !== JSON.stringify(expected)
+    )
+      throw new Error("TREE_TRANSACTION_OWNERSHIP_MISMATCH");
+  }
+
   async prepare(
     input: TreeTransactionInput,
     transactionId: string = crypto.randomUUID(),
@@ -281,6 +310,32 @@ export class TreeTransaction {
           throw new Error("STALE_PULL_PREVIEW");
     }
 
+    const operations = await this.materializeOperations(
+      input,
+      {
+        pathState: (path) => this.readPathState(path),
+        directoryEntries: async (path) => {
+          const entries: Array<[string, PathKind]> = [];
+          if ((await this.vault.pathStatus(path)) !== "directory")
+            return entries;
+          for await (const entry of this.vault.listTree(path))
+            entries.push([
+              entry.relativePath,
+              entry.kind === "directory" ? "directory" : "file",
+            ]);
+          return entries.sort(([left], [right]) => left.localeCompare(right));
+        },
+      },
+      true,
+    );
+    await this.persistPrepared(input, transactionId, operations);
+  }
+
+  private async materializeOperations(
+    input: TreeTransactionInput,
+    source: MaterializationSource,
+    persistArtifacts: boolean,
+  ): Promise<JournalOperation[]> {
     const ownedRoots = input.actions.flatMap((action) => {
       switch (action.kind) {
         case "trash_page":
@@ -308,9 +363,19 @@ export class TreeTransaction {
           input.actions[index]!,
           ownedRoots,
           input.expectedPathStates,
+          source,
+          persistArtifacts,
         ),
       );
     }
+    return operations;
+  }
+
+  private async persistPrepared(
+    input: TreeTransactionInput,
+    transactionId: string,
+    operations: JournalOperation[],
+  ): Promise<void> {
     await this.journal.write({
       schemaVersion: 3,
       transactionId,
@@ -322,6 +387,29 @@ export class TreeTransaction {
       operations,
       deferCommit: input.deferCommit ?? false,
     });
+  }
+
+  private confirmedMaterializationSource(
+    expected: TreeTransactionInput["expectedPathStates"],
+  ): MaterializationSource {
+    if (!expected) throw new Error("TREE_TRANSACTION_OWNERSHIP_MISMATCH");
+    return {
+      pathState: async (path) =>
+        expected[path] ?? { kind: "missing", hash: null },
+      directoryEntries: async (root) => {
+        const prefix = `${root}/`;
+        return Object.entries(expected)
+          .filter(
+            ([path, state]) =>
+              path.startsWith(prefix) && state.kind !== "missing",
+          )
+          .map(
+            ([path, state]) =>
+              [path.slice(prefix.length), state.kind] as [string, PathKind],
+          )
+          .sort(([left], [right]) => left.localeCompare(right));
+      },
+    };
   }
 
   async apply(): Promise<void> {
@@ -505,9 +593,11 @@ export class TreeTransaction {
     index: number,
     action: TreePullActionV3,
     ownedRoots: string[],
-    expectedPathStates?: Record<string, TreeTransactionPathState>,
+    expectedPathStates: Record<string, TreeTransactionPathState> | undefined,
+    source: MaterializationSource,
+    persistArtifacts: boolean,
   ): Promise<JournalOperation> {
-    const directoryClosure = await this.captureDirectoryClosure(action);
+    const directoryClosure = await this.captureDirectoryClosure(action, source);
     let paths: OperationPath[];
     switch (action.kind) {
       case "create_directory":
@@ -520,13 +610,14 @@ export class TreeTransaction {
         ];
         break;
       case "trash_directory":
-        paths = await this.directoryTrashPaths(action.path, ownedRoots);
+        paths = await this.directoryTrashPaths(action.path, ownedRoots, source);
         break;
       case "move_directory":
         paths = await this.directoryMovePaths(
           action.fromPath,
           action.path,
           ownedRoots,
+          source,
         );
         break;
       case "create_page":
@@ -542,7 +633,7 @@ export class TreeTransaction {
         paths = [
           {
             path: action.path,
-            before: await this.readPathState(action.beforePath ?? action.path),
+            before: await source.pathState(action.beforePath ?? action.path),
             after: { kind: "file", hash: await this.resultHash(action) },
           },
         ];
@@ -551,7 +642,7 @@ export class TreeTransaction {
         paths = [
           {
             path: action.fromPath,
-            before: await this.readPathState(
+            before: await source.pathState(
               action.beforePath ?? action.fromPath,
             ),
             after: { kind: "missing", hash: null },
@@ -567,7 +658,7 @@ export class TreeTransaction {
         paths = [
           {
             path: action.path,
-            before: await this.readPathState(action.path),
+            before: await source.pathState(action.path),
             after: { kind: "missing", hash: null },
           },
         ];
@@ -577,7 +668,7 @@ export class TreeTransaction {
         paths = [
           {
             path: action.attachment.path,
-            before: await this.readPathState(action.attachment.path),
+            before: await source.pathState(action.attachment.path),
             after: { kind: "file", hash: action.attachment.contentHash },
           },
         ];
@@ -586,7 +677,7 @@ export class TreeTransaction {
         paths = [
           {
             path: action.path,
-            before: await this.readPathState(action.path),
+            before: await source.pathState(action.path),
             after: { kind: "missing", hash: null },
           },
         ];
@@ -602,71 +693,75 @@ export class TreeTransaction {
         const expected = expectedPathStates[sourcePath];
         if (!expected) throw new Error("STALE_PULL_PREVIEW");
         item.before = expected;
-        if (!sameState(await this.readPathState(sourcePath), expected))
+        if (!sameState(await source.pathState(sourcePath), expected))
           throw new Error("STALE_PULL_PREVIEW");
       }
     }
 
-    for (let pathIndex = 0; pathIndex < paths.length; pathIndex += 1) {
-      const item = paths[pathIndex]!;
-      if (item.before.kind === "file") {
-        const bytes = await this.fileBytes(beforeSourcePath(action, item.path));
-        if ((await sha256Hex(bytes)) !== item.before.hash)
-          throw new Error("前置快照读取失败");
-        if (isAttachmentFileAction(action)) {
-          if (!this.control.writeBinary || !this.control.readBinary)
-            throw new Error("ATTACHMENT_SOURCE_UNAVAILABLE");
-          await this.control.writeBinary(
-            this.beforePath(index, pathIndex),
-            bytes,
+    if (persistArtifacts) {
+      for (let pathIndex = 0; pathIndex < paths.length; pathIndex += 1) {
+        const item = paths[pathIndex]!;
+        if (item.before.kind === "file") {
+          const bytes = await this.fileBytes(
+            beforeSourcePath(action, item.path),
           );
-          const durable = await this.control.readBinary(
-            this.beforePath(index, pathIndex),
-          );
-          if (!durable || (await sha256Hex(durable)) !== item.before.hash)
-            throw new Error("回滚前置快照已损坏");
-        } else {
-          await this.control.write(
-            this.beforePath(index, pathIndex),
-            encodeBase64(bytes),
-          );
+          if ((await sha256Hex(bytes)) !== item.before.hash)
+            throw new Error("前置快照读取失败");
+          if (isAttachmentFileAction(action)) {
+            if (!this.control.writeBinary || !this.control.readBinary)
+              throw new Error("ATTACHMENT_SOURCE_UNAVAILABLE");
+            await this.control.writeBinary(
+              this.beforePath(index, pathIndex),
+              bytes,
+            );
+            const durable = await this.control.readBinary(
+              this.beforePath(index, pathIndex),
+            );
+            if (!durable || (await sha256Hex(durable)) !== item.before.hash)
+              throw new Error("回滚前置快照已损坏");
+          } else {
+            await this.control.write(
+              this.beforePath(index, pathIndex),
+              encodeBase64(bytes),
+            );
+          }
         }
       }
-    }
 
-    if (isPageUpsert(action)) {
-      const body = await this.control.read(action.bodyPath);
-      if (body === null) throw new Error("拉取操作内容缺失");
-      if (
-        (await sha256Hex(encoder.encode(body))) !==
-        (await this.resultHash(action))
-      )
-        throw new Error("拉取结果边车校验失败");
-      await this.control.write(this.resultPath(index), body);
-    }
+      if (isPageUpsert(action)) {
+        const body = await this.control.read(action.bodyPath);
+        if (body === null) throw new Error("拉取操作内容缺失");
+        if (
+          (await sha256Hex(encoder.encode(body))) !==
+          (await this.resultHash(action))
+        )
+          throw new Error("拉取结果边车校验失败");
+        await this.control.write(this.resultPath(index), body);
+      }
 
-    if (
-      action.kind === "create_attachment" ||
-      action.kind === "write_attachment"
-    ) {
-      if (!this.readAttachmentSource || !this.control.writeBinary)
-        throw new Error("ATTACHMENT_SOURCE_UNAVAILABLE");
-      const bytes = await this.readAttachmentSource(action);
       if (
-        !bytes ||
-        bytes.byteLength !== Number(action.attachment.sizeBytes) ||
-        (await sha256Hex(bytes)) !== action.attachment.contentHash
-      )
-        throw new Error("ATTACHMENT_SOURCE_MISMATCH");
-      await this.control.writeBinary(this.attachmentResultPath(index), bytes);
-      const durable = await this.control.readBinary?.(
-        this.attachmentResultPath(index),
-      );
-      if (
-        !durable ||
-        (await sha256Hex(durable)) !== action.attachment.contentHash
-      )
-        throw new Error("ATTACHMENT_SOURCE_MISMATCH");
+        action.kind === "create_attachment" ||
+        action.kind === "write_attachment"
+      ) {
+        if (!this.readAttachmentSource || !this.control.writeBinary)
+          throw new Error("ATTACHMENT_SOURCE_UNAVAILABLE");
+        const bytes = await this.readAttachmentSource(action);
+        if (
+          !bytes ||
+          bytes.byteLength !== Number(action.attachment.sizeBytes) ||
+          (await sha256Hex(bytes)) !== action.attachment.contentHash
+        )
+          throw new Error("ATTACHMENT_SOURCE_MISMATCH");
+        await this.control.writeBinary(this.attachmentResultPath(index), bytes);
+        const durable = await this.control.readBinary?.(
+          this.attachmentResultPath(index),
+        );
+        if (
+          !durable ||
+          (await sha256Hex(durable)) !== action.attachment.contentHash
+        )
+          throw new Error("ATTACHMENT_SOURCE_MISMATCH");
+      }
     }
 
     return {
@@ -691,6 +786,7 @@ export class TreeTransaction {
     fromPath: string,
     toPath: string,
     ownedRoots: string[],
+    source: MaterializationSource,
   ): Promise<OperationPath[]> {
     const others = ownedRoots.filter(
       (root) => pathKey(root) !== pathKey(fromPath),
@@ -707,13 +803,15 @@ export class TreeTransaction {
         after: { kind: "directory", hash: null },
       },
     ];
-    for await (const entry of this.vault.listTree(fromPath)) {
-      const source = `${fromPath}/${entry.relativePath}`;
-      if (others.some((root) => isInsideSubtree(source, root))) continue;
-      const target = `${toPath}/${entry.relativePath}`;
-      if (entry.kind === "directory") {
+    for (const [relativePath, kind] of await source.directoryEntries(
+      fromPath,
+    )) {
+      const sourcePath = `${fromPath}/${relativePath}`;
+      if (others.some((root) => isInsideSubtree(sourcePath, root))) continue;
+      const target = `${toPath}/${relativePath}`;
+      if (kind === "directory") {
         paths.push({
-          path: source,
+          path: sourcePath,
           before: { kind: "directory", hash: null },
           after: { kind: "missing", hash: null },
         });
@@ -723,18 +821,18 @@ export class TreeTransaction {
           after: { kind: "directory", hash: null },
         });
       } else {
-        const bytes = entry.bytes ?? (await this.vault.read(source));
-        if (bytes === null) throw new Error("目录中的文件在读取时消失");
-        const hash = await sha256Hex(bytes);
+        const before = await source.pathState(sourcePath);
+        if (before.kind !== "file" || before.hash === null)
+          throw new Error("目录中的文件在读取时消失");
         paths.push({
-          path: source,
-          before: { kind: "file", hash },
+          path: sourcePath,
+          before,
           after: { kind: "missing", hash: null },
         });
         paths.push({
           path: target,
           before: { kind: "missing", hash: null },
-          after: { kind: "file", hash },
+          after: { kind: "file", hash: before.hash },
         });
       }
     }
@@ -744,6 +842,7 @@ export class TreeTransaction {
   private async directoryTrashPaths(
     path: string,
     ownedRoots: string[],
+    source: MaterializationSource,
   ): Promise<OperationPath[]> {
     const others = ownedRoots.filter((root) => pathKey(root) !== pathKey(path));
     const paths: OperationPath[] = [
@@ -753,24 +852,22 @@ export class TreeTransaction {
         after: { kind: "missing", hash: null },
       },
     ];
-    for await (const entry of this.vault.listTree(path)) {
-      const child = `${path}/${entry.relativePath}`;
+    for (const [relativePath, kind] of await source.directoryEntries(path)) {
+      const child = `${path}/${relativePath}`;
       if (others.some((root) => isInsideSubtree(child, root))) continue;
-      if (entry.kind === "directory") {
+      if (kind === "directory") {
         paths.push({
           path: child,
           before: { kind: "directory", hash: null },
           after: { kind: "missing", hash: null },
         });
       } else {
-        const bytes = entry.bytes ?? (await this.vault.read(child));
-        if (bytes === null) throw new Error("目录中的文件在读取时消失");
+        const before = await source.pathState(child);
+        if (before.kind !== "file" || before.hash === null)
+          throw new Error("目录中的文件在读取时消失");
         paths.push({
           path: child,
-          before: {
-            kind: "file",
-            hash: await sha256Hex(bytes),
-          },
+          before,
           after: { kind: "missing", hash: null },
         });
       }
@@ -796,6 +893,7 @@ export class TreeTransaction {
 
   private async captureDirectoryClosure(
     action: TreePullActionV3,
+    source: MaterializationSource,
   ): Promise<DirectoryClosure | undefined> {
     if (
       action.kind !== "create_directory" &&
@@ -809,13 +907,15 @@ export class TreeTransaction {
         : [action.path];
     const initial: DirectoryClosure["initial"] = {};
     const capture = async (actualRoot: string, logicalRoot: string) => {
-      const rootKind = await this.vault.pathStatus(actualRoot);
+      const rootKind = (await source.pathState(actualRoot)).kind;
       if (rootKind === "missing") return;
       initial[logicalRoot] = rootKind;
       if (rootKind !== "directory") return;
-      for await (const entry of this.vault.listTree(actualRoot))
-        initial[`${logicalRoot}/${entry.relativePath}`] =
-          entry.kind === "directory" ? "directory" : "file";
+      for (const [relativePath, kind] of await source.directoryEntries(
+        actualRoot,
+      ))
+        if (kind !== "missing")
+          initial[`${logicalRoot}/${relativePath}`] = kind;
     };
     if (action.kind === "move_directory") {
       await capture(action.beforePath ?? action.fromPath, action.fromPath);
