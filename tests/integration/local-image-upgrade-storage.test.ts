@@ -26,6 +26,7 @@ const ROOT = ".agentwiki/devices/d-device/spaces/s-space";
 const OPERATION_ID = "upgrade-operation";
 const OPERATION_ROOT = `${ROOT}/local-image-upgrade/${OPERATION_ID}`;
 const JOURNAL = `${ROOT}/local-image-upgrade/journal.json`;
+const LOCAL_JOURNAL = `${OPERATION_ROOT}/local/journal.json`;
 const HASHES = {
   source: "1".repeat(64),
   baseline: "2".repeat(64),
@@ -418,6 +419,132 @@ async function writeLocalJournal(
     isTreeTransactionJournal,
   ).write(journal);
 }
+
+async function forceSupersededIntent(
+  store: ControlStorePort,
+  intent = makeIntent({ phase: "superseded" }),
+): Promise<UpgradeIntent> {
+  await writePushJournal(store, intent, {
+    remoteState: "superseded",
+    result: null,
+    sessionId: null,
+    localCommitPhase: "not_started",
+  });
+  await forceIntent(store, intent);
+  return intent;
+}
+
+const LOCAL_TRANSACTION_STATES = [
+  "prepared",
+  "applying",
+  "applied",
+  "verified",
+  "committed",
+  "rolling_back",
+  "rolled_back",
+  "ambiguous",
+] as const satisfies readonly TreeTransactionJournal["state"][];
+
+describe("LocalImageUpgradeRepository superseded local-child exclusion", () => {
+  it.each(LOCAL_TRANSACTION_STATES)(
+    "fails closed on read when a superseded intent has a %s local child",
+    async (state) => {
+      const store = new MemoryControlStore();
+      const intent = makeIntent({ phase: "superseded" });
+      await writeLocalJournal(store, intent, { state });
+      await forceSupersededIntent(store, intent);
+
+      await expect(repository(store).read()).rejects.toThrow(
+        /local|transaction/i,
+      );
+      expect(await store.read(LOCAL_JOURNAL)).not.toBeNull();
+    },
+  );
+
+  it.each([
+    [
+      "corrupt",
+      async (store: ControlStorePort) => store.write(LOCAL_JOURNAL, "{broken"),
+    ],
+    [
+      "misowned",
+      async (store: ControlStorePort, intent: UpgradeIntent) =>
+        writeLocalJournal(store, intent, {
+          state: "rolled_back",
+          transactionId: "other-transaction",
+          baseRevision: "other-base",
+          targetRevision: "other-target",
+          targetTreeHash: "9".repeat(64),
+        }),
+    ],
+  ])(
+    "fails closed on read when a superseded intent has a %s local child",
+    async (_name, writeChild) => {
+      const store = new MemoryControlStore();
+      const intent = makeIntent({ phase: "superseded" });
+      await writeChild(store, intent);
+      await forceSupersededIntent(store, intent);
+
+      await expect(repository(store).read()).rejects.toThrow();
+      expect(await store.read(LOCAL_JOURNAL)).not.toBeNull();
+    },
+  );
+
+  it("blocks a superseded write when any local child is present", async () => {
+    const store = new MemoryControlStore();
+    const intent = makeIntent({ phase: "superseded" });
+    await repository(store).write(makeIntent());
+    await writePushJournal(store, intent, {
+      remoteState: "superseded",
+      result: null,
+      sessionId: null,
+      localCommitPhase: "not_started",
+    });
+    await writeLocalJournal(store, intent, { state: "rolled_back" });
+
+    await expect(repository(store).write(intent)).rejects.toThrow(
+      /local|transaction/i,
+    );
+    expect((await repository(store).read())?.phase).toBe("confirmed");
+  });
+
+  it("blocks replacement while a superseded operation has any local child", async () => {
+    const store = new MemoryControlStore();
+    const intent = await forceSupersededIntent(store);
+    await writeLocalJournal(store, intent, { state: "rolled_back" });
+    const nextBinding = { ...binding, operationId: "next-operation" };
+    const nextIntent = makeIntent({
+      binding: nextBinding,
+      pushOperationId: nextBinding.operationId,
+      payloadPaths: [
+        `${ROOT}/local-image-upgrade/${nextBinding.operationId}/payload/page.md`,
+      ],
+    });
+
+    await expect(
+      repository(store, nextBinding).write(nextIntent),
+    ).rejects.toThrow(/local|transaction/i);
+    expect(await store.read(LOCAL_JOURNAL)).not.toBeNull();
+    await store.remove(LOCAL_JOURNAL);
+    expect((await repository(store).read())?.binding.operationId).toBe(
+      OPERATION_ID,
+    );
+  });
+
+  it("blocks cleanup and preserves all evidence when any local child is present", async () => {
+    const store = new MemoryControlStore();
+    const intent = await forceSupersededIntent(store);
+    await writeLocalJournal(store, intent, { state: "rolled_back" });
+    await store.write(intent.payloadPaths[0]!, "private payload");
+
+    await expect(repository(store).cleanupCompleted()).rejects.toThrow(
+      /local|transaction/i,
+    );
+    expect(await store.read(intent.payloadPaths[0]!)).toBe("private payload");
+    expect(await store.read(JOURNAL)).not.toBeNull();
+    expect(await store.read(LOCAL_JOURNAL)).not.toBeNull();
+  });
+});
 
 describe("LocalImageUpgradeRepository terminal cleanup", () => {
   it("removes only declared payloads after matching authoritative complete child journals", async () => {

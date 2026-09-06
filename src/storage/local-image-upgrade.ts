@@ -196,10 +196,6 @@ function isUpgradeIntent(value: unknown): value is UpgradeIntent {
   return UpgradeIntentSchema.safeParse(value).success;
 }
 
-function isTerminalLocalState(state: TreeTransactionJournal["state"]): boolean {
-  return state === "committed" || state === "rolled_back";
-}
-
 function hasValidTransactionPathState(
   state: TreeTransactionPathState,
 ): boolean {
@@ -372,6 +368,11 @@ export class LocalImageUpgradeRepository {
         throw new Error(
           "Local image upgrade supersession is not authoritative",
         );
+      const local = await this.readLocal();
+      if (local)
+        throw new Error(
+          "Superseded upgrade has an inconsistent local transaction",
+        );
       return;
     }
     this.assertPublication(intent, push);
@@ -445,24 +446,6 @@ export class LocalImageUpgradeRepository {
       )
         return;
       await this.assertPhaseEvidence(intent);
-      if (intent.phase === "superseded") {
-        const local = await this.readLocal();
-        if (local) {
-          if (!isTerminalLocalState(local.state))
-            throw new Error("Local image upgrade transaction is still pending");
-          if (local.state === "committed")
-            throw new Error(
-              "Superseded upgrade has a committed local transaction",
-            );
-          if (
-            local.transactionId !== intent.localTransactionId ||
-            local.baseRevision !== intent.sourceRevision
-          )
-            throw new Error(
-              "Local image upgrade transaction ownership mismatch",
-            );
-        }
-      }
       for (const path of intent.payloadPaths) await this.store.remove(path);
     });
   }
