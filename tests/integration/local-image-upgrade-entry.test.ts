@@ -1579,6 +1579,46 @@ describe("local image upgrade plugin entry", () => {
     },
   );
 
+  it.each([
+    {
+      evidence: "pending",
+      mutate: async (raw: string) => raw,
+    },
+    {
+      evidence: "corrupt",
+      mutate: async () => "{",
+    },
+  ])(
+    "fails disconnect closed for $evidence upgrade evidence when local device state is missing",
+    async ({ mutate }) => {
+      const harness = await pluginUpgradeHarness();
+      await seedConfirmedUpgradeInPlugin(harness);
+      const journalPath = [...harness.adapter.files.keys()].find((path) =>
+        path.endsWith("/local-image-upgrade/journal.json"),
+      );
+      if (!journalPath) throw new Error("expected upgrade journal");
+      const original = harness.adapter.files.get(journalPath);
+      if (!original) throw new Error("expected upgrade journal body");
+      const persisted = await mutate(original);
+      harness.adapter.files.set(journalPath, persisted);
+      for (const key of [...harness.local.keys()])
+        if (key.includes("agentwiki-sync-device-v1")) harness.local.delete(key);
+      const localBefore = structuredClone([...harness.local.entries()]);
+
+      await expect(harness.plugin.disconnect()).rejects.toThrow();
+
+      expect(harness.plugin.settings.mappings).toHaveLength(1);
+      expect(harness.plugin.settings.serverInstanceId).toBe(
+        harness.connection.serverInstanceId,
+      );
+      expect(harness.secretValue(harness.connection.credentialSecretId)).toBe(
+        "test-secret",
+      );
+      expect(harness.adapter.files.get(journalPath)).toBe(persisted);
+      expect([...harness.local.entries()]).toEqual(localBefore);
+    },
+  );
+
   it("publishes and commits the upgrade through exactly one real modal confirmation", async () => {
     const harness = await pluginUpgradeHarness();
     const subject = harness.plugin as unknown as {

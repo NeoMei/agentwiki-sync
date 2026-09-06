@@ -499,8 +499,10 @@ export default class AgentWikiSyncPlugin extends Plugin {
       ).read()
     )?.payload;
     const deviceId = (await new DeviceStateRepository(local).read())?.deviceId;
-    if (!state || !deviceId) return;
-    for (const candidateDeviceId of new Set([state.deviceId, deviceId])) {
+    if (!state) return;
+    const candidateDeviceIds = new Set([state.deviceId]);
+    if (deviceId) candidateDeviceIds.add(deviceId);
+    for (const candidateDeviceId of candidateDeviceIds) {
       const pending = await inspectLocalImageUpgrade(
         new ObsidianControlStore(this.app.vault.adapter),
         await localImageUpgradeControlRoot(candidateDeviceId, mapping.spaceId),

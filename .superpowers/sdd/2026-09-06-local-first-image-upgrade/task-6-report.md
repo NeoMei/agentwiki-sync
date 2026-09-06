@@ -373,3 +373,34 @@ Base: `b9d7b85d121007efd192289a3a1378791c3ab40c`.
   subtree, preserving conflict controls and page state.
 - Deferred M1 (the large application entry) was not refactored. No packages,
   server, device, external Vault, or AgentWiki main-project state were changed.
+
+## Fix round 2/5 — missing local device-state disconnect evidence
+
+Base: `0fedc81cad36a3e420a20cc2386d98de42e2c8de`.
+
+- Behavioral RED:
+  `npm test -- --run tests/integration/local-image-upgrade-entry.test.ts -t "when local device state is missing"`
+  exited 1 with 2/2 selected cases failing: both a valid pending journal and a
+  corrupt journal under the connection-state `deviceId` incorrectly let
+  `disconnect()` resolve after the local device-state envelope was removed.
+- GREEN: `assertNoPendingLocalImageUpgrade` now returns only when connection
+  state itself is absent. Its candidate set always contains the authoritative
+  connection-state device root and adds the local device-state root only when
+  present (the set removes duplicates). The same focused command exited 0 with
+  2/2 selected cases passing. Both regressions verify credentials, mappings,
+  server binding, journal bytes, and all remaining local control state are
+  unchanged.
+- Covering command:
+  `npm test -- --run tests/integration/local-image-upgrade-entry.test.ts tests/integration/plugin-settings-lifecycle.test.ts`
+  exited 0: 2 files, 56 tests passed. This includes the ordinary no-pending
+  offline disconnect lifecycle behavior.
+- Static gates: the initial chained covering/static invocation stopped after the
+  56 passing tests because Prettier identified the new test as unformatted.
+  After formatting only that test, `npm run check:format`,
+  `npm run lint -- --quiet`, `npm run typecheck`, and `git diff --check` each
+  exited 0. The earlier full lint output still had 0 errors and the same 17
+  repository warnings.
+- Actual round-2 source/test changes are limited to `src/main.ts` and
+  `tests/integration/local-image-upgrade-entry.test.ts`; this append updates the
+  already tracked task report. No protocol, dependency, external Vault, device,
+  server, or AgentWiki main-project state changed.
