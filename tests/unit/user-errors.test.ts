@@ -87,4 +87,14 @@ describe("userErrorMessage", () => {
     expect(message).not.toContain("/Users/");
     expect(message).not.toContain("https://");
   });
+
+  it("explains that a published upgrade must resume local application without re-uploading", () => {
+    const message = userErrorMessage(
+      new Error("UPGRADE_REMOTE_PUBLISHED_LOCAL_PENDING"),
+    );
+
+    expect(message).toMatch(/服务器升级已完成.*本地应用尚未完成/u);
+    expect(message).toContain("恢复已确认升级");
+    expect(message).toMatch(/不要重新发起上传/u);
+  });
 });

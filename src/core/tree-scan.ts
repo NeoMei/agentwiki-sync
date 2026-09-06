@@ -33,6 +33,7 @@ export interface TreeScanLimits {
   maxFolders: number;
   maxPages: number;
   maxPageBytes: number;
+  maxTotalBodyBytes?: number;
 }
 
 export interface TreeScanLimitsV3 extends TreeScanLimits {
@@ -409,9 +410,12 @@ export async function scanLocalTree(
     const decoded = decodeVaultMarkdown(bytes);
     const body = decoded.normalized;
     const hash = await contentHash(body);
-    totalBodyBytes += new TextEncoder().encode(body).byteLength;
-    if (totalBodyBytes > limits.maxPageBytes)
+    const bodyBytes = new TextEncoder().encode(body).byteLength;
+    if (bodyBytes > limits.maxPageBytes)
       throw new RangeError("SPACE_TOO_LARGE: page bytes");
+    totalBodyBytes += bodyBytes;
+    if (totalBodyBytes > (limits.maxTotalBodyBytes ?? limits.maxPageBytes))
+      throw new RangeError("SPACE_TOO_LARGE: total body bytes");
 
     let pageId = pageIdByPathKey.get(key);
     if (pageId === undefined) {

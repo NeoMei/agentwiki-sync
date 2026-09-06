@@ -67,6 +67,16 @@ import {
   resolveFolderConflictV3,
   resolvePageConflictV3,
 } from "./application/tree-diff";
+import {
+  LocalImageUpgradeEntry,
+  type LocalImageUpgradeDraft,
+  type LocalImageUpgradeTextSyncPreview,
+} from "./application/local-image-upgrade-entry";
+import {
+  selectSpaceSyncRoute,
+  type SpaceSyncRoute,
+} from "./application/space-sync-route";
+import type { TreeSpaceSummaryV3 } from "./ports/tree-remote";
 
 const actionLabel = (kind: string): string => {
   const labels: Record<string, string> = {
@@ -129,6 +139,14 @@ export default class AgentWikiSyncPlugin extends Plugin {
   settings: AgentWikiSyncSettings = DEFAULT_SETTINGS;
   private readonly locks = new OperationLock();
   private readonly liveRuntimes = new Map<string, SyncRuntime>();
+  private readonly runtimeRoutes = new WeakMap<
+    SyncRuntime,
+    {
+      route: SpaceSyncRoute;
+      upgrade: LocalImageUpgradeEntry | null;
+      space: TreeSpaceSummaryV3 | null;
+    }
+  >();
   private statusBarEl: HTMLElement | null = null;
   private settingsRepo(): MutableControlRepository<AgentWikiSyncSettings> {
     return new MutableControlRepository(
@@ -187,7 +205,10 @@ export default class AgentWikiSyncPlugin extends Plugin {
       callback: () => this.openSyncCenter(),
     });
     const invalidate = () => {
-      for (const runtime of this.liveRuntimes.values()) runtime.invalidate();
+      for (const runtime of this.liveRuntimes.values()) {
+        runtime.invalidate();
+        this.runtimeRoutes.get(runtime)?.upgrade?.invalidate();
+      }
     };
     this.registerEvent(this.app.vault.on("create", invalidate));
     this.registerEvent(this.app.vault.on("modify", invalidate));
@@ -315,6 +336,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
           role: space.role,
           canRead: space.canRead,
           canPublish: space.canPublish,
+          syncMode: space.syncMode,
           currentRevision: space.currentRevision,
           pageCount: space.pageCount,
           revisionManifestByteLength: space.revisionManifestByteLength,
@@ -371,6 +393,8 @@ export default class AgentWikiSyncPlugin extends Plugin {
       try {
         const runtime = await this.runtime(mapping);
         if (!runtime) throw new Error("请先连接 AgentWiki 再移除活跃映射");
+        if (this.runtimeRoutes.get(runtime)?.route === "recover_upgrade")
+          throw new Error(`Space ${spaceId} 有未完成的图片同步升级`);
         await runtime.recover();
         const status =
           runtime.protocolVersion === "3"
@@ -419,8 +443,12 @@ export default class AgentWikiSyncPlugin extends Plugin {
         // Offline or identity mismatch: local disconnect is the escape hatch.
         continue;
       }
-      if (runtime && (await runtime.hasUnfinishedPush()))
-        throw new Error(`Space ${mapping.spaceId} 有未完成的推送`);
+      if (runtime) {
+        if (this.runtimeRoutes.get(runtime)?.route === "recover_upgrade")
+          throw new Error(`Space ${mapping.spaceId} 有未完成的图片同步升级`);
+        if (await runtime.hasUnfinishedPush())
+          throw new Error(`Space ${mapping.spaceId} 有未完成的推送`);
+      }
     }
     const local = new ObsidianLocalControlStore(this.app);
     const state = await new MutableControlRepository(
@@ -477,17 +505,6 @@ export default class AgentWikiSyncPlugin extends Plugin {
       state.vaultId !== boundVaultId
     )
       throw new Error("连接身份不匹配");
-    const session = SessionResponseSchema.parse(
-      (await client.raw("GET", "/api/integrations/obsidian/session")).json,
-    );
-    if (
-      session.serverInstanceId !== state.serverInstanceId ||
-      session.credentialId !== state.credentialId ||
-      session.deviceId !== state.deviceId ||
-      session.vaultId !== state.vaultId ||
-      session.credentialStatus !== "active"
-    )
-      throw new Error("认证会话身份不匹配");
     const deviceKey = await idFileKey(deviceId);
     const spaceKey = await idFileKey(mapping.spaceId);
     const controlRoot =
@@ -501,16 +518,133 @@ export default class AgentWikiSyncPlugin extends Plugin {
       mapping.spaceId,
       mapping.rootPath,
     ).requiredProtocolVersion();
-    const selection = await this.negotiate(
+    const protocols = new ProtocolNegotiator(
       client,
-      state.serverInstanceId,
-      requiredVersion,
+      new ProtocolSelectionRepository(local),
     );
+    const vault = new ObsidianVaultPort(
+      this.app.vault,
+      this.app.fileManager,
+      mapping.rootPath,
+    );
+    const upgrade = await LocalImageUpgradeEntry.create({
+      client,
+      protocols,
+      vault,
+      control: shared,
+      controlRoot,
+      mapping,
+      authority: {
+        serverOrigin: this.settings.serverUrl,
+        serverInstanceId: state.serverInstanceId,
+        pluginVersion: this.manifest.version,
+        deviceId: state.deviceId,
+        credentialId: state.credentialId,
+        vaultId: state.vaultId,
+      },
+    });
+    if (
+      upgrade.pendingIntent?.phase === "complete" ||
+      upgrade.pendingIntent?.phase === "superseded"
+    )
+      await upgrade.recover();
+    else if (upgrade.pendingIntent) {
+      const carrier = new SyncRuntime(
+        vault,
+        shared,
+        new V1TreeRemote(client, mapping.spaceId, DEFAULT_V1_CAPABILITIES),
+        mapping,
+        deviceKey,
+        spaceKey,
+        state.credentialId,
+        new AgentWikiPushRemote(client, mapping.spaceId),
+      );
+      this.runtimeRoutes.set(carrier, {
+        route: "recover_upgrade",
+        upgrade,
+        space: null,
+      });
+      return carrier;
+    }
+    const session = SessionResponseSchema.parse(
+      (await client.raw("GET", "/api/integrations/obsidian/session")).json,
+    );
+    if (
+      session.serverInstanceId !== state.serverInstanceId ||
+      session.credentialId !== state.credentialId ||
+      session.deviceId !== state.deviceId ||
+      session.vaultId !== state.vaultId ||
+      session.credentialStatus !== "active"
+    )
+      throw new Error("认证会话身份不匹配");
+    const selection = await protocols.selectFresh(requiredVersion);
+    let space: TreeSpaceSummaryV3 | null = null;
+    let v2CapabilitiesHash = "";
+    let runtime: SyncRuntime;
+    if (selection.version === "3") {
+      space =
+        (
+          await new V3TreeRemote(client, mapping.spaceId, selection).spaces()
+        ).find((item) => item.spaceId === mapping.spaceId) ?? null;
+      if (!space) throw new Error("SPACE_FORBIDDEN");
+      if (space.syncMode === "legacy_v2") {
+        const v2 = await protocols.selectV2Fresh();
+        v2CapabilitiesHash = v2.capabilitiesHash;
+        runtime = new SyncRuntime(
+          vault,
+          shared,
+          new V2TreeRemote(client, mapping.spaceId, v2),
+          mapping,
+          deviceKey,
+          spaceKey,
+          state.credentialId,
+          new AgentWikiPushRemote(client, mapping.spaceId),
+        );
+      } else {
+        runtime = SyncRuntime.v3(
+          vault,
+          shared,
+          new V3TreeRemote(client, mapping.spaceId, selection),
+          mapping,
+          deviceKey,
+          spaceKey,
+          state.credentialId,
+        );
+      }
+    } else {
+      runtime = new SyncRuntime(
+        vault,
+        shared,
+        selection.version === "2"
+          ? new V2TreeRemote(client, mapping.spaceId, selection)
+          : new V1TreeRemote(client, mapping.spaceId, session.capabilities),
+        mapping,
+        deviceKey,
+        spaceKey,
+        state.credentialId,
+        new AgentWikiPushRemote(client, mapping.spaceId),
+      );
+      if (selection.version === "2")
+        v2CapabilitiesHash = selection.capabilitiesHash;
+    }
+    const localImageCandidate =
+      selection.version !== "3" || space?.syncMode === "legacy_v2"
+        ? await runtime.hasLocalImageCandidate()
+        : false;
+    const route = selectSpaceSyncRoute({
+      serverVersion: selection.version,
+      syncMode: space?.syncMode ?? null,
+      requiredVersion,
+      pendingUpgrade: false,
+      localImageCandidate,
+      remoteImageCandidate:
+        space?.syncMode === "legacy_v2" && Number(space.attachmentCount) > 0,
+    });
     const protocolSuffix =
       selection.version === "3"
-        ? "3\0" + selection.capabilitiesHash
+        ? `3\0${selection.capabilitiesHash}\0${v2CapabilitiesHash}`
         : selection.version === "2"
-          ? "2\0" + selection.capabilitiesHash
+          ? `2\0${selection.capabilitiesHash}`
           : "1";
     const runtimeKey =
       (this.settings.serverInstanceId ?? "pending") +
@@ -519,38 +653,30 @@ export default class AgentWikiSyncPlugin extends Plugin {
       "\0" +
       mapping.rootPath +
       "\0" +
+      state.credentialId +
+      "\0" +
+      state.deviceId +
+      "\0" +
+      state.vaultId +
+      "\0" +
+      route +
+      "\0" +
       protocolSuffix;
     const existing = this.liveRuntimes.get(runtimeKey);
-    if (existing) return existing;
-    const vault = new ObsidianVaultPort(
-      this.app.vault,
-      this.app.fileManager,
-      mapping.rootPath,
-    );
-    const runtime =
-      selection.version === "3"
-        ? SyncRuntime.v3(
-            vault,
-            shared,
-            new V3TreeRemote(client, mapping.spaceId, selection),
-            mapping,
-            deviceKey,
-            spaceKey,
-            state.credentialId,
-          )
-        : new SyncRuntime(
-            vault,
-            shared,
-            selection.version === "2"
-              ? new V2TreeRemote(client, mapping.spaceId, selection)
-              : new V1TreeRemote(client, mapping.spaceId, session.capabilities),
-            mapping,
-            deviceKey,
-            spaceKey,
-            state.credentialId,
-            new AgentWikiPushRemote(client, mapping.spaceId),
-          );
+    if (existing) {
+      this.runtimeRoutes.set(existing, {
+        route,
+        upgrade: route === "upgrade" ? upgrade : null,
+        space,
+      });
+      return existing;
+    }
     this.liveRuntimes.set(runtimeKey, runtime);
+    this.runtimeRoutes.set(runtime, {
+      route,
+      upgrade: route === "upgrade" ? upgrade : null,
+      space,
+    });
     return runtime;
   }
   // Status bar indicator
@@ -600,6 +726,119 @@ export default class AgentWikiSyncPlugin extends Plugin {
     if (!mapping) throw new Error("请先连接并在设置中添加空间映射。");
     const runtime = await this.runtime(mapping);
     if (!runtime) throw new Error("请先连接并在设置中添加空间映射。");
+    const routed = this.runtimeRoutes.get(runtime);
+    if (routed?.route === "recover_upgrade" && routed.upgrade) {
+      return {
+        canPublish: true,
+        displayName: mapping.spaceId,
+        rootPath: mapping.rootPath,
+        roleLabel: "待恢复",
+        remoteAhead: true,
+        protocolLabel: "Sync v2 → Sync v3",
+        attachmentChanges: null,
+        localFoldersAdded: [],
+        localFoldersMoved: [],
+        localFoldersDeleted: [],
+        remoteFoldersUpdated: [],
+        remoteFoldersArchived: [],
+        folderCount: 0,
+        pageCount: 0,
+        localAdded: [],
+        localModified: [],
+        localRenamed: [],
+        localDeleted: [],
+        remoteUpdated: [],
+        remoteArchived: [],
+        remoteListed: false,
+        remoteFirstBind: false,
+        recoveryPending: true,
+      };
+    }
+    if (routed?.route === "upgrade" && routed.upgrade) {
+      const prepared = await routed.upgrade.prepare(options);
+      const attachments =
+        prepared.kind === "upgrade_draft"
+          ? prepared.merge.resolvedAttachments
+          : prepared.fixed.rawLocal.attachments;
+      const pages = prepared.fixed.rawLocal.pages.map((page) => page.path);
+      const space = routed.space;
+      if (!space) throw new Error("SPACE_MODE_INVALID");
+      return {
+        canPublish: space.canPublish,
+        displayName: space.displayName,
+        rootPath: mapping.rootPath,
+        roleLabel: roleLabel[space.role],
+        remoteAhead: prepared.fixed.remote.sourceRevision !== "0",
+        protocolLabel: "Sync v2 → Sync v3",
+        attachmentChanges: {
+          uploads: attachments.length,
+          downloads: 0,
+          replacements: 0,
+          renames: 0,
+          detached: 0,
+          uploadBytes: attachments.reduce(
+            (total, attachment) => total + Number(attachment.sizeBytes),
+            0,
+          ),
+          downloadBytes: 0,
+          transferLimitBytes:
+            prepared.fixed.v3Capabilities.maxTransferBlobBytes,
+          items: attachments.map((attachment) => ({
+            attachmentId: attachment.attachmentId,
+            path: attachment.path,
+            operation: "upsert_attachment",
+            sizeBytes: Number(attachment.sizeBytes),
+            affectedPageCount: prepared.fixed.rawLocal.pages.filter((page) =>
+              page.referencedAttachmentIds.includes(attachment.attachmentId),
+            ).length,
+          })),
+        },
+        localFoldersAdded: prepared.fixed.rawLocal.folders.map(
+          (folder) => folder.path,
+        ),
+        localFoldersMoved: [],
+        localFoldersDeleted: [],
+        remoteFoldersUpdated: [],
+        remoteFoldersArchived: [],
+        folderCount: prepared.fixed.rawLocal.folders.length,
+        pageCount: pages.length,
+        localAdded: pages,
+        localModified: [],
+        localRenamed: [],
+        localDeleted: [],
+        remoteUpdated: [],
+        remoteArchived: [],
+        remoteListed: true,
+        remoteFirstBind: prepared.fixed.remote.sourceRevision === "0",
+      };
+    }
+    if (routed?.route === "bootstrap" && routed.space) {
+      const space = routed.space;
+      return {
+        canPublish: space.canPublish,
+        displayName: space.displayName,
+        rootPath: mapping.rootPath,
+        roleLabel: roleLabel[space.role],
+        remoteAhead: space.currentRevision !== "0",
+        protocolLabel: "Sync v3",
+        attachmentChanges: null,
+        localFoldersAdded: [],
+        localFoldersMoved: [],
+        localFoldersDeleted: [],
+        remoteFoldersUpdated: [],
+        remoteFoldersArchived: [],
+        folderCount: 0,
+        pageCount: 0,
+        localAdded: [],
+        localModified: [],
+        localRenamed: [],
+        localDeleted: [],
+        remoteUpdated: [],
+        remoteArchived: [],
+        remoteListed: false,
+        remoteFirstBind: true,
+      };
+    }
     await runtime.recover();
     const [status, delta, spaces] = await Promise.all([
       runtime.protocolVersion === "3"
@@ -801,6 +1040,21 @@ export default class AgentWikiSyncPlugin extends Plugin {
     try {
       const runtime = await this.runtime(mapping);
       if (!runtime) throw new Error("请先连接并在设置中添加空间映射。");
+      const routed = this.runtimeRoutes.get(runtime);
+      if (routed?.route === "recover_upgrade" && routed.upgrade) {
+        await routed.upgrade.recover(options);
+        new Notice("已恢复先前确认的图片同步升级。");
+        flow.finish();
+        return;
+      }
+      if (routed?.route === "upgrade" && routed.upgrade)
+        return await this.openLocalImageUpgrade(
+          runtime,
+          routed.upgrade,
+          routed.space?.canPublish ?? false,
+          flow,
+          options,
+        );
       await runtime.recover();
       if (strategy === "server") {
         return await this.syncUseServer(runtime, flow, options);
@@ -813,6 +1067,164 @@ export default class AgentWikiSyncPlugin extends Plugin {
       flow.finish();
       throw error;
     }
+  }
+
+  private upgradeLines(draft: LocalImageUpgradeDraft): string[] {
+    const attachments = draft.merge.resolvedAttachments;
+    const transferBytes = attachments.reduce(
+      (total, attachment) => total + Number(attachment.sizeBytes),
+      0,
+    );
+    return [
+      "Sync v2 → Sync v3：确认后该 Space 不可自动降级，其他客户端需支持 Sync v3。",
+      `图片：${attachments.length} 张 · 传输字节上界 ${transferBytes} B / ${draft.fixed.v3Capabilities.maxTransferBlobBytes} B`,
+      ...attachments.map(
+        (attachment) => `图片：${attachment.path} · ${attachment.sizeBytes} B`,
+      ),
+      ...draft.merge.actions.map(
+        (action) =>
+          `本地应用 ${actionLabel(action.kind)}: ${
+            "attachment" in action
+              ? action.attachment.path
+              : "path" in action
+                ? action.path
+                : action.attachmentId
+          }`,
+      ),
+      ...draft.merge.folderConflicts.map(
+        (conflict) => `目录冲突待处理: ${conflict.folderId}`,
+      ),
+      ...draft.merge.pageConflicts.map(
+        (conflict) => `页面冲突待处理: ${conflict.pageId} · ${conflict.field}`,
+      ),
+      ...draft.merge.attachmentConflicts.map(
+        (conflict) => `图片冲突待处理: ${conflict.attachmentId}`,
+      ),
+    ];
+  }
+
+  private openUpgradeDraft(
+    runtime: SyncRuntime,
+    entry: LocalImageUpgradeEntry,
+    draft: LocalImageUpgradeDraft,
+    canPublish: boolean,
+    flow: SyncFlowLock,
+  ): ModalTransition {
+    const releasePhase = flow.phaseRelease();
+    return () =>
+      new PreviewModal(
+        this.app,
+        "图片同步协议升级预览",
+        this.upgradeLines(draft),
+        async (applyOptions) => {
+          const recomputed = await entry.recompute(draft);
+          if (recomputed.kind === "text_preview_required") {
+            const text = await entry.prepareTextSyncPreview(
+              recomputed,
+              applyOptions,
+            );
+            flow.advance();
+            return this.openUpgradeTextPull(
+              runtime,
+              entry,
+              text,
+              flow,
+              applyOptions,
+            );
+          }
+          const preview = await entry.finalizePreview(recomputed, applyOptions);
+          await entry.confirm(preview, preview.authorizationHash, applyOptions);
+          await this.saveSettings();
+          new Notice("图片同步升级完成。");
+        },
+        releasePhase,
+        [],
+        draft.merge,
+        {
+          confirmLabel: "确认升级并同步",
+          canConfirm: () => canPublish && entry.isCurrent(draft),
+          disabledReason: canPublish
+            ? "预览已失效，请重新打开同步中心生成新预览。"
+            : "当前空间为只读，无法确认升级。",
+          subscribeInvalidation: (listener) => entry.onInvalidate(listener),
+        },
+      ).open();
+  }
+
+  private async openLocalImageUpgrade(
+    runtime: SyncRuntime,
+    entry: LocalImageUpgradeEntry,
+    canPublish: boolean,
+    flow: SyncFlowLock,
+    options: SyncOperationOptions,
+  ): Promise<ModalTransition> {
+    const prepared = await entry.prepare(options);
+    if (prepared.kind === "upgrade_draft")
+      return this.openUpgradeDraft(runtime, entry, prepared, canPublish, flow);
+    const choices = prepared.requirements.map((requirement) => ({
+      kind: requirement.kind,
+      localId: requirement.localId,
+      remoteId: requirement.remoteId,
+    }));
+    const releasePhase = flow.phaseRelease();
+    return () =>
+      new PreviewModal(
+        this.app,
+        "确认初始页面与目录身份",
+        [
+          "这些同路径对象使用不同身份。应用以下显式绑定后才会生成升级预览；此步骤不会写入 Vault 或服务器。",
+          ...prepared.requirements.map(
+            (item) =>
+              `${item.kind === "folder" ? "目录" : "页面"}: ${item.path} · 本地 ${item.localId} → 远端 ${item.remoteId}`,
+          ),
+        ],
+        async () => {
+          const draft = await entry.resolveInitialBindings(prepared, choices);
+          flow.advance();
+          return this.openUpgradeDraft(runtime, entry, draft, canPublish, flow);
+        },
+        releasePhase,
+        [],
+        null,
+        { confirmLabel: "应用身份绑定并继续" },
+      ).open();
+  }
+
+  private openUpgradeTextPull(
+    runtime: SyncRuntime,
+    entry: LocalImageUpgradeEntry,
+    preview: LocalImageUpgradeTextSyncPreview,
+    flow: SyncFlowLock,
+    options: SyncOperationOptions,
+  ): ModalTransition {
+    const releasePhase = flow.phaseRelease();
+    return () =>
+      new PreviewModal(
+        this.app,
+        "Sync v2 文字合并",
+        preview.pull.actions.map(
+          (action) => `${actionLabel(action.kind)}: ${action.path}`,
+        ),
+        async (applyOptions) => {
+          await runtime.applyPull(structuredClone(preview.pull), applyOptions, {
+            expectedPathStates: preview.expectedPathStates,
+            revalidate: () =>
+              entry.revalidateTextSyncPreview(preview, applyOptions),
+          });
+          await this.saveSettings();
+          flow.advance();
+          return await this.openPushPreview(
+            runtime,
+            flow,
+            "Sync v2 推送预览",
+            applyOptions ?? options,
+          );
+        },
+        releasePhase,
+        [],
+        preview.pull,
+        { confirmLabel: "确认文字合并" },
+      ).open();
   }
 
   private async syncUseServer(

@@ -964,4 +964,39 @@ describe("scanLocalTree", () => {
       }),
     ).rejects.toThrow(/SPACE_TOO_LARGE/);
   });
+
+  it("enforces per-page and total body-byte limits independently", async () => {
+    const withinLimits = new MemoryVault({
+      "Wiki/pages/A.md": "123",
+      "Wiki/pages/B.md": "123",
+    });
+    await expect(
+      scanLocalTree(withinLimits, "Wiki", snapshot(), identityState(), {
+        ...limits,
+        maxPageBytes: 4,
+        maxTotalBodyBytes: 100,
+      }),
+    ).resolves.toMatchObject({ pages: [{ body: "123" }, { body: "123" }] });
+
+    const vault = new MemoryVault({
+      "Wiki/pages/A.md": "12345",
+      "Wiki/pages/B.md": "1234",
+    });
+
+    await expect(
+      scanLocalTree(vault, "Wiki", snapshot(), identityState(), {
+        ...limits,
+        maxPageBytes: 4,
+        maxTotalBodyBytes: 100,
+      }),
+    ).rejects.toThrow("SPACE_TOO_LARGE: page bytes");
+
+    await expect(
+      scanLocalTree(vault, "Wiki", snapshot(), identityState(), {
+        ...limits,
+        maxPageBytes: 100,
+        maxTotalBodyBytes: 8,
+      }),
+    ).rejects.toThrow("SPACE_TOO_LARGE: total body bytes");
+  });
 });

@@ -43,7 +43,7 @@ export interface SyncDiff {
   rootPath: string;
   roleLabel: string;
   remoteAhead: boolean;
-  protocolLabel: "Sync v3" | "Sync v2" | "Legacy v1";
+  protocolLabel: "Sync v3" | "Sync v2" | "Legacy v1" | "Sync v2 → Sync v3";
   attachmentChanges?: AttachmentSyncDiff | null;
   localFoldersAdded: string[];
   localFoldersMoved: string[];
@@ -60,6 +60,7 @@ export interface SyncDiff {
   remoteArchived: string[];
   remoteListed: boolean;
   remoteFirstBind: boolean;
+  recoveryPending?: boolean;
 }
 
 export interface SyncTarget {
@@ -355,6 +356,20 @@ export class SyncCenterModal extends Modal {
   }
 
   private renderActions(diff: SyncDiff): void {
+    if (diff.recoveryPending) {
+      this.contentEl.createEl("p", {
+        text: "已有确认过的图片同步升级尚未完成。恢复会继续使用已持久化的确认内容，不会重新请求确认。",
+        cls: "agentwiki-sync-strategy-description",
+      });
+      new Setting(this.contentEl).addButton((button) =>
+        button
+          .setButtonText(this.running ? "恢复中…" : "恢复已确认升级")
+          .setCta()
+          .setDisabled(this.running)
+          .onClick(() => void this.run("server")),
+      );
+      return;
+    }
     this.contentEl.createEl("p", {
       text: "自动合并保留双方不冲突的修改，冲突时可在预览中逐项选择；使用本地/服务器内容会在冲突处直接采用所选一侧。",
       cls: "agentwiki-sync-strategy-description",

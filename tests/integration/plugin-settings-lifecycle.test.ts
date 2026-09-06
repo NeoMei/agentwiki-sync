@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
 import { readFile } from "node:fs/promises";
-import AgentWikiSyncPlugin from "../../src/main";
 import {
   DEFAULT_SETTINGS,
   type AgentWikiSyncSettings,
@@ -18,6 +17,7 @@ import type { PullPreviewV3 } from "../../src/application/sync-runtime";
 import type { ModalTransition } from "../../src/obsidian/modal-handoff";
 import { requestUrlState } from "../fakes/obsidian-mock";
 import type { MockElement } from "../fakes/obsidian-mock";
+import { makePlugin, modalButton } from "../fakes/plugin-harness";
 import { V3_CAPABILITIES } from "../fakes/fake-tree-remote";
 import { FakeHttp } from "../fakes/fake-http";
 import { treeCapabilitiesHashV3 } from "@neomei/agentwiki-sync-protocol";
@@ -28,102 +28,6 @@ const legacyWithMapping: AgentWikiSyncSettings = {
   serverInstanceId: "legacy-instance-must-not-enter-data-json",
   mappings: [{ spaceId: "s1", rootPath: "AgentWiki", status: "active" }],
 };
-
-function memoryAdapter() {
-  const files = new Map<string, string>();
-  const folders = new Set<string>();
-  return {
-    files,
-    exists: async (path: string) => files.has(path) || folders.has(path),
-    read: async (path: string) => {
-      const value = files.get(path);
-      if (value === undefined) throw new Error(`missing ${path}`);
-      return value;
-    },
-    write: async (path: string, value: string) => {
-      files.set(path, value);
-    },
-    remove: async (path: string) => {
-      files.delete(path);
-      folders.delete(path);
-    },
-    rename: async (from: string, to: string) => {
-      const value = files.get(from);
-      if (value === undefined) throw new Error(`missing ${from}`);
-      files.set(to, value);
-      files.delete(from);
-    },
-    mkdir: async (path: string) => {
-      folders.add(path);
-    },
-    list: async () => ({ files: [], folders: [] }),
-  };
-}
-
-async function makePlugin(input: {
-  data: unknown;
-  legacy?: AgentWikiSyncSettings | null;
-  connection?: ConnectionState | null;
-}) {
-  const local = new Map<string, unknown>();
-  const adapter = memoryAdapter();
-  const app = {
-    __pluginData: structuredClone(input.data),
-    __savedData: [] as unknown[],
-    loadLocalStorage: (key: string) => local.get(key) ?? null,
-    saveLocalStorage: (key: string, value: unknown) => {
-      if (value === null) local.delete(key);
-      else local.set(key, value);
-    },
-    secretStorage: {
-      getSecret: () => null,
-      setSecret: () => undefined,
-    },
-    vault: {
-      adapter,
-      getName: () => "Test Vault",
-      on: () => ({}),
-    },
-    workspace: {
-      getActiveFile: () => null,
-      on: () => ({}),
-    },
-    fileManager: {},
-  };
-  const localStore = new ObsidianLocalControlStore(app as never);
-  if (input.legacy) {
-    await new MutableControlRepository(
-      localStore,
-      "device-settings.json",
-      (value): value is AgentWikiSyncSettings =>
-        !!value &&
-        typeof value === "object" &&
-        (value as { schemaVersion?: unknown }).schemaVersion === 1,
-    ).write(input.legacy);
-  }
-  if (input.connection) {
-    await new MutableControlRepository(
-      localStore,
-      "connection-state.json",
-      isConnectionState,
-    ).write(input.connection);
-  }
-  const plugin = new AgentWikiSyncPlugin(app as never, {
-    id: "agentwiki-sync",
-    name: "AgentWiki Sync",
-    version: "0.2.12",
-    minAppVersion: "1.11.5",
-    description: "",
-    author: "NeoMei",
-  });
-  return { plugin, app, local, adapter };
-}
-
-function modalButton(modal: PreviewModal, label: string): MockElement {
-  return (modal.contentEl as unknown as MockElement).queryAll(
-    (item) => item.tag === "button" && item.text === label,
-  )[0]!;
-}
 
 describe("plugin settings lifecycle", () => {
   it("imports 0.2.7 local mappings once and survives reload with local storage gone", async () => {
@@ -385,6 +289,31 @@ describe("plugin settings lifecycle", () => {
           },
           headers: {},
         };
+      if (url.pathname === "/api/sync/v3/spaces")
+        return {
+          status: 200,
+          json: {
+            protocolVersion: "3",
+            spaces: [
+              {
+                spaceId: "s1",
+                displayName: "Space One",
+                role: "owner",
+                canRead: true,
+                canPublish: true,
+                syncMode: "native_v3",
+                currentRevision: "r1",
+                folderCount: "0",
+                pageCount: "0",
+                attachmentCount: "0",
+                revisionManifestByteLength: "0",
+                revisionBodyBytes: "0",
+                revisionAttachmentBytes: "0",
+              },
+            ],
+          },
+          headers: {},
+        };
       throw new Error(`unexpected ${url.pathname}`);
     };
     const subject = harness.plugin as unknown as {
@@ -399,6 +328,7 @@ describe("plugin settings lifecycle", () => {
     expect(paths).toEqual([
       "/api/integrations/obsidian/session",
       "/api/sync/v3/capabilities",
+      "/api/sync/v3/spaces",
     ]);
   });
 

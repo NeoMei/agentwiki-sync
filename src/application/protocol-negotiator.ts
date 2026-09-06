@@ -24,6 +24,15 @@ export type SyncProtocolSelection =
     }
   | { version: "1"; reason: "endpoint_missing" | "protocol_unsupported" };
 
+export type SyncProtocolSelectionV2 = Extract<
+  SyncProtocolSelection,
+  { version: "2" }
+>;
+export type SyncProtocolSelectionV3 = Extract<
+  SyncProtocolSelection,
+  { version: "3" }
+>;
+
 export interface ProtocolProbeIdentity {
   serverOrigin: string;
   serverInstanceId: string;
@@ -69,6 +78,76 @@ export class ProtocolNegotiator {
     private readonly repository: ProtocolSelectionRepository,
   ) {}
 
+  async selectV2Fresh(): Promise<SyncProtocolSelectionV2> {
+    const response = (
+      await this.client.boundedJson(
+        "GET",
+        "/api/sync/v2/capabilities",
+        TREE_SYNC_V2_LIMITS.capabilitiesDiscoveryBytes,
+      )
+    ).json;
+    const parsed = TreeCapabilitiesResponseV2Schema.parse(response);
+    if (
+      (await capabilitiesHash(parsed.capabilities)) !== parsed.capabilitiesHash
+    )
+      throw new Error("Sync v2 capability hash mismatch");
+    return {
+      version: "2",
+      capabilities: parsed.capabilities,
+      capabilitiesHash: parsed.capabilitiesHash,
+    };
+  }
+
+  async selectV3Fresh(): Promise<SyncProtocolSelectionV3> {
+    const response = (
+      await this.client.boundedJson(
+        "GET",
+        "/api/sync/v3/capabilities",
+        TREE_SYNC_V2_LIMITS.capabilitiesDiscoveryBytes,
+      )
+    ).json;
+    const parsed = TreeCapabilitiesResponseV3Schema.parse(response);
+    if (
+      (await treeCapabilitiesHashV3(parsed.capabilities)) !==
+      parsed.capabilitiesHash
+    )
+      throw new Error("Sync v3 capability hash mismatch");
+    return {
+      version: "3",
+      capabilities: parsed.capabilities,
+      capabilitiesHash: parsed.capabilitiesHash,
+    };
+  }
+
+  async selectFresh(
+    requiredVersion: "1" | "2" | "3" = "1",
+  ): Promise<SyncProtocolSelection> {
+    try {
+      const selected = await this.selectV3Fresh();
+      assertRequiredVersion(selected, requiredVersion);
+      return selected;
+    } catch (error) {
+      if (!isExplicitlyUnsupported(error)) throw error;
+    }
+    try {
+      const selected = await this.selectV2Fresh();
+      assertRequiredVersion(selected, requiredVersion);
+      return selected;
+    } catch (error) {
+      if (!isExplicitlyUnsupported(error)) throw error;
+      const code = syncErrorCode(error);
+      const selected = {
+        version: "1" as const,
+        reason:
+          code === "PROTOCOL_UNSUPPORTED"
+            ? ("protocol_unsupported" as const)
+            : ("endpoint_missing" as const),
+      };
+      assertRequiredVersion(selected, requiredVersion);
+      return selected;
+    }
+  }
+
   async select(
     identity: ProtocolProbeIdentity,
     requiredVersion: "1" | "2" | "3" = "1",
@@ -79,48 +158,14 @@ export class ProtocolNegotiator {
       return cached;
     }
     try {
-      const response = (
-        await this.client.boundedJson(
-          "GET",
-          "/api/sync/v3/capabilities",
-          TREE_SYNC_V2_LIMITS.capabilitiesDiscoveryBytes,
-        )
-      ).json;
-      const parsed = TreeCapabilitiesResponseV3Schema.parse(response);
-      if (
-        (await treeCapabilitiesHashV3(parsed.capabilities)) !==
-        parsed.capabilitiesHash
-      )
-        throw new Error("Sync v3 capability hash mismatch");
-      const selected = {
-        version: "3" as const,
-        capabilities: parsed.capabilities,
-        capabilitiesHash: parsed.capabilitiesHash,
-      };
+      const selected = await this.selectV3Fresh();
       await this.repository.write(identity, selected);
       return selected;
     } catch (error) {
       if (!isExplicitlyUnsupported(error)) throw error;
     }
     try {
-      const response = (
-        await this.client.boundedJson(
-          "GET",
-          "/api/sync/v2/capabilities",
-          TREE_SYNC_V2_LIMITS.capabilitiesDiscoveryBytes,
-        )
-      ).json;
-      const parsed = TreeCapabilitiesResponseV2Schema.parse(response);
-      if (
-        (await capabilitiesHash(parsed.capabilities)) !==
-        parsed.capabilitiesHash
-      )
-        throw new Error("Sync v2 capability hash mismatch");
-      const selected = {
-        version: "2" as const,
-        capabilities: parsed.capabilities,
-        capabilitiesHash: parsed.capabilitiesHash,
-      };
+      const selected = await this.selectV2Fresh();
       assertRequiredVersion(selected, requiredVersion);
       await this.repository.write(identity, selected);
       return selected;

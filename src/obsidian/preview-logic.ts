@@ -1,8 +1,9 @@
 import type {
   InitialBindingChoice,
   PullPreview,
-  PullPreviewV3,
 } from "../application/sync-runtime";
+import type { TreePullPreviewV3 } from "../application/tree-diff";
+import type { TreeContentV3 } from "../core/tree-validation";
 import {
   FlatAttachmentPathSchema,
   pathKey,
@@ -81,7 +82,7 @@ export function bindingsRequiringInput(
 
 export function pendingPreviewDecisionCount(
   bindings: readonly InitialBindingChoice[],
-  preview: PullPreview | PullPreviewV3 | null,
+  preview: PullPreview | TreePullPreviewV3<TreeContentV3> | null,
 ): number {
   const pageConflicts = preview
     ? "attachmentConflicts" in preview

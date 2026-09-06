@@ -181,6 +181,32 @@ async function folderConflictPreview(): Promise<PullPreviewV3> {
 afterEach(() => vi.restoreAllMocks());
 
 describe("rendered PreviewModal controls", () => {
+  it("renders the one-time upgrade action and keeps a viewer disabled", () => {
+    const confirm = vi.fn();
+    const modal = new PreviewModal(
+      app,
+      "升级预览",
+      ["Sync v2 → Sync v3"],
+      confirm,
+      undefined,
+      [],
+      null,
+      {
+        confirmLabel: "确认升级并同步",
+        canConfirm: () => false,
+        disabledReason: "当前空间为只读，无法确认升级。",
+      },
+    );
+
+    modal.open();
+
+    expect(modal.contentEl.textContent).toContain("当前空间为只读");
+    const upgrade = button(modal.contentEl, "确认升级并同步");
+    expect(upgrade.disabled).toBe(true);
+    click(upgrade);
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
   it("keeps confirm disabled until the latest rapid Page choice has finished", async () => {
     const preview = await pageConflictPreview();
     const conflictId = preview.pageConflicts[0]!.conflictId;
@@ -230,6 +256,45 @@ describe("rendered PreviewModal controls", () => {
     });
     click(confirm);
     await vi.waitFor(() => expect(confirmed).toEqual([preview]));
+  });
+
+  it("refreshes the current paginated confirm button after an async decision settles", async () => {
+    const preview = await pageConflictPreview();
+    const digest = deferred<ArrayBuffer>();
+    const started = deferred<void>();
+    const originalDigest = crypto.subtle.digest.bind(crypto.subtle);
+    const remoteBody = "remote choice";
+    const remoteHash = await originalDigest(
+      "SHA-256",
+      new TextEncoder().encode(remoteBody),
+    );
+    vi.spyOn(crypto.subtle, "digest").mockImplementation((algorithm, data) => {
+      if (new TextDecoder().decode(data) === remoteBody) {
+        started.resolve();
+        return digest.promise;
+      }
+      return originalDigest(algorithm, data);
+    });
+    const modal = new PreviewModal(
+      app,
+      "Pull",
+      Array.from({ length: 101 }, (_, index) => `line-${index}`),
+      async () => {},
+      undefined,
+      [],
+      preview,
+    );
+    modal.open();
+    const choice = control(setting(modal.contentEl, "body: p1"), "select");
+
+    change(choice, "remote");
+    await started.promise;
+    click(button(modal.contentEl, "下一页"));
+    const currentConfirm = button(modal.contentEl, "确认执行");
+    expect(currentConfirm.disabled).toBe(true);
+
+    digest.resolve(remoteHash);
+    await vi.waitFor(() => expect(currentConfirm.disabled).toBe(false));
   });
 
   it("invalidates an applied attachment choice on every visible draft edit", async () => {

@@ -50,6 +50,8 @@ const errorMessages: Record<string, string> = {
     "预览后内容或服务端能力已变化。请重新预览并明确确认。",
   V3_PUSH_BLOCKED: "推送预览包含未处理的图片阻塞项。请按预览定位修复后重试。",
   FOLDER_ID_CONFLICT: "目录标识冲突。请重新预览后重试。",
+  UPGRADE_REMOTE_PUBLISHED_LOCAL_PENDING:
+    "服务器升级已完成，但本地应用尚未完成。请保留当前 Vault 状态，点击“恢复已确认升级”重试；若仍有本地编辑冲突，请先处理冲突，不要重新发起上传。",
 };
 
 const localErrorMessages: Record<string, string> = {

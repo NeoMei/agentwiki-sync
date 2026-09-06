@@ -224,6 +224,11 @@ export interface PullPreviewV3 extends TreePullPreviewV3 {
   expectedVaultPathStates: Record<string, TreeTransactionPathState>;
 }
 
+export interface ApplyPullGuard {
+  expectedPathStates: Record<string, TreeTransactionPathState>;
+  revalidate: () => Promise<void>;
+}
+
 export interface PushPreview {
   spaceId: string;
   baseRevision: string;
@@ -580,7 +585,8 @@ export class SyncRuntime {
     const limits: TreeScanLimits = {
       maxFolders: capabilities.maxClientSpaceFolders ?? 10000,
       maxPages: capabilities.maxClientSpacePages,
-      maxPageBytes: capabilities.maxClientTotalBodyBytes,
+      maxPageBytes: capabilities.maxPageBytes,
+      maxTotalBodyBytes: capabilities.maxClientTotalBodyBytes,
     };
     const local = await scanLocalTree(
       this.vault,
@@ -710,6 +716,7 @@ export class SyncRuntime {
         ...capabilities,
         maxFolders: capabilities.maxClientSpaceFolders,
         maxPages: capabilities.maxClientSpacePages,
+        maxTotalBodyBytes: capabilities.maxClientTotalBodyBytes,
       },
       async (completed) =>
         progressCheckpoint(options, {
@@ -847,6 +854,16 @@ export class SyncRuntime {
   ): Promise<void> {
     if (preview.scanEpoch !== this.scanEpoch)
       throw new Error("STALE_PULL_PREVIEW");
+    for (const [path, expected] of Object.entries(expectedPathStates)) {
+      const actual = await this.readVaultPathState(path);
+      if (actual.kind !== expected.kind || actual.hash !== expected.hash)
+        throw new Error("STALE_PULL_PREVIEW");
+    }
+  }
+
+  private async assertVaultPathStates(
+    expectedPathStates: Record<string, TreeTransactionPathState>,
+  ): Promise<void> {
     for (const [path, expected] of Object.entries(expectedPathStates)) {
       const actual = await this.readVaultPathState(path);
       if (actual.kind !== expected.kind || actual.hash !== expected.hash)
@@ -2054,7 +2071,7 @@ export class SyncRuntime {
     const remote = await this.downloadRemoteSnapshot(head.revision, options);
     if (
       remote.pages.some((page) => this.hasLegacyManagedImageCandidate(page)) ||
-      (await this.localHasLegacyManagedImageCandidate())
+      (await this.hasLocalImageCandidate())
     )
       throw new Error("SYNC_PROTOCOL_UPGRADE_REQUIRED");
     const local = await this.scan(options, base ? undefined : remote.pages);
@@ -2088,7 +2105,7 @@ export class SyncRuntime {
     );
   }
 
-  private async localHasLegacyManagedImageCandidate(): Promise<boolean> {
+  async hasLocalImageCandidate(): Promise<boolean> {
     for await (const entry of this.vault.listMarkdown(this.mapping.rootPath)) {
       if (!entry.relativePath.startsWith("pages/")) continue;
       validatePortableMarkdownPath(entry.relativePath);
@@ -2108,12 +2125,29 @@ export class SyncRuntime {
   async applyPull(
     preview: PullPreview,
     options?: SyncOperationOptions,
+    guard?: ApplyPullGuard,
   ): Promise<void> {
+    const expectedPathStates = guard
+      ? Object.freeze(
+          Object.fromEntries(
+            Object.entries(guard.expectedPathStates).map(([path, state]) => [
+              path,
+              Object.freeze(structuredClone(state)),
+            ]),
+          ),
+        )
+      : undefined;
+    if (guard) {
+      await guard.revalidate();
+      await this.assertVaultPathStates(expectedPathStates!);
+    }
     await progressCheckpoint(options, {
       phase: "apply",
       completed: 0,
       cancellable: true,
     });
+    if (expectedPathStates)
+      await this.assertVaultPathStates(expectedPathStates);
     for (const conflict of [...preview.pageConflicts]) {
       const resolution = preview.pageConflictResolutions[conflict.conflictId];
       if (resolution)
@@ -2126,6 +2160,8 @@ export class SyncRuntime {
     }
     if (pendingTreeDecisionCount(preview) > 0)
       throw new Error("拉取存在未解决的结构化冲突");
+    if (expectedPathStates)
+      await this.assertVaultPathStates(expectedPathStates);
     const snapshot: TreeSnapshot = {
       protocolVersion: "2",
       spaceId: this.mapping.spaceId,
@@ -2158,6 +2194,7 @@ export class SyncRuntime {
           pages: preview.resolvedPages,
         }),
         actions,
+        ...(expectedPathStates ? { expectedPathStates } : {}),
       },
       baselineTx.transactionId,
     );

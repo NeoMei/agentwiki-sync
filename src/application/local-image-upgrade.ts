@@ -77,7 +77,7 @@ function confirmedPayloadPaths(preview: UpgradePreview): string[] {
   ].sort();
 }
 
-async function assertPreviewEvidence(
+export async function assertUpgradePreviewEvidence(
   preview: UpgradePreview,
   expected?: UpgradeIntent,
 ): Promise<void> {
@@ -188,7 +188,7 @@ export class LocalImageUpgradeCoordinator {
 
   private async confirmed(intent: UpgradeIntent): Promise<UpgradePreview> {
     const preview = await this.port.loadConfirmed(intent);
-    await assertPreviewEvidence(preview, intent);
+    await assertUpgradePreviewEvidence(preview, intent);
     return preview;
   }
 
@@ -241,7 +241,7 @@ export class LocalImageUpgradeCoordinator {
     const preview = structuredClone(input);
     if (authorizationHash !== preview.authorizationHash)
       throw new Error("UPGRADE_AUTHORIZATION_MISMATCH");
-    await assertPreviewEvidence(preview);
+    await assertUpgradePreviewEvidence(preview);
     await this.port.revalidate(preview);
     const intent = this.intent(preview);
     await this.port.persistConfirmed(

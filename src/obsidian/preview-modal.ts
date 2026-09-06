@@ -10,7 +10,6 @@ import { userErrorMessage } from "../core/user-errors";
 import type {
   InitialBindingChoice,
   PullPreview,
-  PullPreviewV3,
   PushPreviewV3,
 } from "../application/sync-runtime";
 import type {
@@ -18,6 +17,10 @@ import type {
   FolderConflict,
   StructuredConflict,
 } from "../core/merge";
+import type { TreePullPreviewV3 } from "../application/tree-diff";
+import type { TreeContentV3 } from "../core/tree-validation";
+
+type CalculationPreviewV3 = TreePullPreviewV3<TreeContentV3>;
 import type { TreeBootstrapPreviewV3 } from "../ports/tree-remote";
 import {
   resolveAttachmentConflict,
@@ -48,7 +51,18 @@ import {
 import { completeModalAction, type ModalTransition } from "./modal-handoff";
 
 type PreviewState =
-  PullPreview | PullPreviewV3 | TreeBootstrapPreviewV3 | PushPreviewV3 | null;
+  | PullPreview
+  | CalculationPreviewV3
+  | TreeBootstrapPreviewV3
+  | PushPreviewV3
+  | null;
+
+export interface PreviewModalActionOptions {
+  confirmLabel?: string;
+  canConfirm?: () => boolean;
+  disabledReason?: string;
+  subscribeInvalidation?: (listener: () => void) => () => void;
+}
 
 interface AttachmentResolutionDraft {
   mode: "" | "local" | "remote" | "keep_both";
@@ -60,11 +74,13 @@ interface AttachmentResolutionDraft {
 
 function isPullPreview(
   preview: PreviewState,
-): preview is PullPreview | PullPreviewV3 {
+): preview is PullPreview | CalculationPreviewV3 {
   return !!preview && "folderConflicts" in preview;
 }
 
-function isPullPreviewV3(preview: PreviewState): preview is PullPreviewV3 {
+function isPullPreviewV3(
+  preview: PreviewState,
+): preview is CalculationPreviewV3 {
   return isPullPreview(preview) && "attachmentConflicts" in preview;
 }
 
@@ -89,11 +105,13 @@ export class PreviewModal extends Modal {
   >();
   private readonly decisionGenerations = new Map<string, number>();
   private readonly unsettledDecisions = new Set<string>();
-  private readonly resolutionSourcePreview: PullPreviewV3 | null;
+  private readonly resolutionSourcePreview: CalculationPreviewV3 | null;
   private resolutionQueue: Promise<void> = Promise.resolve();
   private operation: AbortController | null = null;
   private running = false;
   private closeRequested = false;
+  private refreshCurrentActionState: (() => void) | null = null;
+  private unsubscribeInvalidation: (() => void) | null = null;
   constructor(
     app: App,
     private readonly title: string,
@@ -104,6 +122,7 @@ export class PreviewModal extends Modal {
     private readonly release: () => void = () => {},
     private readonly bindings: InitialBindingChoice[] = [],
     private readonly preview: PreviewState = null,
+    private readonly actionOptions: PreviewModalActionOptions = {},
   ) {
     super(app);
     this.resolutionSourcePreview = isPullPreviewV3(preview)
@@ -112,6 +131,8 @@ export class PreviewModal extends Modal {
     this.modalEl.addClass("agentwiki-sync-modal");
   }
   onClose(): void {
+    this.unsubscribeInvalidation?.();
+    this.unsubscribeInvalidation = null;
     this.operation?.abort();
     if (this.running) {
       this.closeRequested = true;
@@ -127,6 +148,8 @@ export class PreviewModal extends Modal {
   }
   onOpen(): void {
     this.render();
+    this.unsubscribeInvalidation =
+      this.actionOptions.subscribeInvalidation?.(() => this.render()) ?? null;
   }
   private pager(
     total: number,
@@ -170,7 +193,7 @@ export class PreviewModal extends Modal {
   private queueDecision(
     key: string,
     clearResolution: () => void,
-    resolve: (candidate: PullPreviewV3) => Promise<void>,
+    resolve: (candidate: CalculationPreviewV3) => Promise<void>,
     refreshActionState: () => void,
   ): void {
     const generation = this.clearDecision(
@@ -201,9 +224,9 @@ export class PreviewModal extends Modal {
     this.resolutionQueue = work.catch(() => undefined);
     void work
       .catch((error) => new Notice(userErrorMessage(error)))
-      .finally(refreshActionState);
+      .finally(() => this.refreshCurrentActionState?.());
   }
-  private installResolvedPreview(candidate: PullPreviewV3): void {
+  private installResolvedPreview(candidate: CalculationPreviewV3): void {
     if (!isPullPreviewV3(this.preview)) return;
     this.preview.actions = candidate.actions;
     this.preview.blockers = candidate.blockers;
@@ -266,6 +289,11 @@ export class PreviewModal extends Modal {
             : 0;
     const actionDescription = () => {
       const pending = pendingDecisionCount();
+      if (this.actionOptions.canConfirm?.() === false)
+        return (
+          this.actionOptions.disabledReason ??
+          "当前预览不可确认，请刷新后重试。"
+        );
       return pending > 0
         ? `还有 ${pending} 项待处理，完成选择后才能执行。`
         : "确认将应用全部变更（包括其他分页）。";
@@ -276,8 +304,13 @@ export class PreviewModal extends Modal {
     let confirmButton: ButtonComponent | null = null;
     const refreshActionState = () => {
       actions.setDesc(actionDescription());
-      confirmButton?.setDisabled(this.running || pendingDecisionCount() > 0);
+      confirmButton?.setDisabled(
+        this.running ||
+          pendingDecisionCount() > 0 ||
+          this.actionOptions.canConfirm?.() === false,
+      );
     };
+    this.refreshCurrentActionState = refreshActionState;
     actions
       .addButton((button) => {
         cancelButton = button;
@@ -289,9 +322,13 @@ export class PreviewModal extends Modal {
       .addButton((button) => {
         confirmButton = button;
         button
-          .setButtonText("确认执行")
+          .setButtonText(this.actionOptions.confirmLabel ?? "确认执行")
           .setWarning()
-          .setDisabled(this.running || pendingDecisionCount() > 0)
+          .setDisabled(
+            this.running ||
+              pendingDecisionCount() > 0 ||
+              this.actionOptions.canConfirm?.() === false,
+          )
           .onClick(async () => {
             if (this.running) return;
             const pending = pendingDecisionCount();

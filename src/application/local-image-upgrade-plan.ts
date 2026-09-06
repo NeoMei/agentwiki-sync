@@ -13,6 +13,7 @@ import {
 
 import { parseAttachmentReferences } from "../core/attachment-reference";
 import { opaqueFileKey } from "../core/identity-key";
+import type { ResolvedInitialTreeBindings } from "../core/initial-binding";
 import type { TreePullActionV3 } from "../core/merge";
 import type { LocalTreeScanV3 } from "../core/tree-scan";
 import type { TreeSnapshot, TreeSnapshotV3 } from "../core/tree-model";
@@ -76,6 +77,9 @@ export interface UpgradeLocalPlanEvidence {
   expectedPathStates: Record<string, TreeTransactionPathState>;
   scanEpoch: number;
   identities: TreeIdentityStateV2;
+  /** Strict v2 read limits observed for the legacy source calculation. */
+  v2CapabilitiesHash?: string;
+  initialBindings?: ResolvedInitialTreeBindings["evidence"];
 }
 
 export interface UpgradeMergeInput {
@@ -91,9 +95,11 @@ export interface PrepareLegacyUpgradePreviewInput extends UpgradeMergeInput {
   oldBaselineEvidenceHash: string;
   capabilities: TreeSyncCapabilitiesV3;
   capabilitiesHash: string;
+  v2CapabilitiesHash?: string;
   control: ControlStorePort;
   controlRoot: string;
   merge?: TreePullPreviewV3<UpgradeTree>;
+  initialBindingEvidence?: ResolvedInitialTreeBindings["evidence"];
   options?: SyncOperationOptions;
 }
 
@@ -433,6 +439,52 @@ function mergeResultEvidence(merge: TreePullPreviewV3<UpgradeTree>): unknown {
   };
 }
 
+export async function assertUpgradePreviewMaterialization(
+  preview: UpgradePreview,
+): Promise<void> {
+  const rebuilt = await rebuildTreeCalculationPreviewV3(preview.merge);
+  const materialized: UpgradeTree = normalizeCandidateMetadata(
+    preview.remoteBase.projected,
+    {
+      protocolVersion: "3",
+      spaceId: preview.remoteBase.projected.spaceId,
+      folders: structuredClone(rebuilt.resolvedFolders),
+      pages: structuredClone(rebuilt.resolvedPages),
+      attachments: structuredClone(rebuilt.resolvedAttachments),
+    },
+  );
+  const expectedPathStates = expectedV3PathStates(
+    preview.merge.local,
+    rebuilt.actions,
+  );
+  const expectedLocalPlan = {
+    actions: rebuilt.actions,
+    rawPathStates: preview.merge.local.rawPathStates,
+    expectedPathStates,
+    scanEpoch: preview.localPlanEvidence.scanEpoch,
+    identities: preview.localPlanEvidence.identities,
+    ...(preview.localPlanEvidence.v2CapabilitiesHash
+      ? { v2CapabilitiesHash: preview.localPlanEvidence.v2CapabilitiesHash }
+      : {}),
+    ...(preview.localPlanEvidence.initialBindings
+      ? { initialBindings: preview.localPlanEvidence.initialBindings }
+      : {}),
+  } satisfies UpgradeLocalPlanEvidence;
+  if (
+    canonicalBytes(mergeResultEvidence(rebuilt)).toString() !==
+      canonicalBytes(mergeResultEvidence(preview.merge)).toString() ||
+    canonicalBytes(materialized).toString() !==
+      canonicalBytes(preview.candidate).toString() ||
+    canonicalBytes(rebuilt.actions).toString() !==
+      canonicalBytes(preview.localActions).toString() ||
+    canonicalBytes(expectedPathStates).toString() !==
+      canonicalBytes(preview.expectedPathStates).toString() ||
+    canonicalBytes(expectedLocalPlan).toString() !==
+      canonicalBytes(preview.localPlanEvidence).toString()
+  )
+    throw new Error("UPGRADE_PREVIEW_MATERIALIZATION_MISMATCH");
+}
+
 export async function prepareLegacyUpgradePreview(
   input: PrepareLegacyUpgradePreviewInput,
 ): Promise<UpgradePreview> {
@@ -448,8 +500,10 @@ export async function prepareLegacyUpgradePreview(
     oldBaselineEvidenceHash: input.oldBaselineEvidenceHash,
     capabilities: input.capabilities,
     capabilitiesHash: input.capabilitiesHash,
+    v2CapabilitiesHash: input.v2CapabilitiesHash,
     controlRoot: input.controlRoot,
     merge: input.merge,
+    initialBindingEvidence: input.initialBindingEvidence,
   });
   const parsedBinding = UpgradeBindingSchema.parse(frozen.binding);
   assertLegacyMergeInput(frozen);
@@ -510,6 +564,12 @@ export async function prepareLegacyUpgradePreview(
         expectedPathStates,
         scanEpoch: frozen.scanEpoch,
         identities: frozen.identities,
+        ...(frozen.v2CapabilitiesHash
+          ? { v2CapabilitiesHash: frozen.v2CapabilitiesHash }
+          : {}),
+        ...(frozen.initialBindingEvidence
+          ? { initialBindings: frozen.initialBindingEvidence }
+          : {}),
       }),
     );
     const localPlanHash = await hashUpgradeLocalPlan(localPlanEvidence);

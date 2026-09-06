@@ -41,6 +41,8 @@ export interface TreeSpaceSummary {
   role: "viewer" | "editor" | "admin" | "owner";
   canRead: true;
   canPublish: boolean;
+  /** Present only when discovered through the strict public v3 Space schema. */
+  syncMode?: "native_v3" | "bootstrap_required" | "legacy_v2";
   currentRevision: string;
   folderCount: string;
   pageCount: string;

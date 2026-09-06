@@ -18,6 +18,10 @@ import {
   type UpgradeTree,
 } from "../../src/application/local-image-upgrade-plan";
 import { scanLocalTree } from "../../src/core/tree-scan";
+import {
+  resolveExplicitInitialTreeBindings,
+  type ExplicitInitialTreeBinding,
+} from "../../src/core/initial-binding";
 import type {
   TreeFolder,
   TreePage,
@@ -283,6 +287,125 @@ describe("local-first image upgrade preview", () => {
         local: firstLocal,
       }),
     ).rejects.toThrow("INITIAL_BINDING_DECISION_REQUIRED");
+  });
+
+  it("aligns explicit initial Page and Folder identities without injecting remote-only objects into L", async () => {
+    const localFolder = folder("local-folder", "pages/docs");
+    const localPage = {
+      ...(await page(
+        "local-page",
+        "pages/docs/note.md",
+        "local body\n",
+        localFolder.folderId,
+      )),
+      referencedAttachmentIds: [] as string[],
+    };
+    const remoteFolder = folder("remote-folder", "pages/docs");
+    const remoteOnlyFolder = folder("remote-only-folder", "pages/remote-only");
+    const remotePage = {
+      ...(await page(
+        "remote-page",
+        "pages/docs/note.md",
+        "remote body\n",
+        remoteFolder.folderId,
+      )),
+      referencedAttachmentIds: [] as string[],
+    };
+    const remoteOnlyPage = {
+      ...(await page(
+        "remote-only-page",
+        "pages/remote-only/new.md",
+        "remote only\n",
+        remoteOnlyFolder.folderId,
+      )),
+      referencedAttachmentIds: [] as string[],
+    };
+    const local = {
+      rootPath: "Wiki",
+      folders: [localFolder],
+      pages: [localPage],
+      attachments: [],
+      blockers: [],
+      rawPathStates: {
+        "pages/docs": { kind: "directory" as const, hash: null },
+        "pages/docs/note.md": {
+          kind: "file" as const,
+          hash: "a".repeat(64),
+        },
+      },
+    };
+    const choices: ExplicitInitialTreeBinding[] = [
+      {
+        kind: "folder",
+        localId: localFolder.folderId,
+        remoteId: remoteFolder.folderId,
+      },
+      {
+        kind: "page",
+        localId: localPage.pageId,
+        remoteId: remotePage.pageId,
+      },
+    ];
+
+    const resolved = resolveExplicitInitialTreeBindings(
+      local,
+      {
+        protocolVersion: "3",
+        spaceId: SPACE_ID,
+        folders: [remoteFolder, remoteOnlyFolder],
+        pages: [remotePage, remoteOnlyPage],
+        attachments: [],
+      },
+      {
+        ...identities(),
+        pendingFolders: {
+          [localFolder.folderId]: {
+            folderId: localFolder.folderId,
+            path: localFolder.path,
+            pathKey: localFolder.path,
+          },
+        },
+        pendingPages: {
+          [localPage.pageId]: {
+            pageId: localPage.pageId,
+            path: localPage.path,
+            contentHash: localPage.contentHash,
+          },
+        },
+      },
+      choices,
+    );
+
+    expect(resolved.local.folders).toEqual([
+      expect.objectContaining({
+        folderId: remoteFolder.folderId,
+        path: localFolder.path,
+      }),
+    ]);
+    expect(resolved.local.pages).toEqual([
+      expect.objectContaining({
+        pageId: remotePage.pageId,
+        folderId: remoteFolder.folderId,
+        path: localPage.path,
+        body: "local body\n",
+        contentHash: await contentHash("local body\n"),
+      }),
+    ]);
+    expect(resolved.local.pages.map((item) => item.pageId)).not.toContain(
+      remoteOnlyPage.pageId,
+    );
+    expect(resolved.local.folders.map((item) => item.folderId)).not.toContain(
+      remoteOnlyFolder.folderId,
+    );
+    expect(resolved.local.rawPathStates).toEqual(local.rawPathStates);
+    expect(resolved.evidence).toMatchObject({
+      choices,
+      originalLocal: local,
+    });
+    expect(resolved.identities.pendingFolders).toHaveProperty(
+      remoteFolder.folderId,
+    );
+    expect(resolved.identities.pendingPages).toHaveProperty(remotePage.pageId);
   });
 
   it("scans only referenced images and reuses an inactive ID only for the same path and hash", async () => {

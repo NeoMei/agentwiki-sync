@@ -160,7 +160,10 @@ class MockDropdownComponent extends MockValueComponent {
 }
 
 export class Notice {
-  constructor(public readonly message: string) {}
+  static readonly messages: string[] = [];
+  constructor(public readonly message: string) {
+    Notice.messages.push(message);
+  }
 }
 
 interface MockPluginApp {

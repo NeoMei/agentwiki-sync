@@ -95,6 +95,92 @@ const validV3Capabilities = {
 };
 
 describe("ProtocolNegotiator", () => {
+  it("reads strict v2 capabilities independently without replacing the cached v3 selection", async () => {
+    const http = new FakeHttp();
+    const v3Hash = await treeCapabilitiesHashV3(validV3Capabilities);
+    const v2Hash = await capabilitiesHash(validCapabilities);
+    http.route("GET", "/api/sync/v3/capabilities", {
+      status: 200,
+      json: {
+        protocolVersion: "3",
+        capabilities: validV3Capabilities,
+        capabilitiesHash: v3Hash,
+      },
+    });
+    http.route("GET", "/api/sync/v2/capabilities", {
+      status: 200,
+      json: {
+        protocolVersion: "2",
+        capabilities: validCapabilities,
+        capabilitiesHash: v2Hash,
+      },
+    });
+    const store = new MemoryControlStore();
+    const subject = new ProtocolNegotiator(
+      new AgentWikiClient("https://wiki.example.com", http, () => "secret"),
+      new ProtocolSelectionRepository(store),
+    );
+
+    await expect(subject.select(identity)).resolves.toMatchObject({
+      version: "3",
+      capabilitiesHash: v3Hash,
+    });
+    await expect(subject.selectV2Fresh()).resolves.toMatchObject({
+      version: "2",
+      capabilitiesHash: v2Hash,
+    });
+    await expect(subject.select(identity)).resolves.toMatchObject({
+      version: "3",
+      capabilitiesHash: v3Hash,
+    });
+    expect(http.calls.map((call) => call.path)).toEqual([
+      "/api/sync/v3/capabilities",
+      "/api/sync/v2/capabilities",
+    ]);
+  });
+
+  it("refreshes strict v3 capabilities for upgrade authorization without trusting the cached selection", async () => {
+    const http = new FakeHttp();
+    const firstHash = await treeCapabilitiesHashV3(validV3Capabilities);
+    const tightened = { ...validV3Capabilities, maxRevisionAttachments: 99 };
+    const tightenedHash = await treeCapabilitiesHashV3(tightened);
+    http.route("GET", "/api/sync/v3/capabilities", {
+      status: 200,
+      json: {
+        protocolVersion: "3",
+        capabilities: validV3Capabilities,
+        capabilitiesHash: firstHash,
+      },
+    });
+    const store = new MemoryControlStore();
+    const subject = new ProtocolNegotiator(
+      new AgentWikiClient("https://wiki.example.com", http, () => "secret"),
+      new ProtocolSelectionRepository(store),
+    );
+    await subject.select(identity);
+    http.route("GET", "/api/sync/v3/capabilities", {
+      status: 200,
+      json: {
+        protocolVersion: "3",
+        capabilities: tightened,
+        capabilitiesHash: tightenedHash,
+      },
+    });
+
+    await expect(subject.selectV3Fresh()).resolves.toMatchObject({
+      version: "3",
+      capabilitiesHash: tightenedHash,
+    });
+    await expect(subject.select(identity)).resolves.toMatchObject({
+      version: "3",
+      capabilitiesHash: firstHash,
+    });
+    expect(http.calls.map((call) => call.path)).toEqual([
+      "/api/sync/v3/capabilities",
+      "/api/sync/v3/capabilities",
+    ]);
+  });
+
   it("selects v3 before probing v2", async () => {
     const http = new FakeHttp();
     const capabilitiesHashValue =

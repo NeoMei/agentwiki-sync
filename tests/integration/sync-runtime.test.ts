@@ -1579,6 +1579,78 @@ describe("SyncRuntime", () => {
     expect((await runtime.status()).local.added).toHaveLength(0);
   });
 
+  it("rejects guarded text Pull late edits before writing baseline or transaction sidecars", async () => {
+    const remote = new FakeTreeRemote();
+    await remote.seed([await page("p1", "pages/Guide.md", "base")]);
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = new SyncRuntime(vault, control, remote, mapping());
+    await runtime.applyPull(await runtime.previewPull());
+    await remote.replace([await page("p1", "pages/Guide.md", "remote")]);
+    const preview = await runtime.previewPull();
+    const expectedPathStates = {
+      "Wiki/pages/Guide.md": {
+        kind: "file" as const,
+        hash: await sha256Hex(new TextEncoder().encode("base")),
+      },
+    };
+    const controlBefore = new Map(control.files);
+
+    await expect(
+      runtime.applyPull(preview, undefined, {
+        expectedPathStates,
+        revalidate: async () => {
+          await vault.write(
+            "Wiki/pages/Guide.md",
+            new TextEncoder().encode("late local edit"),
+          );
+        },
+      }),
+    ).rejects.toThrow("STALE_PULL_PREVIEW");
+
+    expect(vault.text("Wiki/pages/Guide.md")).toBe("late local edit");
+    expect(control.files).toEqual(controlBefore);
+  });
+
+  it("rechecks guarded text Pull state after yielding progress and before baseline writes", async () => {
+    const remote = new FakeTreeRemote();
+    await remote.seed([await page("p1", "pages/Guide.md", "base")]);
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = new SyncRuntime(vault, control, remote, mapping());
+    await runtime.applyPull(await runtime.previewPull());
+    await remote.replace([await page("p1", "pages/Guide.md", "remote")]);
+    const preview = await runtime.previewPull();
+    const expectedPathStates = {
+      "Wiki/pages/Guide.md": {
+        kind: "file" as const,
+        hash: await sha256Hex(new TextEncoder().encode("base")),
+      },
+    };
+    const controlBefore = new Map(control.files);
+    let edited = false;
+
+    await expect(
+      runtime.applyPull(
+        preview,
+        {
+          onProgress: () => {
+            if (edited) return;
+            edited = true;
+            void vault.write(
+              "Wiki/pages/Guide.md",
+              new TextEncoder().encode("progress-race edit"),
+            );
+          },
+        },
+        { expectedPathStates, revalidate: async () => undefined },
+      ),
+    ).rejects.toThrow("STALE_PULL_PREVIEW");
+
+    expect(vault.text("Wiki/pages/Guide.md")).toBe("progress-race edit");
+    expect(control.files).toEqual(controlBefore);
+  });
+
   it("previews and pushes local edits only after explicit apply", async () => {
     const remote = new FakeTreeRemote();
     const vault = new MemoryVault({ "Wiki/pages/New.md": "new" });
