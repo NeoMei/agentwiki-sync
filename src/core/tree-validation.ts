@@ -178,6 +178,16 @@ function compareTreeChanges(
 }
 
 export function validateTreeSnapshot(input: TreeSnapshot): TreeSnapshot {
+  const content = validateTreeContent(input);
+  return { ...input, folders: content.folders, pages: content.pages };
+}
+
+type TreeContent = Pick<
+  TreeSnapshot,
+  "protocolVersion" | "spaceId" | "folders" | "pages"
+>;
+
+function validateTreeContent(input: TreeContent): TreeContent {
   const protocolVersion: string = input.protocolVersion;
   if (protocolVersion !== "1" && protocolVersion !== "2")
     throw new TypeError(`Unknown protocol version: ${protocolVersion}`);
@@ -262,15 +272,28 @@ function validateAttachmentReferences(
 }
 
 export function validateTreeSnapshotV3(input: TreeSnapshotV3): TreeSnapshotV3 {
+  const content = validateTreeContentV3(input);
+  return {
+    ...input,
+    folders: content.folders,
+    pages: content.pages,
+    attachments: content.attachments,
+  };
+}
+
+export type TreeContentV3 = Pick<
+  TreeSnapshotV3,
+  "protocolVersion" | "spaceId" | "folders" | "pages" | "attachments"
+>;
+
+export function validateTreeContentV3(input: TreeContentV3): TreeContentV3 {
   if (input.protocolVersion !== "3")
     throw new TypeError(
       `Unknown protocol version: ${String(input.protocolVersion)}`,
     );
-  const legacy = validateTreeSnapshot({
+  const legacy = validateTreeContent({
     protocolVersion: "2",
     spaceId: input.spaceId,
-    revision: input.revision,
-    revisionContentHash: input.revisionContentHash,
     folders: input.folders,
     pages: input.pages,
   });

@@ -27,6 +27,7 @@ import type {
   TreeSnapshot,
   TreeSnapshotV3,
 } from "./tree-model";
+import type { TreeContentV3 } from "./tree-validation";
 
 export interface TreeScanLimits {
   maxFolders: number;
@@ -200,7 +201,7 @@ interface IdentityCandidate {
 
 function attachmentIdentityCandidates(
   identities: TreeIdentityState,
-  base: TreeSnapshotV3,
+  base: TreeContentV3 | TreeSnapshotV3,
 ): IdentityCandidate[] {
   const candidates: IdentityCandidate[] = [];
   for (const identity of Object.values(identities.attachments ?? {}))
@@ -258,7 +259,7 @@ function resolveKnownAttachmentId(
 export function scanLocalTree(
   vault: VaultPort,
   rootPath: string,
-  base: TreeSnapshotV3,
+  base: TreeContentV3 | TreeSnapshotV3,
   identities: TreeIdentityState,
   limits: TreeScanLimitsV3,
   onProgress?: (completed: number) => Promise<void>,
@@ -275,7 +276,7 @@ export function scanLocalTree(
 export async function scanLocalTree(
   vault: VaultPort,
   rootPath: string,
-  base: TreeSnapshot | TreeSnapshotV3,
+  base: TreeSnapshot | TreeContentV3 | TreeSnapshotV3,
   identities: TreeIdentityState,
   limits: TreeScanLimits,
   onProgress?: (completed: number) => Promise<void>,

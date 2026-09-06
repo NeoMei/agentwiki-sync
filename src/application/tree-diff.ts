@@ -43,13 +43,10 @@ import type {
 } from "../core/tree-model";
 import {
   validateTreeSnapshot,
-  validateTreeSnapshotV3,
+  validateTreeContentV3,
+  type TreeContentV3,
 } from "../core/tree-validation";
-import {
-  orderPreviewActions,
-  sortTreePullActionsV3,
-  type PreviewCandidate,
-} from "./tree-preview";
+import { sortTreePullActions, sortTreePullActionsV3 } from "./tree-preview";
 
 export type {
   AttachmentConflict,
@@ -60,7 +57,12 @@ export type {
   TreePullActionV3,
 } from "../core/merge";
 
-export interface TreePullPreview {
+type TreeContentV2 = Pick<
+  TreeSnapshot,
+  "protocolVersion" | "spaceId" | "folders" | "pages"
+>;
+
+export interface TreePullPreview<TTree extends TreeContentV2 = TreeSnapshot> {
   revision: string;
   actions: TreePullAction[];
   folderConflicts: FolderConflict[];
@@ -68,15 +70,17 @@ export interface TreePullPreview {
   pageConflicts: StructuredConflict[];
   pageConflictResolutions: Record<string, PageConflictResolution>;
   /** @internal recompute state */
-  readonly base: TreeSnapshot;
+  readonly base: TTree;
   readonly local: LocalTreeScan;
-  readonly remote: TreeSnapshot;
+  readonly remote: TTree;
   pagePlan: PageMergePlan;
   resolvedFolders: TreeFolder[];
   resolvedPages: TreePage[];
 }
 
-export interface TreePullPreviewV3 {
+export interface TreePullPreviewV3<
+  TTree extends TreeContentV3 = TreeSnapshotV3,
+> {
   revision: string;
   actions: TreePullActionV3[];
   blockers: Array<AttachmentScanBlocker | AttachmentRewriteBlocker>;
@@ -86,9 +90,9 @@ export interface TreePullPreviewV3 {
   folderConflictResolutions: Record<string, FolderConflictResolution>;
   pageConflicts: StructuredConflict[];
   pageConflictResolutions: Record<string, PageConflictResolution>;
-  readonly base: TreeSnapshotV3;
+  readonly base: TTree;
   readonly local: LocalTreeScanV3;
-  readonly remote: TreeSnapshotV3;
+  readonly remote: TTree;
   pagePlan: PageMergePlan;
   attachmentPlan: AttachmentMergePlan;
   resolvedFolders: TreeFolder[];
@@ -290,7 +294,7 @@ function bodyPathFor(pageId: string): string {
 }
 
 function computeActions(
-  base: TreeSnapshot,
+  base: TreeContentV2,
   local: LocalTreeScan,
   resolved: ResolvedTree,
   folderConflicts: FolderConflict[],
@@ -412,14 +416,15 @@ function computeActions(
   return actions;
 }
 
-function computePreview(
-  base: TreeSnapshot,
+function computePreview<TTree extends TreeContentV2>(
+  base: TTree,
   local: LocalTreeScan,
-  remote: TreeSnapshot,
+  remote: TTree,
+  revision: string,
   pagePlan: PageMergePlan,
   folderConflictResolutions: Record<string, FolderConflictResolution>,
   pageConflictResolutions: Record<string, PageConflictResolution>,
-): TreePullPreview {
+): TreePullPreview<TTree> {
   const resolutions = new Map<string, FolderConflictResolution>();
   for (const [conflictId, resolution] of Object.entries(
     folderConflictResolutions,
@@ -443,27 +448,28 @@ function computePreview(
     folderConflicts,
     pageConflicts,
   );
-  const candidate: PreviewCandidate = {
+  return {
+    revision,
+    actions: sortTreePullActions(actions),
+    folderConflicts,
+    folderConflictResolutions,
+    pageConflicts,
+    pageConflictResolutions,
     base,
     local,
     remote,
-    resolved,
-    actions,
-    folderConflicts,
-    pageConflicts,
-    folderConflictResolutions,
-    pageConflictResolutions,
     pagePlan,
+    resolvedFolders: resolved.folders,
+    resolvedPages: resolved.pages,
   };
-  return orderPreviewActions(candidate);
 }
 
 async function resolvePagePlan(
   pagePlan: PageMergePlan,
   resolutions: Record<string, PageConflictResolution>,
-  base: TreeSnapshot,
+  base: TreeContentV2,
   local: LocalTreeScan,
-  remote: TreeSnapshot,
+  remote: TreeContentV2,
 ): Promise<PageMergePlan> {
   if (Object.keys(resolutions).length === 0) return pagePlan;
   const basePages = new Map(base.pages.map((page) => [page.pageId, page]));
@@ -637,15 +643,13 @@ export async function buildTreePullPreview(
   remote: TreeSnapshot,
 ): Promise<TreePullPreview> {
   const pagePlan = await mergePagesById(base.pages, local.pages, remote.pages);
-  return computePreview(base, local, remote, pagePlan, {}, {});
+  return computePreview(base, local, remote, remote.revision, pagePlan, {}, {});
 }
 
-function legacySnapshot(snapshot: TreeSnapshotV3): TreeSnapshot {
+function legacyContent(snapshot: TreeContentV3): TreeContentV2 {
   return {
     protocolVersion: "2",
     spaceId: snapshot.spaceId,
-    revision: snapshot.revision,
-    revisionContentHash: snapshot.revisionContentHash,
     folders: snapshot.folders,
     pages: snapshot.pages.map(
       ({ referencedAttachmentIds: _ids, ...page }) => page,
@@ -663,9 +667,9 @@ function legacyScan(scan: LocalTreeScanV3): LocalTreeScan {
 
 function sourcePageFor(
   resolved: TreePage,
-  base: TreeSnapshotV3,
+  base: TreeContentV3,
   local: LocalTreeScanV3,
-  remote: TreeSnapshotV3,
+  remote: TreeContentV3,
 ): TreePageV3 | undefined {
   const candidates = [local.pages, remote.pages, base.pages]
     .map((pages) => pages.find((page) => page.pageId === resolved.pageId))
@@ -724,9 +728,9 @@ function sourcePageFor(
 
 function attachmentReferencesByPage(
   pages: TreePage[],
-  base: TreeSnapshotV3,
+  base: TreeContentV3,
   local: LocalTreeScanV3,
-  remote: TreeSnapshotV3,
+  remote: TreeContentV3,
 ): Map<string, TreePageV3> {
   const result = new Map<string, TreePageV3>();
   for (const page of pages) {
@@ -800,18 +804,19 @@ function attachmentActions(
   return actions;
 }
 
-async function computePreviewV3(
-  base: TreeSnapshotV3,
+async function computePreviewV3<TTree extends TreeContentV3>(
+  base: TTree,
   local: LocalTreeScanV3,
-  remote: TreeSnapshotV3,
+  remote: TTree,
+  revision: string,
   pagePlan: PageMergePlan,
   folderConflictResolutions: Record<string, FolderConflictResolution>,
   pageConflictResolutions: Record<string, PageConflictResolution>,
   attachmentConflictResolutions: Record<string, AttachmentConflictResolution>,
-): Promise<TreePullPreviewV3> {
-  const baseLegacy = legacySnapshot(base);
+): Promise<TreePullPreviewV3<TTree>> {
+  const baseLegacy = legacyContent(base);
   const localLegacy = legacyScan(local);
-  const remoteLegacy = legacySnapshot(remote);
+  const remoteLegacy = legacyContent(remote);
   const appliedPagePlan = await resolvePagePlan(
     pagePlan,
     pageConflictResolutions,
@@ -823,6 +828,7 @@ async function computePreviewV3(
     baseLegacy,
     localLegacy,
     remoteLegacy,
+    revision,
     appliedPagePlan,
     folderConflictResolutions,
     pageConflictResolutions,
@@ -903,6 +909,7 @@ async function computePreviewV3(
     baseLegacy,
     localLegacy,
     remoteLegacy,
+    revision,
     resolvedPagePlan(resolvedPages),
     folderConflictResolutions,
     {},
@@ -917,11 +924,9 @@ async function computePreviewV3(
     legacy.pageConflicts.length === 0 &&
     attachmentPlan.conflicts.length === 0
   )
-    validateTreeSnapshotV3({
+    validateTreeContentV3({
       protocolVersion: "3",
       spaceId: remote.spaceId,
-      revision: remote.revision,
-      revisionContentHash: remote.revisionContentHash,
       folders: legacy.resolvedFolders,
       pages: resolvedPages,
       attachments: attachmentPlan.attachments,
@@ -956,7 +961,7 @@ async function computePreviewV3(
     attachmentConflictIds,
   );
   return {
-    revision: remote.revision,
+    revision,
     actions: sortTreePullActionsV3([...attachment, ...legacyActions]),
     blockers: [...local.blockers, ...rewriteBlockers],
     attachmentConflicts: [...displayedAttachmentConflicts.values()].sort(
@@ -984,7 +989,58 @@ export async function buildTreePullPreviewV3(
   remote: TreeSnapshotV3,
 ): Promise<TreePullPreviewV3> {
   const pagePlan = await mergePagesById(base.pages, local.pages, remote.pages);
-  return computePreviewV3(base, local, remote, pagePlan, {}, {}, {});
+  return computePreviewV3(
+    base,
+    local,
+    remote,
+    remote.revision,
+    pagePlan,
+    {},
+    {},
+    {},
+  );
+}
+
+export async function buildTreeCalculationPreviewV3<
+  TTree extends TreeContentV3,
+>(
+  base: TTree,
+  local: LocalTreeScanV3,
+  remote: TTree,
+  revision: string,
+): Promise<TreePullPreviewV3<TTree>> {
+  const validatedBase = validateTreeContentV3(base) as TTree;
+  const validatedRemote = validateTreeContentV3(remote) as TTree;
+  const pagePlan = await mergePagesById(
+    validatedBase.pages,
+    local.pages,
+    validatedRemote.pages,
+  );
+  return computePreviewV3(
+    validatedBase,
+    local,
+    validatedRemote,
+    revision,
+    pagePlan,
+    {},
+    {},
+    {},
+  );
+}
+
+export async function rebuildTreeCalculationPreviewV3<
+  TTree extends TreeContentV3,
+>(preview: TreePullPreviewV3<TTree>): Promise<TreePullPreviewV3<TTree>> {
+  return computePreviewV3(
+    preview.base,
+    preview.local,
+    preview.remote,
+    preview.revision,
+    preview.pagePlan,
+    preview.folderConflictResolutions,
+    preview.pageConflictResolutions,
+    preview.attachmentConflictResolutions,
+  );
 }
 
 export async function resolveAttachmentConflict(
@@ -1007,6 +1063,7 @@ export async function resolveAttachmentConflict(
     preview.base,
     preview.local,
     preview.remote,
+    preview.revision,
     preview.pagePlan,
     preview.folderConflictResolutions,
     preview.pageConflictResolutions,
@@ -1058,6 +1115,7 @@ export async function resolvePageConflictV3(
     preview.base,
     preview.local,
     preview.remote,
+    preview.revision,
     preview.pagePlan,
     preview.folderConflictResolutions,
     resolutions,
@@ -1072,9 +1130,10 @@ export async function resolveFolderConflictV3(
   resolution: FolderConflictResolution,
 ): Promise<void> {
   const legacy = computePreview(
-    legacySnapshot(preview.base),
+    legacyContent(preview.base),
     legacyScan(preview.local),
-    legacySnapshot(preview.remote),
+    legacyContent(preview.remote),
+    preview.revision,
     preview.pagePlan,
     preview.folderConflictResolutions,
     preview.pageConflictResolutions,
@@ -1084,6 +1143,7 @@ export async function resolveFolderConflictV3(
     preview.base,
     preview.local,
     preview.remote,
+    preview.revision,
     preview.pagePlan,
     legacy.folderConflictResolutions,
     preview.pageConflictResolutions,
@@ -1116,6 +1176,7 @@ export async function resolvePageConflict(
     preview.base,
     preview.local,
     preview.remote,
+    preview.revision,
     pagePlan,
     preview.folderConflictResolutions,
     nextResolutions,
@@ -1131,7 +1192,7 @@ export async function resolvePageConflict(
 }
 
 export function resolveFolderConflict(
-  preview: TreePullPreview,
+  preview: TreePullPreview<TreeContentV2>,
   conflictId: string,
   resolution: FolderConflictResolution,
 ): void {
@@ -1189,6 +1250,7 @@ export function resolveFolderConflict(
     preview.base,
     preview.local,
     preview.remote,
+    preview.revision,
     preview.pagePlan,
     nextResolutions,
     preview.pageConflictResolutions,
@@ -1202,7 +1264,7 @@ export function resolveFolderConflict(
 }
 
 export function pendingTreeDecisionCount(
-  preview: TreePullPreview | TreePullPreviewV3,
+  preview: TreePullPreview<TreeContentV2> | TreePullPreviewV3<TreeContentV3>,
 ): number {
   const unresolvedFolders = preview.folderConflicts.filter(
     (conflict) => !preview.folderConflictResolutions[conflict.conflictId],

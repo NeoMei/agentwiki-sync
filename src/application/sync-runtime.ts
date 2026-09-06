@@ -1,10 +1,8 @@
 import {
   FlatAttachmentPathSchema,
-  canonicalTreeDeltaItemsV3,
   validatePortableMarkdownPath,
   treeCapabilitiesHashV3,
   treeConfirmationHashV3,
-  treeRevisionDeltaV3,
   treeRevisionContentHashV3,
   treeRevisionContentHashV2,
   pathKey,
@@ -96,6 +94,10 @@ import {
   type SyncOperationOptions,
 } from "./progress";
 import { readTreeSnapshot, readTreeSnapshotV3 } from "./tree-snapshot-reader";
+import {
+  expectedV3PathStates,
+  prepareTreePushChangesV3,
+} from "./local-image-upgrade-plan";
 
 export type ConflictResolution = PageConflictResolution;
 
@@ -857,72 +859,7 @@ export class SyncRuntime {
     local: LocalTreeScanV3,
     actions: TreePullActionV3[],
   ): Record<string, TreeTransactionPathState> {
-    const expected: Record<string, TreeTransactionPathState> = {};
-    const stateAt = (path: string): TreeTransactionPathState =>
-      local.rawPathStates[path] ?? { kind: "missing", hash: null };
-    const add = (path: string, state = stateAt(path)): void => {
-      expected[joinRoot(this.mapping.rootPath, path)] = state;
-    };
-    const addSubtree = (path: string): void => {
-      add(path);
-      const prefix = `${path}/`;
-      for (const [candidate, state] of Object.entries(local.rawPathStates))
-        if (candidate.startsWith(prefix)) add(candidate, state);
-    };
-    const addProjectedMissingSubtree = (
-      source: string,
-      target: string,
-    ): void => {
-      add(target);
-      const prefix = `${source}/`;
-      for (const candidate of Object.keys(local.rawPathStates))
-        if (candidate.startsWith(prefix))
-          add(`${target}/${candidate.slice(prefix.length)}`);
-    };
-
-    for (const folder of local.folders) add(folder.path);
-    for (const page of local.pages) add(page.path);
-    for (const attachment of local.attachments) add(attachment.path);
-
-    for (const action of actions) {
-      switch (action.kind) {
-        case "create_directory":
-        case "create_page":
-          add(action.path);
-          break;
-        case "trash_directory":
-          addSubtree(action.path);
-          break;
-        case "move_directory": {
-          const source = action.beforePath ?? action.fromPath;
-          addSubtree(source);
-          addProjectedMissingSubtree(source, action.path);
-          break;
-        }
-        case "write_page":
-          add(action.beforePath ?? action.path);
-          if (action.beforePath) add(action.path);
-          break;
-        case "move_page":
-          add(action.beforePath ?? action.fromPath);
-          if (action.beforePath) add(action.fromPath);
-          add(action.path);
-          break;
-        case "trash_page":
-          add(action.path);
-          break;
-        case "create_attachment":
-        case "write_attachment":
-          add(action.attachment.path);
-          break;
-        case "remove_attachment_path":
-          add(action.path);
-          break;
-        case "detach_attachment":
-          break;
-      }
-    }
-    return expected;
+    return expectedV3PathStates(local, actions);
   }
 
   private async readVaultPathState(
@@ -2066,108 +2003,23 @@ export class SyncRuntime {
     stagePages = true,
   ): Promise<PreparedTreePushChangeV3[]> {
     if (local.blockers.length > 0) throw new Error("V3_PUSH_BLOCKED");
-    const baseFolders = new Map(
-      base.folders.map((item) => [item.folderId, item]),
-    );
-    const basePages = new Map(base.pages.map((item) => [item.pageId, item]));
-    const baseAttachments = new Map(
-      base.attachments.map((item) => [item.attachmentId, item]),
-    );
-    const localFolders = local.folders.map((item) => {
-      const prior = baseFolders.get(item.folderId);
-      return prior &&
-        prior.parentFolderId === item.parentFolderId &&
-        prior.name === item.name &&
-        prior.path === item.path &&
-        prior.sortOrder === item.sortOrder
-        ? { ...item, updatedAt: prior.updatedAt }
-        : item;
-    });
-    const localPages = local.pages.map((item) => {
-      const prior = basePages.get(item.pageId);
-      return prior &&
-        prior.folderId === item.folderId &&
-        prior.path === item.path &&
-        prior.title === item.title &&
-        prior.contentHash === item.contentHash &&
-        JSON.stringify(prior.referencedAttachmentIds) ===
-          JSON.stringify(item.referencedAttachmentIds)
-        ? { ...item, updatedAt: prior.updatedAt }
-        : item;
-    });
-    const localAttachments = local.attachments.map((item) => {
-      const prior = baseAttachments.get(item.attachmentId);
-      return prior &&
-        prior.path === item.path &&
-        prior.mimeType === item.mimeType &&
-        prior.sizeBytes === item.sizeBytes &&
-        prior.width === item.width &&
-        prior.height === item.height &&
-        prior.contentHash === item.contentHash
-        ? { ...item, updatedAt: prior.updatedAt }
-        : item;
-    });
-    const changes = canonicalTreeDeltaItemsV3(
-      treeRevisionDeltaV3(
-        {
-          protocolVersion: "3",
-          spaceId: base.spaceId,
-          folders: base.folders,
-          pages: base.pages,
-          attachments: base.attachments,
-        },
-        {
-          protocolVersion: "3",
-          spaceId: this.mapping.spaceId,
-          folders: localFolders,
-          pages: localPages,
-          attachments: localAttachments,
-        },
-      ),
-    );
     const previewId = crypto.randomUUID();
-    const prepared: PreparedTreePushChangeV3[] = [];
-    let completed = 0;
-    for (const change of changes) {
-      if (change.operation === "upsert_page") {
-        const bodyBytes = new TextEncoder().encode(change.page.body).byteLength;
-        const payloadPath =
-          this.root +
-          "/push-preview/" +
-          previewId +
-          "/" +
-          safeKey(change.page.pageId) +
-          ".md";
-        if (stagePages) await this.control.write(payloadPath, change.page.body);
-        const { body: _body, ...page } = change.page;
-        prepared.push({
-          operation: "upsert_page",
-          page: {
-            ...page,
-            referencedAttachmentIds: [
-              ...new Set(page.referencedAttachmentIds),
-            ].sort(),
-            payloadPath,
-            bodyBytes,
-          },
-        });
-      } else if (change.operation === "upsert_attachment") {
-        prepared.push({
-          operation: "upsert_attachment",
-          attachment: change.attachment,
-          vaultPath: joinRoot(this.mapping.rootPath, change.attachment.path),
-        });
-      } else prepared.push(change);
-      completed += 1;
-      if (completed % 50 === 0)
-        await progressCheckpoint(options, {
-          phase: "merge",
-          completed,
-          total: changes.length,
-          cancellable: true,
-        });
-    }
-    return prepared;
+    const prepared = await prepareTreePushChangesV3({
+      base,
+      candidate: {
+        protocolVersion: "3",
+        spaceId: this.mapping.spaceId,
+        folders: local.folders,
+        pages: local.pages,
+        attachments: local.attachments,
+      },
+      vaultRoot: this.mapping.rootPath,
+      control: this.control,
+      payloadRoot: `${this.root}/push-preview/${previewId}`,
+      options,
+      stagePages,
+    });
+    return prepared.changes;
   }
 
   async previewPushV3(options?: SyncOperationOptions): Promise<PushPreviewV3> {
