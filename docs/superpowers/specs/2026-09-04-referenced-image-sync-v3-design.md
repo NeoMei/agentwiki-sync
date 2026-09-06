@@ -306,7 +306,7 @@ Attachment 独立比较 `path` 和 `contentHash`：
 
 ### 协议选择
 
-- 新插件 + v3 服务器：自动选择 v3。
+- 新插件 + v3 服务器：发现 v3 能力后，按 Space 的 `native_v3 | bootstrap_required | legacy_v2` 模式及本地最低协议要求选择流程，而不是将所有 Space 直接视为 v3。纯文字空间首次本地图片升级见[设计补充](2026-09-06-local-first-image-upgrade-design.md)。
 - 新插件 + 仅 v2/v1 服务器：如果本地和远端候选 Markdown 都没有本地图片引用，可继续使用现有 v2/v1；只要任一端存在候选本地图片引用，就阻止同步并提示升级服务器。
 - 旧插件 + 当前 v3 Revision 含 Attachment：服务器对 v2/v1 head、Snapshot、Delta 和 Push session 返回 `SYNC_PROTOCOL_UPGRADE_REQUIRED`，防止只同步 Markdown。
 - 已进入 v3 的本地映射不自动降级。
