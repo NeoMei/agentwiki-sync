@@ -54,7 +54,6 @@ import {
   emptyTreeIdentityState,
   upgradeTreeIdentityState,
   TreeIdentityRepository,
-  validateTreeIdentityState,
   type TreeAttachmentIdentity,
   type TreeIdentityStateV2,
   type TreeIdentityState,
@@ -98,6 +97,14 @@ import {
   expectedV3PathStates,
   prepareTreePushChangesV3,
 } from "./local-image-upgrade-plan";
+import {
+  applyV3ControlAfter,
+  desiredV3Identities,
+  isV3PullControlAfterState,
+  prefixTreePullActionV3,
+  verifyResolvedV3Vault,
+  type V3PullControlAfterState,
+} from "./tree-local-apply-v3";
 
 export type ConflictResolution = PageConflictResolution;
 
@@ -288,30 +295,6 @@ interface PullControlAfterState {
   moveHints: MoveHintsState;
 }
 
-interface V3PullControlAfterState {
-  schemaVersion: 2;
-  transactionId: string;
-  phase: "pending" | "applied";
-  identities: TreeIdentityStateV2;
-}
-
-const isV3PullControlAfterState = (
-  value: unknown,
-): value is V3PullControlAfterState => {
-  if (!value || typeof value !== "object") return false;
-  const state = value as Partial<V3PullControlAfterState>;
-  if (
-    state.schemaVersion !== 2 ||
-    typeof state.transactionId !== "string" ||
-    !["pending", "applied"].includes(state.phase ?? "")
-  )
-    return false;
-  try {
-    return validateTreeIdentityState(state.identities).schemaVersion === 2;
-  } catch {
-    return false;
-  }
-};
 const isPullControlAfterState = (
   value: unknown,
 ): value is PullControlAfterState => {
@@ -835,24 +818,7 @@ export class SyncRuntime {
   }
 
   private prefixActionV3(action: TreePullActionV3): TreePullActionV3 {
-    if (
-      action.kind === "create_attachment" ||
-      action.kind === "write_attachment"
-    )
-      return {
-        ...action,
-        attachment: {
-          ...action.attachment,
-          path: joinRoot(this.mapping.rootPath, action.attachment.path),
-        },
-      };
-    if (action.kind === "remove_attachment_path")
-      return {
-        ...action,
-        path: joinRoot(this.mapping.rootPath, action.path),
-      };
-    if (action.kind === "detach_attachment") return action;
-    return this.prefixAction(action);
+    return prefixTreePullActionV3(action, this.mapping.rootPath, this.root);
   }
 
   private expectedV3VaultPathStates(
@@ -1639,186 +1605,29 @@ export class SyncRuntime {
   private async desiredV3Identities(
     preview: PullPreviewV3,
   ): Promise<TreeIdentityStateV2> {
-    const current = upgradeTreeIdentityState(await this.readIdentities());
-    const remotePages = new Map(
-      preview.remote.pages.map((page) => [page.pageId, page]),
-    );
-    const remoteAttachments = new Map(
-      preview.remote.attachments.map((attachment) => [
-        attachment.attachmentId,
-        attachment,
-      ]),
-    );
-    const attachments: TreeIdentityStateV2["attachments"] = {};
-    const pendingAttachments: TreeIdentityStateV2["pendingAttachments"] = {};
-    for (const attachment of preview.resolvedAttachments) {
-      const remote = remoteAttachments.get(attachment.attachmentId);
-      if (!remote) {
-        pendingAttachments[attachment.attachmentId] = {
-          attachmentId: attachment.attachmentId,
-          path: attachment.path,
-          pathKey: pathKey(attachment.path),
-          contentHash: attachment.contentHash,
-        };
-        continue;
-      }
-      attachments[attachment.attachmentId] = {
-        attachmentId: attachment.attachmentId,
-        path: attachment.path,
-        pathKey: pathKey(attachment.path),
-        baseContentHash: remote.contentHash,
-        active: true,
-      };
-    }
-    for (const attachment of [
-      ...Object.values(current.attachments),
-      ...preview.base.attachments,
-      ...preview.remote.attachments,
-    ]) {
-      if (
-        attachments[attachment.attachmentId] ||
-        pendingAttachments[attachment.attachmentId]
-      )
-        continue;
-      const path = attachment.path;
-      attachments[attachment.attachmentId] = {
-        attachmentId: attachment.attachmentId,
-        path,
-        pathKey: pathKey(path),
-        baseContentHash:
-          "baseContentHash" in attachment
-            ? attachment.baseContentHash
-            : attachment.contentHash,
-        active: false,
-      };
-    }
-    const pendingPages = Object.fromEntries(
-      preview.resolvedPages
-        .filter((page) => {
-          const remote = remotePages.get(page.pageId);
-          return (
-            !remote ||
-            remote.path !== page.path ||
-            remote.contentHash !== page.contentHash
-          );
-        })
-        .map((page) => [
-          page.pageId,
-          {
-            pageId: page.pageId,
-            path: page.path,
-            contentHash: page.contentHash,
-          },
-        ]),
-    );
-    return upgradeTreeIdentityState({
-      schemaVersion: 2,
-      folders: Object.fromEntries(
-        preview.resolvedFolders.map((folder) => [
-          folder.folderId,
-          {
-            folderId: folder.folderId,
-            path: folder.path,
-            pathKey: pathKey(folder.path),
-          },
-        ]),
-      ),
-      pendingFolders: {},
-      pendingPages,
-      attachments,
-      pendingAttachments,
-    });
+    return desiredV3Identities(await this.readIdentities(), preview);
   }
 
   private async verifyResolvedV3Vault(
     preview: PullPreviewV3,
     identities: TreeIdentityStateV2,
   ): Promise<void> {
-    const actual = await scanLocalTree(
-      this.vault,
-      this.mapping.rootPath,
-      {
-        protocolVersion: "3",
-        spaceId: this.mapping.spaceId,
-        revision: preview.revision,
-        revisionContentHash: await treeRevisionContentHashV3({
-          protocolVersion: "3",
-          spaceId: this.mapping.spaceId,
-          folders: preview.resolvedFolders,
-          pages: preview.resolvedPages,
-          attachments: preview.resolvedAttachments,
-        }),
-        folders: preview.resolvedFolders,
-        pages: preview.resolvedPages,
-        attachments: preview.resolvedAttachments,
-      },
-      structuredClone(identities),
-      {
-        ...preview.capabilities,
-        maxFolders: preview.capabilities.maxClientSpaceFolders,
-        maxPages: preview.capabilities.maxClientSpacePages,
-      },
-    );
-    if (actual.blockers.length > 0) throw new Error("V3_VAULT_VERIFY_FAILED");
-    const folders = new Map(
-      actual.folders.map((item) => [item.folderId, item]),
-    );
-    const pages = new Map(actual.pages.map((item) => [item.pageId, item]));
-    const attachments = new Map(
-      actual.attachments.map((item) => [item.attachmentId, item]),
-    );
-    if (
-      folders.size !== preview.resolvedFolders.length ||
-      pages.size !== preview.resolvedPages.length ||
-      attachments.size !== preview.resolvedAttachments.length
-    )
-      throw new Error("V3_VAULT_VERIFY_FAILED");
-    for (const expected of preview.resolvedFolders) {
-      const value = folders.get(expected.folderId);
-      if (
-        !value ||
-        value.path !== expected.path ||
-        value.parentFolderId !== expected.parentFolderId
-      )
-        throw new Error("V3_VAULT_VERIFY_FAILED");
-    }
-    for (const expected of preview.resolvedPages) {
-      const value = pages.get(expected.pageId);
-      if (
-        !value ||
-        value.path !== expected.path ||
-        value.contentHash !== expected.contentHash ||
-        JSON.stringify(value.referencedAttachmentIds) !==
-          JSON.stringify(expected.referencedAttachmentIds)
-      )
-        throw new Error("V3_VAULT_VERIFY_FAILED");
-    }
-    for (const expected of preview.resolvedAttachments) {
-      const value = attachments.get(expected.attachmentId);
-      if (
-        !value ||
-        value.path !== expected.path ||
-        value.contentHash !== expected.contentHash ||
-        value.sizeBytes !== expected.sizeBytes ||
-        value.mimeType !== expected.mimeType ||
-        value.width !== expected.width ||
-        value.height !== expected.height
-      )
-        throw new Error("V3_VAULT_VERIFY_FAILED");
-    }
+    await verifyResolvedV3Vault({
+      vault: this.vault,
+      rootPath: this.mapping.rootPath,
+      spaceId: this.mapping.spaceId,
+      preview,
+      identities,
+      capabilities: preview.capabilities,
+    });
   }
 
   private async applyV3ControlAfter(transactionId: string): Promise<void> {
-    const after = await this.v3PullControlAfter.read();
-    if (
-      !after ||
-      after.payload.transactionId !== transactionId ||
-      after.payload.phase === "applied"
-    )
-      return;
-    await this.identities.commitConfirmedV3Activation();
-    await this.identities.write(after.payload.identities);
-    await this.v3PullControlAfter.write({ ...after.payload, phase: "applied" });
+    await applyV3ControlAfter(
+      this.v3PullControlAfter,
+      this.identities,
+      transactionId,
+    );
   }
 
   async applyPullV3(

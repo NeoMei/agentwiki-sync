@@ -39,6 +39,11 @@ export interface UpgradeCoordinatorPort {
 function manifestChange(
   change: PreparedTreePushChangeV3,
 ): TreePushConfirmationManifestV3["changes"][number] {
+  if (change.operation === "upsert_attachment")
+    return {
+      operation: change.operation,
+      attachment: structuredClone(change.attachment),
+    };
   if (change.operation !== "upsert_page") return structuredClone(change);
   const {
     payloadPath: _payloadPath,
@@ -215,6 +220,7 @@ export class LocalImageUpgradeCoordinator {
     await this.port.applyPublished(pending, snapshot);
     await this.push.markVerified();
     await this.repository.write({ ...pending, phase: "complete" });
+    await this.repository.cleanupCompleted();
   }
 
   private async reconcileSuperseded(): Promise<void> {
@@ -277,8 +283,11 @@ export class LocalImageUpgradeCoordinator {
 
   async recover(options?: SyncOperationOptions): Promise<void> {
     const intent = await this.repository.read();
-    if (!intent || intent.phase === "complete" || intent.phase === "superseded")
+    if (!intent || intent.phase === "superseded") return;
+    if (intent.phase === "complete") {
+      await this.repository.cleanupCompleted();
       return;
+    }
     if (intent.phase === "local_pending") {
       await this.advancePublished(intent);
       return;
