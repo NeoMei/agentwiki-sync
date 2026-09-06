@@ -1,5 +1,20 @@
 import { readFile } from "node:fs/promises";
-import { describe, expect, it } from "vitest";
+import type { App } from "obsidian";
+import { describe, expect, it, vi } from "vitest";
+import type {
+  InitialBindingChoice,
+  PullPreview,
+} from "../../src/application/sync-runtime";
+import { PreviewModal } from "../../src/obsidian/preview-modal";
+import type { MockElement } from "../fakes/obsidian-mock";
+
+const app = {} as App;
+
+function confirmationButton(modal: PreviewModal): MockElement {
+  return (modal.contentEl as unknown as MockElement).queryAll(
+    (item) => item.tag === "button" && item.text === "确认执行",
+  )[0]!;
+}
 
 describe("preview modal layout", () => {
   it("stacks item information above container-responsive resolution controls", async () => {
@@ -27,14 +42,53 @@ describe("preview modal layout", () => {
     );
   });
 
-  it("keeps confirmation disabled until every conflict and binding is resolved", async () => {
-    const source = await readFile("src/obsidian/preview-modal.ts", "utf8");
-
-    expect(source).toContain("pendingPreviewDecisionCount(");
-    expect(source).toContain(
-      "setDisabled(this.running || pendingDecisionCount() > 0)",
+  it("renders confirmation disabled for pending decisions and a failed currentness predicate", () => {
+    const pendingBinding: InitialBindingChoice = {
+      pageId: "page-1",
+      remotePath: "Remote.md",
+      remoteBody: "remote",
+      localPath: null,
+      localBody: null,
+      localVaultByteHash: null,
+      resolution: null,
+    };
+    const pendingPreview = {
+      conflicts: [],
+      conflictResolutions: {},
+      folderConflicts: [],
+      folderConflictResolutions: {},
+    } as unknown as PullPreview;
+    const pending = new PreviewModal(
+      app,
+      "Pull",
+      [],
+      vi.fn(),
+      undefined,
+      [pendingBinding],
+      pendingPreview,
     );
-    expect(source).toContain("项待处理，完成选择后才能执行");
+    pending.open();
+
+    expect(confirmationButton(pending).disabled).toBe(true);
+    expect(pending.contentEl.textContent).toContain("1 项待处理");
+
+    const stale = new PreviewModal(
+      app,
+      "Pull",
+      [],
+      vi.fn(),
+      undefined,
+      [],
+      null,
+      {
+        canConfirm: () => false,
+        disabledReason: "预览已失效",
+      },
+    );
+    stale.open();
+
+    expect(confirmationButton(stale).disabled).toBe(true);
+    expect(stale.contentEl.textContent).toContain("预览已失效");
   });
 
   it("renders folder conflicts with local/server/manual resolutions and validates the manual path", async () => {

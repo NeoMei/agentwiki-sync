@@ -293,6 +293,7 @@ export async function makePlugin(input: {
     local,
     adapter,
     businessWrites,
+    secretValue: (id: string) => secretValues.get(id) ?? null,
     emitVault: (name: string, ...args: unknown[]) => {
       for (const listener of vaultEvents.get(name) ?? []) listener(...args);
     },

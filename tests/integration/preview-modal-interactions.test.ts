@@ -112,6 +112,20 @@ function click(element: MockElement): void {
   element.dispatchEvent({ type: "click" });
 }
 
+function calculationSummary(preview: PullPreviewV3): string[] {
+  const bytes = preview.resolvedAttachments.reduce(
+    (total, item) => total + Number(item.sizeBytes),
+    0,
+  );
+  return [
+    `图片：${preview.resolvedAttachments.length} 张 · ${bytes} B`,
+    ...preview.resolvedAttachments.map((item) => `图片：${item.path}`),
+    ...preview.resolvedPages.map((item) => `Page：${item.path} · ${item.body}`),
+    ...preview.resolvedFolders.map((item) => `Folder：${item.path}`),
+    ...preview.actions.map((item) => `本地动作：${item.kind}`),
+  ];
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((done) => {
@@ -227,7 +241,7 @@ describe("rendered PreviewModal controls", () => {
     const modal = new PreviewModal(
       app,
       "Pull",
-      [],
+      () => calculationSummary(preview),
       async () => {
         confirmed.push(preview);
       },
@@ -254,6 +268,9 @@ describe("rendered PreviewModal controls", () => {
     expect(preview.pageConflictResolutions[conflictId]).toEqual({
       choice: "remote",
     });
+    expect(modal.contentEl.textContent).toContain(
+      "Page：pages/Note.md · remote choice",
+    );
     click(confirm);
     await vi.waitFor(() => expect(confirmed).toEqual([preview]));
   });
@@ -304,7 +321,7 @@ describe("rendered PreviewModal controls", () => {
     const modal = new PreviewModal(
       app,
       "Pull",
-      [],
+      () => calculationSummary(preview),
       async () => {
         confirmed.push(preview);
       },
@@ -354,6 +371,11 @@ describe("rendered PreviewModal controls", () => {
       secondaryPath: "assets/image-local.png",
       redirectPageIds: ["p1"],
     });
+    expect(modal.contentEl.textContent).toContain("图片：2 张 · 32 B");
+    expect(modal.contentEl.textContent).toContain(
+      "图片：assets/image-local.png",
+    );
+    expect(modal.contentEl.textContent).toContain("本地动作：");
     click(confirm);
     await vi.waitFor(() => expect(confirmed).toEqual([preview]));
   });
@@ -386,7 +408,7 @@ describe("rendered PreviewModal controls", () => {
     const modal = new PreviewModal(
       app,
       "Pull",
-      [],
+      () => calculationSummary(preview),
       async () => {},
       undefined,
       [],
@@ -421,7 +443,7 @@ describe("rendered PreviewModal controls", () => {
     const modal = new PreviewModal(
       app,
       "Pull",
-      [],
+      () => calculationSummary(preview),
       async () => {},
       undefined,
       [],
@@ -436,6 +458,8 @@ describe("rendered PreviewModal controls", () => {
     expect(confirm.disabled).toBe(true);
     change(choice, "remote");
     await vi.waitFor(() => expect(confirm.disabled).toBe(false));
+    expect(modal.contentEl.textContent).toContain("Folder：pages/B/Child");
+    expect(modal.contentEl.textContent).toContain("本地动作：");
     change(choice, "manual");
     change(manual, "pages/Manual");
     expect(confirm.disabled).toBe(true);

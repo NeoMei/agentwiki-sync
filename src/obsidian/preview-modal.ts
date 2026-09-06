@@ -111,11 +111,12 @@ export class PreviewModal extends Modal {
   private running = false;
   private closeRequested = false;
   private refreshCurrentActionState: (() => void) | null = null;
+  private refreshCurrentSummary: (() => void) | null = null;
   private unsubscribeInvalidation: (() => void) | null = null;
   constructor(
     app: App,
     private readonly title: string,
-    private readonly lines: string[],
+    private readonly lines: readonly string[] | (() => readonly string[]),
     private readonly confirm: (
       options: SyncOperationOptions,
     ) => Promise<ModalTransition | void>,
@@ -152,12 +153,13 @@ export class PreviewModal extends Modal {
       this.actionOptions.subscribeInvalidation?.(() => this.render()) ?? null;
   }
   private pager(
+    container: HTMLElement,
     total: number,
     page: number,
     setPage: (page: number) => void,
   ): void {
     if (total <= PREVIEW_PAGE_SIZE) return;
-    new Setting(this.contentEl)
+    new Setting(container)
       .setDesc(`第 ${page + 1} / ${pageCount(total)} 页 · 共 ${total} 项`)
       .addButton((button) =>
         button
@@ -243,6 +245,7 @@ export class PreviewModal extends Modal {
     this.preview.resolvedFolders = candidate.resolvedFolders;
     this.preview.resolvedPages = candidate.resolvedPages;
     this.preview.resolvedAttachments = candidate.resolvedAttachments;
+    this.refreshCurrentSummary?.();
   }
   private unsettledDecisionCount(): number {
     if (!isPullPreviewV3(this.preview)) return 0;
@@ -271,13 +274,24 @@ export class PreviewModal extends Modal {
     this.contentEl.empty();
     this.contentEl.createEl("h2", { text: this.title });
     this.renderBlockers();
-    const list = this.contentEl.createEl("ul");
-    this.linePage = clampPage(this.linePage, this.lines.length);
-    for (const line of pageSlice(this.lines, this.linePage))
-      list.createEl("li", { text: line });
-    this.pager(this.lines.length, this.linePage, (page) => {
-      this.linePage = page;
+    const summary = this.contentEl.createDiv({
+      cls: "agentwiki-sync-preview-summary",
     });
+    const refreshSummary = () => {
+      summary.empty();
+      const lines =
+        typeof this.lines === "function" ? this.lines() : this.lines;
+      this.linePage = clampPage(this.linePage, lines.length);
+      const list = summary.createEl("ul");
+      for (const line of pageSlice(lines, this.linePage))
+        list.createEl("li", { text: line });
+      this.pager(summary, lines.length, this.linePage, (page) => {
+        this.linePage = page;
+        refreshSummary();
+      });
+    };
+    this.refreshCurrentSummary = refreshSummary;
+    refreshSummary();
     const pendingDecisionCount = () =>
       isPullPreview(this.preview)
         ? pendingPreviewDecisionCount(this.bindings, this.preview) +
@@ -340,6 +354,7 @@ export class PreviewModal extends Modal {
             this.running = true;
             this.operation = new AbortController();
             button.setDisabled(true);
+            let completed = false;
             try {
               await completeModalAction(
                 () =>
@@ -355,12 +370,13 @@ export class PreviewModal extends Modal {
                   this.close();
                 },
               );
+              completed = true;
             } catch (error) {
               new Notice(`同步失败：${userErrorMessage(error)}`);
             } finally {
               this.running = false;
               this.operation = null;
-              refreshActionState();
+              if (!completed) refreshActionState();
               cancelButton?.setDisabled(false);
               if (this.closeRequested) this.releaseOnce();
             }
@@ -370,9 +386,14 @@ export class PreviewModal extends Modal {
     this.bindingPage = clampPage(this.bindingPage, pendingBindings.length);
     for (const binding of pageSlice(pendingBindings, this.bindingPage))
       this.renderBinding(binding, refreshActionState);
-    this.pager(pendingBindings.length, this.bindingPage, (page) => {
-      this.bindingPage = page;
-    });
+    this.pager(
+      this.contentEl,
+      pendingBindings.length,
+      this.bindingPage,
+      (page) => {
+        this.bindingPage = page;
+      },
+    );
     const conflicts = isPullPreview(this.preview)
       ? "attachmentConflicts" in this.preview
         ? this.preview.pageConflicts
@@ -380,7 +401,7 @@ export class PreviewModal extends Modal {
       : [];
     for (const conflict of pageSlice(conflicts, this.conflictPage))
       this.renderConflict(conflict, refreshActionState);
-    this.pager(conflicts.length, this.conflictPage, (page) => {
+    this.pager(this.contentEl, conflicts.length, this.conflictPage, (page) => {
       this.conflictPage = page;
     });
     const folderConflicts = isPullPreview(this.preview)
@@ -392,9 +413,14 @@ export class PreviewModal extends Modal {
     );
     for (const conflict of pageSlice(folderConflicts, this.folderConflictPage))
       this.renderFolderConflict(conflict, refreshActionState);
-    this.pager(folderConflicts.length, this.folderConflictPage, (page) => {
-      this.folderConflictPage = page;
-    });
+    this.pager(
+      this.contentEl,
+      folderConflicts.length,
+      this.folderConflictPage,
+      (page) => {
+        this.folderConflictPage = page;
+      },
+    );
     const attachmentConflicts = isPullPreviewV3(this.preview)
       ? this.preview.attachmentConflicts
       : [];
@@ -408,6 +434,7 @@ export class PreviewModal extends Modal {
     ))
       this.renderAttachmentConflict(conflict, refreshActionState);
     this.pager(
+      this.contentEl,
       attachmentConflicts.length,
       this.attachmentConflictPage,
       (page) => {

@@ -40,6 +40,7 @@ import {
   removeMapping,
   resolveMapping,
   validateMappings,
+  type SpaceMapping,
 } from "./application/sync-coordinator";
 import { VaultIdentityService } from "./storage/vault-identity";
 import { idFileKey } from "./core/identity-key";
@@ -77,6 +78,7 @@ import {
   type SpaceSyncRoute,
 } from "./application/space-sync-route";
 import type { TreeSpaceSummaryV3 } from "./ports/tree-remote";
+import { inspectLocalImageUpgrade } from "./storage/local-image-upgrade";
 
 const actionLabel = (kind: string): string => {
   const labels: Record<string, string> = {
@@ -106,6 +108,20 @@ const roleLabel: Record<SyncSpaceSummary["role"], string> = {
   editor: "可编辑",
   admin: "管理员",
   owner: "所有者",
+};
+
+const localImageUpgradeControlRoot = async (
+  deviceId: string,
+  spaceId: string,
+): Promise<string> => {
+  const deviceKey = await idFileKey(deviceId);
+  const spaceKey = await idFileKey(spaceId);
+  return (
+    ".agentwiki/devices/d-" +
+    deviceKey.replace(/[^A-Za-z0-9_-]/gu, "_") +
+    "/spaces/s-" +
+    spaceKey.replace(/[^A-Za-z0-9_-]/gu, "_")
+  );
 };
 
 const DEFAULT_V1_CAPABILITIES: SyncCapabilities = {
@@ -436,6 +452,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
   }
   async disconnect(): Promise<void> {
     for (const mapping of this.settings.mappings) {
+      await this.assertNoPendingLocalImageUpgrade(mapping);
       let runtime: SyncRuntime | null = null;
       try {
         runtime = await this.runtime(mapping);
@@ -469,6 +486,39 @@ export default class AgentWikiSyncPlugin extends Plugin {
     new Notice(
       "已在本地断开连接。如服务器不可达，请在 AgentWiki 网页中撤销该设备。",
     );
+  }
+  private async assertNoPendingLocalImageUpgrade(
+    mapping: SpaceMapping,
+  ): Promise<void> {
+    const local = new ObsidianLocalControlStore(this.app);
+    const state = (
+      await new MutableControlRepository(
+        local,
+        "connection-state.json",
+        isConnectionState,
+      ).read()
+    )?.payload;
+    const deviceId = (await new DeviceStateRepository(local).read())?.deviceId;
+    if (!state || !deviceId) return;
+    for (const candidateDeviceId of new Set([state.deviceId, deviceId])) {
+      const pending = await inspectLocalImageUpgrade(
+        new ObsidianControlStore(this.app.vault.adapter),
+        await localImageUpgradeControlRoot(candidateDeviceId, mapping.spaceId),
+        {
+          serverInstanceId: state.serverInstanceId,
+          spaceId: mapping.spaceId,
+          deviceId: candidateDeviceId,
+          credentialId: state.credentialId,
+          mappingRootKey: mapping.rootPath,
+        },
+      );
+      if (
+        pending &&
+        pending.phase !== "complete" &&
+        pending.phase !== "superseded"
+      )
+        throw new Error(`Space ${mapping.spaceId} 有未完成的图片同步升级`);
+    }
   }
   private selectedMapping(requestedSpaceId?: string) {
     const activePath = this.app.workspace.getActiveFile()?.path ?? "";
@@ -507,11 +557,10 @@ export default class AgentWikiSyncPlugin extends Plugin {
       throw new Error("连接身份不匹配");
     const deviceKey = await idFileKey(deviceId);
     const spaceKey = await idFileKey(mapping.spaceId);
-    const controlRoot =
-      ".agentwiki/devices/d-" +
-      deviceKey.replace(/[^A-Za-z0-9_-]/gu, "_") +
-      "/spaces/s-" +
-      spaceKey.replace(/[^A-Za-z0-9_-]/gu, "_");
+    const controlRoot = await localImageUpgradeControlRoot(
+      deviceId,
+      mapping.spaceId,
+    );
     const requiredVersion = await new TreeBaselineRepository(
       shared,
       controlRoot,
@@ -664,9 +713,10 @@ export default class AgentWikiSyncPlugin extends Plugin {
       protocolSuffix;
     const existing = this.liveRuntimes.get(runtimeKey);
     if (existing) {
+      const boundUpgrade = this.runtimeRoutes.get(existing)?.upgrade ?? null;
       this.runtimeRoutes.set(existing, {
         route,
-        upgrade: route === "upgrade" ? upgrade : null,
+        upgrade: route === "upgrade" ? (boundUpgrade ?? upgrade) : null,
         space,
       });
       return existing;
@@ -1115,7 +1165,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       new PreviewModal(
         this.app,
         "图片同步协议升级预览",
-        this.upgradeLines(draft),
+        () => this.upgradeLines(draft),
         async (applyOptions) => {
           const recomputed = await entry.recompute(draft);
           if (recomputed.kind === "text_preview_required") {

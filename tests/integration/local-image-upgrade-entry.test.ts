@@ -8,7 +8,11 @@ import {
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Notice } from "obsidian";
 
-import { capabilitiesHash, contentHash } from "../../src/agentwiki/protocol";
+import {
+  capabilitiesHash,
+  contentHash,
+  sha256Hex,
+} from "../../src/agentwiki/protocol";
 import { AgentWikiClient } from "../../src/agentwiki/client";
 import { LocalImageUpgradeEntry } from "../../src/application/local-image-upgrade-entry";
 import { ProtocolNegotiator } from "../../src/application/protocol-negotiator";
@@ -1333,6 +1337,7 @@ describe("local image upgrade plugin entry", () => {
         strategy: "auto",
         options: unknown,
       ) => Promise<ModalTransition | void>;
+      runtime: (mapping: SpaceMapping) => Promise<object>;
     };
     const open = vi
       .spyOn(PreviewModal.prototype, "open")
@@ -1346,6 +1351,7 @@ describe("local image upgrade plugin entry", () => {
     const button = modalButton(modal, "确认升级并同步");
     expect(button.disabled).toBe(false);
 
+    await subject.runtime(harness.plugin.settings.mappings[0]!);
     harness.emitVault("modify");
 
     expect(modalButton(modal, "确认升级并同步").disabled).toBe(true);
@@ -1487,6 +1493,91 @@ describe("local image upgrade plugin entry", () => {
       harness.requests.filter((request) => request.method !== "GET"),
     ).toEqual([]);
   });
+
+  it.each([
+    {
+      evidence: "malformed",
+      mutate: async () => "{",
+      deviceStateId: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+    },
+    {
+      evidence: "newer",
+      mutate: async (raw: string) => {
+        const envelope = JSON.parse(raw) as { envelopeSchemaVersion: number };
+        envelope.envelopeSchemaVersion = 2;
+        return JSON.stringify(envelope);
+      },
+      deviceStateId: undefined,
+    },
+    {
+      evidence: "ownership-inconsistent",
+      mutate: async (raw: string) => {
+        const envelope = JSON.parse(raw) as {
+          payloadHash: string;
+          payload: UpgradeIntent;
+        };
+        envelope.payload.binding.mappingRootKey = "Other";
+        envelope.payloadHash = await sha256Hex(
+          canonicalBytes(envelope.payload),
+        );
+        return JSON.stringify(envelope);
+      },
+      deviceStateId: undefined,
+    },
+  ])(
+    "fails disconnect closed for $evidence upgrade evidence",
+    async ({ mutate, deviceStateId }) => {
+      const harness = await pluginUpgradeHarness();
+      await seedConfirmedUpgradeInPlugin(harness);
+      const journalPath = [...harness.adapter.files.keys()].find((path) =>
+        path.endsWith("/local-image-upgrade/journal.json"),
+      );
+      if (!journalPath) throw new Error("expected upgrade journal");
+      const original = harness.adapter.files.get(journalPath);
+      if (!original) throw new Error("expected upgrade journal body");
+      const mutated = await mutate(original);
+      harness.adapter.files.set(journalPath, mutated);
+      if (deviceStateId) {
+        const deviceStatePath = [...harness.local.keys()].find((path) =>
+          path.endsWith("agentwiki-sync-device-v1"),
+        );
+        if (!deviceStatePath) throw new Error("expected device state");
+        const envelope = JSON.parse(
+          String(harness.local.get(deviceStatePath)),
+        ) as {
+          writeGeneration: number;
+          payloadHash: string;
+          payload: { deviceId: string };
+        };
+        envelope.writeGeneration += 1;
+        envelope.payload.deviceId = deviceStateId;
+        envelope.payloadHash = await sha256Hex(
+          canonicalBytes(envelope.payload),
+        );
+        harness.local.set(deviceStatePath, JSON.stringify(envelope));
+      }
+
+      const restarted = new AgentWikiSyncPlugin(
+        harness.app as never,
+        harness.plugin.manifest,
+      );
+      await restarted.onload();
+      const localBefore = structuredClone([...harness.local.entries()]);
+      await expect(restarted.disconnect()).rejects.toThrow();
+
+      expect(restarted.settings.mappings).toEqual(
+        harness.plugin.settings.mappings,
+      );
+      expect(restarted.settings.serverInstanceId).toBe(
+        harness.connection.serverInstanceId,
+      );
+      expect(harness.secretValue(harness.connection.credentialSecretId)).toBe(
+        "test-secret",
+      );
+      expect(harness.adapter.files.get(journalPath)).toBe(mutated);
+      expect([...harness.local.entries()]).toEqual(localBefore);
+    },
+  );
 
   it("publishes and commits the upgrade through exactly one real modal confirmation", async () => {
     const harness = await pluginUpgradeHarness();
@@ -1642,6 +1733,13 @@ describe("local image upgrade plugin entry", () => {
     await vi.waitFor(() =>
       expect(modalButton(upgrade, "确认升级并同步").disabled).toBe(false),
     );
+    expect(upgrade.contentEl.textContent).toContain(
+      "图片：0 张 · 传输字节上界 0 B",
+    );
+    expect(upgrade.contentEl.textContent).not.toContain(
+      "图片：assets/used.png",
+    );
+    expect(upgrade.contentEl.textContent).toContain("本地应用 写入:");
     modalButton(upgrade, "确认升级并同步").dispatchEvent({ type: "click" });
 
     await vi.waitFor(() => expect(open.mock.instances.length).toBe(3));
