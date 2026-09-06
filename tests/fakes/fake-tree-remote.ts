@@ -9,6 +9,7 @@ import {
   TREE_SYNC_V3_HARD_LIMITS,
   blobChunkHashV3,
   blobContentHashV3,
+  canonicalTreeRevisionManifestV2,
   canonicalTreeDeltaItemsV3,
   treeBatchHashV3,
   treeCapabilitiesHashV3,
@@ -142,6 +143,7 @@ export class FakeTreeRemote implements TreeRemotePort {
   }
 
   async spaces(): Promise<TreeSpaceSummary[]> {
+    const snapshot = await this.buildSnapshot();
     return [
       {
         spaceId: "space",
@@ -152,7 +154,7 @@ export class FakeTreeRemote implements TreeRemotePort {
         currentRevision: String(this.revision),
         folderCount: String(this.folders.size),
         pageCount: String(this.pages.size),
-        revisionManifestByteLength: "0",
+        revisionManifestByteLength: String(this.manifestBytes(snapshot)),
         revisionBodyBytes: this.bodyBytes(),
       },
     ];
@@ -168,7 +170,7 @@ export class FakeTreeRemote implements TreeRemotePort {
       revisionContentHash: await this.treeHash(snapshot),
       folderCount: String(this.folders.size),
       pageCount: String(this.pages.size),
-      revisionManifestByteLength: "0",
+      revisionManifestByteLength: String(this.manifestBytes(snapshot)),
       revisionBodyBytes: this.bodyBytes(),
       publishedAt: "2026-08-14T00:00:00.000Z",
     };
@@ -186,6 +188,12 @@ export class FakeTreeRemote implements TreeRemotePort {
   }
 
   private async treeHash(snapshot: TreeSnapshot): Promise<string> {
+    if (
+      this.revision === 0 &&
+      snapshot.folders.length === 0 &&
+      snapshot.pages.length === 0
+    )
+      return "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     if (this.protocolVersionValue === "1")
       return revisionContentHash({
         protocolVersion: "1",
@@ -203,6 +211,36 @@ export class FakeTreeRemote implements TreeRemotePort {
       folders: snapshot.folders,
       pages: snapshot.pages,
     });
+  }
+
+  private manifestBytes(snapshot: TreeSnapshot): number {
+    if (
+      this.revision === 0 &&
+      snapshot.folders.length === 0 &&
+      snapshot.pages.length === 0
+    )
+      return 0;
+    if (this.protocolVersionValue === "1")
+      return canonicalBytes({
+        protocolVersion: "1",
+        spaceId: "space",
+        pages: snapshot.pages.map(
+          ({ pageId, path, title, contentHash: hash }) => ({
+            pageId,
+            path,
+            title,
+            contentHash: hash,
+          }),
+        ),
+      }).byteLength;
+    return canonicalBytes(
+      canonicalTreeRevisionManifestV2({
+        protocolVersion: "2",
+        spaceId: "space",
+        folders: snapshot.folders,
+        pages: snapshot.pages,
+      }),
+    ).byteLength;
   }
 
   private bodyBytes(): string {
@@ -232,7 +270,7 @@ export class FakeTreeRemote implements TreeRemotePort {
       revisionContentHash: await this.treeHash(all),
       folderCount: String(folders.length),
       pageCount: String(pages.length),
-      revisionManifestByteLength: "0",
+      revisionManifestByteLength: String(this.manifestBytes(all)),
       revisionBodyBytes: this.bodyBytes(),
       folders,
       pages,
@@ -355,7 +393,7 @@ export class FakeTreeRemote implements TreeRemotePort {
       revisionContentHash: await this.treeHash(snapshot),
       folderCount: String(this.folders.size),
       pageCount: String(this.pages.size),
-      revisionManifestByteLength: "0",
+      revisionManifestByteLength: String(this.manifestBytes(snapshot)),
       revisionBodyBytes: this.bodyBytes(),
       changeSetId: "c-" + this.revision,
     };

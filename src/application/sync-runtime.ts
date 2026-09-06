@@ -13,13 +13,7 @@ import {
   type TreeSyncCapabilitiesV3,
 } from "@neomei/agentwiki-sync-protocol";
 
-import {
-  canonicalBytes,
-  contentHash,
-  decimalWithinLimit,
-  revisionContentHash,
-  sha256Hex,
-} from "../agentwiki/protocol";
+import { canonicalBytes, contentHash, sha256Hex } from "../agentwiki/protocol";
 import { AgentWikiHttpError } from "../agentwiki/client";
 import { decodeVaultMarkdown } from "../core/markdown";
 import { parseAttachmentReferences } from "../core/attachment-reference";
@@ -43,7 +37,6 @@ import type {
   TreeSnapshot,
   TreeSnapshotV3,
 } from "../core/tree-model";
-import { validateTreeSnapshotV3 } from "../core/tree-validation";
 import type { ControlStorePort } from "../ports/control-store";
 import type { PushRemotePort } from "../ports/push-remote";
 import type {
@@ -102,6 +95,7 @@ import {
   reportProgress,
   type SyncOperationOptions,
 } from "./progress";
+import { readTreeSnapshot, readTreeSnapshotV3 } from "./tree-snapshot-reader";
 
 export type ConflictResolution = PageConflictResolution;
 
@@ -636,110 +630,12 @@ export class SyncRuntime {
     revision: string,
     options?: SyncOperationOptions,
   ): Promise<TreeSnapshot> {
-    const folders: TreeFolder[] = [];
-    const pages: TreePage[] = [];
-    let totalBodyBytes = 0;
-    let pinned: {
-      protocolVersion: "1" | "2";
-      spaceId: string;
-      revision: string;
-      revisionContentHash: string;
-      folderCount: string;
-      pageCount: string;
-      revisionManifestByteLength: string;
-      revisionBodyBytes: string;
-    } | null = null;
-    const capabilities = await this.legacyTreeRemote.capabilities();
-    for await (const segment of this.legacyTreeRemote.snapshotPages(revision)) {
-      const current = {
-        protocolVersion: segment.protocolVersion,
-        spaceId: segment.spaceId,
-        revision: segment.revision,
-        revisionContentHash: segment.revisionContentHash,
-        folderCount: segment.folderCount,
-        pageCount: segment.pageCount,
-        revisionManifestByteLength: segment.revisionManifestByteLength,
-        revisionBodyBytes: segment.revisionBodyBytes,
-      };
-      if (pinned && JSON.stringify(pinned) !== JSON.stringify(current))
-        throw new Error("快照分页元数据已变更");
-      pinned = current;
-      folders.push(...segment.folders);
-      for (const page of segment.pages) {
-        if ((await contentHash(page.body)) !== page.contentHash)
-          throw new Error("快照页面内容哈希不匹配");
-        const bodyBytes = new TextEncoder().encode(page.body).byteLength;
-        if (bodyBytes > capabilities.maxPageBytes)
-          throw new Error("PAGE_TOO_LARGE");
-        totalBodyBytes += bodyBytes;
-      }
-      pages.push(...segment.pages);
-      await progressCheckpoint(options, {
-        phase: "download",
-        completed: pages.length + folders.length,
-        total: undefined,
-        cancellable: true,
-      });
-    }
-    if (!pinned) throw new Error("快照未返回元数据");
-    if (revision !== "current" && pinned.revision !== revision)
-      throw new Error("快照修订不匹配");
-    decimalWithinLimit(pinned.pageCount, capabilities.maxClientSpacePages);
-    decimalWithinLimit(
-      pinned.folderCount,
-      capabilities.maxClientSpaceFolders ?? 10000,
+    return readTreeSnapshot(
+      this.legacyTreeRemote,
+      this.mapping.spaceId,
+      revision,
+      options,
     );
-    if (
-      String(folders.length) !== pinned.folderCount ||
-      String(pages.length) !== pinned.pageCount
-    )
-      throw new Error("快照对象数量不匹配");
-    decimalWithinLimit(
-      pinned.revisionBodyBytes,
-      capabilities.maxClientTotalBodyBytes,
-    );
-    if (totalBodyBytes !== Number(pinned.revisionBodyBytes))
-      throw new Error("快照字节数不匹配");
-    const manifestBytes = this.computeManifestBytes(
-      pinned.protocolVersion,
-      pinned.spaceId,
-      folders,
-      pages,
-    );
-    decimalWithinLimit(
-      pinned.revisionManifestByteLength,
-      capabilities.maxClientManifestBytes,
-    );
-    if (manifestBytes > capabilities.maxClientManifestBytes)
-      throw new Error("SPACE_TOO_LARGE");
-    const contentHashValue =
-      pinned.protocolVersion === "2"
-        ? await treeRevisionContentHashV2({
-            protocolVersion: "2",
-            spaceId: pinned.spaceId,
-            folders,
-            pages,
-          })
-        : await revisionContentHash({
-            protocolVersion: "1",
-            spaceId: pinned.spaceId,
-            pages: pages.map((page) => ({
-              pageId: page.pageId,
-              path: page.path,
-              title: page.title,
-              contentHash: page.contentHash,
-            })),
-          });
-    if (contentHashValue !== pinned.revisionContentHash)
-      throw new Error("快照完整性不匹配");
-    return {
-      protocolVersion: pinned.protocolVersion,
-      spaceId: pinned.spaceId,
-      revision: pinned.revision,
-      revisionContentHash: pinned.revisionContentHash,
-      folders,
-      pages,
-    };
   }
 
   private requireV3Remote(): TreeRemotePortV3 {
@@ -763,92 +659,12 @@ export class SyncRuntime {
     revision: string,
     options?: SyncOperationOptions,
   ): Promise<TreeSnapshotV3> {
-    const remote = this.requireV3Remote();
-    const capabilities = await remote.capabilities();
-    const folders: TreeSnapshotV3["folders"] = [];
-    const pages: TreeSnapshotV3["pages"] = [];
-    const attachments: TreeSnapshotV3["attachments"] = [];
-    let pinned: Omit<
-      Awaited<ReturnType<TreeRemotePortV3["head"]>>,
-      "publishedAt"
-    > | null = null;
-    for await (const segment of remote.snapshotPages(revision)) {
-      const current = {
-        protocolVersion: segment.protocolVersion,
-        spaceId: segment.spaceId,
-        revision: segment.revision,
-        sequence: segment.sequence,
-        revisionContentHash: segment.revisionContentHash,
-        folderCount: segment.folderCount,
-        pageCount: segment.pageCount,
-        attachmentCount: segment.attachmentCount,
-        revisionManifestByteLength: segment.revisionManifestByteLength,
-        revisionBodyBytes: segment.revisionBodyBytes,
-        revisionAttachmentBytes: segment.revisionAttachmentBytes,
-      };
-      if (pinned && JSON.stringify(pinned) !== JSON.stringify(current))
-        throw new Error("快照分页元数据已变更");
-      pinned = current;
-      folders.push(...segment.folders);
-      pages.push(...segment.pages);
-      attachments.push(...segment.attachments);
-      cancellationCheckpoint(options, true);
-    }
-    if (!pinned) throw new Error("快照未返回元数据");
-    if (revision !== "current" && pinned.revision !== revision)
-      throw new Error("快照修订不匹配");
-    decimalWithinLimit(pinned.folderCount, capabilities.maxClientSpaceFolders);
-    decimalWithinLimit(pinned.pageCount, capabilities.maxClientSpacePages);
-    decimalWithinLimit(
-      pinned.attachmentCount,
-      capabilities.maxRevisionAttachments,
+    return readTreeSnapshotV3(
+      this.requireV3Remote(),
+      this.mapping.spaceId,
+      revision,
+      options,
     );
-    if (
-      String(folders.length) !== pinned.folderCount ||
-      String(pages.length) !== pinned.pageCount ||
-      String(attachments.length) !== pinned.attachmentCount
-    )
-      throw new Error("快照对象数量不匹配");
-    const snapshot = validateTreeSnapshotV3({
-      protocolVersion: "3",
-      spaceId: pinned.spaceId,
-      revision: pinned.revision,
-      revisionContentHash: pinned.revisionContentHash,
-      folders,
-      pages,
-      attachments,
-    });
-    const manifest = {
-      protocolVersion: "3" as const,
-      spaceId: snapshot.spaceId,
-      folders: snapshot.folders,
-      pages: snapshot.pages,
-      attachments: snapshot.attachments,
-    };
-    const bodyBytes = snapshot.pages.reduce(
-      (total, page) => total + new TextEncoder().encode(page.body).byteLength,
-      0,
-    );
-    const attachmentBytes = snapshot.attachments.reduce(
-      (total, attachment) => total + Number(attachment.sizeBytes),
-      0,
-    );
-    if (
-      String(bodyBytes) !== pinned.revisionBodyBytes ||
-      String(attachmentBytes) !== pinned.revisionAttachmentBytes ||
-      String(canonicalBytes(manifest).byteLength) !==
-        pinned.revisionManifestByteLength ||
-      (await treeRevisionContentHashV3(manifest)) !== pinned.revisionContentHash
-    )
-      throw new Error("快照完整性不匹配");
-    const completed = folders.length + pages.length + attachments.length;
-    await progressCheckpoint(options, {
-      phase: "download",
-      completed,
-      total: completed,
-      cancellable: true,
-    });
-    return snapshot;
   }
 
   private async scanV3(
@@ -920,38 +736,6 @@ export class SyncRuntime {
     if (epoch !== this.scanEpoch) throw new Error("扫描纪元已变更");
     await this.identities.write(identities);
     return scan;
-  }
-
-  private computeManifestBytes(
-    protocolVersion: "1" | "2",
-    spaceId: string,
-    folders: TreeFolder[],
-    pages: TreePage[],
-  ): number {
-    if (protocolVersion === "1")
-      return canonicalBytes({
-        protocolVersion: "1",
-        spaceId,
-        pages: pages.map((page) => ({
-          pageId: page.pageId,
-          path: page.path,
-          title: page.title,
-          contentHash: page.contentHash,
-        })),
-      }).byteLength;
-    return canonicalBytes({
-      protocolVersion: "2",
-      spaceId,
-      folders,
-      pages: pages.map((page) => ({
-        pageId: page.pageId,
-        folderId: page.folderId,
-        path: page.path,
-        title: page.title,
-        contentHash: page.contentHash,
-        updatedAt: page.updatedAt,
-      })),
-    }).byteLength;
   }
 
   private async discardOrphanPreviews(): Promise<void> {
