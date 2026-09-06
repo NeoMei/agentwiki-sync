@@ -121,6 +121,12 @@ export interface TreePushLocalPortV3 {
   }): Promise<string>;
 }
 
+export interface UpgradePushOwnership {
+  operationId: string;
+  assertSourceCurrent(baseRevision: string): Promise<void>;
+  onStaged(): Promise<void>;
+}
+
 function recordWithOnlyKeys(
   value: unknown,
   keys: readonly string[],
@@ -356,6 +362,7 @@ export class TreePushServiceV3 {
     private readonly store: ControlStorePort,
     private readonly root: string,
     private readonly local: TreePushLocalPortV3,
+    private readonly ownership?: UpgradePushOwnership,
   ) {
     this.journal = new MutableControlRepository(
       store,
@@ -390,7 +397,10 @@ export class TreePushServiceV3 {
       throw new Error("不支持的推送日志版本");
     const value = await this.journal.read();
     if (!value) throw new Error("推送日志缺失或已损坏");
-    return value.payload;
+    const journal = value.payload;
+    if (this.ownership && journal.idempotencyKey !== this.ownership.operationId)
+      throw new Error("UPGRADE_PUSH_OWNERSHIP_MISMATCH");
+    return journal;
   }
 
   async inspect(): Promise<Pick<
@@ -398,6 +408,12 @@ export class TreePushServiceV3 {
     "remoteState" | "result" | "localCommitPhase" | "credentialIdAtCreation"
   > | null> {
     const value = await this.journal.read();
+    if (
+      value &&
+      this.ownership &&
+      value.payload.idempotencyKey !== this.ownership.operationId
+    )
+      throw new Error("UPGRADE_PUSH_OWNERSHIP_MISMATCH");
     return value
       ? {
           remoteState: value.payload.remoteState,
@@ -531,7 +547,7 @@ export class TreePushServiceV3 {
       protocolVersion: "3",
       spaceId: input.spaceId,
       baseRevision: input.baseRevision,
-      idempotencyKey: crypto.randomUUID(),
+      idempotencyKey: this.ownership?.operationId ?? crypto.randomUUID(),
       confirmationHash: input.confirmationHash,
       capabilitiesHash: input.capabilitiesHash,
       capabilities: structuredClone(input.capabilities),
@@ -585,6 +601,21 @@ export class TreePushServiceV3 {
     });
     if (actual !== journal.confirmationHash)
       throw new Error("CONFIRMATION_MISMATCH");
+  }
+
+  private async assertSourceCurrent(journal: TreePushJournalV3): Promise<void> {
+    if (this.ownership) {
+      await this.ownership.assertSourceCurrent(journal.baseRevision);
+    } else if ((await this.remote.head()).revision !== journal.baseRevision) {
+      throw new Error("BASE_STALE");
+    }
+  }
+
+  private async assertFinalizeCurrent(
+    journal: TreePushJournalV3,
+  ): Promise<void> {
+    if (this.ownership) await this.assertSourceCurrent(journal);
+    await this.assertCurrent(journal);
   }
 
   private async hydrate(
@@ -821,7 +852,35 @@ export class TreePushServiceV3 {
   private async cancelBeforeFinalize(
     journal: TreePushJournalV3,
     clear: boolean,
+    definitelyUncreated = false,
   ): Promise<void> {
+    if (this.ownership) {
+      if (!journal.sessionId) {
+        if (definitelyUncreated) {
+          journal.remoteState = "superseded";
+          await this.save(journal);
+        }
+        return;
+      }
+      try {
+        await this.remote.abort(journal.sessionId);
+      } catch {
+        // The status lookup below is authoritative; transport failure is not.
+      }
+      try {
+        const status = await this.remote.getSession(journal.sessionId);
+        if (status.result) {
+          await this.commitResult(journal, status.result);
+          return;
+        }
+        if (status.status !== "aborted" && status.status !== "expired") return;
+        journal.remoteState = "superseded";
+        await this.save(journal);
+      } catch {
+        // Preserve pending when cancellation outcome cannot be proven.
+      }
+      return;
+    }
     if (journal.sessionId) {
       try {
         await this.remote.abort(journal.sessionId);
@@ -851,7 +910,7 @@ export class TreePushServiceV3 {
     await this.save(journal);
     await this.uploadChanges(journal, received, options);
     try {
-      await this.assertCurrent(journal);
+      await this.assertFinalizeCurrent(journal);
     } catch (error) {
       await this.cancelBeforeFinalize(journal, false);
       throw error;
@@ -882,18 +941,17 @@ export class TreePushServiceV3 {
     let journal = await this.stage(input);
     await this.save(journal);
     journal = await this.load();
+    await this.ownership?.onStaged();
+    let createAttempted = false;
     try {
       await progressCheckpoint(options, {
         phase: "upload_blob",
         completed: 0,
         cancellable: true,
       });
-      if ((await this.remote.head()).revision !== journal.baseRevision) {
-        journal.remoteState = "superseded";
-        await this.save(journal);
-        throw new Error("BASE_STALE");
-      }
+      await this.assertSourceCurrent(journal);
       await this.assertCurrent(journal);
+      createAttempted = true;
       const session = await this.remote.createPushSession(
         this.createInput(journal),
       );
@@ -908,6 +966,14 @@ export class TreePushServiceV3 {
         session.status === "ready_to_finalize" ||
         session.status === "finalizing"
       ) {
+        if (session.status === "finalizing" && this.ownership)
+          throw new Error("PUSH_RECOVERY_REQUIRED");
+        try {
+          await this.assertFinalizeCurrent(journal);
+        } catch (error) {
+          await this.cancelBeforeFinalize(journal, false);
+          throw error;
+        }
         journal.remoteState = "finalizing";
         await this.save(journal);
         reportProgress(options, {
@@ -930,11 +996,29 @@ export class TreePushServiceV3 {
         error instanceof SyncCancelledError ||
         options?.signal?.aborted === true;
       if (cancelled && journal.remoteState !== "finalizing") {
-        await this.cancelBeforeFinalize(journal, journal.sessionId === null);
+        await this.cancelBeforeFinalize(
+          journal,
+          journal.sessionId === null,
+          !createAttempted,
+        );
         if (!(error instanceof SyncCancelledError))
           throw new SyncCancelledError();
       }
-      if (syncErrorCode(error) === "BASE_STALE") {
+      if (
+        this.ownership &&
+        !createAttempted &&
+        journal.sessionId === null &&
+        journal.remoteState === "not_created" &&
+        errorMessage(error) === "BASE_STALE"
+      ) {
+        journal.remoteState = "superseded";
+        await this.save(journal);
+      }
+      if (
+        !this.ownership &&
+        (syncErrorCode(error) === "BASE_STALE" ||
+          errorMessage(error) === "BASE_STALE")
+      ) {
         journal.remoteState = "superseded";
         await this.save(journal);
       }
@@ -949,6 +1033,8 @@ export class TreePushServiceV3 {
     if (journal.remoteState === "published" && journal.result)
       return journal.result;
     if (!journal.sessionId) {
+      await this.assertSourceCurrent(journal);
+      await this.assertCurrent(journal);
       const session = await this.remote.createPushSession(
         this.createInput(journal),
       );
@@ -957,6 +1043,13 @@ export class TreePushServiceV3 {
     }
     const status = await this.remote.getSession(journal.sessionId);
     if (status.result) return this.commitResult(journal, status.result);
+    if (status.status === "published")
+      throw new Error("PUSH_TERMINAL_RESULT_MISSING");
+    if (this.ownership && status.status === "finalizing") {
+      journal.remoteState = "finalizing";
+      await this.save(journal);
+      return null;
+    }
     if (journal.finalizeRejectionCode)
       return this.resolveFinalizeRejection(
         journal,
@@ -964,8 +1057,17 @@ export class TreePushServiceV3 {
         true,
         status,
       );
+    if (
+      this.ownership &&
+      (status.status === "aborted" || status.status === "expired")
+    ) {
+      journal.remoteState = "superseded";
+      await this.save(journal);
+      return null;
+    }
     if (status.status === "aborted" || status.status === "expired")
       throw new Error("推送会话无法恢复");
+    if (this.ownership && journal.remoteState === "finalizing") return null;
     for (const hash of status.completedContentHashes) {
       const entry = journal.requiredBlobs[hash];
       if (entry) entry.completed = true;
@@ -981,7 +1083,7 @@ export class TreePushServiceV3 {
         journal.remoteState !== "finalizing"
       ) {
         try {
-          await this.assertCurrent(journal);
+          await this.assertFinalizeCurrent(journal);
         } catch (error) {
           await this.cancelBeforeFinalize(journal, false);
           throw error;
@@ -1045,4 +1147,8 @@ function syncErrorCode(error: unknown): string | null {
   if (typeof body !== "object" || body === null) return null;
   const code = (body as { error?: { code?: unknown } }).error?.code;
   return typeof code === "string" ? code : null;
+}
+
+function errorMessage(error: unknown): string | null {
+  return error instanceof Error ? error.message : null;
 }
