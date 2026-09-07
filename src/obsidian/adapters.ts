@@ -17,7 +17,18 @@ import {
   type HttpResponseType,
 } from "../ports/http";
 import type { SecretPort } from "../ports/secrets";
-import type { VaultPort, VaultTreeEntry } from "../ports/vault";
+import type {
+  ShortestImageResolution,
+  VaultPort,
+  VaultTreeEntry,
+} from "../ports/vault";
+
+interface ShortestImageResolver {
+  resolve(
+    pagePath: string,
+    decodedBasename: string,
+  ): Promise<ShortestImageResolution>;
+}
 
 function safeControlPath(path: string): string {
   const normalized = normalizePath(path);
@@ -203,8 +214,17 @@ export class ObsidianVaultPort implements VaultPort {
     private readonly vault: Vault,
     private readonly fileManager: FileManager,
     rootPath: string,
+    private readonly shortestImageResolver?: ShortestImageResolver,
   ) {
     this.root = normalizePath(rootPath);
+  }
+  async resolveShortestImage(
+    pagePath: string,
+    decodedBasename: string,
+  ): Promise<ShortestImageResolution> {
+    return this.shortestImageResolver
+      ? this.shortestImageResolver.resolve(pagePath, decodedBasename)
+      : { kind: "unavailable" };
   }
   private safe(path: string): string {
     const normalized = normalizePath(path);

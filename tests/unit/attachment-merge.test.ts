@@ -442,6 +442,20 @@ describe("rewriteAttachmentPageReferences", () => {
     expect(result.page.body).toBe("![x](../assets/b\\ name.png)");
   });
 
+  it("preserves percent-encoded Markdown destination style after extraction", async () => {
+    const result = await rewriteAttachmentPageReferences({
+      page: page("p", "pages/P.md", "![x](../assets/a%20name.png)", ["a"]),
+      sourcePath: "pages/P.md",
+      sourceAttachments: [attachment("a", "assets/a name.png")],
+      finalPath: "pages/P.md",
+      finalAttachments: [attachment("a", "assets/b name.png")],
+      redirects: {},
+    });
+
+    expect(result.blockers).toEqual([]);
+    expect(result.page.body).toBe("![x](../assets/b%20name.png)");
+  });
+
   it("leaves unrelated bytes exact and blocks a source range that cannot bind to the declared identity", async () => {
     const body = "prefix ![[assets/other.png|alias]] suffix\n";
     const result = await rewriteAttachmentPageReferences({

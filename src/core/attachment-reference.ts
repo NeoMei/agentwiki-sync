@@ -13,6 +13,12 @@ export interface AttachmentReference {
   reason?: string;
 }
 
+export interface ShortestImageCandidate {
+  targetStart: number;
+  targetEnd: number;
+  decodedBasename: string;
+}
+
 function isEscaped(text: string, index: number): boolean {
   let slashCount = 0;
   for (
@@ -484,12 +490,16 @@ function closingParen(body: string, open: number): number {
   return -1;
 }
 
-export function parseAttachmentReferences(
+interface TokenizedAttachmentReference extends AttachmentReference {
+  grammarValid: boolean;
+}
+
+function tokenizeAttachmentReferences(
   body: string,
   pagePath: string,
-): AttachmentReference[] {
+): TokenizedAttachmentReference[] {
   const mask = excludedMask(body);
-  const references: AttachmentReference[] = [];
+  const references: TokenizedAttachmentReference[] = [];
   for (let index = 0; index < body.length; index += 1) {
     if (mask[index] || body[index] !== "!" || isEscaped(body, index)) continue;
     if (body.startsWith("![[", index)) {
@@ -506,6 +516,7 @@ export function parseAttachmentReferences(
       const rawTarget = body.slice(targetStart, targetEnd);
       references.push({
         syntax: "obsidian",
+        grammarValid: true,
         targetStart,
         targetEnd,
         ...resolvePath(rawTarget, pagePath, "obsidian"),
@@ -526,6 +537,7 @@ export function parseAttachmentReferences(
     const resolved = resolvePath(destination.rawTarget, pagePath, "markdown");
     references.push({
       syntax: "markdown",
+      grammarValid: destination.valid,
       targetStart: destination.targetStart,
       targetEnd: destination.targetEnd,
       ...(destination.valid
@@ -539,4 +551,47 @@ export function parseAttachmentReferences(
     index = close;
   }
   return references;
+}
+
+export function parseAttachmentReferences(
+  body: string,
+  pagePath: string,
+): AttachmentReference[] {
+  return tokenizeAttachmentReferences(body, pagePath).map(
+    ({ grammarValid: _grammarValid, ...reference }) => reference,
+  );
+}
+
+export function parseShortestImageCandidates(
+  body: string,
+): ShortestImageCandidate[] {
+  const candidates: ShortestImageCandidate[] = [];
+  for (const reference of tokenizeAttachmentReferences(
+    body,
+    "pages/__candidate__.md",
+  )) {
+    if (reference.syntax !== "markdown" || !reference.grammarValid) continue;
+    let decodedBasename: string;
+    try {
+      decodedBasename = decodeTarget(
+        body.slice(reference.targetStart, reference.targetEnd),
+      );
+    } catch {
+      continue;
+    }
+    if (
+      decodedBasename.length === 0 ||
+      decodedBasename.includes("/") ||
+      decodedBasename.includes("\\") ||
+      decodedBasename.includes(":") ||
+      !/\.(?:png|jpe?g|webp|gif)$/iu.test(decodedBasename)
+    )
+      continue;
+    candidates.push({
+      targetStart: reference.targetStart,
+      targetEnd: reference.targetEnd,
+      decodedBasename,
+    });
+  }
+  return candidates;
 }

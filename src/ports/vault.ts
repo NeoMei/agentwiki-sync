@@ -7,6 +7,10 @@ export interface VaultTreeEntry {
   updatedAt?: string;
 }
 
+export type ShortestImageResolution =
+  | { kind: "resolved"; attachmentPath: string; basenameKey: string }
+  | { kind: "missing" | "ambiguous" | "out_of_scope" | "unavailable" };
+
 export interface VaultPort {
   rootStatus(rootPath: string): Promise<"folder" | "missing" | "file">;
   listMarkdown(
@@ -27,4 +31,8 @@ export interface VaultPort {
     expected: Uint8Array | null,
     replacement: Uint8Array,
   ): Promise<boolean>;
+  resolveShortestImage?(
+    pagePath: string,
+    decodedBasename: string,
+  ): Promise<ShortestImageResolution>;
 }

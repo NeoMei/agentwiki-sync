@@ -6,7 +6,10 @@ import {
 } from "@neomei/agentwiki-sync-protocol";
 import vectors from "@neomei/agentwiki-sync-protocol/test-vectors/sync-v3.json";
 
-import { parseAttachmentReferences } from "../../src/core/attachment-reference";
+import {
+  parseAttachmentReferences,
+  parseShortestImageCandidates,
+} from "../../src/core/attachment-reference";
 import conformanceCases from "../fixtures/attachment-reference.conformance.json";
 
 type NormalizedClassification =
@@ -263,5 +266,57 @@ describe("parseAttachmentReferences", () => {
         (reference) => reference.resolvedPath,
       ),
     ).toEqual(["assets/real.png"]);
+  });
+});
+
+describe("parseShortestImageCandidates", () => {
+  it.each([
+    ["plain", "![x](photo.png)", "photo.png", "photo.png"],
+    [
+      "percent encoding",
+      "![x](photo%20one.png)",
+      "photo one.png",
+      "photo%20one.png",
+    ],
+    [
+      "escaped punctuation",
+      String.raw`![x](photo\(1\).png)`,
+      "photo(1).png",
+      String.raw`photo\(1\).png`,
+    ],
+    [
+      "angle destination with title",
+      '![x](<photo one.png> "T")',
+      "photo one.png",
+      "photo one.png",
+    ],
+    ["Unicode NFC", "![x](Cafe%CC%81.PNG)", "Café.PNG", "Cafe%CC%81.PNG"],
+    ["percent filename", "![x](100%25.png)", "100%.png", "100%25.png"],
+  ])(
+    "extracts a valid %s target from the tokenizer",
+    (_label, body, name, rawTarget) => {
+      const [candidate] = parseShortestImageCandidates(body);
+
+      expect(candidate?.decodedBasename).toBe(name);
+      expect(body.slice(candidate!.targetStart, candidate!.targetEnd)).toBe(
+        rawTarget,
+      );
+    },
+  );
+
+  it.each([
+    ["malformed percent", "![x](photo%ZZ.png)"],
+    ["network URI", "![x](https://example.test/photo.png)"],
+    ["drive path", "![x](C:/photo.png)"],
+    ["slash", "![x](folder/photo.png)"],
+    ["backslash", String.raw`![x](folder\\photo.png)`],
+    ["traversal", "![x](../photo.png)"],
+    ["unsupported extension", "![x](photo.svg)"],
+    ["invalid title", '![x](photo.png "T" trailing)'],
+    ["inline code", "`![x](photo.png)`"],
+    ["comment", "<!-- ![x](photo.png) -->"],
+    ["wiki embed", "![[photo.png]]"],
+  ])("rejects %s without widening public Markdown grammar", (_label, body) => {
+    expect(parseShortestImageCandidates(body)).toEqual([]);
   });
 });

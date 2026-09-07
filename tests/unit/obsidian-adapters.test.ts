@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import type { App, DataAdapter, FileManager, Vault } from "obsidian";
+import type {
+  App,
+  DataAdapter,
+  FileManager,
+  MetadataCache,
+  Vault,
+} from "obsidian";
 import {
   ObsidianControlStore,
   ObsidianLocalControlStore,
@@ -7,6 +13,7 @@ import {
   ObsidianVaultPort,
   RequestUrlHttp,
 } from "../../src/obsidian/adapters";
+import { ObsidianShortestImageResolver } from "../../src/obsidian/shortest-image-resolver";
 import { HttpResponseTooLargeError } from "../../src/ports/http";
 import { TFile, TFolder, requestUrlState } from "../fakes/obsidian-mock";
 
@@ -136,6 +143,9 @@ class FakeVault {
       .filter((path) => path.endsWith(".md"))
       .map((path) => this.getFileByPath(path)!);
   }
+  getFiles(): TFile[] {
+    return [...this.files.keys()].map((path) => this.getFileByPath(path)!);
+  }
   async readBinary(file: TFile): Promise<ArrayBuffer> {
     this.readPaths.push(file.path);
     return new TextEncoder().encode(this.files.get(file.path) ?? "").buffer;
@@ -262,6 +272,42 @@ describe("ObsidianSecrets", () => {
 });
 
 describe("ObsidianVaultPort", () => {
+  it("returns unavailable without a shortest-image resolver", async () => {
+    const port = new ObsidianVaultPort(
+      new FakeVault() as unknown as Vault,
+      {} as unknown as FileManager,
+      "Wiki",
+    );
+
+    await expect(
+      port.resolveShortestImage("pages/note.md", "photo.png"),
+    ).resolves.toEqual({ kind: "unavailable" });
+  });
+
+  it("delegates shortest-image resolution without widening its mapping root", async () => {
+    const resolver = {
+      resolve: async (pagePath: string, decodedBasename: string) => ({
+        kind: "resolved" as const,
+        attachmentPath: `${pagePath.startsWith("pages/") ? "assets" : "bad"}/${decodedBasename}`,
+        basenameKey: decodedBasename.toLowerCase(),
+      }),
+    };
+    const port = new ObsidianVaultPort(
+      new FakeVault() as unknown as Vault,
+      {} as unknown as FileManager,
+      "Wiki",
+      resolver,
+    );
+
+    await expect(
+      port.resolveShortestImage("pages/note.md", "Photo.PNG"),
+    ).resolves.toEqual({
+      kind: "resolved",
+      attachmentPath: "assets/Photo.PNG",
+      basenameKey: "photo.png",
+    });
+  });
+
   it("prevents reads and writes outside the mapping root", async () => {
     const vault = new FakeVault();
     const port = new ObsidianVaultPort(
@@ -454,6 +500,184 @@ describe("ObsidianVaultPort", () => {
     expect(vault.folders.has("Wiki/pages/New")).toBe(true);
     expect(vault.folders.has("Wiki/pages")).toBe(true);
     expect(vault.folders.has("Wiki")).toBe(true);
+  });
+});
+
+describe("ObsidianShortestImageResolver", () => {
+  function resolverFixture(
+    files: Record<string, string>,
+    destinations: Record<string, string | null>,
+  ): {
+    vault: FakeVault;
+    resolver: ObsidianShortestImageResolver;
+  } {
+    const vault = new FakeVault(files);
+    const metadataCache = {
+      getFirstLinkpathDest(linkpath: string, sourcePath: string): TFile | null {
+        const target = destinations[`${sourcePath}\0${linkpath}`];
+        return target ? vault.getFileByPath(target) : null;
+      },
+    };
+    return {
+      vault,
+      resolver: new ObsidianShortestImageResolver(
+        vault as unknown as Vault,
+        metadataCache as unknown as MetadataCache,
+        "Wiki",
+      ),
+    };
+  }
+
+  it("resolves only a globally unique metadata-agreed flat mapped image", async () => {
+    const { vault, resolver } = resolverFixture(
+      {
+        "Wiki/pages/note.md": "![x](Photo.PNG)",
+        "Wiki/assets/Photo.PNG": "bytes must stay unread",
+      },
+      { "Wiki/pages/note.md\0Photo.PNG": "Wiki/assets/Photo.PNG" },
+    );
+
+    await expect(
+      resolver.resolve("pages/note.md", "Photo.PNG"),
+    ).resolves.toEqual({
+      kind: "resolved",
+      attachmentPath: "assets/Photo.PNG",
+      basenameKey: "photo.png",
+    });
+    expect(vault.readPaths).toEqual([]);
+  });
+
+  it("returns the actual mapped path for a unique Unicode case-fold match", async () => {
+    const { resolver } = resolverFixture(
+      {
+        "Wiki/pages/note.md": "![x](STRASSE.PNG)",
+        "Wiki/assets/straße.png": "mapped",
+      },
+      { "Wiki/pages/note.md\0STRASSE.PNG": "Wiki/assets/straße.png" },
+    );
+
+    await expect(
+      resolver.resolve("pages/note.md", "STRASSE.PNG"),
+    ).resolves.toEqual({
+      kind: "resolved",
+      attachmentPath: "assets/straße.png",
+      basenameKey: "strasse.png",
+    });
+  });
+
+  it.each([
+    [
+      "external exact duplicate",
+      {
+        "Wiki/pages/note.md": "",
+        "Wiki/assets/photo.png": "mapped",
+        "Outside/photo.png": "outside",
+      },
+    ],
+    [
+      "Unicode case-fold duplicate",
+      {
+        "Wiki/pages/note.md": "",
+        "Wiki/assets/straße.png": "mapped",
+        "Outside/STRASSE.PNG": "outside",
+      },
+    ],
+    [
+      "NFC duplicate",
+      {
+        "Wiki/pages/note.md": "",
+        "Wiki/assets/Café.png": "mapped",
+        "Outside/Cafe\u0301.png": "outside",
+      },
+    ],
+  ])("rejects a %s without returning outside paths", async (_label, files) => {
+    const decodedBasename = Object.keys(files)[1]!.slice(
+      Object.keys(files)[1]!.lastIndexOf("/") + 1,
+    );
+    const { resolver } = resolverFixture(files, {
+      [`Wiki/pages/note.md\0${decodedBasename}`]: Object.keys(files)[1]!,
+    });
+
+    const result = await resolver.resolve("pages/note.md", decodedBasename);
+
+    expect(result).toEqual({ kind: "ambiguous" });
+    expect(JSON.stringify(result)).not.toContain("Outside");
+  });
+
+  it.each([
+    ["missing file", {}, null, "missing"],
+    [
+      "metadata disagreement",
+      { "Wiki/assets/photo.png": "mapped", "Other/other.png": "other" },
+      "Other/other.png",
+      "ambiguous",
+    ],
+    [
+      "nested mapped asset",
+      { "Wiki/assets/nested/photo.png": "nested" },
+      "Wiki/assets/nested/photo.png",
+      "out_of_scope",
+    ],
+    [
+      "outside asset",
+      { "Outside/photo.png": "outside" },
+      "Outside/photo.png",
+      "out_of_scope",
+    ],
+  ])(
+    "rejects %s with a reason-only result",
+    async (_label, files, destination, kind) => {
+      const { vault, resolver } = resolverFixture(files, {
+        "Wiki/pages/note.md\0photo.png": destination,
+      });
+
+      const result = await resolver.resolve("pages/note.md", "photo.png");
+
+      expect(result).toEqual({ kind });
+      expect(Object.keys(result)).toEqual(["kind"]);
+      expect(vault.readPaths).toEqual([]);
+    },
+  );
+
+  it.each([
+    ["page outside pages", "other/note.md", "photo.png"],
+    ["traversing page", "pages/../note.md", "photo.png"],
+    ["slash basename", "pages/note.md", "nested/photo.png"],
+    ["backslash basename", "pages/note.md", "nested\\photo.png"],
+    ["unsupported extension", "pages/note.md", "photo.svg"],
+    ["drive basename", "pages/note.md", "C:photo.png"],
+  ])("rejects %s before metadata lookup", async (_label, pagePath, name) => {
+    const { resolver } = resolverFixture(
+      { "Wiki/assets/photo.png": "mapped" },
+      {},
+    );
+
+    await expect(resolver.resolve(pagePath, name)).resolves.toEqual({
+      kind: "out_of_scope",
+    });
+  });
+
+  it("rebuilds its cached uniqueness index after invalidation", async () => {
+    const files = {
+      "Wiki/pages/note.md": "",
+      "Wiki/assets/photo.png": "mapped",
+    };
+    const { vault, resolver } = resolverFixture(files, {
+      "Wiki/pages/note.md\0photo.png": "Wiki/assets/photo.png",
+    });
+    expect(await resolver.resolve("pages/note.md", "photo.png")).toMatchObject({
+      kind: "resolved",
+    });
+
+    vault.files.set("Outside/PHOTO.PNG", "new duplicate");
+    expect(await resolver.resolve("pages/note.md", "photo.png")).toMatchObject({
+      kind: "resolved",
+    });
+    resolver.invalidate();
+
+    await expect(
+      resolver.resolve("pages/note.md", "photo.png"),
+    ).resolves.toEqual({ kind: "ambiguous" });
   });
 });
 
