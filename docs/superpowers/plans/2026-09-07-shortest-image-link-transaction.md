@@ -266,6 +266,7 @@ export class NormalizedPushRepository {
     plan: NormalizedPushPlan,
     push: TreePushPreviewV3,
     candidate: TreeSnapshotV3,
+    rawPageBytes: Record<string, Uint8Array>,
   ): Promise<void>;
   read(): Promise<NormalizedPushJournal | null>;
   loadConfirmed(journal: NormalizedPushJournal): Promise<{
@@ -280,6 +281,8 @@ export class NormalizedPushRepository {
 ```
 
 `candidate` 暂存的 revision 仅承载源计算上下文，不当作发布结果；比较候选使用 revisionContentHash 与正文/引用/附件集合。`stage` 将候选及 wire Page payload 转存到父操作的受控 payload 子目录，重验 hash/长度/能力后原子写父 journal；父 journal 未 durable 前不能调用远端。
+
+实施接口澄清：`stage` 的第四参数是映射相对路径到真实源 Page 原字节的完整集合，精确覆盖 `rawPathStates` 中 `pages/**/*.md` 文件。验证集合、原字节 hash、严格 UTF-8 与逐页/累计 raw 配额，canonical 暂存另行计量。原字节不落盘、不进入日志或网络。它弥补仅凭 hash 无法证明字节长度的接口缺口，不新增日志字段。Task 4 在完整授权重验后、stage 前从绑定 Vault/root 有界读取该集合；stage 再次比对 hash，拒绝读取竞态。已持久操作恢复不重新 stage 或采纳当前正文；Task 5 的扫描仍须前置独立 raw/canonical 限额。
 
 - [ ] fixture 导出 `makeNormalizedPlanInput(rawText?: string): Promise<NormalizedPushPlanInput>`：固定 `op-1/tx-1`、`https://example.test`、`server-1/space-1/device-1/credential-1/vault-1/Wiki`，单 Page `pages/note.md`，默认原文 `![A](photo.png)` 与目标 `![A](../assets/photo.png)`，源 `rev-1`；可选 rawText 仅供测试 LF/CRLF 等价字节时覆写原文，使用真实解码/规范化及 hash 函数重建全部证据。使用空 v2 identity 状态和确定能力，不使用全零 hash 冒充可验证内容。fixture 的候选由 FakeTreeRemoteV3 seed 的真实快照取得，wire 使用既有 prepareTreePushChangesV3。
 - [ ] 在已有形状校验最小实现上增加授权行为 RED：
@@ -320,6 +323,9 @@ const authorizationHash = await sha256Hex(
 ```
 
 - [ ] 实现 strict schema 与语义约束：unknown keys/未来版本/非法路径/非 write_page/重复 Page/重叠目标/错误 hash/无界长度拒绝。local_only 不许 remote_pending；local_pending/complete 要 target；complete 要 completion。guard 仅证明形状，repository 再证明同 operation 的子日志、事务和历史 completion，不能凭 phase 成功。
+
+取消边界澄清：local_only 的 local_pending 仅在没有远端子日志、存在同归属且精确绑定原 actions/raw 预条件/固定 source 的 deferred 本地事务、并已真实安全 rolled_back 时可转 superseded。保留回滚归属元数据，不写 completion 或改变 baseline/身份；prepared/applied/verified/committed/ambiguous 均不得伪装成取消。所保留 verifiedTarget 只能是原 sourceRevision/sourceTreeHash，不是新增发布证明。remote_push 已发布仍不能 supersede；writer 锁内重验全部证据。
+
 - [ ] 根日志使用 union guard 读取 3/4 的全部 main/prev/next，再验证每个 envelope/hash 和等代际分叉；未知、损坏、错误归属全部 fail closed。旧 1/2 不进入 union service，保持原调度拥有。默认 TreePushServiceV3 构造器仍严格 schema3；增加第六个可选 `journalPort?: JournalPort<TreePushJournalV3>`。注入时 load/inspect 均走该 port，不再直接解析根文件而误拒绝 terminal4；未注入的升级/新远端子引擎行为完全不变。
 - [ ] `v3Port().read()` 遇当前 4：仅在 `assertTerminal` 通过且保存历史 completion 凭据后返回 null；pending/伪 complete 拒绝。`write()` 重验根未变化，再用 union repository 递增 generation 写新3，不 clear4。反向3→4只允许 published+local verified 或权威 superseded 的3，保留旧 terminal envelope 于受控 operation 证据。注入 port 的 clear 只处理同拥有、权威未发布的活动3；不得删除 pending4 或历史完成凭据。按 controlRoot 串行化读-重验-写，避免两个 writer 抢占。
 - [ ] 增加行为测试：1/2旧 dispatcher不改、strict3拒绝4、terminal3→4→terminal4→3、prev/next各排列、断在.next/rename、同代分叉、未来schema、corrupt高/低代、foreign operation、缺/改payload、丢completion、完成后用户编辑/新Pull仍terminal、pending无法替换。所有恢复重复两次，比较 generation 与写入事实，不只 assert guard true。
