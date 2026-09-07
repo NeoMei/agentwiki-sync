@@ -43,6 +43,8 @@ import {
   pageCount,
   pageSlice,
   PREVIEW_PAGE_SIZE,
+  canConfirmV3Push,
+  localImageRepairLines,
 } from "./preview-logic";
 import {
   progressLabel,
@@ -58,6 +60,8 @@ type PreviewState =
   | null;
 
 export interface PreviewModalActionOptions {
+  closeLabel?: string;
+  files?: { path: string; open: () => Promise<void> }[];
   confirmLabel?: string;
   canConfirm?: () => boolean;
   disabledReason?: string;
@@ -279,12 +283,33 @@ export class PreviewModal extends Modal {
     });
     const refreshSummary = () => {
       summary.empty();
-      const lines =
+      const originalLines =
         typeof this.lines === "function" ? this.lines() : this.lines;
+      const localLines =
+        this.preview &&
+        ("normalizedPush" in this.preview || isPullPreviewV3(this.preview))
+          ? localImageRepairLines(this.preview)
+          : [];
+      const lines = [
+        ...localLines,
+        ...originalLines,
+        ...(this.actionOptions.files ?? []),
+      ];
       this.linePage = clampPage(this.linePage, lines.length);
       const list = summary.createEl("ul");
-      for (const line of pageSlice(lines, this.linePage))
-        list.createEl("li", { text: line });
+      for (const line of pageSlice(lines, this.linePage)) {
+        if (typeof line === "string") list.createEl("li", { text: line });
+        else
+          new Setting(list.createEl("li")).addButton((button) =>
+            button.setButtonText(`查看文件：${line.path}`).onClick(async () => {
+              try {
+                await line.open();
+              } catch (error) {
+                new Notice(`打开文件失败：${userErrorMessage(error)}`);
+              }
+            }),
+          );
+      }
       this.pager(summary, lines.length, this.linePage, (page) => {
         this.linePage = page;
         refreshSummary();
@@ -301,9 +326,14 @@ export class PreviewModal extends Modal {
           : this.preview && "mode" in this.preview
             ? this.preview.blockers.length
             : 0;
+    const canConfirm = () =>
+      this.actionOptions.canConfirm?.() !== false &&
+      (!this.preview ||
+        !("normalizedPush" in this.preview) ||
+        canConfirmV3Push(this.preview));
     const actionDescription = () => {
       const pending = pendingDecisionCount();
-      if (this.actionOptions.canConfirm?.() === false)
+      if (!canConfirm())
         return (
           this.actionOptions.disabledReason ??
           "当前预览不可确认，请刷新后重试。"
@@ -319,32 +349,38 @@ export class PreviewModal extends Modal {
     const refreshActionState = () => {
       actions.setDesc(actionDescription());
       confirmButton?.setDisabled(
-        this.running ||
-          pendingDecisionCount() > 0 ||
-          this.actionOptions.canConfirm?.() === false,
+        this.running || pendingDecisionCount() > 0 || !canConfirm(),
       );
     };
     this.refreshCurrentActionState = refreshActionState;
     actions
       .addButton((button) => {
         cancelButton = button;
-        button.setButtonText("取消").onClick(() => {
-          if (this.running) this.operation?.abort();
-          else this.close();
-        });
+        button
+          .setButtonText(this.actionOptions.closeLabel ?? "取消")
+          .onClick(() => {
+            if (this.running && this.actionOptions.closeLabel) return;
+            if (this.running) this.operation?.abort();
+            else this.close();
+          });
       })
       .addButton((button) => {
         confirmButton = button;
         button
-          .setButtonText(this.actionOptions.confirmLabel ?? "确认执行")
+          .setButtonText(
+            this.actionOptions.confirmLabel ??
+              (this.preview &&
+              "normalizedPush" in this.preview &&
+              this.preview.normalizedPush?.plan.mode === "local_only"
+                ? "确认修正本地链接"
+                : "确认执行"),
+          )
           .setWarning()
           .setDisabled(
-            this.running ||
-              pendingDecisionCount() > 0 ||
-              this.actionOptions.canConfirm?.() === false,
+            this.running || pendingDecisionCount() > 0 || !canConfirm(),
           )
           .onClick(async () => {
-            if (this.running) return;
+            if (this.running || !canConfirm()) return;
             const pending = pendingDecisionCount();
             if (pending > 0) {
               new Notice(`还有 ${pending} 项待处理，请先完成选择。`);
@@ -352,6 +388,7 @@ export class PreviewModal extends Modal {
               return;
             }
             this.running = true;
+            if (this.actionOptions.closeLabel) cancelButton?.setDisabled(true);
             this.operation = new AbortController();
             button.setDisabled(true);
             let completed = false;
@@ -362,7 +399,10 @@ export class PreviewModal extends Modal {
                     signal: this.operation!.signal,
                     onProgress: (progress) => {
                       actions.setDesc(progressLabel(progress));
-                      cancelButton?.setDisabled(!progress.cancellable);
+                      cancelButton?.setDisabled(
+                        !!this.actionOptions.closeLabel ||
+                          !progress.cancellable,
+                      );
                     },
                   }),
                 () => {

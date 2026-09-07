@@ -13,9 +13,14 @@ import {
   ObsidianVaultPort,
   RequestUrlHttp,
 } from "../../src/obsidian/adapters";
-import { ObsidianShortestImageResolver } from "../../src/obsidian/shortest-image-resolver";
+import {
+  ObsidianShortestImageResolver,
+  ObsidianShortestImageIndex,
+} from "../../src/obsidian/shortest-image-resolver";
 import { HttpResponseTooLargeError } from "../../src/ports/http";
 import { TFile, TFolder, requestUrlState } from "../fakes/obsidian-mock";
+import { TreeTransaction } from "../../src/application/tree-transaction";
+import { MemoryControlStore } from "../fakes/memory-control-store";
 
 class FakeDataAdapter {
   readonly files = new Map<string, string>();
@@ -272,6 +277,37 @@ describe("ObsidianSecrets", () => {
 });
 
 describe("ObsidianVaultPort", () => {
+  it("prepares a directory beneath a nested mapping without probing outside its bound root", async () => {
+    const vault = new FakeVault({ "Parent/Wiki/pages/note.md": "note" });
+    const port = new ObsidianVaultPort(
+      vault as unknown as Vault,
+      {} as unknown as FileManager,
+      "Parent/Wiki",
+    );
+    const transaction = new TreeTransaction(
+      port,
+      new MemoryControlStore(),
+      ".agentwiki/nested",
+    );
+    await transaction.prepare({
+      baseRevision: "base",
+      targetRevision: "target",
+      targetTreeHash: "0".repeat(64),
+      expectedPathStates: {
+        "Parent/Wiki/pages/new/child": { kind: "missing", hash: null },
+      },
+      actions: [
+        {
+          kind: "create_directory",
+          folderId: "folder",
+          path: "Parent/Wiki/pages/new/child",
+        },
+      ],
+    });
+    expect((await transaction.inspect())?.state).toBe("prepared");
+    expect(vault.readPaths).toEqual([]);
+    expect(vault.files.get("Parent/Wiki/pages/note.md")).toBe("note");
+  });
   it("returns unavailable without a shortest-image resolver", async () => {
     const port = new ObsidianVaultPort(
       new FakeVault() as unknown as Vault,
@@ -446,6 +482,75 @@ describe("ObsidianVaultPort", () => {
       },
       { kind: "directory", relativePath: "pages/Empty" },
     ]);
+  });
+
+  it("shares the whole-Vault index across mapping resolvers and invalidates outside duplicates", async () => {
+    const vault = new FakeVault({
+      "Wiki/assets/photo.png": "a",
+      "Other/assets/second.png": "b",
+    });
+    let enumerations = 0;
+    const getFiles = vault.getFiles.bind(vault);
+    vault.getFiles = () => {
+      enumerations += 1;
+      return getFiles();
+    };
+    const index = new ObsidianShortestImageIndex(vault as unknown as Vault);
+    const metadata = {
+      getFirstLinkpathDest: (name: string) =>
+        vault.getFileByPath(
+          name === "photo.png"
+            ? "Wiki/assets/photo.png"
+            : "Other/assets/second.png",
+        ),
+    } as unknown as MetadataCache;
+    const first = new ObsidianShortestImageResolver(
+      vault as unknown as Vault,
+      metadata,
+      "Wiki",
+      index,
+    );
+    const second = new ObsidianShortestImageResolver(
+      vault as unknown as Vault,
+      metadata,
+      "Other",
+      index,
+    );
+    expect((await first.resolve("pages/note.md", "photo.png")).kind).toBe(
+      "resolved",
+    );
+    expect((await second.resolve("pages/note.md", "second.png")).kind).toBe(
+      "resolved",
+    );
+    expect(enumerations).toBe(1);
+    vault.files.set("Unmapped/photo.png", "do not read");
+    index.invalidate();
+    expect(await first.resolve("pages/note.md", "photo.png")).toEqual({
+      kind: "ambiguous",
+    });
+    expect(vault.readPaths).toEqual([]);
+  });
+
+  it("lists raw Markdown sizes without reading any bytes in metadata-only mode", async () => {
+    const vault = new FakeVault({
+      "Wiki/pages/A.md": "abc",
+      "Wiki/assets/unused.png": "unused",
+    });
+    const port = new ObsidianVaultPort(
+      vault as unknown as Vault,
+      {} as FileManager,
+      "Wiki",
+    );
+    const entries = await collect(
+      port.listTree("Wiki", { metadataOnly: true }),
+    );
+    expect(vault.readPaths).toEqual([]);
+    expect(entries).toContainEqual({
+      kind: "markdown",
+      relativePath: "pages/A.md",
+      byteLength: 3,
+      updatedAt: "2026-09-04T00:00:00.000Z",
+    });
   });
 
   it("does not read non-Markdown bytes while listing the tree", async () => {

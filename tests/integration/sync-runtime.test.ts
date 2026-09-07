@@ -2069,10 +2069,12 @@ describe("SyncRuntime", () => {
         envelopeSchemaVersion: 1,
         writeGeneration: 1,
         payloadHash: "x".repeat(64),
-        payload: { schemaVersion: 3, spaceId: "space" },
+        payload: { schemaVersion: 9, spaceId: "space" },
       }),
     );
-    await expect(runtime.recover()).rejects.toThrow(/不支持的推送日志版本/);
+    await expect(runtime.recover()).rejects.toThrow(
+      "检测到未知或未来的控制 payload 版本",
+    );
   });
 
   it("clones an empty-bodied page without treating it as a missing sidecar", async () => {
@@ -2245,7 +2247,7 @@ describe("SyncRuntime", () => {
     expect(await runtime.hasUnfinishedPush()).toBe(false);
   });
 
-  it("picks the highest writeGeneration journal candidate for routing", async () => {
+  it("rejects malformed candidates before routing even when a newer candidate exists", async () => {
     const remote = new FakeTreeRemote();
     const control = new MemoryControlStore();
     const runtime = new SyncRuntime(
@@ -2273,7 +2275,11 @@ describe("SyncRuntime", () => {
         payload: { schemaVersion: 3 },
       }),
     );
-    await expect(runtime.recover()).rejects.toThrow(/不支持的推送日志版本/);
+    const before = [...control.files];
+    await expect(runtime.recover()).rejects.toThrow(
+      "检测到未知或未来的控制 payload 版本",
+    );
+    expect([...control.files]).toEqual(before);
   });
 
   it("applies a legacy pull-control-after state during recovery", async () => {

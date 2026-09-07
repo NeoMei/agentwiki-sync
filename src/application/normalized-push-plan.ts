@@ -8,6 +8,46 @@ import {
 import { canonicalBytes, sha256Hex } from "../agentwiki/protocol";
 import type { LocalImageNormalization } from "../core/local-image-normalization";
 import type { LocalTreeScanV3 } from "../core/tree-scan";
+import type { TreePullActionV3 } from "../core/merge";
+import type { TreePageV3 } from "../core/tree-model";
+import { sortTreePullActionsV3 } from "./tree-preview";
+
+export function retainNormalizedPageWrites(input: {
+  actions: TreePullActionV3[];
+  finalPages: TreePageV3[];
+  normalizations: LocalImageNormalization[];
+  rawPathStates: LocalTreeScanV3["rawPathStates"];
+}): TreePullActionV3[] {
+  const actions = [...input.actions];
+  for (const normalization of input.normalizations) {
+    const page = input.finalPages.find(
+      (p) => p.pageId === normalization.pageId,
+    );
+    if (!page) continue;
+    const raw = input.rawPathStates[normalization.pagePath];
+    if (raw?.kind !== "file" || raw.hash === page.contentHash) continue;
+    if (
+      actions.some(
+        (action) =>
+          (action.kind === "create_page" ||
+            action.kind === "write_page" ||
+            action.kind === "move_page") &&
+          action.path === page.path,
+      )
+    )
+      continue;
+    actions.push({
+      kind: "write_page",
+      pageId: page.pageId,
+      path: page.path,
+      bodyPath: `tree-preview-body/${page.pageId}.md`,
+      ...(page.path === normalization.pagePath
+        ? {}
+        : { beforePath: normalization.pagePath }),
+    });
+  }
+  return sortTreePullActionsV3(actions);
+}
 import {
   validateTreeIdentityState,
   type TreeIdentityStateV2,

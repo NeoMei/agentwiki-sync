@@ -11,6 +11,7 @@ import AgentWikiSyncPlugin from "../../src/main";
 import { TFile, TFolder, type MockElement } from "./obsidian-mock";
 
 export function memoryAdapter() {
+  const readPaths: string[] = [];
   const files = new Map<string, string>();
   const binaryFiles = new Map<string, Uint8Array>();
   const folders = new Set<string>();
@@ -71,6 +72,7 @@ export function memoryAdapter() {
     return folders.has(path) ? new TFolder(path, directChildren(path)) : null;
   };
   return {
+    readPaths,
     files,
     binaryFiles,
     folders,
@@ -80,6 +82,7 @@ export function memoryAdapter() {
     exists: async (path: string) =>
       files.has(path) || binaryFiles.has(path) || folders.has(path),
     read: async (path: string) => {
+      readPaths.push(path);
       const value = files.get(path);
       if (value === undefined) throw new Error(`missing ${path}`);
       return value;
@@ -90,6 +93,7 @@ export function memoryAdapter() {
       deriveParents(path);
     },
     readBinary: async (path: string) => {
+      readPaths.push(path);
       const value = bytes(path);
       if (!value) throw new Error(`missing ${path}`);
       return value.buffer.slice(
@@ -179,7 +183,16 @@ export async function makePlugin(input: {
         const listeners = vaultEvents.get(name) ?? [];
         listeners.push(callback);
         vaultEvents.set(name, listeners);
-        return {};
+        return {
+          off: () => {
+            vaultEvents.set(
+              name,
+              (vaultEvents.get(name) ?? []).filter(
+                (listener) => listener !== callback,
+              ),
+            );
+          },
+        };
       },
       getAbstractFileByPath: (path: string) => adapter.abstractFile(path),
       getFileByPath: (path: string) => {
@@ -191,7 +204,12 @@ export async function makePlugin(input: {
           .filter((path) => path.toLowerCase().endsWith(".md"))
           .map((path) => adapter.abstractFile(path))
           .filter((value): value is TFile => value instanceof TFile),
+      getFiles: () =>
+        [...new Set([...adapter.files.keys(), ...adapter.binaryFiles.keys()])]
+          .map((path) => adapter.abstractFile(path))
+          .filter((value): value is TFile => value instanceof TFile),
       readBinary: async (file: TFile) => {
+        adapter.readPaths.push(file.path);
         const value = adapter.bytes(file.path);
         if (!value) throw new Error(`missing ${file.path}`);
         return value.buffer.slice(
@@ -231,7 +249,21 @@ export async function makePlugin(input: {
         adapter.deriveParents(to);
       },
     },
+    metadataCache: {
+      getFirstLinkpathDest: (name: string) => {
+        const path = [
+          ...new Set([...adapter.files.keys(), ...adapter.binaryFiles.keys()]),
+        ].find((p) => p.split("/").at(-1) === name);
+        const value = path ? adapter.abstractFile(path) : null;
+        return value instanceof TFile ? value : null;
+      },
+    },
     workspace: {
+      openLinkText: async (
+        _path: string,
+        _sourcePath: string,
+        _newLeaf?: boolean,
+      ) => {},
       getActiveFile: () => null,
       on: () => ({}),
     },

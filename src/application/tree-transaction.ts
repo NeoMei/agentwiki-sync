@@ -310,25 +310,58 @@ export class TreeTransaction {
     )
       throw new Error("存在未终结的事务，请先执行恢复（recover）");
 
+    const readOwnedPathState = async (
+      path: string,
+    ): Promise<TreeTransactionPathState> => {
+      if (input.expectedPathStates) {
+        const expected = input.expectedPathStates[path];
+        if (!Object.hasOwn(input.expectedPathStates, path) || !expected)
+          throw new Error("STALE_PULL_PREVIEW");
+        let ancestor = path.slice(0, path.lastIndexOf("/"));
+        while (ancestor) {
+          const kind = await this.vault.pathStatus(ancestor);
+          if (kind === "file") throw new Error("STALE_PULL_PREVIEW");
+          if (kind === "directory") break;
+          const separator = ancestor.lastIndexOf("/");
+          ancestor = separator < 0 ? "" : ancestor.slice(0, separator);
+        }
+        if (
+          (await this.vault.pathStatus(path)) === "file" &&
+          (expected.kind !== "file" || !expected.hash)
+        )
+          throw new Error("STALE_PULL_PREVIEW");
+      }
+      return this.readPathState(path);
+    };
     if (input.expectedPathStates) {
       for (const [path, expected] of Object.entries(input.expectedPathStates))
-        if (!sameState(await this.readPathState(path), expected))
+        if (!sameState(await readOwnedPathState(path), expected))
           throw new Error("STALE_PULL_PREVIEW");
     }
 
     const operations = await this.materializeOperations(
       input,
       {
-        pathState: (path) => this.readPathState(path),
+        pathState: readOwnedPathState,
         directoryEntries: async (path) => {
           const entries: Array<[string, PathKind]> = [];
           if ((await this.vault.pathStatus(path)) !== "directory")
             return entries;
-          for await (const entry of this.vault.listTree(path))
+          for await (const entry of this.vault.listTree(
+            path,
+            input.expectedPathStates ? { metadataOnly: true } : undefined,
+          )) {
+            if (input.expectedPathStates && entry.kind !== "directory") {
+              const expected =
+                input.expectedPathStates[`${path}/${entry.relativePath}`];
+              if (!expected || expected.kind !== "file" || !expected.hash)
+                throw new Error("STALE_PULL_PREVIEW");
+            }
             entries.push([
               entry.relativePath,
               entry.kind === "directory" ? "directory" : "file",
             ]);
+          }
           return entries.sort(([left], [right]) => left.localeCompare(right));
         },
       },

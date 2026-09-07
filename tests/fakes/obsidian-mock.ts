@@ -172,6 +172,7 @@ interface MockPluginApp {
 }
 
 export class Plugin {
+  private readonly eventRefs: Array<{ off?: () => void }> = [];
   constructor(
     public readonly app: MockPluginApp,
     public readonly manifest: { version: string } = { version: "0.0.0" },
@@ -189,7 +190,14 @@ export class Plugin {
   addStatusBarItem(): MockElement {
     return new MockElement();
   }
-  registerEvent(): void {}
+  registerEvent(ref: { off?: () => void }): void {
+    this.eventRefs.push(ref);
+  }
+  unload(): void {
+    (this as { onunload?: () => void }).onunload?.();
+    for (const ref of this.eventRefs) ref.off?.();
+    this.eventRefs.length = 0;
+  }
   registerDomEvent(): void {}
 }
 

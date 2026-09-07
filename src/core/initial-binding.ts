@@ -215,6 +215,12 @@ export function resolveExplicitInitialTreeBindings(
         ? null
         : (folderIds.get(page.folderId) ?? page.folderId),
   }));
+  if (Object.hasOwn(local, "normalizations")) {
+    local.normalizations = local.normalizations.map((normalization) => ({
+      ...normalization,
+      pageId: pageIds.get(normalization.pageId) ?? normalization.pageId,
+    }));
+  }
 
   const remapIdentity = <T extends { folderId: string }>(
     records: Record<string, T>,

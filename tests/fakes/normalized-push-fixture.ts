@@ -45,6 +45,85 @@ import {
 } from "../../src/application/tree-push-service-v3";
 import { NormalizedPushCoordinator } from "../../src/application/normalized-push";
 import { readTreeSnapshotV3 } from "../../src/application/tree-snapshot-reader";
+import { SyncRuntime } from "../../src/application/sync-runtime";
+
+export async function makeNormalizedRuntimeFixture(
+  mode: "remote_push" | "local_only",
+) {
+  const bytes = Uint8Array.from([
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0,
+    0, 0, 3, 8, 6, 0, 0, 0, 0, 0, 0, 0,
+  ]);
+  const attachmentId = "11111111-1111-4111-8111-111111111111";
+  const filename = mode === "remote_push" ? "old.png" : "photo.png";
+  const body = `![A](../assets/${filename})`;
+  const remote = new FakeTreeRemoteV3();
+  await remote.seedTree({
+    spaceId: "space-1",
+    revision: "rev-1",
+    pages: [
+      {
+        pageId: "22222222-2222-4222-8222-222222222222",
+        folderId: null,
+        path: "pages/note.md",
+        title: "note",
+        body,
+        contentHash: await contentHash(body),
+        referencedAttachmentIds: [attachmentId],
+        updatedAt: "2026-09-07T00:00:00.000Z",
+      },
+    ],
+    attachments: [
+      {
+        attachmentId,
+        path: `assets/${filename}`,
+        mimeType: "image/png",
+        sizeBytes: String(bytes.byteLength),
+        width: 2,
+        height: 3,
+        contentHash: await sha256Hex(bytes),
+        updatedAt: "2026-09-07T00:00:00.000Z",
+      },
+    ],
+    blobs: { [attachmentId]: bytes },
+  });
+  const vault = new MemoryVault({});
+  const control = new MemoryControlStore();
+  Object.assign(vault, {
+    resolveShortestImage: async () => ({
+      kind: "resolved",
+      attachmentPath: "assets/photo.png",
+      basenameKey: "photo.png",
+    }),
+  });
+  const rebuild = () => {
+    const runtime = SyncRuntime.v3(
+      vault,
+      control,
+      remote,
+      { spaceId: "space-1", rootPath: "Wiki", status: "active" },
+      "device-1",
+      "space-1",
+      "credential-1",
+    );
+    runtime.configureNormalizedPush({
+      serverOrigin: "https://example.test",
+      serverInstanceId: "server-1",
+      deviceId: "device-1",
+      credentialId: "credential-1",
+      vaultId: "vault-1",
+    });
+    return runtime;
+  };
+  const runtime = rebuild();
+  await runtime.applyPullV3(await runtime.previewPullV3());
+  if (mode === "remote_push") {
+    await vault.rename("Wiki/assets/old.png", "Wiki/assets/photo.png");
+    await runtime.recordRename("Wiki/assets/old.png", "Wiki/assets/photo.png");
+  }
+  vault.seedMarkdown("Wiki/pages/note.md", "![A](photo.png)");
+  return { runtime, vault, control, remote, rebuild };
+}
 
 export const NORMALIZED_ROOT = ".agentwiki/device-1/space-1";
 export async function makeNormalizedFixture(rawText = "![A](photo.png)") {

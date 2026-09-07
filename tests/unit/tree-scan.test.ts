@@ -105,6 +105,141 @@ const pngBytes = Uint8Array.from([
   0, 0, 3, 8, 6, 0, 0, 0, 0, 0, 0, 0,
 ]);
 
+it("enumerates unreferenced images under pages without reading or inventing raw evidence", async () => {
+  const vault = new MemoryVault({ "Wiki/pages/note.md": "text" });
+  vault.seedFile("Wiki/pages/loose.png", pngBytes);
+  const scan = await scanLocalTree(
+    vault,
+    "Wiki",
+    snapshotV3(),
+    identityState(),
+    imageLimits,
+  );
+  expect(vault.readPaths).not.toContain("Wiki/pages/loose.png");
+  expect(scan.unmanagedPaths).toEqual(["pages/loose.png"]);
+  expect(scan.rawPathStates["pages/loose.png"]).toBeUndefined();
+});
+
+it("normalizes only opted-in v3 scans and retains the original raw hash without writes", async () => {
+  const vault = new MemoryVault({ "Wiki/pages/note.md": "![A](a.png)" });
+  vault.seedFile("Wiki/assets/a.png", pngBytes);
+  vault.seedFile("Wiki/assets/unused.png", pngBytes);
+  Object.assign(vault, {
+    resolveShortestImage: async () => ({
+      kind: "resolved",
+      attachmentPath: "assets/a.png",
+      basenameKey: "a.png",
+    }),
+  });
+  const strict = await scanLocalTree(
+    vault,
+    "Wiki",
+    snapshotV3(),
+    identityState(),
+    imageLimits,
+  );
+  expect(strict.blockers).toHaveLength(1);
+  const identities = identityState();
+  const scan = await scanLocalTree(
+    vault,
+    "Wiki",
+    snapshotV3(),
+    identities,
+    imageLimits,
+    undefined,
+    { normalizeShortestImages: true },
+  );
+  expect(scan.pages[0]?.body).toBe("![A](../assets/a.png)");
+  expect(scan.normalizations).toHaveLength(1);
+  expect(scan.rawPathStates["pages/note.md"]?.hash).toBe(
+    await sha256Hex(new TextEncoder().encode("![A](a.png)")),
+  );
+  expect(scan.rawPathStates["pages/note.md"]?.hash).not.toBe(
+    scan.pages[0]?.contentHash,
+  );
+  await scanLocalTree(
+    vault,
+    "Wiki",
+    snapshotV3(),
+    identities,
+    imageLimits,
+    undefined,
+    { normalizeShortestImages: true },
+  );
+  expect(vault.operations).toBe(0);
+  expect(vault.readPaths.filter((path) => !path.endsWith(".md"))).not.toContain(
+    "Wiki/assets/unused.png",
+  );
+});
+
+it("rejects raw Markdown over quota before reading it even when newline normalization would shrink it", async () => {
+  const vault = new MemoryVault({ "Wiki/pages/note.md": "a\r\nb\r\n" });
+  await expect(
+    scanLocalTree(vault, "Wiki", snapshotV3(), identityState(), {
+      ...imageLimits,
+      maxPageBytes: 5,
+    }),
+  ).rejects.toThrow("SPACE_TOO_LARGE");
+  expect(vault.readPaths).toEqual([]);
+});
+
+it.each([NaN, -1, 1.5, Infinity])(
+  "rejects invalid Markdown metadata size %s before any read",
+  async (size) => {
+    const vault = new MemoryVault({ "Wiki/pages/note.md": "abc" });
+    vault.setListedByteLength("Wiki/pages/note.md", size);
+    await expect(
+      scanLocalTree(vault, "Wiki", snapshotV3(), identityState(), imageLimits),
+    ).rejects.toThrow("INVALID_RAW_PAGE_SIZE");
+    expect(vault.readPaths).toEqual([]);
+  },
+);
+
+it("rejects a Markdown size changed between metadata enumeration and read", async () => {
+  const vault = new MemoryVault({ "Wiki/pages/note.md": "abc" });
+  vault.setListedByteLength("Wiki/pages/note.md", 2);
+  await expect(
+    scanLocalTree(vault, "Wiki", snapshotV3(), identityState(), imageLimits),
+  ).rejects.toThrow("RAW_PAGE_SIZE_CHANGED");
+  expect(vault.readPaths).toEqual(["Wiki/pages/note.md"]);
+});
+
+it("stops the raw aggregate before reading the page that exceeds the total", async () => {
+  const vault = new MemoryVault({
+    "Wiki/pages/A.md": "abc",
+    "Wiki/pages/B.md": "def",
+  });
+  await expect(
+    scanLocalTree(vault, "Wiki", snapshotV3(), identityState(), {
+      ...imageLimits,
+      maxTotalBodyBytes: 5,
+    }),
+  ).rejects.toThrow("SPACE_TOO_LARGE");
+  expect(vault.readPaths).toEqual(["Wiki/pages/A.md"]);
+});
+
+it("bounds canonical expansion separately from raw bytes", async () => {
+  const vault = new MemoryVault({ "Wiki/pages/note.md": "![A](a.png)" });
+  Object.assign(vault, {
+    resolveShortestImage: async () => ({
+      kind: "resolved",
+      attachmentPath: "assets/a.png",
+      basenameKey: "a.png",
+    }),
+  });
+  await expect(
+    scanLocalTree(
+      vault,
+      "Wiki",
+      snapshotV3(),
+      identityState(),
+      { ...imageLimits, maxPageBytes: 12 },
+      undefined,
+      { normalizeShortestImages: true },
+    ),
+  ).rejects.toThrow("SPACE_TOO_LARGE");
+});
+
 function attachment(
   attachmentId: string,
   path: string,
@@ -154,7 +289,7 @@ describe("scanLocalTree", () => {
 
     expect(scan.attachments).toEqual([]);
     expect(scan.blockers).toEqual([]);
-    expect(vault.readPaths).toEqual([]);
+    expect(vault.readPaths.filter((path) => !path.endsWith(".md"))).toEqual([]);
   });
 
   it("enumerates folders and pages under the managed pages root", async () => {
@@ -209,7 +344,9 @@ describe("scanLocalTree", () => {
       imageLimits,
     );
 
-    expect(vault.readPaths).not.toContain("assets/unused.png");
+    expect(
+      vault.readPaths.filter((path) => !path.endsWith(".md")),
+    ).not.toContain("assets/unused.png");
     expect(scan.attachments).toEqual([]);
     expect(scan.blockers).toEqual([]);
   });
@@ -244,7 +381,9 @@ describe("scanLocalTree", () => {
 
     const scan = await scanLocalTree(vault, "", base, identities, imageLimits);
 
-    expect(vault.readPaths).not.toContain("assets/kept.png");
+    expect(
+      vault.readPaths.filter((path) => !path.endsWith(".md")),
+    ).not.toContain("assets/kept.png");
     expect(vault.operations).toBe(0);
     expect(vault.exists("assets/kept.png")).toBe(true);
     expect(scan.attachments).toEqual([]);
@@ -311,7 +450,7 @@ describe("scanLocalTree", () => {
       imageLimits,
     );
 
-    expect(vault.readPaths).toEqual([]);
+    expect(vault.readPaths.filter((path) => !path.endsWith(".md"))).toEqual([]);
     expect(scan.blockers).toEqual([]);
   });
 
@@ -345,7 +484,9 @@ describe("scanLocalTree", () => {
       imageLimits,
     );
 
-    expect(ambiguous.readPaths).toEqual([]);
+    expect(ambiguous.readPaths.filter((path) => !path.endsWith(".md"))).toEqual(
+      [],
+    );
     expect(ambiguousScan.blockers.map((item) => item.code)).toContain(
       "ATTACHMENT_NAME_CONFLICT",
     );
@@ -372,7 +513,9 @@ describe("scanLocalTree", () => {
       );
 
       expect(scan.blockers.map((item) => item.code)).toContain(code);
-      expect(vault.readPaths).toEqual([]);
+      expect(vault.readPaths.filter((path) => !path.endsWith(".md"))).toEqual(
+        [],
+      );
     },
   );
 
@@ -392,7 +535,9 @@ describe("scanLocalTree", () => {
       identityState(),
       tinyLimit,
     );
-    expect(oversized.readPaths).toEqual([]);
+    expect(oversized.readPaths.filter((path) => !path.endsWith(".md"))).toEqual(
+      [],
+    );
     expect(listedBlock.blockers.map((item) => item.code)).toContain(
       "ATTACHMENT_QUOTA_EXCEEDED",
     );
@@ -408,7 +553,9 @@ describe("scanLocalTree", () => {
       identityState(),
       tinyLimit,
     );
-    expect(inaccurate.readPaths).toEqual(["assets/a.png"]);
+    expect(
+      inaccurate.readPaths.filter((path) => !path.endsWith(".md")),
+    ).toEqual(["assets/a.png"]);
     expect(actualBlock.blockers.map((item) => item.code)).toContain(
       "ATTACHMENT_QUOTA_EXCEEDED",
     );
@@ -634,7 +781,7 @@ describe("scanLocalTree", () => {
     expect(countBlock.blockers.map((item) => item.code)).toContain(
       "ATTACHMENT_QUOTA_EXCEEDED",
     );
-    expect(vault.readPaths).toEqual([]);
+    expect(vault.readPaths.filter((path) => !path.endsWith(".md"))).toEqual([]);
   });
 
   it("blocks path-to-multiple-ID and ID-to-multiple-path collisions", async () => {
@@ -680,7 +827,7 @@ describe("scanLocalTree", () => {
     expect(scan.blockers.map((item) => item.code)).toContain(
       "ATTACHMENT_NAME_CONFLICT",
     );
-    expect(vault.readPaths).toEqual([]);
+    expect(vault.readPaths.filter((path) => !path.endsWith(".md"))).toEqual([]);
   });
 
   it("blocks a detached reactivation whose ID is active at another path", async () => {

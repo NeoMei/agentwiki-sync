@@ -27,6 +27,19 @@ import type {
   TreeScanLimits,
 } from "../core/tree-scan";
 import { scanLocalTree } from "../core/tree-scan";
+import {
+  NormalizedPushRuntimeAdapter,
+  type NormalizedRuntimeAuthority,
+} from "./normalized-push-runtime";
+import {
+  normalizedPushPaths,
+  type NormalizedPushPlan,
+  type NormalizedPushJournal,
+} from "./normalized-push-plan";
+import {
+  PushJournalRouter,
+  readPushProtocolRequirement,
+} from "../storage/push-journal-router";
 import type {
   TreeDeltaItem,
   TreeAttachment,
@@ -161,11 +174,16 @@ export interface RuntimeStatusV3 {
 }
 
 export type PublishablePushPreviewV3 = TreePushPreviewV3 & {
+  normalizedPush: {
+    plan: NormalizedPushPlan;
+    candidate: TreeSnapshotV3;
+  } | null;
   publishable: true;
   blockers: [];
 };
 
 export interface BlockedPushPreviewV3 {
+  normalizedPush: null;
   protocolVersion: "3";
   publishable: false;
   spaceId: string;
@@ -330,7 +348,14 @@ const emptySnapshot = (
 });
 
 export class SyncRuntime {
+  private normalizedPush: NormalizedPushRuntimeAdapter | null = null;
+  private normalizedAuthority: NormalizedRuntimeAuthority | null = null;
   private scanEpoch = 0;
+  private readonly invalidationListeners = new Set<() => void>();
+  private readonly pushPreviewBindings = new WeakMap<
+    PushPreviewV3,
+    { epoch: number; authority: NormalizedRuntimeAuthority | null }
+  >();
   private readonly root: string;
   private readonly treeBaseline: TreeBaselineRepository;
   private readonly legacyBaseline: BaselineRepository;
@@ -415,6 +440,87 @@ export class SyncRuntime {
 
   invalidate(): void {
     this.scanEpoch += 1;
+    for (const listener of this.invalidationListeners) listener();
+  }
+
+  onInvalidate(listener: () => void): () => void {
+    this.invalidationListeners.add(listener);
+    return () => {
+      this.invalidationListeners.delete(listener);
+    };
+  }
+
+  isPushPreviewCurrent(preview: PushPreviewV3): boolean {
+    const binding = this.pushPreviewBindings.get(preview);
+    return (
+      preview.publishable &&
+      !!binding &&
+      binding.epoch === this.scanEpoch &&
+      binding.authority === this.normalizedAuthority &&
+      (!this.normalizedAuthority || !!this.normalizedPush)
+    );
+  }
+
+  async inspectNormalizedPush(): Promise<NormalizedPushJournal | null> {
+    if (!this.normalizedPush)
+      throw new Error("NORMALIZED_PUSH_AUTHORITY_REQUIRED");
+    await this.readJournalSchemaVersion(this.root + "/push/journal.json");
+    return this.normalizedPush.coordinator.inspect();
+  }
+
+  async cancelNormalizedPush(): Promise<void> {
+    if (!this.normalizedPush)
+      throw new Error("NORMALIZED_PUSH_AUTHORITY_REQUIRED");
+    await this.readJournalSchemaVersion(this.root + "/push/journal.json");
+    await this.normalizedPush.coordinator.cancel();
+  }
+
+  configureNormalizedPush(authority: NormalizedRuntimeAuthority): void {
+    const keys = [
+      "serverOrigin",
+      "serverInstanceId",
+      "deviceId",
+      "credentialId",
+      "vaultId",
+    ] as const;
+    if (
+      !authority ||
+      Object.keys(authority).length !== keys.length ||
+      keys.some(
+        (key) =>
+          typeof authority[key] !== "string" ||
+          authority[key].trim().length === 0,
+      )
+    )
+      throw new Error("NORMALIZED_PUSH_AUTHORITY_INVALID");
+    if (this.normalizedAuthority) {
+      if (
+        keys.every(
+          (key) => this.normalizedAuthority![key] === authority[key],
+        ) &&
+        this.normalizedPush
+      )
+        return;
+      this.invalidate();
+      this.normalizedPush = null;
+      throw new Error("NORMALIZED_PUSH_AUTHORITY_CHANGED");
+    }
+    if (authority.credentialId !== this.credentialId)
+      throw new Error("NORMALIZED_PUSH_AUTHORITY_INVALID");
+    this.normalizedAuthority = structuredClone(authority);
+    this.normalizedPush = new NormalizedPushRuntimeAdapter({
+      authority: this.normalizedAuthority,
+      mapping: this.mapping,
+      vault: this.vault,
+      control: this.control,
+      controlRoot: this.root,
+      remote: this.requireV3Remote(),
+      baseline: this.treeBaseline,
+      identities: this.identities,
+      scan: (base, caps, options) =>
+        this.scanV3(base, caps, options, true, false),
+      epoch: () => this.scanEpoch,
+    });
   }
 
   get spaceId(): string {
@@ -506,8 +612,15 @@ export class SyncRuntime {
     const page = base.pages.find(
       (item) => pathKey(item.path) === pathKey(fromRel),
     );
+    if (!page || !page.path.startsWith("pages/") || !toRel.startsWith("pages/"))
+      return;
+    try {
+      validatePortableMarkdownPath(toRel);
+    } catch {
+      return;
+    }
     const bytes = await this.vault.read(toPath);
-    if (!page || !bytes) return;
+    if (!bytes) return;
     const current = (await this.moveHints.read())?.payload.hints ?? [];
     const hints = current.filter((item) => item.pageId !== page.pageId);
     hints.push({
@@ -662,6 +775,8 @@ export class SyncRuntime {
     base: TreeSnapshotV3,
     capabilities: TreeSyncCapabilitiesV3,
     options?: SyncOperationOptions,
+    normalizeShortestImages = false,
+    persistIdentities = true,
   ): Promise<LocalTreeScanV3> {
     const epoch = this.scanEpoch;
     const status = await this.vault.rootStatus(this.mapping.rootPath);
@@ -669,19 +784,17 @@ export class SyncRuntime {
     if (status === "file") throw new Error("MAPPING_ROOT_NOT_DIRECTORY");
     const identities = await this.readIdentities();
     const hints = (await this.moveHints.read())?.payload.hints ?? [];
-    for (const hint of hints) {
-      const bytes = await this.vault.read(
-        joinRoot(this.mapping.rootPath, hint.toPath),
-      );
-      if (!bytes) continue;
-      const body = decodeVaultMarkdown(bytes).normalized;
-      identities.pendingPages[hint.pageId] = {
-        pageId: hint.pageId,
-        path: hint.toPath,
-        contentHash: await contentHash(body),
-      };
-    }
     const scanBase = structuredClone(base);
+    for (const hint of hints) {
+      const page = scanBase.pages.find((item) => item.pageId === hint.pageId);
+      if (!page || !hint.toPath.startsWith("pages/")) continue;
+      try {
+        validatePortableMarkdownPath(hint.toPath);
+      } catch {
+        continue;
+      }
+      page.path = hint.toPath;
+    }
     const renamedById = new Map<
       string,
       TreeAttachmentIdentity | TreePendingAttachmentIdentity
@@ -724,9 +837,26 @@ export class SyncRuntime {
           completed,
           cancellable: true,
         }),
+      {
+        normalizeShortestImages:
+          normalizeShortestImages && this.normalizedPush !== null,
+      },
     );
     if (epoch !== this.scanEpoch) throw new Error("扫描纪元已变更");
-    await this.identities.write(identities);
+    if (persistIdentities) {
+      for (const hint of hints) {
+        const page = scan.pages.find(
+          (item) => item.pageId === hint.pageId && item.path === hint.toPath,
+        );
+        if (page)
+          identities.pendingPages[page.pageId] = {
+            pageId: page.pageId,
+            path: page.path,
+            contentHash: page.contentHash,
+          };
+      }
+      await this.identities.write(identities);
+    }
     return scan;
   }
 
@@ -749,6 +879,24 @@ export class SyncRuntime {
   }
 
   private async readJournalSchemaVersion(path: string): Promise<number | null> {
+    if (path === this.root + "/push/journal.json") {
+      const requirement = await readPushProtocolRequirement(
+        this.control,
+        this.root,
+        {
+          spaceId: this.mapping.spaceId,
+          ...(this.normalizedAuthority
+            ? {
+                normalizedAuthority: {
+                  ...this.normalizedAuthority,
+                  mappingRootKey: this.mapping.rootPath,
+                },
+              }
+            : {}),
+        },
+      );
+      return requirement?.schemaVersion ?? null;
+    }
     let best: { writeGeneration: number; version: number } | null = null;
     for (const candidate of [path, path + ".prev", path + ".next"]) {
       const raw = await this.control.read(candidate);
@@ -854,7 +1002,28 @@ export class SyncRuntime {
   ): Promise<void> {
     if (preview.scanEpoch !== this.scanEpoch)
       throw new Error("STALE_PULL_PREVIEW");
+    {
+      const fresh = await this.scanV3(
+        preview.base,
+        preview.capabilities,
+        undefined,
+        preview.local.normalizations.length > 0,
+        false,
+      );
+      expectedV3PathStates(fresh, preview.actions);
+      if (
+        fresh.blockers.length ||
+        canonicalBytes(fresh.normalizations).toString() !==
+          canonicalBytes(preview.local.normalizations).toString()
+      )
+        throw new Error("STALE_PULL_PREVIEW");
+    }
     for (const [path, expected] of Object.entries(expectedPathStates)) {
+      if (
+        (await this.vault.pathStatus(path)) === "file" &&
+        (expected.kind !== "file" || !expected.hash)
+      )
+        throw new Error("STALE_PULL_PREVIEW");
       const actual = await this.readVaultPathState(path);
       if (actual.kind !== expected.kind || actual.hash !== expected.hash)
         throw new Error("STALE_PULL_PREVIEW");
@@ -888,6 +1057,15 @@ export class SyncRuntime {
   }
 
   async recover(): Promise<void> {
+    if (
+      (await this.readJournalSchemaVersion(
+        this.root + "/push/journal.json",
+      )) === 4
+    ) {
+      if (!this.normalizedPush)
+        throw new Error("NORMALIZED_PUSH_AUTHORITY_REQUIRED");
+      await this.normalizedPush.coordinator.recover();
+    }
     await this.discardOrphanPreviews();
     const pullVersion = await this.readJournalSchemaVersion(
       this.root + "/pull/journal.json",
@@ -900,12 +1078,19 @@ export class SyncRuntime {
     const pushVersion = await this.readJournalSchemaVersion(
       this.root + "/push/journal.json",
     );
+    if (this.remoteV3 && (pushVersion === 1 || pushVersion === 2)) {
+      // A separate image upgrade can leave the old owner's proven terminal root.
+      // The router retains it and rejects pending/foreign candidates before v3 proceeds.
+      await new PushJournalRouter(this.control, this.root).v3Port().read();
+      return;
+    }
     if (pushVersion === 1) await this.recoverLegacyPush();
     else if (pushVersion === 2) await this.recoverTreePush();
     else if (pushVersion === 3) {
       if (!this.remoteV3) throw new Error("不支持的推送日志版本");
       await this.recoverTreePushV3();
-    } else if (pushVersion !== null) throw new Error("不支持的推送日志版本");
+    } else if (pushVersion !== null && pushVersion !== 4)
+      throw new Error("不支持的推送日志版本");
   }
 
   private async recoverLegacyPull(): Promise<void> {
@@ -1184,6 +1369,8 @@ export class SyncRuntime {
           });
         },
       },
+      undefined,
+      new PushJournalRouter(this.control, this.root).v3Port(),
     );
   }
 
@@ -1351,9 +1538,18 @@ export class SyncRuntime {
     const version = await this.readJournalSchemaVersion(
       this.root + "/push/journal.json",
     );
+    if (version === 4) {
+      if (!this.normalizedPush)
+        throw new Error("NORMALIZED_PUSH_AUTHORITY_REQUIRED");
+      const journal = await this.normalizedPush.coordinator.inspect();
+      return (
+        !!journal &&
+        journal.phase !== "complete" &&
+        journal.phase !== "superseded"
+      );
+    }
     if (this.remoteV3) {
       if (version === null) return false;
-      if (version !== 3) throw new Error("不支持的推送日志版本");
       const push = await this.v3PushService().inspect();
       return (
         !!push &&
@@ -1484,6 +1680,8 @@ export class SyncRuntime {
   }
 
   async previewPullV3(options?: SyncOperationOptions): Promise<PullPreviewV3> {
+    if (await this.hasUnfinishedPush())
+      throw new Error("PUSH_RECOVERY_REQUIRED");
     await this.assertNoActiveV3PullTransaction();
     const remotePort = this.requireV3Remote();
     const space = (await remotePort.spaces()).find(
@@ -1495,7 +1693,7 @@ export class SyncRuntime {
     const remote = await this.downloadRemoteSnapshotV3(head.revision, options);
     const capabilities = await remotePort.capabilities();
     const base = (await this.readBaseSnapshotV3()) ?? this.emptySnapshotV3();
-    const local = await this.scanV3(base, capabilities, options);
+    const local = await this.scanV3(base, capabilities, options, true);
     const scanEpoch = this.scanEpoch;
     const missing = remote.attachments.filter((attachment) => {
       const localAttachment = local.attachments.find(
@@ -1651,6 +1849,8 @@ export class SyncRuntime {
     preview: PullPreviewV3,
     options?: SyncOperationOptions,
   ): Promise<void> {
+    if (await this.hasUnfinishedPush())
+      throw new Error("PUSH_RECOVERY_REQUIRED");
     if (pendingTreeDecisionCount(preview) > 0)
       throw new Error("拉取存在未解决的结构化冲突");
     const expectedPathStates = this.expectedV3VaultPathStates(
@@ -1755,6 +1955,26 @@ export class SyncRuntime {
   }
 
   async discardPushPreviewV3(preview: PushPreviewV3): Promise<void> {
+    if (preview.normalizedPush) {
+      if (!this.normalizedPush)
+        throw new Error("NORMALIZED_PUSH_AUTHORITY_REQUIRED");
+      await this.readJournalSchemaVersion(this.root + "/push/journal.json");
+      const journal = await this.normalizedPush.coordinator.inspect();
+      if (
+        journal &&
+        journal.binding.operationId ===
+          preview.normalizedPush.plan.binding.operationId &&
+        journal.phase !== "complete" &&
+        journal.phase !== "superseded"
+      )
+        throw new Error("PUSH_RECOVERY_REQUIRED");
+      await this.control.removeTree?.(
+        normalizedPushPaths(
+          this.root,
+          preview.normalizedPush.plan.binding.operationId,
+        ).payloadRoot,
+      );
+    }
     if ("previewId" in preview && preview.previewId)
       await this.control.removeTree?.(
         this.root + "/push-preview/" + safeKey(preview.previewId),
@@ -1849,6 +2069,8 @@ export class SyncRuntime {
   }
 
   async previewPushV3(options?: SyncOperationOptions): Promise<PushPreviewV3> {
+    if (await this.hasUnfinishedPush())
+      throw new Error("PUSH_RECOVERY_REQUIRED");
     const remote = this.requireV3Remote();
     const base = await this.readBaseSnapshotV3();
     if (!base) throw new Error("INITIAL_PULL_REQUIRED");
@@ -1858,11 +2080,12 @@ export class SyncRuntime {
     const capabilitiesHash = await treeCapabilitiesHashV3(capabilities);
     if (capabilitiesHash !== (await remote.capabilitiesHash))
       throw new Error("CAPABILITIES_CHANGED");
-    const local = await this.scanV3(base, capabilities, options);
+    const local = await this.scanV3(base, capabilities, options, true);
     if (local.blockers.length > 0)
       return {
         protocolVersion: "3",
         publishable: false,
+        normalizedPush: null,
         spaceId: this.mapping.spaceId,
         baseRevision: base.revision,
         changes: [],
@@ -1879,9 +2102,10 @@ export class SyncRuntime {
       capabilitiesHash,
       changes: changes.map((change) => this.pushManifestChangeV3(change)),
     });
-    return {
+    const preview: PublishablePushPreviewV3 = {
       protocolVersion: "3",
       publishable: true,
+      normalizedPush: null,
       blockers: [],
       spaceId: this.mapping.spaceId,
       baseRevision: base.revision,
@@ -1899,6 +2123,13 @@ export class SyncRuntime {
               .at(-2)
           : crypto.randomUUID(),
     };
+    preview.normalizedPush =
+      (await this.normalizedPush?.prepare(base, local, preview)) ?? null;
+    this.pushPreviewBindings.set(preview, {
+      epoch: this.scanEpoch,
+      authority: this.normalizedAuthority,
+    });
+    return preview;
   }
 
   private async finishV3Push(
@@ -2022,6 +2253,28 @@ export class SyncRuntime {
   ): Promise<void> {
     if (!preview.publishable || preview.blockers.length > 0)
       throw new Error("V3_PUSH_BLOCKED");
+    if (preview.normalizedPush) {
+      if (!this.normalizedPush)
+        throw new Error("NORMALIZED_PUSH_AUTHORITY_REQUIRED");
+      const wire: TreePushPreviewV3 = {
+        protocolVersion: preview.protocolVersion,
+        spaceId: preview.spaceId,
+        baseRevision: preview.baseRevision,
+        changes: preview.changes,
+        capabilities: preview.capabilities,
+        capabilitiesHash: preview.capabilitiesHash,
+        confirmationHash: preview.confirmationHash,
+        credentialId: preview.credentialId,
+        ...(preview.previewId ? { previewId: preview.previewId } : {}),
+      };
+      await this.normalizedPush.coordinator.confirm(
+        preview.normalizedPush.plan,
+        wire,
+        preview.normalizedPush.candidate,
+        options,
+      );
+      return;
+    }
     if (!preview.changes.length) return;
     const service = this.v3PushService();
     let effectivePreview = preview;
@@ -2106,10 +2359,43 @@ export class SyncRuntime {
   }
 
   async hasLocalImageCandidate(): Promise<boolean> {
-    for await (const entry of this.vault.listMarkdown(this.mapping.rootPath)) {
-      if (!entry.relativePath.startsWith("pages/")) continue;
+    const capabilities = await (
+      this.remoteV3 ?? this.legacyTreeRemote
+    ).capabilities();
+    let count = 0;
+    let total = 0;
+    const assertSize = (size: number) => {
+      if (!Number.isSafeInteger(size) || size < 0)
+        throw new Error("INVALID_RAW_PAGE_SIZE");
+      if (
+        size > capabilities.maxPageBytes ||
+        total + size > capabilities.maxClientTotalBodyBytes
+      )
+        throw new Error("SPACE_TOO_LARGE: image probe raw bytes");
+    };
+    for await (const entry of this.vault.listTree(this.mapping.rootPath, {
+      metadataOnly: true,
+    })) {
+      if (entry.kind !== "markdown" || !entry.relativePath.startsWith("pages/"))
+        continue;
       validatePortableMarkdownPath(entry.relativePath);
-      const body = decodeVaultMarkdown(entry.bytes).normalized;
+      if (++count > capabilities.maxClientSpacePages)
+        throw new Error("SPACE_TOO_LARGE: image probe page count");
+      if (entry.byteLength !== undefined) assertSize(entry.byteLength);
+      const bytes =
+        entry.bytes ??
+        (await this.vault.read(
+          joinRoot(this.mapping.rootPath, entry.relativePath),
+        ));
+      if (!bytes) throw new Error("RAW_PAGE_MISSING");
+      assertSize(bytes.byteLength);
+      if (
+        entry.byteLength !== undefined &&
+        entry.byteLength !== bytes.byteLength
+      )
+        throw new Error("RAW_PAGE_SIZE_CHANGED");
+      total += bytes.byteLength;
+      const body = decodeVaultMarkdown(bytes).normalized;
       if (
         parseAttachmentReferences(body, entry.relativePath).some(
           (reference) =>

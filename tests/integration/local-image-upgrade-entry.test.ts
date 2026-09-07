@@ -20,16 +20,25 @@ import type { SyncRuntime } from "../../src/application/sync-runtime";
 import { resolvePageConflictV3 } from "../../src/application/tree-diff";
 import {
   prepareLegacyUpgradePreview,
+  hashUpgradeLocalPlan,
+  hashUpgradeAuthorization,
   projectLegacyBase,
   type UpgradePreview,
 } from "../../src/application/local-image-upgrade-plan";
 import { selectSpaceSyncRoute } from "../../src/application/space-sync-route";
-import type { ConnectionState } from "../../src/application/connection-service";
+import {
+  isConnectionState,
+  type ConnectionState,
+} from "../../src/application/connection-service";
 import type { SpaceMapping } from "../../src/application/sync-coordinator";
 import type { ModalTransition } from "../../src/obsidian/modal-handoff";
 import { PreviewModal } from "../../src/obsidian/preview-modal";
 import { SyncCenterModal } from "../../src/obsidian/sync-center-modal";
-import { ObsidianControlStore } from "../../src/obsidian/adapters";
+import {
+  ObsidianControlStore,
+  ObsidianLocalControlStore,
+} from "../../src/obsidian/adapters";
+import { MutableControlRepository } from "../../src/storage/envelope";
 import { scanLocalTree } from "../../src/core/tree-scan";
 import { idFileKey } from "../../src/core/identity-key";
 import { ConfirmedUpgradePreviewRepository } from "../../src/storage/local-image-upgrade-confirmation";
@@ -462,7 +471,34 @@ async function pluginUpgradeHarness(
             },
           ],
         };
-    else if (path === "/api/sync/v2/spaces/space-1/head") {
+    else if (publishPreview && path === "/api/sync/v3/spaces/space-1/head") {
+      json = {
+        protocolVersion: "3",
+        spaceId: "space-1",
+        revision: "revision-v3",
+        sequence: 1,
+        revisionContentHash: publishPreview.candidateHash,
+        folderCount: String(publishPreview.candidate.folders.length),
+        pageCount: String(publishPreview.candidate.pages.length),
+        attachmentCount: String(publishPreview.candidate.attachments.length),
+        revisionManifestByteLength: String(
+          canonicalBytes(publishPreview.candidate).byteLength,
+        ),
+        revisionBodyBytes: String(
+          publishPreview.candidate.pages.reduce(
+            (n, p) => n + new TextEncoder().encode(p.body).byteLength,
+            0,
+          ),
+        ),
+        revisionAttachmentBytes: String(
+          publishPreview.candidate.attachments.reduce(
+            (n, a) => n + Number(a.sizeBytes),
+            0,
+          ),
+        ),
+        publishedAt: "2026-09-06T00:01:00.000Z",
+      };
+    } else if (path === "/api/sync/v2/spaces/space-1/head") {
       const metrics = await remoteMetrics();
       json = {
         protocolVersion: "2",
@@ -710,7 +746,8 @@ async function pluginUpgradeHarness(
 
 async function seedConfirmedUpgradeInPlugin(
   harness: Awaited<ReturnType<typeof pluginUpgradeHarness>>,
-): Promise<void> {
+  legacyShape = false,
+): Promise<UpgradePreview> {
   const subject = harness.plugin as unknown as {
     runtime: (mapping: SpaceMapping) => Promise<object>;
     runtimeRoutes: WeakMap<object, { upgrade: LocalImageUpgradeEntry | null }>;
@@ -721,7 +758,43 @@ async function seedConfirmedUpgradeInPlugin(
   if (!entry) throw new Error("expected upgrade entry");
   const draft = await entry.prepare();
   if (draft.kind !== "upgrade_draft") throw new Error("expected draft");
-  const preview = await entry.finalizePreview(draft);
+  const preview = structuredClone(await entry.finalizePreview(draft));
+  if (legacyShape) {
+    // Reconstruct the exact old scanner shape: it retained bytes for non-MD
+    // files under pages, before unmanaged metadata was introduced.
+    for (const [path, bytes] of harness.adapter.binaryFiles) {
+      if (!path.startsWith("Wiki/pages/") || path.toLowerCase().endsWith(".md"))
+        continue;
+      const relativePath = path.slice("Wiki/".length);
+      const state = { kind: "file" as const, hash: await sha256Hex(bytes) };
+      preview.merge.local.rawPathStates[relativePath] = state;
+      preview.localPlanEvidence.rawPathStates[relativePath] = state;
+      preview.localPlanEvidence.initialBindings!.originalLocal.rawPathStates[
+        relativePath
+      ] = state;
+    }
+    delete preview.localPlanEvidence.unmanagedPaths;
+    delete preview.localPlanEvidence.normalizations;
+    delete (preview.merge.local as Partial<typeof preview.merge.local>)
+      .normalizations;
+    delete preview.merge.local.unmanagedPaths;
+    const original = preview.localPlanEvidence.initialBindings!.originalLocal;
+    delete (original as Partial<typeof original>).normalizations;
+    delete original.unmanagedPaths;
+    preview.localPlanHash = await hashUpgradeLocalPlan(
+      preview.localPlanEvidence,
+    );
+    preview.authorizationHash = await hashUpgradeAuthorization({
+      binding: preview.binding,
+      sourceRevision: preview.remoteBase.sourceRevision,
+      sourceV2RevisionHash: preview.remoteBase.sourceV2RevisionHash,
+      projectedV3BaseHash: preview.remoteBase.projectedV3BaseHash,
+      oldBaselineEvidenceHash: preview.oldBaselineEvidenceHash,
+      candidateHash: preview.candidateHash,
+      localPlanHash: preview.localPlanHash,
+      confirmationHash: preview.push.confirmationHash,
+    });
+  }
   const deviceKey = await idFileKey(harness.connection.deviceId);
   const spaceKey = await idFileKey(mapping.spaceId);
   const root = `.agentwiki/devices/d-${deviceKey}/spaces/s-${spaceKey}`;
@@ -757,6 +830,7 @@ async function seedConfirmedUpgradeInPlugin(
   await new LocalImageUpgradeRepository(store, root, intent.binding).write(
     intent,
   );
+  return preview;
 }
 
 async function confirmedPreviewFixture(): Promise<{
@@ -851,6 +925,254 @@ async function confirmedPreviewFixture(): Promise<{
 }
 
 describe("local image upgrade plugin entry", () => {
+  it("rejects oversized Markdown in the real factory image probe before its first read", async () => {
+    const h = await pluginUpgradeHarness({
+      localBody: "x".repeat(V2_CAPABILITIES.maxPageBytes + 1),
+    });
+    h.adapter.readPaths.length = 0;
+    const subject = h.plugin as unknown as {
+      runtime: (mapping: SpaceMapping) => Promise<SyncRuntime>;
+    };
+    await expect(
+      subject.runtime(h.plugin.settings.mappings[0]!),
+    ).rejects.toThrow("SPACE_TOO_LARGE");
+    expect(h.adapter.readPaths).not.toContain("Wiki/pages/note.md");
+    expect(h.businessWrites).toEqual([]);
+  });
+  it.each([
+    "same",
+    "revoked",
+    "serverInstanceId",
+    "credentialId",
+    "deviceId",
+    "vaultId",
+    "serverOrigin",
+    "localCredential",
+    "readOnlyRemotePush",
+  ])(
+    "rechecks actual factory authority before ordinary modal confirmation: %s",
+    async (change) => {
+      const h = await pluginUpgradeHarness();
+      const subject = h.plugin as unknown as {
+        runtime: (mapping: SpaceMapping) => Promise<SyncRuntime>;
+        runtimeRoutes: WeakMap<
+          SyncRuntime,
+          { upgrade: LocalImageUpgradeEntry | null }
+        >;
+        openPushPreviewV3: (
+          runtime: SyncRuntime,
+          flow: unknown,
+          title: string,
+        ) => Promise<ModalTransition>;
+      };
+      const mapping = h.plugin.settings.mappings[0]!;
+      const carrier = await subject.runtime(mapping);
+      const entry = subject.runtimeRoutes.get(carrier)?.upgrade;
+      if (!entry) throw new Error("missing upgrade");
+      const draft = await entry.prepare();
+      if (draft.kind !== "upgrade_draft") throw new Error("missing draft");
+      const upgrade = await entry.finalizePreview(draft);
+      h.setPublishPreview(upgrade);
+      await entry.confirm(upgrade, upgrade.authorizationHash);
+      h.setSyncMode("native_v3");
+      const runtime = await subject.runtime(mapping);
+      const canonical = h.adapter.files.get("Wiki/pages/note.md")!;
+      const raw =
+        (change === "readOnlyRemotePush" ? "changed " : "") +
+        canonical.replace("../assets/used.png", "used.png");
+      h.adapter.files.set("Wiki/pages/note.md", raw);
+      const open = vi.spyOn(PreviewModal.prototype, "open");
+      (
+        await subject.openPushPreviewV3(
+          runtime,
+          { phaseRelease: () => () => {}, finish: () => {} },
+          "Push",
+        )
+      )();
+      const modal = open.mock.instances.at(-1) as unknown as PreviewModal;
+      const original = requestUrlState.impl;
+      requestUrlState.impl = async (request) => {
+        const response = await original(request);
+        const path = new URL((request as { url: string }).url).pathname;
+        if (
+          path.endsWith("/session") &&
+          [
+            "revoked",
+            "serverInstanceId",
+            "credentialId",
+            "deviceId",
+            "vaultId",
+          ].includes(change)
+        ) {
+          const json = {
+            ...(response.json as Record<string, unknown>),
+            [change === "revoked" ? "credentialStatus" : change]:
+              change === "revoked"
+                ? "revoked"
+                : "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+          };
+          return { ...response, json, text: JSON.stringify(json) };
+        }
+        if (path === "/api/sync/v3/spaces" && change === "readOnlyRemotePush") {
+          const body = response.json as {
+            spaces: Array<Record<string, unknown>>;
+          };
+          const json = {
+            ...body,
+            spaces: body.spaces.map((space) => ({
+              ...space,
+              canPublish: false,
+            })),
+          };
+          return { ...response, json, text: JSON.stringify(json) };
+        }
+        return response;
+      };
+      if (change === "serverOrigin")
+        h.plugin.settings.serverUrl = "https://different.example.com";
+      if (change === "localCredential") {
+        const connection = new MutableControlRepository(
+          new ObsidianLocalControlStore(h.app as never),
+          "connection-state.json",
+          isConnectionState,
+        );
+        await connection.write({
+          ...h.connection,
+          credentialId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        });
+      }
+      h.requests.length = 0;
+      h.businessWrites.length = 0;
+      const notices = noticeMessages().length;
+      modalButton(
+        modal,
+        change === "readOnlyRemotePush" ? "确认执行" : "确认修正本地链接",
+      ).dispatchEvent({ type: "click" });
+      await vi.waitFor(() =>
+        expect(noticeMessages().length).toBeGreaterThan(notices),
+      );
+      if (change === "same")
+        expect(h.adapter.files.get("Wiki/pages/note.md")).toBe(canonical);
+      else {
+        expect(h.adapter.files.get("Wiki/pages/note.md")).toBe(raw);
+        expect(h.businessWrites).toEqual([]);
+      }
+      expect(h.requests.filter((request) => request.method !== "GET")).toEqual(
+        [],
+      );
+      modal.close();
+      open.mockRestore();
+    },
+  );
+  it("unsubscribes and disables an open upgrade confirmation on plugin unload", async () => {
+    const h = await pluginUpgradeHarness();
+    const off = vi.fn();
+    const subscribe = Object.getOwnPropertyDescriptor(
+      LocalImageUpgradeEntry.prototype,
+      "onInvalidate",
+    )!.value as LocalImageUpgradeEntry["onInvalidate"];
+    const subscription = vi
+      .spyOn(LocalImageUpgradeEntry.prototype, "onInvalidate")
+      .mockImplementation(function (this: LocalImageUpgradeEntry, listener) {
+        const unsubscribe = subscribe.call(this, listener);
+        return () => {
+          off();
+          unsubscribe();
+        };
+      });
+    const subject = h.plugin as unknown as {
+      runSyncStrategy: (
+        id: string,
+        strategy: "auto",
+        options: unknown,
+      ) => Promise<ModalTransition>;
+    };
+    const open = vi.spyOn(PreviewModal.prototype, "open");
+    (await subject.runSyncStrategy("space-1", "auto", {}))();
+    const modal = open.mock.instances.at(-1) as unknown as PreviewModal;
+    expect(modalButton(modal, "确认升级并同步").disabled).toBe(false);
+    h.plugin.unload();
+    expect(off).toHaveBeenCalledOnce();
+    expect(modalButton(modal, "确认升级并同步").disabled).toBe(true);
+    expect(h.businessWrites).toEqual([]);
+    expect(h.requests.filter((request) => request.method !== "GET")).toEqual(
+      [],
+    );
+    open.mockRestore();
+    subscription.mockRestore();
+  });
+  it("recovers a persisted pre-normalization upgrade without adding fields or changing its authorization", async () => {
+    const h = await pluginUpgradeHarness();
+    h.adapter.binaryFiles.set(
+      "Wiki/pages/legacy.bin",
+      new Uint8Array([1, 2, 3]),
+    );
+    h.adapter.deriveParents("Wiki/pages/legacy.bin");
+    const old = await seedConfirmedUpgradeInPlugin(h, true);
+    h.setPublishPreview(old);
+    const restarted = new AgentWikiSyncPlugin(
+      h.app as never,
+      h.plugin.manifest,
+    );
+    await restarted.onload();
+    const subject = restarted as unknown as {
+      runSyncStrategy: (
+        id: string,
+        strategy: "auto",
+        options: unknown,
+      ) => Promise<unknown>;
+    };
+    await subject.runSyncStrategy("space-1", "auto", {});
+    const roots = [...h.adapter.files.entries()].filter(([path]) =>
+      path.endsWith("local-image-upgrade/journal.json"),
+    );
+    expect(roots).toHaveLength(1);
+    const { payload: result } = JSON.parse(roots[0]![1]) as {
+      payload: { phase: string; authorizationHash: string };
+    };
+    expect(result.phase).toBe("complete");
+    expect(result.authorizationHash).toBe(old.authorizationHash);
+    expect(Object.hasOwn(old.localPlanEvidence, "normalizations")).toBe(false);
+    expect(Object.hasOwn(old.localPlanEvidence, "unmanagedPaths")).toBe(false);
+    expect(h.adapter.binaryFiles.get("Wiki/pages/legacy.bin")).toEqual(
+      new Uint8Array([1, 2, 3]),
+    );
+  });
+  it("does not extend an old confirmed upgrade's opaque-file authorization to a new file", async () => {
+    const h = await pluginUpgradeHarness();
+    const old = await seedConfirmedUpgradeInPlugin(h, true);
+    h.setPublishPreview(old);
+    h.adapter.binaryFiles.set("Wiki/pages/new.png", PNG);
+    h.adapter.deriveParents("Wiki/pages/new.png");
+    h.adapter.readPaths.length = 0;
+    const before = [...h.adapter.files.entries()].filter(
+      ([path]) =>
+        path.includes("tree-identities") ||
+        path.endsWith("/payload/confirmed-preview.json"),
+    );
+    const subject = h.plugin as unknown as {
+      runSyncStrategy: (
+        id: string,
+        strategy: "auto",
+        options: unknown,
+      ) => Promise<unknown>;
+    };
+    await expect(
+      subject.runSyncStrategy("space-1", "auto", {}),
+    ).rejects.toThrow("STALE_UPGRADE_PREVIEW");
+    expect(h.adapter.readPaths).not.toContain("Wiki/pages/new.png");
+    expect(h.requests.filter((request) => request.method !== "GET")).toEqual(
+      [],
+    );
+    expect(h.businessWrites).toEqual([]);
+    expect(
+      [...h.adapter.files.entries()].filter(
+        ([path]) =>
+          path.includes("tree-identities") ||
+          path.endsWith("/payload/confirmed-preview.json"),
+      ),
+    ).toEqual(before);
+  });
   beforeEach(() => {
     noticeMessages().length = 0;
   });
@@ -1195,6 +1517,79 @@ describe("local image upgrade plugin entry", () => {
     expect(http.calls.every((call) => call.method === "GET")).toBe(true);
     expect(vault.operationLog).toEqual([]);
     expect(store.files.size).toBe(0);
+  });
+
+  it("binds shortest-image normalization into the single upgrade confirmation and local write plan", async () => {
+    const { entry, vault, http } = await makeUpgradeEntryFixture();
+    vault.seedMarkdown("Wiki/pages/note.md", "![A](used.png)");
+    Object.assign(vault, {
+      resolveShortestImage: async () => ({
+        kind: "resolved",
+        attachmentPath: "assets/used.png",
+        basenameKey: "used.png",
+      }),
+    });
+    const draft = await entry.prepare();
+    expect(draft.kind).toBe("upgrade_draft");
+    if (draft.kind !== "upgrade_draft") throw new Error("expected draft");
+    const preview = await entry.finalizePreview(draft);
+    expect(preview.localPlanEvidence.normalizations).toHaveLength(1);
+    expect(preview.localActions).toContainEqual(
+      expect.objectContaining({ kind: "write_page", path: "pages/note.md" }),
+    );
+    expect(http.calls.every((call) => call.method === "GET")).toBe(true);
+    expect(
+      new TextDecoder().decode((await vault.read("Wiki/pages/note.md"))!),
+    ).toBe("![A](used.png)");
+  });
+
+  it("repairs the explicitly bound remote PageID through the real first-upgrade factory", async () => {
+    const h = await pluginUpgradeHarness({ remoteBody: "server text\n" });
+    h.adapter.files.set("Wiki/pages/note.md", "![A](used.png)");
+    const subject = h.plugin as unknown as {
+      runtime: (mapping: SpaceMapping) => Promise<SyncRuntime>;
+      runtimeRoutes: WeakMap<
+        SyncRuntime,
+        { upgrade: LocalImageUpgradeEntry | null }
+      >;
+    };
+    const runtime = await subject.runtime(h.plugin.settings.mappings[0]!);
+    const entry = subject.runtimeRoutes.get(runtime)!.upgrade!;
+    const required = await entry.prepare();
+    if (required.kind !== "initial_binding_required")
+      throw new Error("expected bindings");
+    await expect(entry.resolveInitialBindings(required, [])).rejects.toThrow();
+    const draft = await entry.resolveInitialBindings(
+      required,
+      required.requirements.map((r) => ({
+        kind: r.kind,
+        localId: r.localId,
+        remoteId: r.remoteId,
+      })),
+    );
+    for (const conflict of [...draft.merge.pageConflicts])
+      await resolvePageConflictV3(draft.merge, conflict.conflictId, {
+        choice: "local",
+      });
+    const preview = await entry.finalizePreview(draft);
+    const page = preview.candidate.pages.find(
+      (p) => p.path === "pages/note.md",
+    )!;
+    expect(preview.localPlanEvidence.normalizations![0]!.pageId).toBe(
+      page.pageId,
+    );
+    expect(preview.localActions).toContainEqual(
+      expect.objectContaining({
+        kind: "write_page",
+        pageId: page.pageId,
+        path: page.path,
+      }),
+    );
+    h.setPublishPreview(preview);
+    await entry.confirm(preview, preview.authorizationHash);
+    expect(h.adapter.files.get("Wiki/pages/note.md")).toBe(
+      "![A](../assets/used.png)",
+    );
   });
 
   it("allows a viewer to inspect an upgrade draft but not confirm it", async () => {
@@ -1618,6 +2013,180 @@ describe("local image upgrade plugin entry", () => {
       expect([...harness.local.entries()]).toEqual(localBefore);
     },
   );
+
+  it("uses the production resolver and authority and rejects an outside duplicate created after preview", async () => {
+    const h = await pluginUpgradeHarness({ localBody: "![A](used.png)" });
+    const subject = h.plugin as unknown as {
+      runtime: (mapping: SpaceMapping) => Promise<SyncRuntime>;
+      runtimeRoutes: WeakMap<
+        SyncRuntime,
+        { upgrade: LocalImageUpgradeEntry | null }
+      >;
+    };
+    const carrier = await subject.runtime(h.plugin.settings.mappings[0]!);
+    const entry = subject.runtimeRoutes.get(carrier)?.upgrade;
+    if (!entry) throw new Error("expected upgrade");
+    const draft = await entry.prepare();
+    if (draft.kind !== "upgrade_draft") throw new Error("expected draft");
+    const preview = await entry.finalizePreview(draft);
+    expect(preview.localPlanEvidence.normalizations).toHaveLength(1);
+    h.adapter.binaryFiles.set("Outside/used.png", PNG);
+    h.adapter.binaryFiles.set("Wiki/assets/unused.png", PNG);
+    h.adapter.deriveParents("Outside/used.png");
+    h.emitVault("create", h.adapter.abstractFile("Outside/used.png"));
+    await expect(
+      entry.confirm(preview, preview.authorizationHash),
+    ).rejects.toThrow();
+    expect(h.requests.filter((r) => r.method !== "GET")).toEqual([]);
+    expect(h.businessWrites).toEqual([]);
+    expect(h.adapter.readPaths).not.toContain("Outside/used.png");
+    expect(h.adapter.readPaths).not.toContain("Wiki/assets/unused.png");
+  });
+
+  it("continues native sync after a real text Push and first image upgrade without losing the old terminal journal", async () => {
+    const h = await pluginUpgradeHarness({ includeLocalImage: false });
+    const subject = h.plugin as unknown as {
+      runtime: (mapping: SpaceMapping) => Promise<SyncRuntime>;
+      runtimeRoutes: WeakMap<
+        SyncRuntime,
+        { upgrade: LocalImageUpgradeEntry | null }
+      >;
+    };
+    const mapping = h.plugin.settings.mappings[0]!;
+    const text = await subject.runtime(mapping);
+    await text.applyPull(await text.previewPull());
+    await text.applyPush(await text.previewPush());
+    const oldPath = [...h.adapter.files.keys()].find((path) =>
+      path.endsWith("/push/journal.json"),
+    );
+    expect(oldPath).toBeDefined();
+    const old = JSON.parse(h.adapter.files.get(oldPath!)!) as {
+      payload: { schemaVersion: number; localCommitPhase: string };
+    };
+    expect(old.payload).toMatchObject({
+      schemaVersion: 2,
+      localCommitPhase: "verified",
+    });
+    h.adapter.files.set(
+      "Wiki/pages/note.md",
+      "local text only\n![A](../assets/used.png)",
+    );
+    h.adapter.binaryFiles.set("Wiki/assets/used.png", PNG);
+    h.adapter.deriveParents("Wiki/assets/used.png");
+    h.emitVault("create", h.adapter.abstractFile("Wiki/assets/used.png"));
+    const carrier = await subject.runtime(mapping);
+    const upgrade = subject.runtimeRoutes.get(carrier)?.upgrade;
+    if (!upgrade) throw new Error("expected upgrade entry");
+    const draft = await upgrade.prepare();
+    if (draft.kind !== "upgrade_draft") throw new Error("expected draft");
+    const confirmed = await upgrade.finalizePreview(draft);
+    h.setPublishPreview(confirmed);
+    await upgrade.confirm(confirmed, confirmed.authorizationHash);
+    h.setSyncMode("native_v3");
+    const native = await subject.runtime(mapping);
+    await native.recover();
+    await expect(native.hasUnfinishedPush()).resolves.toBe(false);
+    expect(h.adapter.files.has(oldPath!)).toBe(true);
+    const oldEnvelope = JSON.parse(h.adapter.files.get(oldPath!)!) as {
+      writeGeneration: number;
+      payload: unknown;
+    };
+    h.adapter.files.set(
+      "Wiki/pages/note.md",
+      h.adapter.files
+        .get("Wiki/pages/note.md")!
+        .replace("../assets/used.png", "used.png"),
+    );
+    h.emitVault("modify", h.adapter.abstractFile("Wiki/pages/note.md"));
+    const repair = await native.previewPushV3();
+    expect(repair.normalizedPush?.plan.mode).toBe("local_only");
+    expect(repair.normalizedPush!.plan.binding).toMatchObject({
+      serverOrigin: h.plugin.settings.serverUrl,
+      serverInstanceId: h.connection.serverInstanceId,
+      deviceId: h.connection.deviceId,
+      credentialId: h.connection.credentialId,
+      vaultId: h.connection.vaultId,
+      spaceId: mapping.spaceId,
+      mappingRootKey: mapping.rootPath,
+    });
+    const process = h.app.vault.process;
+    h.app.vault.process = async () => {
+      throw new Error("injected actual CAS interruption");
+    };
+    await expect(native.applyPushV3(repair)).rejects.toThrow();
+    h.app.vault.process = process;
+    expect((await native.inspectNormalizedPush())?.phase).toBe("local_pending");
+    const lifecycle = h.plugin as unknown as {
+      collectSyncDiff: (
+        id: string,
+        options: unknown,
+      ) => Promise<{ displayName: string; recoveryPending: boolean }>;
+      runSyncStrategy: (
+        id: string,
+        strategy: "auto",
+        options: unknown,
+      ) => Promise<ModalTransition>;
+    };
+    const beforeWrites = [...h.businessWrites];
+    const beforeRequests = h.requests.length;
+    expect(await lifecycle.collectSyncDiff("space-1", {})).toMatchObject({
+      displayName: "本地链接修正待处理，未发布云端版本",
+      recoveryPending: true,
+    });
+    expect(h.businessWrites).toEqual(beforeWrites);
+    expect(
+      h.requests.slice(beforeRequests).some((r) => r.path.includes("/head")),
+    ).toBe(false);
+    await expect(h.plugin.removeMapping("space-1")).rejects.toThrow();
+    await expect(h.plugin.disconnect()).rejects.toThrow();
+    expect(h.plugin.settings.mappings).toContainEqual(mapping);
+    const open = vi.spyOn(PreviewModal.prototype, "open");
+    const openFile = vi.spyOn(h.app.workspace, "openLinkText");
+    (await lifecycle.runSyncStrategy("space-1", "auto", {}))();
+    const pendingModal = open.mock.instances.at(-1) as unknown as PreviewModal;
+    modalButton(pendingModal, "查看文件：pages/note.md").dispatchEvent({
+      type: "click",
+    });
+    await vi.waitFor(() =>
+      expect(openFile).toHaveBeenCalledWith("Wiki/pages/note.md", "", false),
+    );
+    expect(h.businessWrites).toEqual(beforeWrites);
+    modalButton(pendingModal, "关闭").dispatchEvent({ type: "click" });
+    expect((await native.inspectNormalizedPush())?.phase).toBe("local_pending");
+    (await lifecycle.runSyncStrategy("space-1", "auto", {}))();
+    const retryModal = open.mock.instances.at(-1) as unknown as PreviewModal;
+    modalButton(retryModal, "重试").dispatchEvent({ type: "click" });
+    await vi.waitFor(async () =>
+      expect((await native.inspectNormalizedPush())?.phase).toBe("complete"),
+    );
+    open.mockRestore();
+    openFile.mockRestore();
+    const current = JSON.parse(h.adapter.files.get(oldPath!)!) as {
+      writeGeneration: number;
+      payload: unknown;
+    };
+    expect(current.payload).toMatchObject({
+      schemaVersion: 4,
+      phase: "complete",
+    });
+    expect(current.writeGeneration).toBeGreaterThan(
+      oldEnvelope.writeGeneration,
+    );
+    const history = [...h.adapter.files.entries()].filter(
+      ([path]) =>
+        path.includes("/history-2-") && path.endsWith("/terminal.json"),
+    );
+    expect(history).toHaveLength(1);
+    expect(JSON.parse(history[0]![1])).toEqual(oldEnvelope);
+    expect(h.adapter.files.get("Wiki/pages/note.md")).toContain(
+      "../assets/used.png",
+    );
+    const invalidate = vi.spyOn(native, "invalidate");
+    h.plugin.unload();
+    const count = invalidate.mock.calls.length;
+    h.emitVault("create", h.adapter.abstractFile("Wiki/assets/used.png"));
+    expect(invalidate.mock.calls).toHaveLength(count);
+  });
 
   it("publishes and commits the upgrade through exactly one real modal confirmation", async () => {
     const harness = await pluginUpgradeHarness();

@@ -16,7 +16,10 @@ import {
 } from "../fakes/normalized-push-fixture";
 import { sha256Hex } from "../../src/agentwiki/protocol";
 import { NormalizedPushRepository } from "../../src/storage/normalized-push";
-import { PushJournalRouter } from "../../src/storage/push-journal-router";
+import {
+  PushJournalRouter,
+  readPushProtocolRequirement,
+} from "../../src/storage/push-journal-router";
 import { normalizedPushPaths } from "../../src/application/normalized-push-plan";
 import {
   TreePushServiceV3,
@@ -35,6 +38,166 @@ import type { MutableControlEnvelope } from "../../src/storage/envelope";
 import { MemoryVault } from "../fakes/memory-vault";
 
 describe("normalized push storage", () => {
+  it.each([1, 2] as const)(
+    "retains schema %s terminal evidence through every forward-writer interruption",
+    async (schemaVersion) => {
+      for (const boundary of [
+        "history",
+        "next",
+        "main-prev",
+        "next-main",
+      ] as const)
+        for (const after of [false, true]) {
+          const f = await makeNormalizedFixture();
+          const next = makeV3Journal(f, { idempotencyKey: "new-v3" });
+          const old = {
+            ...next,
+            schemaVersion,
+            idempotencyKey: "old-legacy",
+            changes: [],
+          };
+          const rootPath = `${NORMALIZED_ROOT}/push/journal.json`;
+          const original = await envelopeFor(old, 12);
+          await f.store.write(rootPath, original);
+          const write = f.store.write.bind(f.store);
+          const rename = f.store.rename.bind(f.store);
+          let tripped = false;
+          const interrupt = async (
+            matches: boolean,
+            operation: () => Promise<void>,
+          ) => {
+            if (!matches || tripped) return operation();
+            tripped = true;
+            if (after) await operation();
+            throw new Error("handoff interruption");
+          };
+          f.store.write = (path, value) =>
+            interrupt(
+              boundary === "history"
+                ? path.includes(`/history-${schemaVersion}-`)
+                : boundary === "next" && path === `${rootPath}.next`,
+              () => write(path, value),
+            );
+          f.store.rename = (from, to) =>
+            interrupt(
+              boundary === "main-prev"
+                ? from === rootPath
+                : boundary === "next-main" && from === `${rootPath}.next`,
+              () => rename(from, to),
+            );
+          const port = new PushJournalRouter(f.store, NORMALIZED_ROOT).v3Port();
+          await expect(
+            (async () => {
+              await port.read();
+              await port.write(next);
+            })(),
+          ).rejects.toThrow("handoff interruption");
+          expect(tripped).toBe(true);
+          f.store.write = write;
+          f.store.rename = rename;
+          const rebuilt = new PushJournalRouter(
+            f.store,
+            NORMALIZED_ROOT,
+          ).v3Port();
+          const resumed = await rebuilt.read();
+          if (!resumed) await rebuilt.write(next);
+          const current = await new PushJournalRouter(
+            f.store,
+            NORMALIZED_ROOT,
+          ).read();
+          expect(current!.payload.schemaVersion).toBe(3);
+          expect(current!.writeGeneration).toBe(13);
+          expect(
+            [...f.store.files.entries()]
+              .filter(([path]) => path.includes(`/history-${schemaVersion}-`))
+              .map(([, value]) => value),
+          ).toEqual([original]);
+        }
+    },
+  );
+
+  it.each([
+    "pending",
+    "foreign",
+    "corrupt",
+    "fork",
+    "missing-owner",
+    "mixed-legacy",
+    "backward",
+  ])(
+    "refuses %s evidence without discarding a legacy owner",
+    async (variant) => {
+      const f = await makeNormalizedFixture();
+      const next = makeV3Journal(f, { idempotencyKey: "new-v3" });
+      const old: Record<string, unknown> = {
+        ...next,
+        schemaVersion: 1,
+        idempotencyKey: "legacy",
+        changes: [],
+      };
+      if (variant === "pending") old.remoteState = "uploading";
+      if (variant === "missing-owner") delete old.idempotencyKey;
+      const path = `${NORMALIZED_ROOT}/push/journal.json`;
+      await f.store.write(path, await envelopeFor(old, 5));
+      if (variant === "foreign")
+        await f.store.write(
+          `${path}.prev`,
+          await envelopeFor({ ...old, spaceId: "foreign" }, 4),
+        );
+      if (variant === "corrupt") await f.store.write(`${path}.prev`, "corrupt");
+      if (variant === "fork")
+        await f.store.write(
+          `${path}.next`,
+          await envelopeFor({ ...old, idempotencyKey: "fork" }, 5),
+        );
+      if (variant === "mixed-legacy")
+        await f.store.write(
+          `${path}.next`,
+          await envelopeFor({ ...old, schemaVersion: 2 }, 6),
+        );
+      if (variant === "backward")
+        await f.store.write(`${path}.prev`, await envelopeFor(next, 4));
+      const before = [...f.store.files];
+      await expect(
+        new PushJournalRouter(f.store, NORMALIZED_ROOT).v3Port().read(),
+      ).rejects.toThrow();
+      expect([...f.store.files]).toEqual(before);
+    },
+  );
+
+  it("preserves schema2 capability refresh and original credential ownership across retained candidates", async () => {
+    const f = await makeNormalizedFixture();
+    const template = makeV3Journal(f);
+    const old = {
+      ...template,
+      schemaVersion: 2,
+      changes: [],
+      remoteState: "uploading",
+      credentialIdAtCreation: "rotated-old",
+    };
+    const latest = {
+      ...old,
+      capabilities: { ...old.capabilities, maxPageItems: 17 },
+      capabilitiesHash: "updated-caps",
+      remoteState: "superseded",
+      result: null,
+      localCommitPhase: "not_started",
+    };
+    const path = `${NORMALIZED_ROOT}/push/journal.json`;
+    await f.store.write(`${path}.prev`, await envelopeFor(old, 4));
+    await f.store.write(path, await envelopeFor(latest, 5));
+    expect(
+      await readPushProtocolRequirement(f.store, NORMALIZED_ROOT, {
+        spaceId: old.spaceId,
+      }),
+    ).toEqual({ schemaVersion: 2, minimumProtocolVersion: "1" });
+    expect(
+      (await new PushJournalRouter(f.store, NORMALIZED_ROOT).read())!.payload,
+    ).toEqual(latest);
+    await expect(
+      new PushJournalRouter(f.store, NORMALIZED_ROOT).v3Port().read(),
+    ).resolves.toBeNull();
+  });
   it("binds actual changed after-state identities without rewriting original authorization", async () => {
     const f = await makeLocalOnlyFixture();
     const original = await sealNormalizedPushPlan(f.input);

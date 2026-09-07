@@ -20,6 +20,72 @@ import { MemoryVault } from "../fakes/memory-vault";
 
 const IMAGE_BYTES = Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]);
 
+it.each(["pages/new", "pages/new/child"])(
+  "refuses an unconfirmed opaque target or ancestor before creating %s",
+  async (target) => {
+    const vault = new MemoryVault({});
+    vault.seedFile("pages/new", IMAGE_BYTES);
+    const control = new MemoryControlStore();
+    const transaction = new TreeTransaction(
+      vault,
+      control,
+      ".agentwiki/opaque-target",
+    );
+    await expect(
+      transaction.prepare({
+        baseRevision: "base",
+        targetRevision: "target",
+        targetTreeHash: "0".repeat(64),
+        expectedPathStates: { [target]: { kind: "missing", hash: null } },
+        actions: [
+          { kind: "create_directory", folderId: "folder", path: target },
+        ],
+      }),
+    ).rejects.toThrow("STALE_PULL_PREVIEW");
+    expect(vault.readPaths).not.toContain("pages/new");
+    expect(vault.operationLog).toEqual([]);
+    expect(await transaction.inspect()).toBeNull();
+  },
+);
+
+it("refuses a file introduced between final preflight and directory materialization before reading it", async () => {
+  const vault = new MemoryVault({});
+  vault.folders.add("pages/old");
+  const list = vault.listTree.bind(vault);
+  vault.listTree = async function* (root, options) {
+    vault.seedFile("pages/old/late.png", IMAGE_BYTES);
+    yield* list(root, options);
+  };
+  const control = new MemoryControlStore();
+  const transaction = new TreeTransaction(
+    vault,
+    control,
+    ".agentwiki/late-opaque",
+  );
+  await expect(
+    transaction.prepare({
+      baseRevision: "base",
+      targetRevision: "target",
+      targetTreeHash: "0".repeat(64),
+      expectedPathStates: {
+        "pages/old": { kind: "directory", hash: null },
+        "pages/new": { kind: "missing", hash: null },
+      },
+      actions: [
+        {
+          kind: "move_directory",
+          folderId: "folder",
+          fromPath: "pages/old",
+          path: "pages/new",
+        },
+      ],
+    }),
+  ).rejects.toThrow("STALE_PULL_PREVIEW");
+  expect(vault.readPaths).not.toContain("pages/old/late.png");
+  expect(vault.operationLog).toEqual([]);
+  expect(await transaction.inspect()).toBeNull();
+});
+
 async function attachmentAction(
   kind: "create_attachment" | "write_attachment",
   path: string,

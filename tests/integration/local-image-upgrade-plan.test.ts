@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import { contentHash, sha256Hex } from "../../src/agentwiki/protocol";
 import {
   hashUpgradeAuthorization,
+  expectedV3PathStates,
   hashUpgradeLocalPlan,
   mergeLegacyUpgrade,
   prepareLegacyUpgradePreview,
@@ -31,6 +32,158 @@ import type { UpgradeBinding } from "../../src/storage/local-image-upgrade";
 import type { TreeIdentityStateV2 } from "../../src/storage/tree-identities";
 import { MemoryControlStore } from "../fakes/memory-control-store";
 import { MemoryVault } from "../fakes/memory-vault";
+import { makeNormalizedRuntimeFixture } from "../fakes/normalized-push-fixture";
+import {
+  buildTreePullPreviewV3,
+  resolveAttachmentConflict,
+  resolvePageConflictV3,
+} from "../../src/application/tree-diff";
+import { retainNormalizedPageWrites } from "../../src/application/normalized-push-plan";
+
+it.each(["trash-source", "move-source", "target-file", "target-ancestor"])(
+  "rejects %s directory involvement with unmanaged metadata without reading bytes",
+  async (variant) => {
+    const f = await makeNormalizedRuntimeFixture("local_only");
+    f.vault.seedFile("Wiki/pages/opaque.png", new Uint8Array(16));
+    const preview = await f.runtime.previewPullV3();
+    const local = preview.local;
+    expect(local.unmanagedPaths).toEqual(["pages/opaque.png"]);
+    expect(f.vault.readPaths).not.toContain("Wiki/pages/opaque.png");
+    const action =
+      variant === "trash-source"
+        ? { kind: "trash_directory" as const, folderId: "f", path: "pages" }
+        : variant === "move-source"
+          ? {
+              kind: "move_directory" as const,
+              folderId: "f",
+              fromPath: "pages",
+              path: "other",
+            }
+          : {
+              kind: "create_directory" as const,
+              folderId: "f",
+              path:
+                variant === "target-file"
+                  ? "pages/opaque.png"
+                  : "pages/opaque.png/child",
+            };
+    expect(() => expectedV3PathStates(local, [action])).toThrow(
+      "UNMANAGED_FILE_IN_DIRECTORY_ACTION",
+    );
+    expect(() => expectedV3PathStates(local, preview.actions)).not.toThrow();
+    expect(f.vault.readPaths).not.toContain("Wiki/pages/opaque.png");
+  },
+);
+
+it("recomputes a normalized repair from the final keep-both redirect", async () => {
+  const f = await makeNormalizedRuntimeFixture("local_only");
+  const source = await f.runtime.previewPullV3();
+  const local = structuredClone(source.local);
+  const remote = structuredClone(source.remote);
+  const secondPage = {
+    ...source.remote.pages[0]!,
+    pageId: "44444444-4444-4444-8444-444444444444",
+    path: "pages/second.md",
+    title: "second",
+  };
+  source.base.pages.push(structuredClone(secondPage));
+  local.pages.push(structuredClone(secondPage));
+  remote.pages.push(structuredClone(secondPage));
+  local.attachments[0]!.contentHash = "a".repeat(64);
+  remote.attachments[0]!.contentHash = "b".repeat(64);
+  const merged = await buildTreePullPreviewV3(source.base, local, remote);
+  const conflict = merged.attachmentConflicts[0]!;
+  expect(conflict).toBeDefined();
+  await resolveAttachmentConflict(merged, conflict.conflictId, {
+    choice: "keep_both",
+    primary: "remote",
+    secondaryAttachmentId: "33333333-3333-4333-8333-333333333333",
+    secondaryPath: "assets/local.png",
+    redirectPageIds: [local.pages[0]!.pageId],
+  });
+  expect(merged.resolvedPages[0]!.body).toBe("![A](../assets/local.png)");
+  expect(
+    merged.actions.filter((action) => action.kind === "write_page"),
+  ).toHaveLength(1);
+  expect(merged.resolvedPages[0]!.body).not.toContain("(photo.png)");
+});
+
+it.each(["local", "remote", "manual", "delete"] as const)(
+  "retains only the final %s Page choice after normalized merge",
+  async (choice) => {
+    const f = await makeNormalizedRuntimeFixture("local_only");
+    f.vault.seedMarkdown("Wiki/pages/note.md", "local\n![A](photo.png)");
+    const source = await f.runtime.previewPullV3();
+    const remote = structuredClone(source.remote);
+    remote.pages[0]!.body = "remote\n![A](../assets/photo.png)";
+    remote.pages[0]!.contentHash = await contentHash(remote.pages[0]!.body);
+    if (choice === "delete") remote.pages = [];
+    const merged = await buildTreePullPreviewV3(
+      source.base,
+      source.local,
+      remote,
+    );
+    expect(merged.pageConflicts.length).toBeGreaterThan(0);
+    expect(merged.actions.some((a) => a.kind === "write_page")).toBe(false);
+    for (const conflict of [...merged.pageConflicts])
+      await resolvePageConflictV3(
+        merged,
+        conflict.conflictId,
+        choice === "manual"
+          ? {
+              choice: "manual",
+              manualValue: "manual\n![A](../assets/photo.png)",
+            }
+          : { choice: choice === "delete" ? "remote" : choice },
+      );
+    if (choice === "delete") {
+      expect(merged.resolvedPages).toEqual([]);
+      expect(merged.actions.some((a) => a.kind === "write_page")).toBe(false);
+    } else {
+      expect(merged.resolvedPages[0]!.body).toBe(
+        `${choice}\n![A](../assets/photo.png)`,
+      );
+      expect(
+        merged.actions.filter((a) => a.kind === "write_page"),
+      ).toHaveLength(1);
+      const again = retainNormalizedPageWrites({
+        actions: merged.actions,
+        finalPages: merged.resolvedPages,
+        normalizations: merged.local.normalizations,
+        rawPathStates: merged.local.rawPathStates,
+      });
+      expect(again).toEqual(merged.actions);
+    }
+  },
+);
+
+it("places a retained repair at its final moved path without duplicating an existing move", async () => {
+  const f = await makeNormalizedRuntimeFixture("local_only");
+  const preview = await f.runtime.previewPullV3();
+  const final = { ...preview.resolvedPages[0]!, path: "pages/moved.md" };
+  const input = {
+    finalPages: [final],
+    normalizations: preview.local.normalizations,
+    rawPathStates: preview.local.rawPathStates,
+  };
+  expect(retainNormalizedPageWrites({ ...input, actions: [] })).toEqual([
+    expect.objectContaining({
+      kind: "write_page",
+      path: "pages/moved.md",
+      beforePath: "pages/note.md",
+    }),
+  ]);
+  const move = {
+    kind: "move_page" as const,
+    pageId: final.pageId,
+    fromPath: "pages/note.md",
+    path: final.path,
+    bodyPath: `tree-preview-body/${final.pageId}.md`,
+  };
+  expect(retainNormalizedPageWrites({ ...input, actions: [move] })).toEqual([
+    move,
+  ]);
+});
 
 const SPACE_ID = "11111111-1111-4111-8111-111111111111";
 const TIME = "2026-09-06T00:00:00.000Z";
@@ -279,6 +432,7 @@ describe("local-first image upgrade preview", () => {
       attachments: [],
       blockers: [],
       rawPathStates: {},
+      normalizations: [],
     };
     await expect(
       mergeLegacyUpgrade({
@@ -322,6 +476,7 @@ describe("local-first image upgrade preview", () => {
     };
     const local = {
       rootPath: "Wiki",
+      normalizations: [],
       folders: [localFolder],
       pages: [localPage],
       attachments: [],

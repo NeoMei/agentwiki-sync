@@ -19,6 +19,10 @@ import {
 import { parseAttachmentReferences } from "../core/attachment-reference";
 import type { LocalTreeScan, LocalTreeScanV3 } from "../core/tree-scan";
 import { scanLocalTree } from "../core/tree-scan";
+import {
+  readPushProtocolRequirement,
+  PushJournalRouter,
+} from "../storage/push-journal-router";
 import type { ControlStorePort } from "../ports/control-store";
 import type { VaultPort } from "../ports/vault";
 import { ConfirmedUpgradePreviewRepository } from "../storage/local-image-upgrade-confirmation";
@@ -141,7 +145,11 @@ interface FreshUpgradeInputs {
   v3Capabilities: UpgradeDraftFixed["v3Capabilities"];
 }
 
-function semanticLocal(local: LocalTreeScanV3): unknown {
+function semanticLocal(
+  local: LocalTreeScanV3,
+  includeNormalizations = Object.hasOwn(local, "normalizations"),
+  includeUnmanaged = Object.hasOwn(local, "unmanagedPaths"),
+): unknown {
   return {
     rootPath: local.rootPath,
     folders: local.folders.map(({ updatedAt: _updatedAt, ...item }) => item),
@@ -151,6 +159,8 @@ function semanticLocal(local: LocalTreeScanV3): unknown {
     ),
     blockers: local.blockers,
     rawPathStates: local.rawPathStates,
+    ...(includeNormalizations ? { normalizations: local.normalizations } : {}),
+    ...(includeUnmanaged ? { unmanagedPaths: local.unmanagedPaths } : {}),
   };
 }
 
@@ -385,7 +395,37 @@ export class LocalImageUpgradeEntry {
     options?: SyncOperationOptions,
     seed?: LocalTreeScanV3,
     requirePublish = false,
+    normalizeShortestImages = true,
   ): Promise<FreshUpgradeInputs> {
+    const push = await readPushProtocolRequirement(
+      this.deps.control,
+      this.deps.controlRoot,
+      {
+        spaceId: this.deps.mapping.spaceId,
+        normalizedAuthority: {
+          serverOrigin: this.deps.authority.serverOrigin,
+          serverInstanceId: this.deps.authority.serverInstanceId,
+          deviceId: this.deps.authority.deviceId,
+          credentialId: this.deps.authority.credentialId,
+          vaultId: this.deps.authority.vaultId,
+          mappingRootKey: this.deps.mapping.rootPath,
+        },
+      },
+    );
+    if (push?.schemaVersion === 4) {
+      const journal = (
+        await new PushJournalRouter(
+          this.deps.control,
+          this.deps.controlRoot,
+        ).read()
+      )?.payload;
+      if (
+        journal?.schemaVersion === 4 &&
+        journal.phase !== "complete" &&
+        journal.phase !== "superseded"
+      )
+        throw new Error("PUSH_RECOVERY_REQUIRED");
+    }
     await this.assertSession();
     const v3Selection = await this.deps.protocols.selectV3Fresh();
     const v2Selection = await this.deps.protocols.selectV2Fresh();
@@ -464,6 +504,8 @@ export class LocalImageUpgradeEntry {
           v3Selection.capabilities.maxClientTotalBodyBytes,
         ),
       },
+      undefined,
+      { normalizeShortestImages },
     );
     if (epoch !== this.scanEpoch) throw new Error("STALE_UPGRADE_PREVIEW");
     return {
@@ -794,13 +836,50 @@ export class LocalImageUpgradeEntry {
   }
 
   private async revalidate(preview: UpgradePreview): Promise<void> {
+    const epoch = this.scanEpoch;
+    const includeUnmanaged = Object.hasOwn(
+      preview.localPlanEvidence,
+      "unmanagedPaths",
+    );
+    const includeNormalizations = Object.hasOwn(
+      preview.localPlanEvidence,
+      "normalizations",
+    );
     const initial = preview.localPlanEvidence.initialBindings;
     if (!initial) throw new Error("UPGRADE_INITIAL_BINDING_EVIDENCE_MISSING");
     const fresh = await this.freshInputs(
       undefined,
       initial.originalLocal,
       true,
+      includeNormalizations,
     );
+    if (!includeUnmanaged && fresh.rawLocal.unmanagedPaths?.length) {
+      const intent = await new LocalImageUpgradeRepository(
+        this.deps.control,
+        this.deps.controlRoot,
+        preview.binding,
+      ).read();
+      if (!intent) throw new Error("STALE_UPGRADE_PREVIEW");
+      const owned = await new ConfirmedUpgradePreviewRepository(
+        this.deps.control,
+        this.deps.controlRoot,
+      ).load(intent);
+      if (!sameCanonical(owned, preview))
+        throw new Error("STALE_UPGRADE_PREVIEW");
+      for (const path of fresh.rawLocal.unmanagedPaths) {
+        const expected = initial.originalLocal.rawPathStates[path];
+        if (!expected || expected.kind !== "file" || !expected.hash)
+          throw new Error("STALE_UPGRADE_PREVIEW");
+        const bytes = await this.deps.vault.read(
+          `${this.deps.mapping.rootPath}/${path}`,
+        );
+        if (!bytes || (await sha256Hex(bytes)) !== expected.hash)
+          throw new Error("STALE_UPGRADE_PREVIEW");
+        fresh.rawLocal.rawPathStates[path] = structuredClone(expected);
+      }
+      delete fresh.rawLocal.unmanagedPaths;
+    }
+    expectedV3PathStates(fresh.rawLocal, preview.localActions);
     const resolved = resolveExplicitInitialTreeBindings(
       fresh.rawLocal,
       fresh.remote.projected,
@@ -818,16 +897,25 @@ export class LocalImageUpgradeEntry {
         preview.remoteBase.sourceV2RevisionHash ||
       !sameCanonical(fresh.remote, preview.remoteBase) ||
       !sameCanonical(
-        semanticLocal(fresh.rawLocal),
-        semanticLocal(initial.originalLocal),
+        semanticLocal(fresh.rawLocal, includeNormalizations, includeUnmanaged),
+        semanticLocal(
+          initial.originalLocal,
+          includeNormalizations,
+          includeUnmanaged,
+        ),
       ) ||
       !sameCanonical(
-        semanticLocal(resolved.local),
-        semanticLocal(preview.merge.local),
+        semanticLocal(resolved.local, includeNormalizations, includeUnmanaged),
+        semanticLocal(
+          preview.merge.local,
+          includeNormalizations,
+          includeUnmanaged,
+        ),
       ) ||
       !sameCanonical(fresh.identities, preview.localPlanEvidence.identities)
     )
       throw new Error("STALE_UPGRADE_PREVIEW");
+    if (epoch !== this.scanEpoch) throw new Error("STALE_UPGRADE_PREVIEW");
   }
 
   private coordinator(preview: UpgradePreview): LocalImageUpgradeCoordinator {

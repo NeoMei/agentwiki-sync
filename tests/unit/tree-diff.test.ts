@@ -135,6 +135,7 @@ function localScanV3(
     attachments,
     blockers,
     rawPathStates: {},
+    normalizations: [],
   };
 }
 

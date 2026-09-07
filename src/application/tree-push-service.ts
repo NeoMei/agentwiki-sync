@@ -56,7 +56,7 @@ export interface TreePushPreview {
   credentialId?: string | null;
 }
 
-interface TreePushJournal {
+export interface TreePushJournal {
   schemaVersion: 2;
   spaceId: string;
   baseRevision: string;
@@ -131,7 +131,7 @@ function isPreparedTreePushChange(
   }
 }
 
-function isTreePushJournal(value: unknown): value is TreePushJournal {
+export function isTreePushJournal(value: unknown): value is TreePushJournal {
   if (!value || typeof value !== "object") return false;
   const item = value as Partial<TreePushJournal>;
   return (

@@ -19,6 +19,7 @@ import { requestUrlState } from "../fakes/obsidian-mock";
 import type { MockElement } from "../fakes/obsidian-mock";
 import { makePlugin, modalButton } from "../fakes/plugin-harness";
 import { V3_CAPABILITIES } from "../fakes/fake-tree-remote";
+import { makeNormalizedRuntimeFixture } from "../fakes/normalized-push-fixture";
 import { FakeHttp } from "../fakes/fake-http";
 import { treeCapabilitiesHashV3 } from "@neomei/agentwiki-sync-protocol";
 
@@ -30,6 +31,41 @@ const legacyWithMapping: AgentWikiSyncSettings = {
 };
 
 describe("plugin settings lifecycle", () => {
+  it("unsubscribes an open real-runtime preview on plugin unload and detaches Vault events", async () => {
+    const h = await makePlugin({ data: DEFAULT_SETTINGS });
+    await h.plugin.onload();
+    const f = await makeNormalizedRuntimeFixture("local_only");
+    const off = vi.fn();
+    const subscribe = f.runtime.onInvalidate.bind(f.runtime);
+    vi.spyOn(f.runtime, "onInvalidate").mockImplementation((listener) => {
+      const unsubscribe = subscribe(listener);
+      return () => {
+        off();
+        unsubscribe();
+      };
+    });
+    const subject = h.plugin as unknown as {
+      openPushPreviewV3: (
+        runtime: typeof f.runtime,
+        flow: unknown,
+        title: string,
+      ) => Promise<ModalTransition>;
+    };
+    const open = vi.spyOn(PreviewModal.prototype, "open");
+    const transition = await subject.openPushPreviewV3(
+      f.runtime,
+      { phaseRelease: () => () => {}, finish: () => {} },
+      "Sync",
+    );
+    transition();
+    const modal = open.mock.instances.at(-1) as unknown as PreviewModal;
+    expect(modalButton(modal, "确认修正本地链接").disabled).toBe(false);
+    h.plugin.unload();
+    expect(off).toHaveBeenCalledOnce();
+    f.runtime.invalidate();
+    expect(modalButton(modal, "确认修正本地链接").disabled).toBe(true);
+    open.mockRestore();
+  });
   it("imports 0.2.7 local mappings once and survives reload with local storage gone", async () => {
     const first = await makePlugin({
       data: DEFAULT_SETTINGS,
@@ -370,6 +406,7 @@ describe("plugin settings lifecycle", () => {
     };
     const runtime = {
       protocolVersion: "3" as const,
+      inspectNormalizedPush: async () => null,
       recover: async () => calls.push("recover"),
       status: async () => {
         throw new Error("legacy status must not run");
@@ -556,6 +593,9 @@ describe("plugin settings lifecycle", () => {
     };
     const runtime = {
       protocolVersion: "3" as const,
+      inspectNormalizedPush: async () => null,
+      isPushPreviewCurrent: () => false,
+      onInvalidate: () => () => {},
       recover: async () => undefined,
       remoteDeltaV3: async () => ({
         protocolVersion: "3" as const,
@@ -612,6 +652,7 @@ describe("plugin settings lifecycle", () => {
     await harness.plugin.onload();
     const pullPreview = {
       capabilities: V3_CAPABILITIES,
+      local: { normalizations: [] },
       blockers: [],
       attachmentConflicts: [],
       attachmentConflictResolutions: {},
@@ -640,7 +681,11 @@ describe("plugin settings lifecycle", () => {
     } as never;
     const calls: string[] = [];
     const runtime = {
+      spaceId: "s1",
       protocolVersion: "3" as const,
+      inspectNormalizedPush: async () => null,
+      isPushPreviewCurrent: () => true,
+      onInvalidate: () => () => {},
       recover: async () => calls.push("recover"),
       remoteDeltaV3: async () => {
         calls.push("delta-v3");
@@ -674,6 +719,10 @@ describe("plugin settings lifecycle", () => {
     };
     const subject = harness.plugin as unknown as {
       runtime: () => Promise<typeof runtime>;
+      runtimeRoutes: WeakMap<
+        object,
+        { route: "native_v3"; upgrade: null; space: { canPublish: boolean } }
+      >;
       runSyncStrategy: (
         spaceId: string,
         strategy: "auto",
@@ -681,6 +730,11 @@ describe("plugin settings lifecycle", () => {
       ) => Promise<ModalTransition | void>;
     };
     subject.runtime = async () => runtime;
+    subject.runtimeRoutes.set(runtime, {
+      route: "native_v3",
+      upgrade: null,
+      space: { canPublish: true },
+    });
     let opened: PreviewModal | null = null;
     const open = vi
       .spyOn(PreviewModal.prototype, "open")
@@ -731,6 +785,7 @@ describe("plugin settings lifecycle", () => {
     const pullPreview = {
       capabilities: V3_CAPABILITIES,
       blockers: [],
+      local: { normalizations: [] },
       attachmentConflicts: [],
       attachmentConflictResolutions: {},
       folderConflicts: [],
@@ -751,6 +806,7 @@ describe("plugin settings lifecycle", () => {
     const calls: string[] = [];
     const runtime = {
       protocolVersion: "3" as const,
+      inspectNormalizedPush: async () => null,
       recover: async () => calls.push("recover"),
       remoteDeltaV3: async () => ({
         protocolVersion: "3" as const,

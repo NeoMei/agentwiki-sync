@@ -44,7 +44,7 @@ interface PreparedPushInput {
   capabilities: SyncCapabilities;
   credentialId?: string | null;
 }
-interface PushJournal {
+export interface PushJournal {
   schemaVersion: 1;
   spaceId: string;
   baseRevision: string;
@@ -61,7 +61,7 @@ interface PushJournal {
   result: FinalizeResult | null;
   localCommitPhase: "not_started" | "verified";
 }
-function isPushJournal(value: unknown): value is PushJournal {
+export function isPushJournal(value: unknown): value is PushJournal {
   const item = value as Partial<PushJournal>;
   return (
     !!value &&

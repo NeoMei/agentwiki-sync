@@ -46,7 +46,8 @@ import {
   validateTreeContentV3,
   type TreeContentV3,
 } from "../core/tree-validation";
-import { sortTreePullActions, sortTreePullActionsV3 } from "./tree-preview";
+import { sortTreePullActions } from "./tree-preview";
+import { retainNormalizedPageWrites } from "./normalized-push-plan";
 
 export type {
   AttachmentConflict,
@@ -962,7 +963,14 @@ async function computePreviewV3<TTree extends TreeContentV3>(
   );
   return {
     revision,
-    actions: sortTreePullActionsV3([...attachment, ...legacyActions]),
+    actions: retainNormalizedPageWrites({
+      actions: [...attachment, ...legacyActions],
+      finalPages: resolvedPages.filter(
+        (page) => !unresolvedPageIds.has(page.pageId),
+      ),
+      normalizations: local.normalizations ?? [],
+      rawPathStates: local.rawPathStates,
+    }),
     blockers: [...local.blockers, ...rewriteBlockers],
     attachmentConflicts: [...displayedAttachmentConflicts.values()].sort(
       (left, right) => left.conflictId.localeCompare(right.conflictId),

@@ -11,6 +11,11 @@ import {
 import { treeCapabilitiesHashV3 } from "@neomei/agentwiki-sync-protocol";
 import type { HttpPort } from "../../src/ports/http";
 import { MemoryControlStore } from "../fakes/memory-control-store";
+import {
+  makeNormalizedRuntimeFixture,
+  envelopeFor,
+} from "../fakes/normalized-push-fixture";
+import { readPushProtocolRequirement } from "../../src/storage/push-journal-router";
 import { FakeHttp } from "../fakes/fake-http";
 import {
   ProtocolNegotiator,
@@ -95,6 +100,51 @@ const validV3Capabilities = {
 };
 
 describe("ProtocolNegotiator", () => {
+  it("routes an owned schema4 candidate to minimum wire3 and refuses missing authority or corrupt siblings", async () => {
+    const f = await makeNormalizedRuntimeFixture("remote_push");
+    const preview = await f.runtime.previewPushV3();
+    f.remote.loseCreateResponseOnce = true;
+    await expect(f.runtime.applyPushV3(preview)).rejects.toThrow();
+    const root = ".agentwiki/devices/d-device-1/spaces/s-space-1";
+    const {
+      operationId: _operation,
+      spaceId,
+      ...authority
+    } = preview.normalizedPush!.plan.binding;
+    const expected = { spaceId, normalizedAuthority: authority };
+    expect(
+      await readPushProtocolRequirement(f.control, root, expected),
+    ).toEqual({ schemaVersion: 4, minimumProtocolVersion: "3" });
+    await expect(
+      readPushProtocolRequirement(f.control, root, { spaceId }),
+    ).rejects.toThrow();
+    await expect(
+      negotiator(
+        fakeClientReturningV2({
+          protocolVersion: "2",
+          capabilities: validCapabilities,
+          capabilitiesHash: await capabilitiesHash(validCapabilities),
+        }),
+      ).selectFresh("3"),
+    ).rejects.toThrow("Sync protocol 3");
+    const path = `${root}/push/journal.json`;
+    const original = f.control.files.get(path)!;
+    const envelope = JSON.parse(original) as {
+      payload: Record<string, unknown>;
+      writeGeneration: number;
+    };
+    f.control.files.set(
+      `${path}.next`,
+      await envelopeFor(
+        { ...envelope.payload, schemaVersion: 9 },
+        envelope.writeGeneration - 1,
+      ),
+    );
+    await expect(
+      readPushProtocolRequirement(f.control, root, expected),
+    ).rejects.toThrow();
+    expect(f.control.files.get(path)).toBe(original);
+  });
   it("reads strict v2 capabilities independently without replacing the cached v3 selection", async () => {
     const http = new FakeHttp();
     const v3Hash = await treeCapabilitiesHashV3(validV3Capabilities);

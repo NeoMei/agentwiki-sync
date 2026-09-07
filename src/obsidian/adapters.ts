@@ -267,7 +267,10 @@ export class ObsidianVaultPort implements VaultPort {
     if (entry instanceof TFile) return "file";
     return "missing";
   }
-  async *listTree(rootPath: string): AsyncIterable<VaultTreeEntry> {
+  async *listTree(
+    rootPath: string,
+    options?: { metadataOnly?: boolean },
+  ): AsyncIterable<VaultTreeEntry> {
     const root = this.vault.getAbstractFileByPath(this.safe(rootPath));
     if (!(root instanceof TFolder)) return;
     const vault = this.vault;
@@ -288,7 +291,14 @@ export class ObsidianVaultPort implements VaultPort {
           yield* visit(child);
         } else if (child instanceof TFile) {
           if (child.extension.toLowerCase() === "md") {
-            if (isMappingRoot && relativePath.startsWith("pages/")) {
+            if (options?.metadataOnly) {
+              yield {
+                kind: "markdown",
+                relativePath,
+                byteLength: child.stat.size,
+                updatedAt: new Date(child.stat.mtime).toISOString(),
+              };
+            } else if (isMappingRoot && relativePath.startsWith("pages/")) {
               const bytes = new Uint8Array(await vault.readBinary(child));
               yield { kind: "markdown", relativePath, bytes };
             } else yield { kind: "markdown", relativePath };

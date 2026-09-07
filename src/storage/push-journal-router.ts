@@ -5,11 +5,73 @@ import {
   normalizedPlan,
   normalizedPushPaths,
   type NormalizedPushJournal,
+  type NormalizedPushBinding,
 } from "../application/normalized-push-plan";
 import {
   isTreePushJournalV3,
   type TreePushJournalV3,
 } from "../application/tree-push-service-v3";
+import { isPushJournal, type PushJournal } from "../application/push-service";
+import {
+  isTreePushJournal,
+  type TreePushJournal,
+} from "../application/tree-push-service";
+
+export async function readPushProtocolRequirement(
+  store: ControlStorePort,
+  controlRoot: string,
+  expected: {
+    spaceId: string;
+    normalizedAuthority?: Omit<
+      NormalizedPushBinding,
+      "operationId" | "spaceId"
+    >;
+  },
+): Promise<{
+  schemaVersion: 1 | 2 | 3 | 4;
+  minimumProtocolVersion: "1" | "3";
+} | null> {
+  type AnyJournal =
+    PushJournal | TreePushJournal | TreePushJournalV3 | NormalizedPushJournal;
+  const accepts = (value: unknown): value is AnyJournal =>
+    isPushJournal(value) || isTreePushJournal(value) || guard(value);
+  const versions = new Set<number>();
+  const highest = await strictPushEnvelopeRead(
+    store,
+    `${controlRoot}/push/journal.json`,
+    accepts,
+    (journal) => {
+      versions.add(journal.schemaVersion);
+      const spaceId =
+        journal.schemaVersion === 4 ? journal.binding.spaceId : journal.spaceId;
+      if (spaceId !== expected.spaceId)
+        throw new Error("Foreign Push root ownership");
+      if (journal.schemaVersion === 4) {
+        if (!expected.normalizedAuthority)
+          throw new Error("NORMALIZED_PUSH_AUTHORITY_REQUIRED");
+        const {
+          operationId: _op,
+          spaceId: _space,
+          ...authority
+        } = journal.binding;
+        if (
+          canonicalBytes(authority).toString() !==
+          canonicalBytes(expected.normalizedAuthority).toString()
+        )
+          throw new Error("Foreign normalized root ownership");
+      }
+    },
+  );
+  if (!highest) return null;
+  if (versions.has(1) && versions.has(2))
+    throw new Error("Mixed legacy Push ownership");
+  if (highest.payload.schemaVersion >= 3 || versions.size > 1)
+    await new PushJournalRouter(store, controlRoot).read();
+  return {
+    schemaVersion: highest.payload.schemaVersion,
+    minimumProtocolVersion: highest.payload.schemaVersion >= 3 ? "3" : "1",
+  };
+}
 import { opaqueFileKey } from "../core/identity-key";
 import type { ControlStorePort } from "../ports/control-store";
 import {
@@ -26,9 +88,13 @@ export type JournalPort<T> = Pick<
   MutableControlRepository<T>,
   "read" | "write" | "clear"
 >;
-type Journal = TreePushJournalV3 | NormalizedPushJournal;
+type Journal =
+  PushJournal | TreePushJournal | TreePushJournalV3 | NormalizedPushJournal;
 const guard = (value: unknown): value is Journal =>
-  isTreePushJournalV3(value) || isNormalizedPushJournal(value);
+  isPushJournal(value) ||
+  isTreePushJournal(value) ||
+  isTreePushJournalV3(value) ||
+  isNormalizedPushJournal(value);
 const queues = new Map<string, Promise<void>>();
 /** Serializes all adapters addressing the same control root, including distinct views. */
 export async function withPushJournalLock<T>(
@@ -96,12 +162,39 @@ export async function strictPushEnvelopeRead<T>(
 function owner(j: Journal): string {
   return j.schemaVersion === 4
     ? `4:${j.binding.operationId}`
-    : `3:${j.idempotencyKey}`;
+    : `${j.schemaVersion}:${j.idempotencyKey}`;
 }
 function assertSameRootOwner(a: Journal, b: Journal): void {
   const space = (j: Journal) =>
     j.schemaVersion === 4 ? j.binding.spaceId : j.spaceId;
   if (space(a) !== space(b)) throw new Error("Foreign Push root ownership");
+  if (
+    (a.schemaVersion < 3 &&
+      b.schemaVersion < 3 &&
+      a.schemaVersion !== b.schemaVersion) ||
+    (a.schemaVersion >= 3 && b.schemaVersion < 3)
+  )
+    throw new Error("Invalid legacy Push transition");
+  if (
+    a.schemaVersion < 3 &&
+    b.schemaVersion === a.schemaVersion &&
+    owner(a) === owner(b)
+  ) {
+    const frozen = (j: PushJournal | TreePushJournal) => ({
+      spaceId: j.spaceId,
+      baseRevision: j.baseRevision,
+      idempotencyKey: j.idempotencyKey,
+      confirmationHash: j.confirmationHash,
+      changes: j.changes,
+      totalBodyBytes: j.totalBodyBytes,
+      credentialIdAtCreation: j.credentialIdAtCreation,
+    });
+    if (
+      canonicalBytes(frozen(a as PushJournal | TreePushJournal)).toString() !==
+      canonicalBytes(frozen(b as PushJournal | TreePushJournal)).toString()
+    )
+      throw new Error("Frozen legacy operation changed");
+  }
   if (a.schemaVersion === 4 && b.schemaVersion === 4) {
     const { operationId: _a, ...left } = a.binding;
     const { operationId: _b, ...right } = b.binding;
@@ -202,7 +295,25 @@ export class PushJournalRouter {
     this.repository = new MutableControlRepository(store, this.path, guard);
   }
   private async terminal(j: Journal): Promise<void> {
-    if (j.schemaVersion === 3) assertTerminalV3(j);
+    if (j.schemaVersion === 1 || j.schemaVersion === 2) {
+      if (
+        typeof j.idempotencyKey !== "string" ||
+        !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(j.idempotencyKey) ||
+        typeof j.baseRevision !== "string" ||
+        typeof j.confirmationHash !== "string"
+      )
+        throw new Error("Legacy Push ownership missing");
+      if (
+        (j.remoteState === "published" &&
+          j.result?.status === "published" &&
+          j.localCommitPhase === "verified") ||
+        (j.remoteState === "superseded" &&
+          j.result === null &&
+          j.localCommitPhase === "not_started")
+      )
+        return;
+      throw new Error("Legacy Push is not terminal");
+    } else if (j.schemaVersion === 3) assertTerminalV3(j);
     else {
       if (j.phase !== "complete" && j.phase !== "superseded")
         throw new Error("Normalized push is pending");
@@ -217,7 +328,7 @@ export class PushJournalRouter {
     const path =
       j.schemaVersion === 4
         ? `${normalizedPushPaths(this.controlRoot, j.binding.operationId).operationRoot}/terminal.json`
-        : `${this.controlRoot}/push/operations/history-${await opaqueFileKey(j.idempotencyKey)}/terminal.json`;
+        : `${this.controlRoot}/push/operations/history-${j.schemaVersion < 3 ? `${j.schemaVersion}-` : ""}${await opaqueFileKey(j.idempotencyKey)}/terminal.json`;
     const raw = JSON.stringify(envelope);
     const existing = await this.store.read(path);
     if (existing !== null && existing !== raw)
@@ -306,12 +417,15 @@ export class PushJournalRouter {
         withPushJournalLock(this.controlRoot, async () => {
           const current = await this.read();
           observed = token(current);
-          if (current?.payload.schemaVersion === 4) {
+          if (current && current.payload.schemaVersion !== 3) {
             await this.retain(current);
             ownedId = null;
             return null;
           }
-          ownedId = current?.payload.idempotencyKey ?? null;
+          ownedId =
+            current?.payload.schemaVersion === 3
+              ? current.payload.idempotencyKey
+              : null;
           return current as MutableControlEnvelope<TreePushJournalV3> | null;
         }),
       write: (journal) =>

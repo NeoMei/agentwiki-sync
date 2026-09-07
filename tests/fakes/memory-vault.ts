@@ -67,7 +67,10 @@ export class MemoryVault implements VaultPort {
       )
         yield { relativePath: path.slice(prefix.length), bytes: bytes.slice() };
   }
-  async *listTree(rootPath: string): AsyncIterable<VaultTreeEntry> {
+  async *listTree(
+    rootPath: string,
+    options?: { metadataOnly?: boolean },
+  ): AsyncIterable<VaultTreeEntry> {
     const prefix = rootPath.length > 0 ? `${rootPath}/` : "";
     const entries: VaultTreeEntry[] = [];
     for (const dir of this.folders) {
@@ -85,9 +88,14 @@ export class MemoryVault implements VaultPort {
         entries.push({
           kind: "markdown",
           relativePath,
-          ...(relativePath.startsWith("pages/")
-            ? { bytes: bytes.slice() }
-            : {}),
+          ...(options?.metadataOnly
+            ? {
+                byteLength:
+                  this.listedByteLengths.get(path) ?? bytes.byteLength,
+              }
+            : relativePath.startsWith("pages/")
+              ? { bytes: bytes.slice() }
+              : {}),
         });
       else
         entries.push({

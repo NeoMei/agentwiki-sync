@@ -35,6 +35,28 @@ import {
   type SyncDiff,
 } from "../../src/obsidian/sync-center-modal";
 import * as previewLogic from "../../src/obsidian/preview-logic";
+import { makeNormalizedRuntimeFixture } from "../fakes/normalized-push-fixture";
+
+it("counts local repairs separately and allows an empty wire delta only with real local actions", async () => {
+  const f = await makeNormalizedRuntimeFixture("local_only");
+  const preview = await f.runtime.previewPushV3();
+  expect(preview.changes).toEqual([]);
+  expect(previewLogic.canConfirmV3Push(preview)).toBe(true);
+  expect(previewLogic.localImageRepairLines(preview)).toEqual([
+    "本地图片链接修正：1 个 Page",
+    "pages/note.md",
+  ]);
+  expect(
+    previewLogic.canConfirmV3Push({ ...preview, normalizedPush: null }),
+  ).toBe(false);
+  expect(
+    previewLogic.canConfirmV3Push({
+      ...preview,
+      publishable: false,
+      normalizedPush: null,
+    } as never),
+  ).toBe(false);
+});
 
 function binding(
   overrides: Partial<InitialBindingChoice> = {},

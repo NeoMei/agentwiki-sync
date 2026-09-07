@@ -18,6 +18,10 @@ import {
   type ImageMimeType,
 } from "./image-metadata";
 import { decodeVaultMarkdown } from "./markdown";
+import {
+  normalizeLocalImageLinks,
+  type LocalImageNormalization,
+} from "./local-image-normalization";
 import { titleFromPath } from "./portable-path";
 import type {
   TreeAttachment,
@@ -135,6 +139,8 @@ export interface AttachmentScanBlocker {
 }
 
 export interface LocalTreeScanV3 {
+  unmanagedPaths?: string[];
+  normalizations: LocalImageNormalization[];
   rootPath: string;
   folders: TreeFolder[];
   pages: TreePageV3[];
@@ -264,6 +270,7 @@ export function scanLocalTree(
   identities: TreeIdentityState,
   limits: TreeScanLimitsV3,
   onProgress?: (completed: number) => Promise<void>,
+  options?: { normalizeShortestImages?: boolean },
 ): Promise<LocalTreeScanV3>;
 export function scanLocalTree(
   vault: VaultPort,
@@ -272,6 +279,7 @@ export function scanLocalTree(
   identities: TreeIdentityState,
   limits: TreeScanLimits,
   onProgress?: (completed: number) => Promise<void>,
+  options?: { normalizeShortestImages?: boolean },
 ): Promise<LocalTreeScan>;
 
 export async function scanLocalTree(
@@ -281,18 +289,36 @@ export async function scanLocalTree(
   identities: TreeIdentityState,
   limits: TreeScanLimits,
   onProgress?: (completed: number) => Promise<void>,
+  options?: { normalizeShortestImages?: boolean },
 ): Promise<LocalTreeScan | LocalTreeScanV3> {
   const directories: string[] = [];
   const markdown = new Map<string, Uint8Array>();
   const files = new Map<string, VaultTreeEntry>();
   const rawPathStates: LocalTreeScanV3["rawPathStates"] = {};
   let scanned = 0;
-  for await (const entry of vault.listTree(rootPath)) {
+  let totalRawBytes = 0;
+  const assertRawSize = (size: number) => {
+    if (!Number.isSafeInteger(size) || size < 0)
+      throw new TypeError("INVALID_RAW_PAGE_SIZE");
+    if (size > limits.maxPageBytes)
+      throw new RangeError("SPACE_TOO_LARGE: page bytes (raw)");
+    if (
+      totalRawBytes + size >
+      (limits.maxTotalBodyBytes ?? limits.maxPageBytes)
+    )
+      throw new RangeError("SPACE_TOO_LARGE: total body bytes (raw)");
+  };
+  const unmanagedPaths: string[] = [];
+  for await (const entry of vault.listTree(rootPath, { metadataOnly: true })) {
     scanned += 1;
     if (scanned % 50 === 0) await onProgress?.(scanned);
     if (entry.kind === "file") {
       files.set(entry.relativePath, entry);
       if (entry.relativePath.startsWith(MANAGED_PREFIX)) {
+        if (base.protocolVersion === "3") {
+          unmanagedPaths.push(entry.relativePath);
+          continue;
+        }
         const involvedBytes =
           entry.bytes ??
           (await vault.read(joinRoot(rootPath, entry.relativePath)));
@@ -307,9 +333,24 @@ export async function scanLocalTree(
     if (!entry.relativePath.startsWith(MANAGED_PREFIX)) continue;
     if (entry.kind === "directory") {
       directories.push(entry.relativePath);
+      if (directories.length > limits.maxFolders)
+        throw new RangeError("SPACE_TOO_LARGE: folder count");
       rawPathStates[entry.relativePath] = { kind: "directory", hash: null };
     } else {
-      const bytes = entry.bytes ?? new Uint8Array();
+      if (markdown.size >= limits.maxPages)
+        throw new RangeError("SPACE_TOO_LARGE: page count");
+      if (entry.byteLength !== undefined) assertRawSize(entry.byteLength);
+      const bytes =
+        entry.bytes ??
+        (await vault.read(joinRoot(rootPath, entry.relativePath)));
+      if (!bytes) throw new Error("RAW_PAGE_MISSING");
+      assertRawSize(bytes.byteLength);
+      if (
+        entry.byteLength !== undefined &&
+        entry.byteLength !== bytes.byteLength
+      )
+        throw new Error("RAW_PAGE_SIZE_CHANGED");
+      totalRawBytes += bytes.byteLength;
       markdown.set(entry.relativePath, bytes);
       rawPathStates[entry.relativePath] = {
         kind: "file",
@@ -402,13 +443,26 @@ export async function scanLocalTree(
     throw new RangeError("SPACE_TOO_LARGE: page count");
 
   const pages: TreePage[] = [];
+  const normalizations: LocalImageNormalization[] = [];
   const pageReferences = new Map<string, AttachmentReference[]>();
   let totalBodyBytes = 0;
   for (const rawPath of sortedPages) {
     const bytes = markdown.get(rawPath) ?? new Uint8Array();
     const { path, key } = validatePortableMarkdownPath(rawPath);
-    const decoded = decodeVaultMarkdown(bytes);
-    const body = decoded.normalized;
+    let pageId = pageIdByPathKey.get(key);
+    const isNewPage = pageId === undefined;
+    pageId ??= crypto.randomUUID();
+    const normalized =
+      base.protocolVersion === "3" && options?.normalizeShortestImages
+        ? await normalizeLocalImageLinks({
+            pageId,
+            pagePath: path,
+            raw: bytes,
+            resolve: vault.resolveShortestImage?.bind(vault),
+          })
+        : { body: decodeVaultMarkdown(bytes).normalized, evidence: null };
+    const body = normalized.body;
+    if (normalized.evidence) normalizations.push(normalized.evidence);
     const hash = await contentHash(body);
     const bodyBytes = new TextEncoder().encode(body).byteLength;
     if (bodyBytes > limits.maxPageBytes)
@@ -417,9 +471,7 @@ export async function scanLocalTree(
     if (totalBodyBytes > (limits.maxTotalBodyBytes ?? limits.maxPageBytes))
       throw new RangeError("SPACE_TOO_LARGE: total body bytes");
 
-    let pageId = pageIdByPathKey.get(key);
-    if (pageId === undefined) {
-      pageId = crypto.randomUUID();
+    if (isNewPage) {
       identities.pendingPages[pageId] = { pageId, path, contentHash: hash };
     }
 
@@ -717,5 +769,9 @@ export async function scanLocalTree(
     attachments,
     blockers,
     rawPathStates,
+    unmanagedPaths: unmanagedPaths.sort(),
+    normalizations: normalizations.sort((a, b) =>
+      a.pagePath.localeCompare(b.pagePath),
+    ),
   };
 }

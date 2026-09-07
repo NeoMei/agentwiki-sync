@@ -72,6 +72,8 @@ export interface UpgradePreview {
 }
 
 export interface UpgradeLocalPlanEvidence {
+  unmanagedPaths?: LocalTreeScanV3["unmanagedPaths"];
+  normalizations?: LocalTreeScanV3["normalizations"];
   actions: TreePullActionV3[];
   rawPathStates: LocalTreeScanV3["rawPathStates"];
   expectedPathStates: Record<string, TreeTransactionPathState>;
@@ -283,6 +285,32 @@ export function expectedV3PathStates(
   local: LocalTreeScanV3,
   actions: TreePullActionV3[],
 ): Record<string, TreeTransactionPathState> {
+  for (const action of actions) {
+    if (
+      action.kind !== "move_directory" &&
+      action.kind !== "trash_directory" &&
+      action.kind !== "create_directory"
+    )
+      continue;
+    const affected =
+      action.kind === "move_directory"
+        ? [action.beforePath ?? action.fromPath, action.path]
+        : [action.path];
+    if (
+      (local.unmanagedPaths ?? []).some((path) =>
+        affected.some((root) => {
+          const opaque = pathKey(path),
+            directory = pathKey(root);
+          return (
+            opaque === directory ||
+            opaque.startsWith(`${directory}/`) ||
+            directory.startsWith(`${opaque}/`)
+          );
+        }),
+      )
+    )
+      throw new Error("UNMANAGED_FILE_IN_DIRECTORY_ACTION");
+  }
   const expected: Record<string, TreeTransactionPathState> = {};
   const stateAt = (path: string): TreeTransactionPathState =>
     local.rawPathStates[path] ?? { kind: "missing", hash: null };
@@ -463,6 +491,12 @@ export async function assertUpgradePreviewMaterialization(
     expectedPathStates,
     scanEpoch: preview.localPlanEvidence.scanEpoch,
     identities: preview.localPlanEvidence.identities,
+    ...(Object.hasOwn(preview.localPlanEvidence, "unmanagedPaths")
+      ? { unmanagedPaths: preview.merge.local.unmanagedPaths }
+      : {}),
+    ...(Object.hasOwn(preview.localPlanEvidence, "normalizations")
+      ? { normalizations: preview.merge.local.normalizations }
+      : {}),
     ...(preview.localPlanEvidence.v2CapabilitiesHash
       ? { v2CapabilitiesHash: preview.localPlanEvidence.v2CapabilitiesHash }
       : {}),
@@ -564,6 +598,10 @@ export async function prepareLegacyUpgradePreview(
         expectedPathStates,
         scanEpoch: frozen.scanEpoch,
         identities: frozen.identities,
+        normalizations: frozen.local.normalizations,
+        ...(Object.hasOwn(frozen.local, "unmanagedPaths")
+          ? { unmanagedPaths: frozen.local.unmanagedPaths }
+          : {}),
         ...(frozen.v2CapabilitiesHash
           ? { v2CapabilitiesHash: frozen.v2CapabilitiesHash }
           : {}),

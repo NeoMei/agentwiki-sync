@@ -9,17 +9,9 @@ import {
 
 import type { ShortestImageResolution } from "../ports/vault";
 
-export class ObsidianShortestImageResolver {
-  private readonly root: string;
+export class ObsidianShortestImageIndex {
   private basenameIndex: Map<string, TFile[]> | null = null;
-
-  constructor(
-    private readonly vault: Vault,
-    private readonly metadataCache: MetadataCache,
-    mappingRoot: string,
-  ) {
-    this.root = normalizePath(mappingRoot).normalize("NFC");
-  }
+  constructor(private readonly vault: Vault) {}
 
   invalidate(): void {
     this.basenameIndex = null;
@@ -37,6 +29,27 @@ export class ObsidianShortestImageResolver {
     }
     this.basenameIndex = index;
     return index;
+  }
+
+  get(basenameKey: string): readonly TFile[] {
+    return this.index().get(basenameKey) ?? [];
+  }
+}
+
+export class ObsidianShortestImageResolver {
+  private readonly root: string;
+  private readonly basenameIndex: ObsidianShortestImageIndex;
+  constructor(
+    vault: Vault,
+    private readonly metadataCache: MetadataCache,
+    mappingRoot: string,
+    index?: ObsidianShortestImageIndex,
+  ) {
+    this.root = normalizePath(mappingRoot).normalize("NFC");
+    this.basenameIndex = index ?? new ObsidianShortestImageIndex(vault);
+  }
+  invalidate(): void {
+    this.basenameIndex.invalidate();
   }
 
   async resolve(
@@ -64,7 +77,7 @@ export class ObsidianShortestImageResolver {
       return { kind: "out_of_scope" };
 
     const basenameKey = caseFold(normalizedBasename);
-    const matches = this.index().get(basenameKey) ?? [];
+    const matches = this.basenameIndex.get(basenameKey);
     if (matches.length === 0) return { kind: "missing" };
     if (matches.length !== 1) return { kind: "ambiguous" };
     const match = matches[0]!;

@@ -12,6 +12,169 @@ import type {
 import type { LocalTreeScanV3 } from "../../src/core/tree-scan";
 import { PreviewModal } from "../../src/obsidian/preview-modal";
 import type { MockElement } from "../fakes/obsidian-mock";
+import { makeNormalizedRuntimeFixture } from "../fakes/normalized-push-fixture";
+
+it("keeps the full repair count across async resolution, small-page pagination and invalidation", async () => {
+  const f = await makeNormalizedRuntimeFixture("local_only");
+  for (let i = 0; i < 24; i++)
+    f.vault.seedMarkdown(`Wiki/pages/extra-${i}.md`, "![A](photo.png)");
+  const resolver = (
+    f.vault as typeof f.vault & { resolveShortestImage: () => Promise<unknown> }
+  ).resolveShortestImage;
+  Object.assign(f.vault, {
+    resolveShortestImage: async () => {
+      await Promise.resolve();
+      return resolver();
+    },
+  });
+  const preview = await f.runtime.previewPushV3();
+  const off = vi.fn();
+  const modal = new PreviewModal(
+    app,
+    "Sync",
+    Array.from({ length: 100 }, (_, i) => `变更 ${i}`),
+    (options) => f.runtime.applyPushV3(preview, options),
+    () => {},
+    [],
+    preview,
+    {
+      canConfirm: () => f.runtime.isPushPreviewCurrent(preview),
+      subscribeInvalidation: (listener) => {
+        const unsubscribe = f.runtime.onInvalidate(listener);
+        return () => {
+          off();
+          unsubscribe();
+        };
+      },
+    },
+  );
+  modal.open();
+  const root = modal.contentEl as unknown as MockElement;
+  expect(root.textContent).toContain("本地图片链接修正：25 个 Page");
+  expect(root.textContent).toContain("共 126 项");
+  root
+    .queryAll((e) => e.tag === "button" && e.textContent === "下一页")[0]!
+    .dispatchEvent({ type: "click" });
+  expect(root.textContent).toContain("共 126 项");
+  f.runtime.invalidate();
+  expect(
+    root.queryAll((e) => e.tag === "button" && e.textContent === "确认执行")[0]!
+      .disabled,
+  ).toBe(true);
+  modal.close();
+  expect(off).toHaveBeenCalledOnce();
+});
+
+it.each(["local_only", "remote_push"] as const)(
+  "shows %s pending files without cancelling the owned transaction",
+  async (mode) => {
+    const f = await makeNormalizedRuntimeFixture(mode);
+    const preview = await f.runtime.previewPushV3();
+    f.vault.failAfterOperations = f.vault.operations + 1;
+    await expect(f.runtime.applyPushV3(preview)).rejects.toThrow();
+    const journal = await f.runtime.inspectNormalizedPush();
+    expect(journal?.phase).toBe("local_pending");
+    const open = vi.fn(async () => {});
+    const state =
+      mode === "local_only"
+        ? "本地链接修正待处理，未发布云端版本"
+        : "远端已发布，本地待处理";
+    const modal = new PreviewModal(
+      app,
+      state,
+      [state],
+      () => f.runtime.recover(),
+      () => {},
+      [],
+      null,
+      {
+        closeLabel: "关闭",
+        confirmLabel: "重试",
+        files: journal!.localPlan.map((a) => ({ path: a.path, open })),
+      },
+    );
+    modal.open();
+    const root = modal.contentEl as unknown as MockElement;
+    const writes = [...f.vault.operationLog];
+    const requests = f.remote.createInputs.length;
+    const file = root.queryAll(
+      (e) => e.tag === "button" && e.textContent === "查看文件：pages/note.md",
+    )[0];
+    expect(file).toBeDefined();
+    file!.dispatchEvent({ type: "click" });
+    await vi.waitFor(() => expect(open).toHaveBeenCalledOnce());
+    expect(f.vault.operationLog).toEqual(writes);
+    expect(f.remote.createInputs).toHaveLength(requests);
+    root
+      .queryAll((e) => e.tag === "button" && e.textContent === "关闭")[0]!
+      .dispatchEvent({ type: "click" });
+    expect((await f.runtime.inspectNormalizedPush())?.phase).toBe(
+      "local_pending",
+    );
+    f.vault.failAfterOperations = null;
+    modal.open();
+    root
+      .queryAll((e) => e.tag === "button" && e.textContent === "重试")[0]!
+      .dispatchEvent({ type: "click" });
+    await vi.waitFor(async () =>
+      expect((await f.runtime.inspectNormalizedPush())?.phase).toBe("complete"),
+    );
+    expect(f.remote.finalizeCalls).toBe(mode === "local_only" ? 0 : 1);
+  },
+);
+
+it("confirms a real local-only repair from the DOM despite an empty wire delta", async () => {
+  const f = await makeNormalizedRuntimeFixture("local_only");
+  const preview = await f.runtime.previewPushV3();
+  const modal = new PreviewModal(
+    app,
+    "Sync",
+    [],
+    (options) => f.runtime.applyPushV3(preview, options),
+    () => {},
+    [],
+    preview,
+  );
+  modal.onOpen();
+  const root = modal.contentEl as unknown as MockElement;
+  expect(root.textContent).toContain("本地图片链接修正");
+  expect(root.textContent).toContain("pages/note.md");
+  const button = root.queryAll(
+    (e) => e.tag === "button" && e.textContent === "确认修正本地链接",
+  )[0]!;
+  expect(button).toBeDefined();
+  expect(button.disabled).toBe(false);
+  button.dispatchEvent({ type: "click" });
+  await vi.waitFor(async () =>
+    expect(
+      new TextDecoder().decode((await f.vault.read("Wiki/pages/note.md"))!),
+    ).toBe("![A](../assets/photo.png)"),
+  );
+  expect(f.remote.createInputs).toEqual([]);
+});
+
+it("cancels the real repair preview without RPC or Vault writes", async () => {
+  const f = await makeNormalizedRuntimeFixture("local_only");
+  const preview = await f.runtime.previewPushV3();
+  const before = [...f.vault.operationLog];
+  const modal = new PreviewModal(
+    app,
+    "Sync",
+    [],
+    (options) => f.runtime.applyPushV3(preview, options),
+    () => {
+      void f.runtime.discardPushPreviewV3(preview);
+    },
+    [],
+    preview,
+  );
+  modal.onOpen();
+  (modal.contentEl as unknown as MockElement)
+    .queryAll((e) => e.tag === "button" && e.textContent === "取消")[0]!
+    .dispatchEvent({ type: "click" });
+  expect(f.vault.operationLog).toEqual(before);
+  expect(f.remote.createInputs).toEqual([]);
+});
 
 const app = {
   vault: { adapter: { read: async () => "" } },
@@ -78,6 +241,7 @@ function scan(
     attachments,
     blockers: [],
     rawPathStates: {},
+    normalizations: [],
   };
 }
 
@@ -486,6 +650,7 @@ describe("rendered PreviewModal controls", () => {
       {
         protocolVersion: "3",
         publishable: false,
+        normalizedPush: null,
         spaceId: "space",
         baseRevision: "revision",
         changes: [],

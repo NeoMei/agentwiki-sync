@@ -1,6 +1,7 @@
 import type {
   InitialBindingChoice,
   PullPreview,
+  PushPreviewV3,
 } from "../application/sync-runtime";
 import type { TreePullPreviewV3 } from "../application/tree-diff";
 import type { TreeContentV3 } from "../core/tree-validation";
@@ -17,6 +18,38 @@ import type {
 import type { AttachmentSyncDiff } from "./sync-center-modal";
 
 export const PREVIEW_PAGE_SIZE = 100;
+
+export function canConfirmV3Push(preview: PushPreviewV3): boolean {
+  return (
+    preview.publishable &&
+    preview.blockers.length === 0 &&
+    (preview.changes.length > 0 ||
+      (preview.normalizedPush?.plan.localPlan.length ?? 0) > 0)
+  );
+}
+
+export function localImageRepairLines(
+  preview: PushPreviewV3 | TreePullPreviewV3<TreeContentV3>,
+): string[] {
+  const paths =
+    "normalizedPush" in preview
+      ? (preview.normalizedPush?.plan.localPlan.map((action) => action.path) ??
+        [])
+      : (preview.local.normalizations ?? []).flatMap((normalization) => {
+          const action = preview.actions.find(
+            (a) =>
+              (a.kind === "write_page" ||
+                a.kind === "move_page" ||
+                a.kind === "create_page") &&
+              a.pageId === normalization.pageId,
+          );
+          return action && "path" in action ? [action.path] : [];
+        });
+  const unique = [...new Set(paths)].sort();
+  return unique.length
+    ? [`本地图片链接修正：${unique.length} 个 Page`, ...unique]
+    : [];
+}
 
 export type SyncProtocolLabel = "Sync v3" | "Sync v2" | "Legacy v1";
 

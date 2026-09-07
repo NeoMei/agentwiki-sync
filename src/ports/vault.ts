@@ -16,7 +16,10 @@ export interface VaultPort {
   listMarkdown(
     rootPath: string,
   ): AsyncIterable<{ relativePath: string; bytes: Uint8Array }>;
-  listTree(rootPath: string): AsyncIterable<VaultTreeEntry>;
+  listTree(
+    rootPath: string,
+    options?: { metadataOnly?: boolean },
+  ): AsyncIterable<VaultTreeEntry>;
   pathStatus(path: string): Promise<"directory" | "file" | "missing">;
   createDirectory(path: string): Promise<void>;
   trashDirectory(path: string): Promise<void>;

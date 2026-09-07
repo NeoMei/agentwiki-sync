@@ -56,6 +56,14 @@ import { DeviceStateRepository } from "./storage/device-state";
 import { StorageMigration } from "./storage/migration";
 import { TreeBaselineRepository } from "./storage/tree-baseline";
 import {
+  PushJournalRouter,
+  readPushProtocolRequirement,
+} from "./storage/push-journal-router";
+import {
+  ObsidianShortestImageIndex,
+  ObsidianShortestImageResolver,
+} from "./obsidian/shortest-image-resolver";
+import {
   attachmentOperationLabel,
   preferLocalPull,
   protocolLabel,
@@ -152,9 +160,11 @@ const isDeviceSettings = (value: unknown): value is AgentWikiSyncSettings => {
 };
 
 export default class AgentWikiSyncPlugin extends Plugin {
+  private shortestImageIndex: ObsidianShortestImageIndex | null = null;
   settings: AgentWikiSyncSettings = DEFAULT_SETTINGS;
   private readonly locks = new OperationLock();
   private readonly liveRuntimes = new Map<string, SyncRuntime>();
+  private readonly previewUnloadCleanups = new Set<() => void>();
   private readonly runtimeRoutes = new WeakMap<
     SyncRuntime,
     {
@@ -171,6 +181,14 @@ export default class AgentWikiSyncPlugin extends Plugin {
       isDeviceSettings,
     );
   }
+  override onunload(): void {
+    for (const cleanup of [...this.previewUnloadCleanups]) cleanup();
+    this.previewUnloadCleanups.clear();
+    for (const runtime of this.liveRuntimes.values()) runtime.invalidate();
+    this.liveRuntimes.clear();
+    this.shortestImageIndex?.invalidate();
+  }
+
   override async onload(): Promise<void> {
     const stored: unknown = await this.loadData();
     const needsLegacy =
@@ -221,6 +239,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       callback: () => this.openSyncCenter(),
     });
     const invalidate = () => {
+      this.shortestImageIndex?.invalidate();
       for (const runtime of this.liveRuntimes.values()) {
         runtime.invalidate();
         this.runtimeRoutes.get(runtime)?.upgrade?.invalidate();
@@ -399,6 +418,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       (item) => item.spaceId === spaceId,
     );
     if (!mapping) return;
+    await this.assertNoPendingLocalImageUpgrade(mapping);
     let gate = {
       activeTransaction: false,
       localClean: true,
@@ -503,6 +523,35 @@ export default class AgentWikiSyncPlugin extends Plugin {
     const candidateDeviceIds = new Set([state.deviceId]);
     if (deviceId) candidateDeviceIds.add(deviceId);
     for (const candidateDeviceId of candidateDeviceIds) {
+      const controlRoot = await localImageUpgradeControlRoot(
+        candidateDeviceId,
+        mapping.spaceId,
+      );
+      const control = new ObsidianControlStore(this.app.vault.adapter);
+      const push = await readPushProtocolRequirement(control, controlRoot, {
+        spaceId: mapping.spaceId,
+        normalizedAuthority: {
+          serverOrigin: state.serverUrl,
+          serverInstanceId: state.serverInstanceId,
+          deviceId: candidateDeviceId,
+          credentialId: state.credentialId,
+          vaultId: state.vaultId,
+          mappingRootKey: mapping.rootPath,
+        },
+      });
+      if (push) {
+        const journal = (
+          await new PushJournalRouter(control, controlRoot).read()
+        )?.payload;
+        if (
+          journal &&
+          (journal.schemaVersion === 4
+            ? journal.phase !== "complete" && journal.phase !== "superseded"
+            : journal.remoteState !== "superseded" &&
+              journal.localCommitPhase !== "verified")
+        )
+          throw new Error(`Space ${mapping.spaceId} 有未完成的推送`);
+      }
       const pending = await inspectLocalImageUpgrade(
         new ObsidianControlStore(this.app.vault.adapter),
         await localImageUpgradeControlRoot(candidateDeviceId, mapping.spaceId),
@@ -529,207 +578,297 @@ export default class AgentWikiSyncPlugin extends Plugin {
   private async runtime(
     mapping: NonNullable<ReturnType<AgentWikiSyncPlugin["selectedMapping"]>>,
   ): Promise<SyncRuntime | null> {
-    const local = new ObsidianLocalControlStore(this.app);
-    const shared = new ObsidianControlStore(this.app.vault.adapter);
-    await new VaultIdentityService(shared, local).assertBound();
-    const connectionState = await new MutableControlRepository(
-      local,
-      "connection-state.json",
-      isConnectionState,
-    ).read();
-    const secretId = connectionState?.payload.credentialSecretId ?? null;
-    const deviceState = new DeviceStateRepository(local);
-    const deviceId = (await deviceState.read())?.deviceId;
-    if (!secretId || !deviceId) return null;
-    const secrets = new ObsidianSecrets(this.app);
-    const client = new AgentWikiClient(
-      this.settings.serverUrl,
-      new RequestUrlHttp(),
-      () => secrets.get(secretId),
-    );
-    const state = connectionState?.payload ?? null;
-    const boundVaultId = await deviceState.getBoundVaultId();
-    if (
-      !state ||
-      state.serverUrl !== this.settings.serverUrl ||
-      state.serverInstanceId !== this.settings.serverInstanceId ||
-      state.deviceId !== deviceId ||
-      state.vaultId !== boundVaultId
-    )
-      throw new Error("连接身份不匹配");
-    const deviceKey = await idFileKey(deviceId);
-    const spaceKey = await idFileKey(mapping.spaceId);
-    const controlRoot = await localImageUpgradeControlRoot(
-      deviceId,
-      mapping.spaceId,
-    );
-    const requiredVersion = await new TreeBaselineRepository(
-      shared,
-      controlRoot,
-      mapping.spaceId,
-      mapping.rootPath,
-    ).requiredProtocolVersion();
-    const protocols = new ProtocolNegotiator(
-      client,
-      new ProtocolSelectionRepository(local),
-    );
-    const vault = new ObsidianVaultPort(
-      this.app.vault,
-      this.app.fileManager,
-      mapping.rootPath,
-    );
-    const upgrade = await LocalImageUpgradeEntry.create({
-      client,
-      protocols,
-      vault,
-      control: shared,
-      controlRoot,
-      mapping,
-      authority: {
-        serverOrigin: this.settings.serverUrl,
-        serverInstanceId: state.serverInstanceId,
-        pluginVersion: this.manifest.version,
-        deviceId: state.deviceId,
-        credentialId: state.credentialId,
-        vaultId: state.vaultId,
-      },
-    });
-    if (
-      upgrade.pendingIntent?.phase === "complete" ||
-      upgrade.pendingIntent?.phase === "superseded"
-    )
-      await upgrade.recover();
-    else if (upgrade.pendingIntent) {
-      const carrier = new SyncRuntime(
-        vault,
-        shared,
-        new V1TreeRemote(client, mapping.spaceId, DEFAULT_V1_CAPABILITIES),
-        mapping,
-        deviceKey,
-        spaceKey,
-        state.credentialId,
-        new AgentWikiPushRemote(client, mapping.spaceId),
+    const invalidateCached = () => {
+      for (const [key, runtime] of this.liveRuntimes) {
+        if (runtime.spaceId !== mapping.spaceId) continue;
+        runtime.invalidate();
+        this.runtimeRoutes.get(runtime)?.upgrade?.invalidate();
+        this.liveRuntimes.delete(key);
+      }
+    };
+    try {
+      const local = new ObsidianLocalControlStore(this.app);
+      const shared = new ObsidianControlStore(this.app.vault.adapter);
+      await new VaultIdentityService(shared, local).assertBound();
+      const connectionState = await new MutableControlRepository(
+        local,
+        "connection-state.json",
+        isConnectionState,
+      ).read();
+      const secretId = connectionState?.payload.credentialSecretId ?? null;
+      const deviceState = new DeviceStateRepository(local);
+      const deviceId = (await deviceState.read())?.deviceId;
+      if (!secretId || !deviceId) {
+        invalidateCached();
+        return null;
+      }
+      const secrets = new ObsidianSecrets(this.app);
+      const client = new AgentWikiClient(
+        this.settings.serverUrl,
+        new RequestUrlHttp(),
+        () => secrets.get(secretId),
       );
-      this.runtimeRoutes.set(carrier, {
-        route: "recover_upgrade",
-        upgrade,
-        space: null,
-      });
-      return carrier;
-    }
-    const session = SessionResponseSchema.parse(
-      (await client.raw("GET", "/api/integrations/obsidian/session")).json,
-    );
-    if (
-      session.serverInstanceId !== state.serverInstanceId ||
-      session.credentialId !== state.credentialId ||
-      session.deviceId !== state.deviceId ||
-      session.vaultId !== state.vaultId ||
-      session.credentialStatus !== "active"
-    )
-      throw new Error("认证会话身份不匹配");
-    const selection = await protocols.selectFresh(requiredVersion);
-    let space: TreeSpaceSummaryV3 | null = null;
-    let v2CapabilitiesHash = "";
-    let runtime: SyncRuntime;
-    if (selection.version === "3") {
-      space =
-        (
-          await new V3TreeRemote(client, mapping.spaceId, selection).spaces()
-        ).find((item) => item.spaceId === mapping.spaceId) ?? null;
-      if (!space) throw new Error("SPACE_FORBIDDEN");
-      if (space.syncMode === "legacy_v2") {
-        const v2 = await protocols.selectV2Fresh();
-        v2CapabilitiesHash = v2.capabilitiesHash;
-        runtime = new SyncRuntime(
+      const state = connectionState?.payload ?? null;
+      const boundVaultId = await deviceState.getBoundVaultId();
+      if (
+        !state ||
+        state.serverUrl !== this.settings.serverUrl ||
+        state.serverInstanceId !== this.settings.serverInstanceId ||
+        state.deviceId !== deviceId ||
+        state.vaultId !== boundVaultId
+      )
+        throw new Error("连接身份不匹配");
+      const deviceKey = await idFileKey(deviceId);
+      const spaceKey = await idFileKey(mapping.spaceId);
+      const controlRoot = await localImageUpgradeControlRoot(
+        deviceId,
+        mapping.spaceId,
+      );
+      const pushRequirement = await readPushProtocolRequirement(
+        shared,
+        controlRoot,
+        {
+          spaceId: mapping.spaceId,
+          normalizedAuthority: {
+            serverOrigin: this.settings.serverUrl,
+            serverInstanceId: state.serverInstanceId,
+            deviceId: state.deviceId,
+            credentialId: state.credentialId,
+            vaultId: state.vaultId,
+            mappingRootKey: mapping.rootPath,
+          },
+        },
+      );
+      const parent =
+        pushRequirement?.schemaVersion === 4
+          ? (await new PushJournalRouter(shared, controlRoot).read())?.payload
+          : null;
+      const normalizedPending =
+        parent?.schemaVersion === 4 &&
+        parent.phase !== "complete" &&
+        parent.phase !== "superseded";
+      const baselineRequiredVersion = await new TreeBaselineRepository(
+        shared,
+        controlRoot,
+        mapping.spaceId,
+        mapping.rootPath,
+      ).requiredProtocolVersion();
+      const requiredVersion =
+        pushRequirement?.minimumProtocolVersion === "3"
+          ? "3"
+          : baselineRequiredVersion;
+      const protocols = new ProtocolNegotiator(
+        client,
+        new ProtocolSelectionRepository(local),
+      );
+      const vault = new ObsidianVaultPort(
+        this.app.vault,
+        this.app.fileManager,
+        mapping.rootPath,
+        new ObsidianShortestImageResolver(
+          this.app.vault,
+          this.app.metadataCache,
+          mapping.rootPath,
+          (this.shortestImageIndex ??= new ObsidianShortestImageIndex(
+            this.app.vault,
+          )),
+        ),
+      );
+      const upgrade = normalizedPending
+        ? null
+        : await LocalImageUpgradeEntry.create({
+            client,
+            protocols,
+            vault,
+            control: shared,
+            controlRoot,
+            mapping,
+            authority: {
+              serverOrigin: this.settings.serverUrl,
+              serverInstanceId: state.serverInstanceId,
+              pluginVersion: this.manifest.version,
+              deviceId: state.deviceId,
+              credentialId: state.credentialId,
+              vaultId: state.vaultId,
+            },
+          });
+      if (
+        upgrade?.pendingIntent?.phase === "complete" ||
+        upgrade?.pendingIntent?.phase === "superseded"
+      )
+        await upgrade.recover();
+      else if (upgrade?.pendingIntent) {
+        const carrier = new SyncRuntime(
           vault,
           shared,
-          new V2TreeRemote(client, mapping.spaceId, v2),
+          new V1TreeRemote(client, mapping.spaceId, DEFAULT_V1_CAPABILITIES),
           mapping,
           deviceKey,
           spaceKey,
           state.credentialId,
           new AgentWikiPushRemote(client, mapping.spaceId),
         );
+        this.runtimeRoutes.set(carrier, {
+          route: "recover_upgrade",
+          upgrade,
+          space: null,
+        });
+        return carrier;
+      }
+      const session = SessionResponseSchema.parse(
+        (await client.raw("GET", "/api/integrations/obsidian/session")).json,
+      );
+      if (
+        session.serverInstanceId !== state.serverInstanceId ||
+        session.credentialId !== state.credentialId ||
+        session.deviceId !== state.deviceId ||
+        session.vaultId !== state.vaultId ||
+        session.credentialStatus !== "active"
+      )
+        throw new Error("认证会话身份不匹配");
+      const selection = await protocols.selectFresh(requiredVersion);
+      let space: TreeSpaceSummaryV3 | null = null;
+      let v2CapabilitiesHash = "";
+      let runtime: SyncRuntime;
+      if (selection.version === "3") {
+        space =
+          (
+            await new V3TreeRemote(client, mapping.spaceId, selection).spaces()
+          ).find((item) => item.spaceId === mapping.spaceId) ?? null;
+        if (!space) throw new Error("SPACE_FORBIDDEN");
+        if (space.syncMode === "legacy_v2" && !normalizedPending) {
+          const v2 = await protocols.selectV2Fresh();
+          v2CapabilitiesHash = v2.capabilitiesHash;
+          runtime = new SyncRuntime(
+            vault,
+            shared,
+            new V2TreeRemote(client, mapping.spaceId, v2),
+            mapping,
+            deviceKey,
+            spaceKey,
+            state.credentialId,
+            new AgentWikiPushRemote(client, mapping.spaceId),
+          );
+        } else {
+          runtime = SyncRuntime.v3(
+            vault,
+            shared,
+            new V3TreeRemote(client, mapping.spaceId, selection),
+            mapping,
+            deviceKey,
+            spaceKey,
+            state.credentialId,
+          );
+        }
       } else {
-        runtime = SyncRuntime.v3(
+        runtime = new SyncRuntime(
           vault,
           shared,
-          new V3TreeRemote(client, mapping.spaceId, selection),
+          selection.version === "2"
+            ? new V2TreeRemote(client, mapping.spaceId, selection)
+            : new V1TreeRemote(client, mapping.spaceId, session.capabilities),
           mapping,
           deviceKey,
           spaceKey,
           state.credentialId,
+          new AgentWikiPushRemote(client, mapping.spaceId),
         );
+        if (selection.version === "2")
+          v2CapabilitiesHash = selection.capabilitiesHash;
       }
-    } else {
-      runtime = new SyncRuntime(
-        vault,
-        shared,
-        selection.version === "2"
-          ? new V2TreeRemote(client, mapping.spaceId, selection)
-          : new V1TreeRemote(client, mapping.spaceId, session.capabilities),
-        mapping,
-        deviceKey,
-        spaceKey,
-        state.credentialId,
-        new AgentWikiPushRemote(client, mapping.spaceId),
-      );
-      if (selection.version === "2")
-        v2CapabilitiesHash = selection.capabilitiesHash;
-    }
-    const localImageCandidate =
-      selection.version !== "3" || space?.syncMode === "legacy_v2"
-        ? await runtime.hasLocalImageCandidate()
-        : false;
-    const route = selectSpaceSyncRoute({
-      serverVersion: selection.version,
-      syncMode: space?.syncMode ?? null,
-      requiredVersion,
-      pendingUpgrade: false,
-      localImageCandidate,
-      remoteImageCandidate:
-        space?.syncMode === "legacy_v2" && Number(space.attachmentCount) > 0,
-    });
-    const protocolSuffix =
-      selection.version === "3"
-        ? `3\0${selection.capabilitiesHash}\0${v2CapabilitiesHash}`
-        : selection.version === "2"
-          ? `2\0${selection.capabilitiesHash}`
-          : "1";
-    const runtimeKey =
-      (this.settings.serverInstanceId ?? "pending") +
-      "\0" +
-      mapping.spaceId +
-      "\0" +
-      mapping.rootPath +
-      "\0" +
-      state.credentialId +
-      "\0" +
-      state.deviceId +
-      "\0" +
-      state.vaultId +
-      "\0" +
-      route +
-      "\0" +
-      protocolSuffix;
-    const existing = this.liveRuntimes.get(runtimeKey);
-    if (existing) {
-      const boundUpgrade = this.runtimeRoutes.get(existing)?.upgrade ?? null;
-      this.runtimeRoutes.set(existing, {
+      const localImageCandidate =
+        selection.version !== "3" || space?.syncMode === "legacy_v2"
+          ? await runtime.hasLocalImageCandidate()
+          : false;
+      const route = normalizedPending
+        ? "native_v3"
+        : selectSpaceSyncRoute({
+            serverVersion: selection.version,
+            syncMode: space?.syncMode ?? null,
+            requiredVersion,
+            pendingUpgrade: false,
+            localImageCandidate,
+            remoteImageCandidate:
+              space?.syncMode === "legacy_v2" &&
+              Number(space.attachmentCount) > 0,
+          });
+      const protocolSuffix =
+        selection.version === "3"
+          ? `3\0${selection.capabilitiesHash}\0${v2CapabilitiesHash}`
+          : selection.version === "2"
+            ? `2\0${selection.capabilitiesHash}`
+            : "1";
+      const runtimeKey =
+        this.settings.serverUrl +
+        "\0" +
+        (this.settings.serverInstanceId ?? "pending") +
+        "\0" +
+        mapping.spaceId +
+        "\0" +
+        mapping.rootPath +
+        "\0" +
+        state.credentialId +
+        "\0" +
+        state.deviceId +
+        "\0" +
+        state.vaultId +
+        "\0" +
+        route +
+        "\0" +
+        protocolSuffix;
+      for (const [key, cached] of this.liveRuntimes) {
+        if (cached.protocolVersion !== "3") continue;
+        try {
+          cached.configureNormalizedPush({
+            serverOrigin: this.settings.serverUrl,
+            serverInstanceId: session.serverInstanceId,
+            deviceId: session.deviceId,
+            credentialId: session.credentialId,
+            vaultId: session.vaultId,
+          });
+        } catch {
+          cached.invalidate();
+          this.runtimeRoutes.get(cached)?.upgrade?.invalidate();
+          this.liveRuntimes.delete(key);
+        }
+      }
+      const existing = this.liveRuntimes.get(runtimeKey);
+      if (existing) {
+        if (existing.protocolVersion === "3")
+          existing.configureNormalizedPush({
+            serverOrigin: this.settings.serverUrl,
+            serverInstanceId: session.serverInstanceId,
+            deviceId: session.deviceId,
+            credentialId: session.credentialId,
+            vaultId: session.vaultId,
+          });
+        const boundUpgrade = this.runtimeRoutes.get(existing)?.upgrade ?? null;
+        this.runtimeRoutes.set(existing, {
+          route,
+          upgrade: route === "upgrade" ? (boundUpgrade ?? upgrade) : null,
+          space,
+        });
+        return existing;
+      }
+      if (runtime.protocolVersion === "3")
+        runtime.configureNormalizedPush({
+          serverOrigin: this.settings.serverUrl,
+          serverInstanceId: session.serverInstanceId,
+          deviceId: session.deviceId,
+          credentialId: session.credentialId,
+          vaultId: session.vaultId,
+        });
+      this.liveRuntimes.set(runtimeKey, runtime);
+      this.runtimeRoutes.set(runtime, {
         route,
-        upgrade: route === "upgrade" ? (boundUpgrade ?? upgrade) : null,
+        upgrade: route === "upgrade" ? upgrade : null,
         space,
       });
-      return existing;
+      return runtime;
+    } catch (error) {
+      invalidateCached();
+      throw error;
     }
-    this.liveRuntimes.set(runtimeKey, runtime);
-    this.runtimeRoutes.set(runtime, {
-      route,
-      upgrade: route === "upgrade" ? upgrade : null,
-      space,
-    });
-    return runtime;
   }
   // Status bar indicator
   private initStatusBar(): void {
@@ -778,6 +917,44 @@ export default class AgentWikiSyncPlugin extends Plugin {
     if (!mapping) throw new Error("请先连接并在设置中添加空间映射。");
     const runtime = await this.runtime(mapping);
     if (!runtime) throw new Error("请先连接并在设置中添加空间映射。");
+    if (runtime.protocolVersion === "3") {
+      const pending = await runtime.inspectNormalizedPush();
+      if (
+        pending &&
+        pending.phase !== "complete" &&
+        pending.phase !== "superseded"
+      )
+        return {
+          canPublish: true,
+          displayName:
+            pending.mode === "local_only"
+              ? "本地链接修正待处理，未发布云端版本"
+              : pending.verifiedTarget
+                ? "远端已发布，本地待处理"
+                : "图片链接规范化推送待处理",
+          rootPath: mapping.rootPath,
+          roleLabel: "待恢复",
+          remoteAhead: false,
+          protocolLabel: "Sync v3",
+          attachmentChanges: null,
+          localFoldersAdded: [],
+          localFoldersMoved: [],
+          localFoldersDeleted: [],
+          remoteFoldersUpdated: [],
+          remoteFoldersArchived: [],
+          folderCount: 0,
+          pageCount: pending.localPlan.length,
+          localAdded: [],
+          localModified: pending.localPlan.map((action) => action.path),
+          localRenamed: [],
+          localDeleted: [],
+          remoteUpdated: [],
+          remoteArchived: [],
+          remoteListed: false,
+          remoteFirstBind: false,
+          recoveryPending: true,
+        };
+    }
     const routed = this.runtimeRoutes.get(runtime);
     if (routed?.route === "recover_upgrade" && routed.upgrade) {
       return {
@@ -1092,6 +1269,49 @@ export default class AgentWikiSyncPlugin extends Plugin {
     try {
       const runtime = await this.runtime(mapping);
       if (!runtime) throw new Error("请先连接并在设置中添加空间映射。");
+      if (runtime.protocolVersion === "3") {
+        const pending = await runtime.inspectNormalizedPush();
+        if (
+          pending &&
+          pending.phase !== "complete" &&
+          pending.phase !== "superseded"
+        ) {
+          const state =
+            pending.mode === "local_only"
+              ? "本地链接修正待处理，未发布云端版本"
+              : pending.verifiedTarget
+                ? "远端已发布，本地待处理"
+                : "图片链接规范化推送待处理";
+          return () =>
+            new PreviewModal(
+              this.app,
+              state,
+              [state, `本地图片链接修正：${pending.localPlan.length} 个 Page`],
+              async () => {
+                await runtime.recover();
+                await this.saveSettings();
+                new Notice("恢复完成。");
+              },
+              flow.phaseRelease(),
+              [],
+              null,
+              {
+                closeLabel: "关闭",
+                confirmLabel: "重试",
+                files: pending.localPlan.map((action) => ({
+                  path: action.path,
+                  open: async () => {
+                    await this.app.workspace.openLinkText(
+                      `${pending.binding.mappingRootKey}/${action.path}`,
+                      "",
+                      false,
+                    );
+                  },
+                })),
+              },
+            ).open();
+        }
+      }
       const routed = this.runtimeRoutes.get(runtime);
       if (routed?.route === "recover_upgrade" && routed.upgrade) {
         await routed.upgrade.recover(options);
@@ -1198,7 +1418,19 @@ export default class AgentWikiSyncPlugin extends Plugin {
           disabledReason: canPublish
             ? "预览已失效，请重新打开同步中心生成新预览。"
             : "当前空间为只读，无法确认升级。",
-          subscribeInvalidation: (listener) => entry.onInvalidate(listener),
+          subscribeInvalidation: (listener) => {
+            const off = entry.onInvalidate(listener);
+            const cleanup = () => {
+              entry.invalidate();
+              unsubscribe();
+            };
+            const unsubscribe = () => {
+              if (!this.previewUnloadCleanups.delete(cleanup)) return;
+              off();
+            };
+            this.previewUnloadCleanups.add(cleanup);
+            return unsubscribe;
+          },
         },
       ).open();
   }
@@ -1686,7 +1918,11 @@ export default class AgentWikiSyncPlugin extends Plugin {
   ): Promise<ModalTransition | void> {
     try {
       const preview = await runtime.previewPushV3(options);
-      if (preview.publishable && !preview.changes.length) {
+      if (
+        preview.publishable &&
+        !preview.changes.length &&
+        !preview.normalizedPush?.plan.localPlan.length
+      ) {
         new Notice("本地没有待推送的变更。");
         flow.finish();
         return;
@@ -1699,6 +1935,18 @@ export default class AgentWikiSyncPlugin extends Plugin {
           this.v3PushLines(preview),
           async (applyOptions) => {
             try {
+              const mapping = this.settings.mappings.find(
+                (item) => item.spaceId === runtime.spaceId,
+              );
+              if (!mapping || (await this.runtime(mapping)) !== runtime) {
+                runtime.invalidate();
+                throw new Error("STALE_PUSH_PREVIEW");
+              }
+              if (
+                preview.changes.length &&
+                !this.runtimeRoutes.get(runtime)?.space?.canPublish
+              )
+                throw new Error("SPACE_READ_ONLY");
               await runtime.applyPushV3(preview, applyOptions);
             } catch (error) {
               if (
@@ -1711,13 +1959,39 @@ export default class AgentWikiSyncPlugin extends Plugin {
               return this.openPushPreviewV3(runtime, flow, title, applyOptions);
             }
             await this.saveSettings();
-            new Notice("推送完成。");
+            new Notice(
+              preview.normalizedPush?.plan.mode === "local_only"
+                ? "本地图片链接修正完成，未发布云端版本。"
+                : "推送完成。",
+            );
           },
           () => {
-            void runtime.discardPushPreviewV3(preview).finally(releasePhase);
+            void runtime
+              .discardPushPreviewV3(preview)
+              .catch(() => {
+                // A confirmed pending owner retains its private payload for recovery.
+              })
+              .finally(releasePhase);
           },
           [],
           preview,
+          {
+            canConfirm: () => runtime.isPushPreviewCurrent(preview),
+            subscribeInvalidation: (listener) => {
+              const off = runtime.onInvalidate(listener);
+              const cleanup = () => {
+                runtime.invalidate();
+                unsubscribe();
+              };
+              const unsubscribe = () => {
+                if (!this.previewUnloadCleanups.delete(cleanup)) return;
+                off();
+              };
+              this.previewUnloadCleanups.add(cleanup);
+              return unsubscribe;
+            },
+            disabledReason: "预览已失效，请关闭后重新预览。",
+          },
         ).open();
     } catch (error) {
       new Notice(userErrorMessage(error));
