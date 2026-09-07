@@ -65,8 +65,7 @@ export async function readPushProtocolRequirement(
   if (!highest) return null;
   if (versions.has(1) && versions.has(2))
     throw new Error("Mixed legacy Push ownership");
-  if (highest.payload.schemaVersion >= 3 || versions.size > 1)
-    await new PushJournalRouter(store, controlRoot).read();
+  await new PushJournalRouter(store, controlRoot).read();
   return {
     schemaVersion: highest.payload.schemaVersion,
     minimumProtocolVersion: highest.payload.schemaVersion >= 3 ? "3" : "1",

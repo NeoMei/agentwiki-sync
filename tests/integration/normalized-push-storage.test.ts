@@ -36,8 +36,82 @@ import {
 import type { TreePushJournalV3 } from "../../src/application/tree-push-service-v3";
 import type { MutableControlEnvelope } from "../../src/storage/envelope";
 import { MemoryVault } from "../fakes/memory-vault";
+import { PushService } from "../../src/application/push-service";
+import { TreePushService } from "../../src/application/tree-push-service";
 
 describe("normalized push storage", () => {
+  it.each(
+    ([1, 2] as const).flatMap((schemaVersion) =>
+      (["owner", "frozen", "caps"] as const).map((change) => ({
+        schemaVersion,
+        change,
+      })),
+    ),
+  )(
+    "validates every schema $schemaVersion candidate before dispatch: $change",
+    async ({ schemaVersion, change }) => {
+      const f = await makeNormalizedFixture();
+      const template = makeV3Journal(f);
+      const old = {
+        ...template,
+        schemaVersion,
+        changes: [],
+        remoteState: "uploading",
+        result: null,
+        localCommitPhase: "not_started",
+      };
+      const latest = {
+        ...template,
+        schemaVersion,
+        changes: [],
+        remoteState: "published",
+        localCommitPhase: "verified",
+        result: { status: "published", revision: "published-revision" },
+        ...(change === "owner" ? { idempotencyKey: "other-owner" } : {}),
+        ...(change === "frozen"
+          ? { confirmationHash: "changed-authorization" }
+          : {}),
+        ...(change === "caps"
+          ? {
+              capabilities: { ...template.capabilities, maxPageItems: 17 },
+              capabilitiesHash: "refreshed",
+            }
+          : {}),
+      };
+      const path = `${NORMALIZED_ROOT}/push/journal.json`;
+      await f.store.write(`${path}.prev`, await envelopeFor(old, 4));
+      await f.store.write(path, await envelopeFor(latest, 5));
+      // inspect is genuinely the old owner's highest-candidate read, not a replacement guard.
+      const owner =
+        schemaVersion === 1
+          ? new PushService({} as never, f.store, `${NORMALIZED_ROOT}/push`)
+          : new TreePushService(
+              {} as never,
+              f.store,
+              `${NORMALIZED_ROOT}/push`,
+            );
+      expect(await owner.inspect()).toMatchObject({
+        remoteState: "published",
+        localCommitPhase: "verified",
+      });
+      const before = [...f.store.files];
+      const dispatch = readPushProtocolRequirement(f.store, NORMALIZED_ROOT, {
+        spaceId: template.spaceId,
+      });
+      if (change === "caps")
+        await expect(dispatch).resolves.toEqual({
+          schemaVersion,
+          minimumProtocolVersion: "1",
+        });
+      else
+        await expect(dispatch).rejects.toThrow(
+          change === "owner"
+            ? "Legacy Push is not terminal"
+            : "Frozen legacy operation changed",
+        );
+      expect([...f.store.files]).toEqual(before);
+    },
+  );
   it.each([1, 2] as const)(
     "retains schema %s terminal evidence through every forward-writer interruption",
     async (schemaVersion) => {

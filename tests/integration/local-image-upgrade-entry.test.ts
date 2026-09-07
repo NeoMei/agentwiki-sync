@@ -14,6 +14,8 @@ import {
   sha256Hex,
 } from "../../src/agentwiki/protocol";
 import { AgentWikiClient } from "../../src/agentwiki/client";
+import { AgentWikiPushRemote } from "../../src/agentwiki/push-remote";
+import { PushService } from "../../src/application/push-service";
 import { LocalImageUpgradeEntry } from "../../src/application/local-image-upgrade-entry";
 import { ProtocolNegotiator } from "../../src/application/protocol-negotiator";
 import type { SyncRuntime } from "../../src/application/sync-runtime";
@@ -37,6 +39,7 @@ import { SyncCenterModal } from "../../src/obsidian/sync-center-modal";
 import {
   ObsidianControlStore,
   ObsidianLocalControlStore,
+  RequestUrlHttp,
 } from "../../src/obsidian/adapters";
 import { MutableControlRepository } from "../../src/storage/envelope";
 import { scanLocalTree } from "../../src/core/tree-scan";
@@ -84,6 +87,11 @@ const V2_CAPABILITIES = {
   maxResponseBytes: 4_194_304,
   maxPageItems: 200,
   pushSessionTtlSeconds: 900,
+};
+const V1_CAPABILITIES = {
+  ...V2_CAPABILITIES,
+  maxChangeCount: 5000,
+  maxClientTotalBodyBytes: 104_857_600,
 };
 
 const noticeMessages = (): string[] =>
@@ -498,10 +506,10 @@ async function pluginUpgradeHarness(
         ),
         publishedAt: "2026-09-06T00:01:00.000Z",
       };
-    } else if (path === "/api/sync/v2/spaces/space-1/head") {
+    } else if (/^\/api\/sync\/v[12]\/spaces\/space-1\/head$/.test(path)) {
       const metrics = await remoteMetrics();
       json = {
-        protocolVersion: "2",
+        protocolVersion: path.includes("/v1/") ? "1" : "2",
         spaceId: "space-1",
         revision: remoteRevision,
         sequence: remoteRevision === "0" ? 0 : 1,
@@ -669,10 +677,11 @@ async function pluginUpgradeHarness(
     } else if (
       !publishPreview &&
       value.method === "POST" &&
-      path === "/api/sync/v2/spaces/space-1/push-sessions"
+      /^\/api\/sync\/v[12]\/spaces\/space-1\/push-sessions$/.test(path)
     )
       json = {
-        protocolVersion: "2",
+        protocolVersion: path.includes("/v1/") ? "1" : "2",
+        ...(path.includes("/v1/") ? { capabilities: V1_CAPABILITIES } : {}),
         sessionId,
         status: "uploading",
         expiresAt: "2099-01-01T00:00:00.000Z",
@@ -681,7 +690,7 @@ async function pluginUpgradeHarness(
     else if (
       !publishPreview &&
       value.method === "PUT" &&
-      path.includes("/api/sync/v2/spaces/space-1/push-sessions/") &&
+      /^\/api\/sync\/v[12]\/spaces\/space-1\/push-sessions\//.test(path) &&
       path.includes("/batches/")
     ) {
       const batch = JSON.parse(value.body as string) as {
@@ -689,9 +698,31 @@ async function pluginUpgradeHarness(
         batchHash: string;
         changes: typeof uploadedV2Changes;
       };
-      uploadedV2Changes = structuredClone(batch.changes);
+      uploadedV2Changes = path.includes("/v1/")
+        ? (
+            batch.changes as unknown as {
+              operation: string;
+              pageId: string;
+              path: string;
+              title: string;
+              body: string;
+              contentHash: string;
+            }[]
+          ).map((change) => ({
+            operation: "upsert_page",
+            page: {
+              pageId: change.pageId,
+              path: change.path,
+              title: change.title,
+              body: change.body,
+              contentHash: change.contentHash,
+              folderId: null,
+              updatedAt: "2026-09-06T00:00:00.000Z",
+            },
+          }))
+        : structuredClone(batch.changes);
       json = {
-        protocolVersion: "2",
+        protocolVersion: path.includes("/v1/") ? "1" : "2",
         sessionId,
         batchIndex: batch.batchIndex,
         batchHash: batch.batchHash,
@@ -701,7 +732,10 @@ async function pluginUpgradeHarness(
     } else if (
       !publishPreview &&
       value.method === "POST" &&
-      path === `/api/sync/v2/spaces/space-1/push-sessions/${sessionId}/finalize`
+      (path ===
+        `/api/sync/v2/spaces/space-1/push-sessions/${sessionId}/finalize` ||
+        path ===
+          `/api/sync/v1/spaces/space-1/push-sessions/${sessionId}/finalize`)
     ) {
       for (const change of uploadedV2Changes)
         if (change.operation === "upsert_page" && change.page)
@@ -709,7 +743,7 @@ async function pluginUpgradeHarness(
       remoteRevision = "text-published";
       const metrics = await remoteMetrics();
       json = {
-        protocolVersion: "2",
+        protocolVersion: path.includes("/v1/") ? "1" : "2",
         status: "published",
         revision: remoteRevision,
         sequence: 2,
@@ -2042,6 +2076,336 @@ describe("local image upgrade plugin entry", () => {
     expect(h.adapter.readPaths).not.toContain("Outside/used.png");
     expect(h.adapter.readPaths).not.toContain("Wiki/assets/unused.png");
   });
+
+  it.each(
+    ([1, 2] as const).flatMap((schemaVersion) =>
+      [false, true].map((confirmRace) => ({ schemaVersion, confirmRace })),
+    ),
+  )(
+    "recovers actual old schema $schemaVersion response loss before image upgrade (confirm race $confirmRace)",
+    async ({ schemaVersion, confirmRace }) => {
+      const h = await pluginUpgradeHarness({ includeLocalImage: false });
+      const subject = h.plugin as unknown as {
+        runtime: (mapping: SpaceMapping) => Promise<SyncRuntime>;
+        runtimeRoutes: WeakMap<
+          SyncRuntime,
+          { route: string; upgrade: LocalImageUpgradeEntry | null }
+        >;
+        runSyncStrategy: (
+          id: string,
+          strategy: "auto",
+          options: unknown,
+        ) => Promise<ModalTransition | void>;
+        collectSyncDiff: (
+          id: string,
+          options: unknown,
+        ) => Promise<{ recoveryPending: boolean }>;
+      };
+      const mapping = h.plugin.settings.mappings[0]!;
+      const text = await subject.runtime(mapping);
+      await text.applyPull(await text.previewPull());
+      const textPreview = await text.previewPush();
+      const addImage = () => {
+        h.adapter.files.set(
+          "Wiki/pages/note.md",
+          "local text only\n![A](../assets/used.png)\n",
+        );
+        h.adapter.binaryFiles.set("Wiki/assets/used.png", PNG);
+        h.adapter.deriveParents("Wiki/assets/used.png");
+        h.emitVault("create", h.adapter.abstractFile("Wiki/assets/used.png"));
+      };
+      let staleUpgrade: {
+        entry: LocalImageUpgradeEntry;
+        preview: UpgradePreview;
+      } | null = null;
+      if (confirmRace) {
+        addImage();
+        const carrier = await subject.runtime(mapping);
+        const entry = subject.runtimeRoutes.get(carrier)!.upgrade!;
+        const draft = await entry.prepare();
+        if (draft.kind !== "upgrade_draft") throw new Error("expected draft");
+        staleUpgrade = { entry, preview: await entry.finalizePreview(draft) };
+      }
+      const http = requestUrlState.impl;
+      let accepted = false;
+      requestUrlState.impl = async (request) => {
+        const response = await http(request);
+        const value = request as { method: string; url: string };
+        if (
+          !accepted &&
+          value.method === "POST" &&
+          value.url.endsWith("/push-sessions")
+        ) {
+          accepted = true;
+          throw new Error("accepted create response lost");
+        }
+        return response;
+      };
+      if (schemaVersion === 2)
+        await expect(text.applyPush(textPreview)).rejects.toThrow();
+      else {
+        const root = `.agentwiki/devices/d-${await idFileKey(h.connection.deviceId)}/spaces/s-${await idFileKey(mapping.spaceId)}`;
+        const service = new PushService(
+          new AgentWikiPushRemote(
+            new AgentWikiClient(
+              h.connection.serverUrl,
+              new RequestUrlHttp(),
+              () => "secret-1",
+            ),
+            mapping.spaceId,
+          ),
+          new ObsidianControlStore(h.app.vault.adapter as never),
+          `${root}/push`,
+        );
+        const page = textPreview.changes.find(
+          (change) => change.operation === "upsert_page",
+        );
+        if (page?.operation !== "upsert_page")
+          throw new Error("expected text Page");
+        await expect(
+          service.publish({
+            spaceId: mapping.spaceId,
+            baseRevision: "0",
+            capabilities: V1_CAPABILITIES,
+            credentialId: h.connection.credentialId,
+            changes: [
+              {
+                operation: "upsert",
+                pageId: page.page.pageId,
+                path: page.page.path,
+                title: page.page.title,
+                body: "local text only\n",
+                contentHash: await contentHash("local text only\n"),
+              },
+            ],
+          }),
+        ).rejects.toThrow();
+      }
+      expect(accepted).toBe(true);
+      requestUrlState.impl = http;
+      const path = [...h.adapter.files.keys()].find((path) =>
+        path.endsWith("/push/journal.json"),
+      )!;
+      const original = h.adapter.files.get(path)!;
+      expect(
+        (JSON.parse(original) as { payload: unknown }).payload,
+      ).toMatchObject({
+        schemaVersion,
+        remoteState: "not_created",
+        localCommitPhase: "not_started",
+      });
+      if (staleUpgrade) {
+        const requests = h.requests.length;
+        const writes = [...h.businessWrites];
+        await expect(
+          staleUpgrade.entry.confirm(
+            staleUpgrade.preview,
+            staleUpgrade.preview.authorizationHash,
+          ),
+        ).rejects.toThrow("PUSH_RECOVERY_REQUIRED");
+        expect(
+          h.requests
+            .slice(requests)
+            .filter((request) => request.method !== "GET"),
+        ).toEqual([]);
+        expect(h.businessWrites).toEqual(writes);
+        expect(h.adapter.files.get(path)).toBe(original);
+      } else addImage();
+      const pending = await subject.runtime(mapping);
+      expect(subject.runtimeRoutes.get(pending)?.route).toBe("legacy");
+      expect(subject.runtimeRoutes.get(pending)?.upgrade).toBeNull();
+      const writes = [...h.businessWrites];
+      const before = h.requests.length;
+      expect(await subject.collectSyncDiff("space-1", {})).toMatchObject({
+        recoveryPending: true,
+      });
+      expect(h.adapter.files.get(path)).toBe(original);
+      expect(h.businessWrites).toEqual(writes);
+      expect(
+        await subject.runSyncStrategy("space-1", "auto", {}),
+      ).toBeUndefined();
+      expect(
+        (JSON.parse(h.adapter.files.get(path)!) as { payload: unknown })
+          .payload,
+      ).toMatchObject({
+        schemaVersion,
+        remoteState: "published",
+        localCommitPhase: "verified",
+      });
+      expect(
+        h.requests
+          .slice(before)
+          .filter((request) => request.method !== "GET")
+          .every((request) => request.path.includes(`/v${schemaVersion}/`)),
+      ).toBe(true);
+      const next = await subject.runtime(mapping);
+      const upgrade = subject.runtimeRoutes.get(next)!.upgrade!;
+      expect(subject.runtimeRoutes.get(next)?.route).toBe("upgrade");
+      const draft = await upgrade.prepare();
+      if (draft.kind !== "upgrade_draft") throw new Error("expected draft");
+      for (const conflict of [...draft.merge.pageConflicts])
+        await resolvePageConflictV3(draft.merge, conflict.conflictId, {
+          choice: "local",
+        });
+      const confirmed = await upgrade.finalizePreview(draft);
+      h.setPublishPreview(confirmed);
+      await upgrade.confirm(confirmed, confirmed.authorizationHash);
+      h.setSyncMode("native_v3");
+      await (await subject.runtime(mapping)).recover();
+      expect(h.adapter.files.has(path)).toBe(true);
+      h.plugin.unload();
+    },
+  );
+
+  it.each([
+    "origin",
+    "credential",
+    "local-credential",
+    "mapping",
+    "session",
+    "unload",
+    "unload-before-open",
+    "unload-during-session",
+    "epoch",
+    "restart",
+  ])(
+    "rechecks pending retry authority and lifecycle after %s without replanning durable work",
+    async (change) => {
+      const h = await pluginUpgradeHarness();
+      const subject = h.plugin as unknown as {
+        runtime: (mapping: SpaceMapping) => Promise<SyncRuntime>;
+        runtimeRoutes: WeakMap<
+          SyncRuntime,
+          { upgrade: LocalImageUpgradeEntry | null }
+        >;
+        runSyncStrategy: (
+          id: string,
+          strategy: "auto",
+          options: unknown,
+        ) => Promise<ModalTransition>;
+        previewUnloadCleanups: Set<() => void>;
+      };
+      const mapping = h.plugin.settings.mappings[0]!;
+      const carrier = await subject.runtime(mapping);
+      const entry = subject.runtimeRoutes.get(carrier)!.upgrade!;
+      const draft = await entry.prepare();
+      if (draft.kind !== "upgrade_draft") throw new Error("expected draft");
+      const preview = await entry.finalizePreview(draft);
+      h.setPublishPreview(preview);
+      await entry.confirm(preview, preview.authorizationHash);
+      h.setSyncMode("native_v3");
+      const native = await subject.runtime(mapping);
+      h.adapter.files.set(
+        "Wiki/pages/note.md",
+        h.adapter.files
+          .get("Wiki/pages/note.md")!
+          .replace("../assets/used.png", "used.png"),
+      );
+      h.emitVault("modify", h.adapter.abstractFile("Wiki/pages/note.md"));
+      const repair = await native.previewPushV3();
+      const process = h.app.vault.process;
+      h.app.vault.process = async () => {
+        throw new Error("actual CAS interruption");
+      };
+      await expect(native.applyPushV3(repair)).rejects.toThrow();
+      h.app.vault.process = process;
+      const pending = await native.inspectNormalizedPush();
+      expect(pending?.phase).toBe("local_pending");
+      if (change === "restart") {
+        h.plugin.unload();
+        await h.plugin.onload();
+      }
+      const open = vi.spyOn(PreviewModal.prototype, "open");
+      const transition = await subject.runSyncStrategy("space-1", "auto", {});
+      if (change === "unload-before-open") h.plugin.unload();
+      transition();
+      const modal = open.mock.instances.at(-1) as unknown as PreviewModal;
+      const writes = [...h.businessWrites];
+      const start = h.requests.length;
+      const http = requestUrlState.impl;
+      if (change === "origin")
+        h.plugin.settings.serverUrl = "https://changed.example";
+      if (change === "credential") {
+        h.connection.credentialId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+      }
+      if (change === "local-credential")
+        await new MutableControlRepository(
+          new ObsidianLocalControlStore(h.app as never),
+          "connection-state.json",
+          isConnectionState,
+        ).write({
+          ...h.connection,
+          credentialId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        });
+      if (change === "mapping") h.plugin.settings.mappings = [];
+      if (change === "session" || change === "unload-during-session")
+        requestUrlState.impl = async (request) => {
+          const response = await http(request);
+          if (
+            (request as { url: string }).url.endsWith(
+              "/api/integrations/obsidian/session",
+            )
+          ) {
+            if (change === "unload-during-session") {
+              h.plugin.unload();
+              return response;
+            }
+            return {
+              ...response,
+              json: {
+                ...(response.json as object),
+                credentialStatus: "revoked",
+              },
+            };
+          }
+          return response;
+        };
+      if (change === "unload") h.plugin.unload();
+      if (change === "epoch")
+        h.emitVault("modify", h.adapter.abstractFile("Wiki/pages/note.md"));
+      if (change === "unload" || change === "unload-before-open") {
+        expect(modalButton(modal, "重试").disabled).toBe(true);
+        await expect(
+          (
+            modal as unknown as { confirm: (options: object) => Promise<void> }
+          ).confirm({}),
+        ).rejects.toThrow("STALE_PUSH_PREVIEW");
+      }
+      modalButton(modal, "重试").dispatchEvent({ type: "click" });
+      if (change === "epoch" || change === "restart") {
+        await vi.waitFor(async () =>
+          expect((await native.inspectNormalizedPush())?.phase).toBe(
+            "complete",
+          ),
+        );
+        expect((await native.inspectNormalizedPush())?.authorizationHash).toBe(
+          pending?.authorizationHash,
+        );
+        expect(
+          h.requests
+            .slice(start)
+            .some((request) => request.path.endsWith("/session")),
+        ).toBe(true);
+      } else {
+        if (change !== "unload" && change !== "unload-before-open")
+          await vi.waitFor(() =>
+            expect(noticeMessages().length).toBeGreaterThan(0),
+          );
+        expect((await native.inspectNormalizedPush())?.phase).toBe(
+          "local_pending",
+        );
+        expect(h.businessWrites).toEqual(writes);
+        expect(
+          h.requests.slice(start).filter((request) => request.method !== "GET"),
+        ).toEqual([]);
+      }
+      modal.close();
+      expect(subject.previewUnloadCleanups.size).toBe(0);
+      requestUrlState.impl = http;
+      open.mockRestore();
+      h.plugin.unload();
+    },
+  );
 
   it("continues native sync after a real text Push and first image upgrade without losing the old terminal journal", async () => {
     const h = await pluginUpgradeHarness({ includeLocalImage: false });

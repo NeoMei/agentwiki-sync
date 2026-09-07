@@ -412,7 +412,7 @@ export class LocalImageUpgradeEntry {
         },
       },
     );
-    if (push?.schemaVersion === 4) {
+    if (push) {
       const journal = (
         await new PushJournalRouter(
           this.deps.control,
@@ -420,9 +420,12 @@ export class LocalImageUpgradeEntry {
         ).read()
       )?.payload;
       if (
-        journal?.schemaVersion === 4 &&
-        journal.phase !== "complete" &&
-        journal.phase !== "superseded"
+        ((journal?.schemaVersion === 1 || journal?.schemaVersion === 2) &&
+          journal.remoteState !== "superseded" &&
+          journal.localCommitPhase !== "verified") ||
+        (journal?.schemaVersion === 4 &&
+          journal.phase !== "complete" &&
+          journal.phase !== "superseded")
       )
         throw new Error("PUSH_RECOVERY_REQUIRED");
     }

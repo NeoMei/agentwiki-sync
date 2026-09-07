@@ -639,14 +639,17 @@ export default class AgentWikiSyncPlugin extends Plugin {
           },
         },
       );
-      const parent =
-        pushRequirement?.schemaVersion === 4
-          ? (await new PushJournalRouter(shared, controlRoot).read())?.payload
-          : null;
+      const parent = pushRequirement
+        ? (await new PushJournalRouter(shared, controlRoot).read())?.payload
+        : null;
       const normalizedPending =
         parent?.schemaVersion === 4 &&
         parent.phase !== "complete" &&
         parent.phase !== "superseded";
+      const legacyPending =
+        (parent?.schemaVersion === 1 || parent?.schemaVersion === 2) &&
+        parent.remoteState !== "superseded" &&
+        parent.localCommitPhase !== "verified";
       const baselineRequiredVersion = await new TreeBaselineRepository(
         shared,
         controlRoot,
@@ -674,24 +677,25 @@ export default class AgentWikiSyncPlugin extends Plugin {
           )),
         ),
       );
-      const upgrade = normalizedPending
-        ? null
-        : await LocalImageUpgradeEntry.create({
-            client,
-            protocols,
-            vault,
-            control: shared,
-            controlRoot,
-            mapping,
-            authority: {
-              serverOrigin: this.settings.serverUrl,
-              serverInstanceId: state.serverInstanceId,
-              pluginVersion: this.manifest.version,
-              deviceId: state.deviceId,
-              credentialId: state.credentialId,
-              vaultId: state.vaultId,
-            },
-          });
+      const upgrade =
+        normalizedPending || legacyPending
+          ? null
+          : await LocalImageUpgradeEntry.create({
+              client,
+              protocols,
+              vault,
+              control: shared,
+              controlRoot,
+              mapping,
+              authority: {
+                serverOrigin: this.settings.serverUrl,
+                serverInstanceId: state.serverInstanceId,
+                pluginVersion: this.manifest.version,
+                deviceId: state.deviceId,
+                credentialId: state.credentialId,
+                vaultId: state.vaultId,
+              },
+            });
       if (
         upgrade?.pendingIntent?.phase === "complete" ||
         upgrade?.pendingIntent?.phase === "superseded"
@@ -736,6 +740,8 @@ export default class AgentWikiSyncPlugin extends Plugin {
             await new V3TreeRemote(client, mapping.spaceId, selection).spaces()
           ).find((item) => item.spaceId === mapping.spaceId) ?? null;
         if (!space) throw new Error("SPACE_FORBIDDEN");
+        if (legacyPending && space.syncMode !== "legacy_v2")
+          throw new Error("PUSH_RECOVERY_REQUIRED");
         if (space.syncMode === "legacy_v2" && !normalizedPending) {
           const v2 = await protocols.selectV2Fresh();
           v2CapabilitiesHash = v2.capabilitiesHash;
@@ -777,21 +783,24 @@ export default class AgentWikiSyncPlugin extends Plugin {
           v2CapabilitiesHash = selection.capabilitiesHash;
       }
       const localImageCandidate =
-        selection.version !== "3" || space?.syncMode === "legacy_v2"
+        !legacyPending &&
+        (selection.version !== "3" || space?.syncMode === "legacy_v2")
           ? await runtime.hasLocalImageCandidate()
           : false;
       const route = normalizedPending
         ? "native_v3"
-        : selectSpaceSyncRoute({
-            serverVersion: selection.version,
-            syncMode: space?.syncMode ?? null,
-            requiredVersion,
-            pendingUpgrade: false,
-            localImageCandidate,
-            remoteImageCandidate:
-              space?.syncMode === "legacy_v2" &&
-              Number(space.attachmentCount) > 0,
-          });
+        : legacyPending
+          ? "legacy"
+          : selectSpaceSyncRoute({
+              serverVersion: selection.version,
+              syncMode: space?.syncMode ?? null,
+              requiredVersion,
+              pendingUpgrade: false,
+              localImageCandidate,
+              remoteImageCandidate:
+                space?.syncMode === "legacy_v2" &&
+                Number(space.attachmentCount) > 0,
+            });
       const protocolSuffix =
         selection.version === "3"
           ? `3\0${selection.capabilitiesHash}\0${v2CapabilitiesHash}`
@@ -956,14 +965,23 @@ export default class AgentWikiSyncPlugin extends Plugin {
         };
     }
     const routed = this.runtimeRoutes.get(runtime);
-    if (routed?.route === "recover_upgrade" && routed.upgrade) {
+    const legacyPending =
+      runtime.protocolVersion !== "3" && (await runtime.hasUnfinishedPush());
+    if (
+      legacyPending ||
+      (routed?.route === "recover_upgrade" && routed.upgrade)
+    ) {
       return {
         canPublish: true,
         displayName: mapping.spaceId,
         rootPath: mapping.rootPath,
         roleLabel: "待恢复",
         remoteAhead: true,
-        protocolLabel: "Sync v2 → Sync v3",
+        protocolLabel: legacyPending
+          ? runtime.protocolVersion === "1"
+            ? "Legacy v1"
+            : "Sync v2"
+          : "Sync v2 → Sync v3",
         attachmentChanges: null,
         localFoldersAdded: [],
         localFoldersMoved: [],
@@ -1282,13 +1300,42 @@ export default class AgentWikiSyncPlugin extends Plugin {
               : pending.verifiedTarget
                 ? "远端已发布，本地待处理"
                 : "图片链接规范化推送待处理";
+          let active = true;
+          let notifyInvalidation: (() => void) | null = null;
+          const unsubscribe = () => {
+            active = false;
+            notifyInvalidation = null;
+            this.previewUnloadCleanups.delete(cleanup);
+          };
+          const cleanup = () => {
+            active = false;
+            notifyInvalidation?.();
+            unsubscribe();
+          };
+          this.previewUnloadCleanups.add(cleanup);
           return () =>
             new PreviewModal(
               this.app,
               state,
               [state, `本地图片链接修正：${pending.localPlan.length} 个 Page`],
               async () => {
-                await runtime.recover();
+                if (!active) throw new Error("STALE_PUSH_PREVIEW");
+                const currentMapping = this.settings.mappings.find(
+                  (item) => item.spaceId === pending.binding.spaceId,
+                );
+                const current = currentMapping
+                  ? await this.runtime(currentMapping)
+                  : null;
+                if (!active || current?.protocolVersion !== "3")
+                  throw new Error("STALE_PUSH_PREVIEW");
+                const owned = await current.inspectNormalizedPush();
+                if (
+                  !active ||
+                  owned?.binding.operationId !== pending.binding.operationId ||
+                  owned.authorizationHash !== pending.authorizationHash
+                )
+                  throw new Error("STALE_PUSH_PREVIEW");
+                await current.recover();
                 await this.saveSettings();
                 new Notice("恢复完成。");
               },
@@ -1298,6 +1345,12 @@ export default class AgentWikiSyncPlugin extends Plugin {
               {
                 closeLabel: "关闭",
                 confirmLabel: "重试",
+                canConfirm: () => active,
+                disabledReason: "恢复入口已关闭，请重新打开同步。",
+                subscribeInvalidation: (listener) => {
+                  notifyInvalidation = listener;
+                  return unsubscribe;
+                },
                 files: pending.localPlan.map((action) => ({
                   path: action.path,
                   open: async () => {
@@ -1311,6 +1364,16 @@ export default class AgentWikiSyncPlugin extends Plugin {
               },
             ).open();
         }
+      }
+      if (
+        runtime.protocolVersion !== "3" &&
+        (await runtime.hasUnfinishedPush())
+      ) {
+        await runtime.recover();
+        await this.saveSettings();
+        new Notice("已恢复先前确认的推送，请重新预览同步。");
+        flow.finish();
+        return;
       }
       const routed = this.runtimeRoutes.get(runtime);
       if (routed?.route === "recover_upgrade" && routed.upgrade) {
