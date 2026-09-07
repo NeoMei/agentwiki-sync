@@ -2261,6 +2261,9 @@ describe("local image upgrade plugin entry", () => {
     "origin",
     "credential",
     "local-credential",
+    "vault",
+    "root",
+    "space",
     "mapping",
     "session",
     "unload",
@@ -2337,6 +2340,14 @@ describe("local image upgrade plugin entry", () => {
           ...h.connection,
           credentialId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
         });
+      if (change === "vault")
+        h.connection.vaultId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+      if (change === "root")
+        h.plugin.settings.mappings = [{ ...mapping, rootPath: "Other" }];
+      if (change === "space")
+        h.plugin.settings.mappings = [
+          { ...mapping, spaceId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee" },
+        ];
       if (change === "mapping") h.plugin.settings.mappings = [];
       if (change === "session" || change === "unload-during-session")
         requestUrlState.impl = async (request) => {
