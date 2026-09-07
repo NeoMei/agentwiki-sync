@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { contentHash, sha256Hex } from "../../src/agentwiki/protocol/hash";
+import { parseAttachmentReferences } from "../../src/core/attachment-reference";
 import { normalizeLocalImageLinks } from "../../src/core/local-image-normalization";
 
 describe("normalizeLocalImageLinks", () => {
@@ -112,8 +113,77 @@ describe("normalizeLocalImageLinks", () => {
 
       expect(result.body).toBe(expected);
       expect(result.evidence?.replacements).toHaveLength(1);
+      expect(parseAttachmentReferences(result.body, "pages/note.md")).toEqual([
+        expect.objectContaining({
+          classification: "local",
+          resolvedPath: attachmentPath,
+        }),
+      ]);
     },
   );
+
+  it.each([
+    ["plain", "![A](100%25.png)"],
+    ["angle", "![A](<100%25.png>)"],
+    ["backslash", String.raw`![A](100\%25.png)`],
+  ])(
+    "conservatively rejects a protocol-invalid literal percent in %s style",
+    async (_label, body) => {
+      const result = await normalizeLocalImageLinks({
+        pageId: "page-1",
+        pagePath: "pages/note.md",
+        raw: new TextEncoder().encode(body),
+        resolve: async () => ({
+          kind: "resolved",
+          attachmentPath: "assets/100%.png",
+          basenameKey: "100%.png",
+        }),
+      });
+
+      expect(result).toEqual({ body, evidence: null });
+    },
+  );
+
+  it("rejects BOM and malformed UTF-8 before normalization", async () => {
+    await expect(
+      normalizeLocalImageLinks({
+        pageId: "page-1",
+        pagePath: "pages/note.md",
+        raw: new Uint8Array([0xef, 0xbb, 0xbf, 0x61]),
+      }),
+    ).rejects.toThrow(/BOM/);
+    await expect(
+      normalizeLocalImageLinks({
+        pageId: "page-1",
+        pagePath: "pages/note.md",
+        raw: new Uint8Array([0xc3, 0x28]),
+      }),
+    ).rejects.toThrow(/UTF-8/);
+  });
+
+  it("normalizes line endings while preserving distinct raw byte evidence", async () => {
+    const normalize = (body: string) =>
+      normalizeLocalImageLinks({
+        pageId: "page-1",
+        pagePath: "pages/note.md",
+        raw: new TextEncoder().encode(body),
+        resolve: async () => ({
+          kind: "resolved" as const,
+          attachmentPath: "assets/photo.png",
+          basenameKey: "photo.png",
+        }),
+      });
+
+    const lf = await normalize("before\n![A](photo.png)\nafter");
+    const crlf = await normalize("before\r\n![A](photo.png)\r\nafter");
+
+    expect(crlf.body).toBe("before\n![A](../assets/photo.png)\nafter");
+    expect(crlf.body).toBe(lf.body);
+    expect(crlf.evidence?.canonicalContentHash).toBe(
+      lf.evidence?.canonicalContentHash,
+    );
+    expect(crlf.evidence?.rawHash).not.toBe(lf.evidence?.rawHash);
+  });
 
   it.each(["missing", "ambiguous", "out_of_scope", "unavailable"] as const)(
     "keeps the original invalid target when resolution is %s",

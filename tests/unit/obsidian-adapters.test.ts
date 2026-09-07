@@ -657,6 +657,18 @@ describe("ObsidianShortestImageResolver", () => {
     });
   });
 
+  it("rejects a literal percent filename forbidden by the public attachment schema", async () => {
+    const { vault, resolver } = resolverFixture(
+      { "Wiki/assets/100%.png": "must stay unread" },
+      { ["Wiki/pages/note.md\0" + "100%.png"]: "Wiki/assets/100%.png" },
+    );
+
+    await expect(
+      resolver.resolve("pages/note.md", "100%.png"),
+    ).resolves.toEqual({ kind: "out_of_scope" });
+    expect(vault.readPaths).toEqual([]);
+  });
+
   it("rebuilds its cached uniqueness index after invalidation", async () => {
     const files = {
       "Wiki/pages/note.md": "",

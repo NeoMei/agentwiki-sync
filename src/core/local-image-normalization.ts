@@ -8,6 +8,7 @@ import {
   preserveMarkdownTargetStyle,
   relativeAttachmentPath,
 } from "./attachment-target";
+import { decodeVaultMarkdown } from "./markdown";
 
 export type ResolveShortestImage = (
   pagePath: string,
@@ -37,7 +38,7 @@ export async function normalizeLocalImageLinks(input: {
   raw: Uint8Array;
   resolve?: ResolveShortestImage;
 }): Promise<{ body: string; evidence: LocalImageNormalization | null }> {
-  const body = new TextDecoder().decode(input.raw);
+  const body = decodeVaultMarkdown(input.raw).normalized;
   if (!input.resolve) return { body, evidence: null };
 
   const replacements: LocalImageReplacement[] = [];
