@@ -156,7 +156,7 @@ for (const replacement of [...replacements].sort(
 
 - [ ] 实现 `ObsidianShortestImageResolver(vault: Vault, metadataCache: MetadataCache, mappingRoot: string)`，公开 `resolve(pagePath: string, decodedBasename: string): Promise<ShortestImageResolution>`、`invalidate(): void`。仅 `vault.getFiles()` 建路径元数据索引，NFC + unicode-case-folding，索引命中必须全 Vault 数量为 1 且与 `getFirstLinkpathDest` 实际目标相同，再检查 flat assets。返回错误只有 kind，不携带外部路径。
 - [ ] `ObsidianVaultPort` 构造器增加第四个可选 resolver 参数；端口无 resolver 返回 unavailable。事件注册由 Task 5 的插件生命周期承担，不在每个 adapter 创建永久监听器。
-- [ ] 增加边界表：空格/括号/%/Unicode/角括号/title/反斜杠等价转义；非法 `%`、URI、盘符、slash、backslash、traversal、不支持扩展名、非法 title；code/comment；外部同 basename、大小写/NFC 重名、metadata 分歧、缺文件、非 flat assets；索引失效后新重名。断言拒绝输出不泄露外部路径，metadata 测试 readBinary 调用为 0。
+- [ ] 增加边界表：空格/括号/合法百分号编码 token/Unicode/角括号/title/反斜杠等价转义；非法 `%` 编码、解码后文件名含字面 `%`（公开协议 0.5.1 禁止，保留原引用并阻塞）、URI、盘符、slash、backslash、traversal、不支持扩展名、非法 title；code/comment；外部同 basename、大小写/NFC 重名、metadata 分歧、缺文件、非 flat assets；索引失效后新重名。断言拒绝输出不泄露外部路径，metadata 测试 readBinary 调用为 0。
 - [ ] 运行 `npx vitest run tests/unit/local-image-normalization.test.ts tests/unit/attachment-reference.test.ts tests/unit/attachment-merge.test.ts tests/unit/obsidian-adapters.test.ts` 和 `npm run typecheck`，全部 PASS。检查公开 conformance fixture 未改宽。
 - [ ] 仅 stage 本 Task 文件；提交 `feat(sync): calculate scoped shortest image link normalization`，进入独立任务审查。未启用生产规范化。
 
@@ -281,21 +281,21 @@ export class NormalizedPushRepository {
 
 `candidate` 暂存的 revision 仅承载源计算上下文，不当作发布结果；比较候选使用 revisionContentHash 与正文/引用/附件集合。`stage` 将候选及 wire Page payload 转存到父操作的受控 payload 子目录，重验 hash/长度/能力后原子写父 journal；父 journal 未 durable 前不能调用远端。
 
-- [ ] fixture 导出 `makeNormalizedPlanInput(): Promise<NormalizedPushPlanInput>`：固定 `op-1/tx-1`、`https://example.test`、`server-1/space-1/device-1/credential-1/vault-1/Wiki`，单 Page `pages/note.md`，原 `![A](photo.png)` 与目标 `![A](../assets/photo.png)`，源 `rev-1`，使用真实 hash 函数、空 v2 identity 状态和确定能力，不使用全零 hash 冒充可验证内容。fixture 的候选由 FakeTreeRemoteV3 seed 的真实快照取得，wire 使用既有 prepareTreePushChangesV3。
+- [ ] fixture 导出 `makeNormalizedPlanInput(rawText?: string): Promise<NormalizedPushPlanInput>`：固定 `op-1/tx-1`、`https://example.test`、`server-1/space-1/device-1/credential-1/vault-1/Wiki`，单 Page `pages/note.md`，默认原文 `![A](photo.png)` 与目标 `![A](../assets/photo.png)`，源 `rev-1`；可选 rawText 仅供测试 LF/CRLF 等价字节时覆写原文，使用真实解码/规范化及 hash 函数重建全部证据。使用空 v2 identity 状态和确定能力，不使用全零 hash 冒充可验证内容。fixture 的候选由 FakeTreeRemoteV3 seed 的真实快照取得，wire 使用既有 prepareTreePushChangesV3。
 - [ ] 在已有形状校验最小实现上增加授权行为 RED：
 
 ```ts
 it("binds original bytes even when canonical wire stays equal", async () => {
-  const input = await makeNormalizedPlanInput();
+  const input = await makeNormalizedPlanInput("![A](photo.png)\n");
   const first = await sealNormalizedPushPlan(input);
   const changed = structuredClone(input);
   const newRawHash = await sha256Hex(
-    new TextEncoder().encode("\uFEFF![A](photo.png)"),
+    new TextEncoder().encode("![A](photo.png)\r\n"),
   );
   changed.rawPathStates["pages/note.md"].hash = newRawHash;
   changed.localPlan[0].beforeHash = newRawHash;
   changed.normalizations[0].rawHash = newRawHash;
-  // UTF-8 BOM 改变原字节；既有正文解码结果和 canonical wire 不变。
+  // LF/CRLF 改变原字节，但 normalized 正文与 wire 相同；BOM 仍按现有规则拒绝。
   const second = await sealNormalizedPushPlan(changed);
   expect(second.authorizationHash).not.toBe(first.authorizationHash);
   expect(second.wireConfirmationHash).toBe(first.wireConfirmationHash);

@@ -43,7 +43,9 @@ Obsidian adapter 使用公开 metadata API 获取实际链接目标，并用仅�
 
 ### 2.2 精确改写和扫描证据
 
-复用、必要时提取 `attachment-merge.ts` 已有相对路径及目标样式工具，不复制解析器。只修改 source range 对应的目标 token；保留 alt、title、角括号、可等价保留的百分号编码/反斜杠转义和其他内容。新文件名中的空格、括号、百分号等必须正确编码，改写后重新走公开解析器验证。
+复用、必要时提取 `attachment-merge.ts` 已有相对路径及目标样式工具，不复制解析器。只修改 source range 对应的目标 token；保留 alt、title、角括号、可等价保留的百分号编码/反斜杠转义和其他内容。协议允许的新文件名中的空格、括号等必须正确编码，改写后重新走公开解析器验证。
+
+实施澄清（2026-09-07）：百分号编码 token 与实际文件名含字面 `%` 不同。固定依赖的公开协议 0.5.1 明确禁止后一种附件路径；它应保留原引用并阻塞，不能因编码成 `%25` 而宣称支持。本补充不放宽这项协议边界。
 
 canonical Page body、contentHash 和 referencedAttachmentIds 使用规范化结果；`rawPathStates` 始终记录原始 Vault 字节，不能被 canonical hash 替换。
 
