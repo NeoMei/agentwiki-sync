@@ -212,6 +212,15 @@ export interface NormalizedPushCompletion {
   identitiesHash: string;
   localPlanHash: string;
 }
+export interface NormalizedPushLocalBinding {
+  schemaVersion: 1;
+  operationId: string;
+  transactionId: string;
+  targetRevision: string;
+  targetTreeHash: string;
+  identitiesHash: string;
+  localPlanHash: string;
+}
 export interface NormalizedPushJournal extends NormalizedPushPlan {
   phase:
     | "confirmed"
@@ -241,11 +250,14 @@ export function normalizedPushPaths(
   localRoot: string;
   payloadRoot: string;
   controlAfterPath: string;
+  controlAfterBindingPath: string;
   completionPath: string;
 };
 ```
 
 paths 严格推导为 `<controlRoot>/push/operations/<operationId>/{remote,local,payload,control-after.json,completion.json}`；Page payload 名以现有 `opaqueFileKey` 生成，禁止原路径直接拼进私有文件名。源正文按 UTF-8 长度校验，原字节证据和 canonical 暂存分别受已解析的 Page/累计能力上限约束。时间戳、临时 previewId 不进入语义 hash，身份和 raw/normalization 证据必须进入。
+
+后状态绑定澄清：`controlAfterBindingPath` 为同 operation 目录的 `control-after-binding.json`，用严格 `NormalizedPushLocalBinding` envelope 保存。它在第一笔 Vault 写入之前与原 V3 control-after 一起固定，绑定实际 `desiredV3Identities` 后状态 hash，不含完成标志。`plan.identities` 仍是原授权证据，不能强求后状态等于它。Task 3 恢复时验证同归属及固定内容，不改写绑定来迁就当前状态；真实文件/baseline/身份提交后才写 completion。终态交叉校验该绑定、committed 本地事务、applied control-after 和 completion；所有绑定元数据在 payload 清理后保留，同 operation 的候选不得变更后状态绑定。
 
 ```ts
 export type JournalPort<T> = Pick<
