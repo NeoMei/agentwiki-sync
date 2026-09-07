@@ -347,6 +347,12 @@ const authorizationHash = await sha256Hex(
 
 **Files:** 新增 normalized-push-local 及其测试，扩展 fixture；必要时从 tree-local-apply-v3 提取同一身份提交逻辑；不重写 tree-transaction 或 baseline 算法。
 
+基线归属校验澄清：允许在 `TreeBaselineRepository` 增加只读 `assertPreparedOwnership(snapshot, transactionId, kind: TreeBaselineKind)`，完整复用现有 `assertPreparedPull` 校验；后者委托 `kind="pull"`，普通 Push 使用 `kind="push"`。不得改变 prepare/commit/recover 算法。扩展既有 `tests/integration/tree-baseline-upgrade.test.ts`，证明正确 Push 通过，错误事务、kind、目标及 hash 在指针变更前拒绝，并保留 Pull 回归。
+
+取消接口澄清：本地提交器新增 `rollbackUncommitted(journal): Promise<void>`，仅用于 local_only/local_pending 且已存在精确同归属 deferred 文件事务。prepared/applying/applied/rolling_back 复用原 `tx.recover()` 到 rolled_back，已有 rolled_back 幂等；拒绝缺失事务、verified/committed/ambiguous、同事务 baseline 已开始或 control-after 已 applied/completion 已存在。不重建事务、不删证据、不改 target/baseline/身份。prepare 前中断仍可恢复原确认，但不能伪造 rollback 来取消；confirmed 无 child 由协调器单独处理。测试真实部分写入回滚、晚编辑 ambiguous 保留及各拒绝项无额外突变。
+
+写入竞态修正：Task3 复现既有 `TreeTransaction` 的检查→`VaultPort.write` 间隙会覆盖新编辑，故允许最小安全加固而不重写事务算法/格式：既有 `write_page` 用原 before/result 字节与 `VaultPort.compareAndSwap` 在实际写入点验证；该动作 file→file 回滚也须比较实际事务结果，失败保留第三方内容并持久 ambiguous，不推进基线/身份/完成。正式测试覆盖应用和回滚的检查后编辑；fixture 的首次写检查、故障计数及注入须覆盖实际 CAS 边界，不能因换入口而失效。核验现有 Obsidian CAS 的空 replacement 二次写；若存在同类风险，仅消除冗余写入并补 adapter 回归。不扩展通用 create/move/附件事务架构。
+
 **Interfaces:** 消费 Task 2 plan/journal/paths，既有 VaultPort、ControlStorePort、TreeBaselineRepository、TreeIdentityRepository。新模块导出：
 
 ```ts
