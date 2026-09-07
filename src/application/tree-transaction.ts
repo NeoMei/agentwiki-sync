@@ -12,6 +12,12 @@ import { MutableControlRepository } from "../storage/envelope";
 
 const encoder = new TextEncoder();
 
+class PageCompareAndSwapConflict extends Error {
+  constructor() {
+    super("TREE_TRANSACTION_AMBIGUOUS: Page changed before atomic replacement");
+  }
+}
+
 type PathKind = "directory" | "file" | "missing";
 
 export interface TreeTransactionPathState {
@@ -465,6 +471,10 @@ export class TreeTransaction {
         await this.discardSidecars();
       }
     } catch (error) {
+      if (error instanceof PageCompareAndSwapConflict) {
+        journal.state = "ambiguous";
+        await this.save(journal);
+      }
       if (journal.state === "ambiguous") throw error;
       journal.state = "rolling_back";
       await this.save(journal);
@@ -1049,8 +1059,12 @@ export class TreeTransaction {
         await this.vault.trashDirectory(action.path);
         break;
       case "create_page":
-      case "write_page":
         await this.vault.write(action.path, await this.resultBody(index));
+        break;
+      case "write_page":
+        if (operation.paths[0]?.before.kind === "file")
+          await this.compareAndSwapPage(index, operation, false);
+        else await this.vault.write(action.path, await this.resultBody(index));
         break;
       case "move_page": {
         await this.vault.rename(action.fromPath, action.path);
@@ -1091,6 +1105,26 @@ export class TreeTransaction {
     const raw = await this.control.read(this.resultPath(operationIndex));
     if (raw === null) throw new Error("拉取结果边车缺失");
     return encoder.encode(raw);
+  }
+
+  private async compareAndSwapPage(
+    index: number,
+    operation: JournalOperation,
+    rollback: boolean,
+  ): Promise<void> {
+    const path = operation.paths[0]!;
+    const before = await this.beforeBytes(index, operation, path.path);
+    const result = await this.resultBody(index);
+    if ((await sha256Hex(result)) !== path.after.hash)
+      throw new Error("Page transaction result sidecar changed");
+    if (
+      !(await this.vault.compareAndSwap(
+        path.path,
+        rollback ? result : before,
+        rollback ? before : result,
+      ))
+    )
+      throw new PageCompareAndSwapConflict();
   }
 
   private async isFullyApplied(
@@ -1180,7 +1214,21 @@ export class TreeTransaction {
             "TREE_TRANSACTION_AMBIGUOUS: 回滚时目录子树出现未记录的变更",
           );
         }
-        await this.revertPath(index, operation, item);
+        try {
+          if (
+            operation.action.kind === "write_page" &&
+            item.before.kind === "file" &&
+            item.after.kind === "file"
+          )
+            await this.compareAndSwapPage(index, operation, true);
+          else await this.revertPath(index, operation, item);
+        } catch (error) {
+          if (error instanceof PageCompareAndSwapConflict) {
+            journal.state = "ambiguous";
+            await this.save(journal);
+          }
+          throw error;
+        }
         continue;
       }
       journal.state = "ambiguous";

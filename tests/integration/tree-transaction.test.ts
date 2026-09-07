@@ -410,7 +410,7 @@ describe("TreeTransaction", () => {
 
     expect(vault.operationLog).toEqual([
       "write:Wiki/assets/new.png",
-      "write:Wiki/pages/note.md",
+      "cas:Wiki/pages/note.md",
       "trash:Wiki/assets/old.png",
     ]);
     expect((await tx.inspect())?.state).toBe("applied");

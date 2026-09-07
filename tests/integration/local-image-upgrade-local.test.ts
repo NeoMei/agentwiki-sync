@@ -810,6 +810,7 @@ describe("UpgradeLocalApply", () => {
         if (options.boundary === "page Vault write") {
           expect(vault.operationLog).toContain("write:Wiki/assets/used.png");
           expect(vault.operationLog).not.toContain("write:Wiki/pages/note.md");
+          expect(vault.operationLog).not.toContain("cas:Wiki/pages/note.md");
         }
         if (options.boundary === "page rename") {
           expect(vault.operationLog).toContain("write:Wiki/assets/used.png");

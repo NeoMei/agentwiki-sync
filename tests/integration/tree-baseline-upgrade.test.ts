@@ -73,6 +73,40 @@ function attachment(): TreeAttachment {
 }
 
 describe("v2 tree baseline upgrade", () => {
+  it("checks ordinary push ownership without changing its kind or pointer", async () => {
+    const store = new MemoryControlStore();
+    const repository = new TreeBaselineRepository(
+      store,
+      ROOT,
+      "space-1",
+      "Wiki",
+    );
+    const source = snapshotV3();
+    source.revisionContentHash = await repository.revisionContentHashV3(source);
+    await repository.prepare(source, "pull", "source");
+    await repository.recover("source");
+    const target = { ...source, revision: "push-target" };
+    await repository.prepare(target, "push", "push-tx");
+    const before = new Map(store.files);
+    expect(typeof repository.assertPreparedOwnership).toBe("function");
+    await expect(
+      repository.assertPreparedOwnership(target, "push-tx", "push"),
+    ).resolves.toBeUndefined();
+    for (const [value, tx, kind] of [
+      [target, "foreign", "push"],
+      [target, "push-tx", "pull"],
+      [{ ...target, revision: "foreign" }, "push-tx", "push"],
+      [{ ...target, revisionContentHash: "f".repeat(64) }, "push-tx", "push"],
+    ] as const)
+      await expect(
+        repository.assertPreparedOwnership(value, tx, kind),
+      ).rejects.toThrow("TREE_BASELINE_OWNERSHIP_MISMATCH");
+    await expect(
+      repository.assertPreparedPull(target, "push-tx"),
+    ).rejects.toThrow("TREE_BASELINE_OWNERSHIP_MISMATCH");
+    expect(store.files).toEqual(before);
+    expect((await repository.read()).baseRevision).toBe(source.revision);
+  });
   it("rejects a same-id staged generation that is not the fixed R3 before pointer mutation", async () => {
     const store = new MemoryControlStore();
     const repository = new TreeBaselineRepository(

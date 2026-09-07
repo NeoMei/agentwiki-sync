@@ -332,11 +332,19 @@ export class TreeBaselineRepository {
     snapshot: TreeSnapshotV3,
     transactionId: string,
   ): Promise<void> {
+    return this.assertPreparedOwnership(snapshot, transactionId, "pull");
+  }
+
+  async assertPreparedOwnership(
+    snapshot: TreeSnapshotV3,
+    transactionId: string,
+    kind: TreeBaselineKind,
+  ): Promise<void> {
     const current = await this.journal.read();
     if (
       !current ||
       current.payload.transactionId !== transactionId ||
-      current.payload.kind !== "pull"
+      current.payload.kind !== kind
     )
       throw new Error("TREE_BASELINE_OWNERSHIP_MISMATCH");
     const generation = await this.generations.verify(

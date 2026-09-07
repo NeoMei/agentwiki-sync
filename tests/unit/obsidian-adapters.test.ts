@@ -358,6 +358,29 @@ describe("ObsidianVaultPort", () => {
     expect(vault.files.get("Wiki/A.md")).toBe("new");
   });
 
+  it("does not erase a later edit with a second write after an empty CAS", async () => {
+    const vault = new FakeVault({ "Wiki/A.md": "old" });
+    const original = vault.process.bind(vault);
+    vault.process = async (...args) => {
+      await original(...args);
+      expect(vault.files.get("Wiki/A.md")).toBe("");
+      vault.files.set("Wiki/A.md", "edit after process");
+    };
+    const port = new ObsidianVaultPort(
+      vault as unknown as Vault,
+      {} as unknown as FileManager,
+      "Wiki",
+    );
+    expect(
+      await port.compareAndSwap(
+        "Wiki/A.md",
+        encoder.encode("old"),
+        new Uint8Array(),
+      ),
+    ).toBe(true);
+    expect(vault.files.get("Wiki/A.md")).toBe("edit after process");
+  });
+
   it("compareAndSwap creates only when expected is null and refuses otherwise", async () => {
     const vault = new FakeVault();
     const port = new ObsidianVaultPort(

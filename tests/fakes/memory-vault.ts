@@ -221,6 +221,7 @@ export class MemoryVault implements VaultPort {
           actual.every((value, index) => value === expected[index]);
     if (!equal) return false;
     this.fail();
+    this.operationLog.push(`cas:${path}`);
     this.files.set(path, replacement.slice());
     return true;
   }

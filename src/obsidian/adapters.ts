@@ -360,10 +360,6 @@ export class ObsidianVaultPort implements VaultPort {
     }
     if (expected === null) return false;
     let matched = false;
-    const data = replacement.buffer.slice(
-      replacement.byteOffset,
-      replacement.byteOffset + replacement.byteLength,
-    ) as ArrayBuffer;
     await this.vault.process(file, (current) => {
       const actual = new TextEncoder().encode(current);
       matched =
@@ -371,8 +367,6 @@ export class ObsidianVaultPort implements VaultPort {
         actual.every((value, index) => value === expected[index]);
       return matched ? new TextDecoder().decode(replacement) : current;
     });
-    if (matched && replacement.byteLength === 0)
-      await this.vault.modifyBinary(file, data);
     return matched;
   }
   async remove(path: string): Promise<void> {
