@@ -495,6 +495,45 @@ await repository.write({
 
 ## Task 5: 完整生产接线、Pull/升级与预览 UI
 
+统一只读恢复选择入口位于现有 push-journal-router.ts：`readPushProtocolRequirement(store: ControlStorePort, controlRoot: string, expected: { spaceId: string; normalizedAuthority?: Omit<NormalizedPushBinding, "operationId" | "spaceId"> }): Promise<{ schemaVersion: 1 | 2 | 3 | 4; minimumProtocolVersion: "1" | "3" } | null>`。复用 strictPushEnvelopeRead 和各原 owner guard（允许原旧类型/guard 直接导出），校验全部候选 hash/fork/unknown/Space 和 router 跨 owner 证据。schema4 缺完整六字段 authority 或不符则拒绝。旧1/2/3凭据轮换继续原 owner 语义，不以只读入口冒认取消；schema2 无 wire 版本，minimum1 仅是不新增最低要求，真实协议仍由原 baseline/owner 决定。候选1与2混合、3/4倒退到1/2均失败关闭；仅允许受下述终态证据约束的1/2→3/4前向交接以及原3/4互转，不自动转换旧授权。
+
+Task5 旧终态衔接修订 Task2 的 router 私有 union 范围（不改变旧 service）：已完成普通1/2 Push 后，首次升级使用独立 remoteRoot，不会清除普通根日志。扩展现有 PushJournalRouter 私有 Journal/guard 并复用 retain 与单调 generation writer；不新增迁移 API/状态，不 clear 根。旧 owner 终态仅接受 published+result.status=published+localCommitPhase=verified，或 superseded+result=null+localCommitPhase=not_started；必需 owner 键与终态字段确证。旧 envelope 先持久归档到 schema 区分的历史路径，再原子推进新3/4；v3Port 见旧终态返回 null 但保留 observed generation 重验，旧 pending 不可占用。只读 reader 仍返回旧 pending 给原 owner 恢复。同旧 owner 的历史 pending→终态合法，跨 owner 必须证明前 owner 终态；同 owner 原确认 Space/base/key/changes/confirmationHash/totalBodyBytes/credential 身份不可改，不能阻止原 schema2 CAPABILITIES_CHANGED 逻辑合法刷新 capabilities/capabilitiesHash。必须真实旧 Push→首次升级→native Push，以及归档/next/rename 故障重建、pending/foreign/fork/corrupt/倒退拒绝回归；不能仅以手造 terminal fixture 声称升级衔接通过。
+
+Runtime 确认参数澄清：Runtime preview 含 UI 字段，调用 coordinator.confirm 前明确投影为既有 TreePushPreviewV3 允许字段；原 plan/candidate 不变，不能放宽 Task2 strict wire guard 来接受 UI 对象。
+
+早期限额接口澄清：允许现有 `VaultPort.listTree(rootPath, options?: { metadataOnly?: boolean })` 可选参数，默认行为不变。Obsidian adapter 与 MemoryVault 在 metadataOnly 模式只返回元数据及可得 byteLength/mtime，不预读 Markdown。scanner 按该模式枚举，对受管 MD 在读取前校验数量、元数据声明的原字节单页/累计上限，实际读取后重验真实长度及累计，canonical 正文另计限额。无效大小失败关闭；旧 fake 缺失 byteLength 可读后核验，但不能宣称为生产预读边界证明。测试 metadata-only 无正文读取、元数据超限读取前拒绝、读取时大小变化仍核限、未引用图片零读取、默认 listTree 兼容。不新增文件系统抽象，不改其他事务枚举默认语义。
+
+职责提取澄清：新增 `src/application/normalized-push-runtime.ts`，仅适配既有 Runtime 与已审查的 repository/local/coordinator，不保存另一套 session/result/phase/完成事实。`NormalizedRuntimeAuthority` 的唯一导出定义在此（下方五字段保持不变），SyncRuntime 使用或类型再导出。新增精确接口：
+
+```ts
+export class NormalizedPushRuntimeAdapter {
+  constructor(input: {
+    authority: NormalizedRuntimeAuthority;
+    mapping: { spaceId: string; rootPath: string };
+    vault: VaultPort;
+    control: ControlStorePort;
+    controlRoot: string;
+    remote: TreeRemotePortV3;
+    baseline: TreeBaselineRepository;
+    identities: TreeIdentityRepository;
+    scan: (
+      base: TreeSnapshotV3,
+      caps: TreeSyncCapabilitiesV3,
+      options?: SyncOperationOptions,
+    ) => Promise<LocalTreeScanV3>;
+    epoch: () => number;
+  });
+  prepare(
+    base: TreeSnapshotV3,
+    local: LocalTreeScanV3,
+    push: TreePushPreviewV3,
+  ): Promise<{ plan: NormalizedPushPlan; candidate: TreeSnapshotV3 } | null>;
+  readonly coordinator: NormalizedPushCoordinator;
+}
+```
+
+prepare 是新计划/payload 构造入口；private revalidate 重读真实 baseline/head/caps、scan、identities/epoch，禁止写 payload 或改变已确认 operation/路径/身份证据。Runtime 直接调用既有 coordinator 方法，不增加重复包装。现有 `shortest-image-resolver.ts` 提取 `ObsidianShortestImageIndex`，constructor(vault: Vault)、get(basenameKey: string): readonly TFile[]、invalidate(): void；resolver 原三参之后可选第四参 index，独立默认行为保持不变，invalidate 委托共享索引。main 每插件实例一个全 Vault 元数据索引，映射外 create/delete/rename 也使所有依赖缓存预览失效，不读取这些文件字节。
+
 **Files:** 修改职责表 Task5 的文件；扩展 `tests/unit/tree-scan.test.ts`、`tests/unit/preview-logic.test.ts`、`tests/unit/protocol-negotiator.test.ts`、`tests/integration/plugin-settings-lifecycle.test.ts`、`tests/integration/preview-modal-interactions.test.ts`、`tests/integration/local-image-upgrade-plan.test.ts`、`tests/integration/local-image-upgrade-entry.test.ts`；新增 normalized-push-runtime 测试。只在本 Task 成功后开启生产规范化。
 
 **Interfaces:**
@@ -518,7 +557,32 @@ export interface NormalizedRuntimeAuthority {
 }
 // SyncRuntime 新增一次性配置入口，由 production factory 在缓存插入前调用。
 configureNormalizedPush(authority: NormalizedRuntimeAuthority): void;
+// Runtime UI 只读/安全取消委托；不新增持久状态或第二套调度。
+inspectNormalizedPush(): Promise<NormalizedPushJournal | null>;
+cancelNormalizedPush(): Promise<void>;
+onInvalidate(listener: () => void): () => void;
+isPushPreviewCurrent(preview: PushPreviewV3): boolean;
 ```
+
+上述 inspect/cancel 在完整 authority 校验后仅委托既有 coordinator。onInvalidate 使用既有 entry 的订阅/解绑约定，modal 关闭和插件卸载不遗留监听；isPushPreviewCurrent 只判断已绑定 epoch/authority 的 UI 新鲜度，blocked/未绑定不能默认有效，不代替确认全量重扫。不得增加 UI 专属持久字段或无界持有完整 preview；沿用已有绑定或弱引用。远端已发布不能误导性提供取消，本地 pending 缺所属事务仍遵守既有保守取消边界。
+
+进程内 scanEpoch 与持久授权的区别：未持久确认的预览必须有当前 Runtime 的弱绑定且当前 epoch 等于 plan.scanEpoch。已确认恢复先经严格 router/repository.loadConfirmed 证明当前 owned 操作与完整原 plan 一致；保持原 plan.scanEpoch 参与原 authorizationHash，重新扫描前后只要求当前进程 epoch 不变，同时完整核验 raw/normalization/identity/head/caps/authority，不把重启后的零值改写进旧授权。不能仅因弱绑定未命中就冒认恢复，也不能因绑定仍在而阻断已有 durable 操作的同进程恢复；无绑定且无所属持久确认必须拒绝。禁止重新 stage 新计划/改变 operation、payload 或 fixed target。测试真实 rename epoch>0→create 成功响应丢失→重建 epoch0 恢复，以及未确认预览重启、扫描中事件/原字节变动拒绝。
+
+既有 `PreviewModalActionOptions` 仅补 `closeLabel?: string` 与 `files?: { path: string; open: () => Promise<void> }[]`。pending 使用“关闭”而不是误导性的事务取消；重试中禁用关闭或明确停止本次重试，不能表示取消已发布事务。文件 path 显示映射相对路径，main 的回调使用已校验 journal.localPlan 受限完整 Vault 路径和公开 workspace.openLinkText，UI 只分页渲染打开按钮并处理失败，不执行 RPC/业务写入。关闭保留 pending；实际 DOM 覆盖两类状态、重试、打开正确笔记、分页计数与关闭后日志保留。
+
+Task5 允许窄改既有 `src/core/initial-binding.ts`：`resolveExplicitInitialTreeBindings` 在相同 pageIds 映射旁同步重映射已存在的 local.normalizations[].pageId。保持原 input/evidence.originalLocal、token/path/raw/canonical hash 不变，旧持久对象缺字段不补数组，不新增身份算法或公开签名。真实首次无 baseline 同路径显式绑定后，修正计划必须使用最终 PageID 并实际写回；覆盖旧缺字段兼容和不完整绑定拒绝。
+
+Task5 非受管文件零读边界：`LocalTreeScanV3` 增加 `unmanagedPaths?: string[]`，新 v3 扫描总是生成排序数组（含空数组），仅记录 pages/ 下非 Markdown 文件元数据，不读字节、不用 null 伪造 raw file hash；v1/v2 原行为不变。现有 `expectedV3PathStates(local, actions)` 对最终本地目录移动/删除涉及的非受管子树及目录目标/祖先被非受管文件占据的情况，抛 `UNMANAGED_FILE_IN_DIRECTORY_ACTION`；不阻止无关 Markdown/引用 assets 同步。Runtime 和 upgrade 确认 fresh 重验再次经过该门，不能用旧 preview 漏过新出现文件。`UpgradeLocalPlanEvidence` 同名可选字段及 semanticLocal 按存在性散列；旧持久缺字段不补入旧授权。仅严格证明同归属的已确认旧操作，可对原 rawPathStates 已明确授权的非 Markdown path/hash 按原 owner 重读作临时比较，不回写原 payload/hash/授权、不扩展到新增文件或未确认预览。
+
+为关闭最后预检到 prepare 枚举之间的新增文件窗口，允许窄改既有 `TreeTransaction.prepare` 的实际 MaterializationSource：仅当 input.expectedPathStates 存在，pathState 在 readPathState 之前要求自有确认键；directoryEntries 使用 metadataOnly 并在任何文件字节读取前要求完整路径为已确认 file 且 hash 非空。未确认路径抛 `STALE_PULL_PREVIEW`，无 expected 的原 legacy 调用保持默认行为。不新增接口/状态/schema，不移除现有 CAS、目录 closure 或回滚保护。实际测试在最后预检后/prepare 枚举前加入 pages/late.png，证明零字节读取、零业务写入并拒绝；旧已确认拥有 opaque hash 的恢复仍按原 owner 通过。
+
+同一 expected 保护内追加最小祖先元数据校验：readOwnedPathState 向上发现 ancestor=file 即 `STALE_PULL_PREVIEW`，不读父文件字节；遇最近的真实 directory 停止，不无条件越过绑定 Vault/root。无 expected 旧行为不变。覆盖 opaque 占目标及更高祖先、嵌套 mapping root 的真实 adapter 正常路径，避免零读保护误拒全部嵌套映射。
+
+Task5 v3 rename hint 早读修正：recordRename 先证明 base managed Page 存在且目标为合法 pages/**/*.md，再读 Page bytes；scanV3 不在有界 scanner 之前读取 moveHint.toPath，只投影已有 PageID/path 到 scanBase.pages。扫描后仅正常 preview 的 persistIdentities=true 路径用实际 scan Page.contentHash 更新 pendingPages；该值为新 v3 canonical 正文 hash（CRLF 沿 scanner 归一化），不是 rawPathStates hash。MoveHint.observedVaultByteHash 仍为原始字节 SHA，旧1/2 scan 和已确认持久 identity 不改。测试超限 hint 在 scanner 配额前零读和未引用图片 rename 零读；仅出现在 baseline 附件 metadata 的孤立文件不能未经证明被称为已引用。
+
+普通 v3 预览确认的 main 回调须从当前 settings 重新定位同 Space/mapping，重新 await 现有 runtime factory 并要求返回同一 cached Runtime，才提交原 sealed preview。复用现有 factory 重新验证本地五身份、公开 session、capabilities 和 Space；失败使相关 cache/preview 失效，不改持久状态，不新增 adapter session callback/API。remote_push 检查当前 canPublish；local_only 保持公开读权限/active session 门且不假造写权限或 publication。pending 重试仍由既有 factory→recover。真实主入口覆盖预览后 session revoked/五身份或 credential 变化零 mutation/业务写，同身份正常确认；不能仅比较过期闭包中的五个字符串。
+
+首次升级前的 `hasLocalImageCandidate()` 同属早期限额边界：使用现有 metadataOnly listTree，仅处理 pages Markdown，按该 Runtime 已协商的 v1/v2 或 v3 remote capabilities 逐页/计数/累计限额，在 read 前校验元数据、read 后复核实际长度/累计，不依赖 eager listMarkdown。保留仅探测图片语法、零图片读取、原文字/图片分流；不新增公开签名或改变旧发布算法。实际 factory 超限 Markdown 零读、metadata/actual drift、正常分流和 v3 可调用兼容均测试；旧 fake 缺元数据后的 read 校验不冒称生产 pre-read 证明。
 
 配置入口只接受非秘密 ID；同 runtime 再传不同 authority 必须使旧preview失效并拒绝复用。不具备全部 authority 的旧 test/runtime仍可走无本地规范化的严格旧路径；不能填造默认身份来激活新功能。Task5 production factory 必须实际传入完整 authority。底层 scan 保持无业务写入，调用方没有可恢复本地所有者时不传 resolver；不允许“做了 canonical scan 却走旧 finishV3Push”。
 
