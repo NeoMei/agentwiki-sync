@@ -501,6 +501,8 @@ Task5 旧终态衔接修订 Task2 的 router 私有 union 范围（不改变旧 
 
 Runtime 确认参数澄清：Runtime preview 含 UI 字段，调用 coordinator.confirm 前明确投影为既有 TreePushPreviewV3 允许字段；原 plan/candidate 不变，不能放宽 Task2 strict wire guard 来接受 UI 对象。
 
+Task5 I3 修复接线澄清：strict reader/router 证明普通 schema1/2 尚未终结时，factory 优先构造现有合法 legacy carrier，保持既有 `route="legacy"`，不创建新 upgrade 或探测本地图后改走升级。沿原 hasUnfinishedPush 的 pending 语义，schema1 由现有 AgentWikiPushRemote/PushService 恢复，schema2 由原 TreePushService 和真实可用旧 wire 恢复，不能把私有 schema 数字当作 wire 版本。runSyncStrategy 先调用旧 owner recover，成功后结束本次入口，下一次新预览才考虑升级；collectSyncDiff 使用已有 recoveryPending 展示，不自动发布新工作。首次升级 freshInputs 再拒绝旧 pending，堵住预览到确认窗口。若原协议或身份不可用，失败关闭并保留日志，不清根、不取消旧授权、不强行完成，不增加 route/API/状态机；既有 terminal→upgrade→native 合法链仍须通过。
+
 早期限额接口澄清：允许现有 `VaultPort.listTree(rootPath, options?: { metadataOnly?: boolean })` 可选参数，默认行为不变。Obsidian adapter 与 MemoryVault 在 metadataOnly 模式只返回元数据及可得 byteLength/mtime，不预读 Markdown。scanner 按该模式枚举，对受管 MD 在读取前校验数量、元数据声明的原字节单页/累计上限，实际读取后重验真实长度及累计，canonical 正文另计限额。无效大小失败关闭；旧 fake 缺失 byteLength 可读后核验，但不能宣称为生产预读边界证明。测试 metadata-only 无正文读取、元数据超限读取前拒绝、读取时大小变化仍核限、未引用图片零读取、默认 listTree 兼容。不新增文件系统抽象，不改其他事务枚举默认语义。
 
 职责提取澄清：新增 `src/application/normalized-push-runtime.ts`，仅适配既有 Runtime 与已审查的 repository/local/coordinator，不保存另一套 session/result/phase/完成事实。`NormalizedRuntimeAuthority` 的唯一导出定义在此（下方五字段保持不变），SyncRuntime 使用或类型再导出。新增精确接口：
