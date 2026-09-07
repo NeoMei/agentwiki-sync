@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   isNormalizedPushJournal,
   sealNormalizedPushPlan,
+  isNormalizedPushLocalBinding,
+  type NormalizedPushLocalBinding,
 } from "../../src/application/normalized-push-plan";
 import {
   makeNormalizedPlanInput,
@@ -33,6 +35,129 @@ import type { MutableControlEnvelope } from "../../src/storage/envelope";
 import { MemoryVault } from "../fakes/memory-vault";
 
 describe("normalized push storage", () => {
+  it("binds actual changed after-state identities without rewriting original authorization", async () => {
+    const f = await makeLocalOnlyFixture();
+    const original = await sealNormalizedPushPlan(f.input);
+    const { repo, journal, paths } = await completeLocalOnly(f);
+    expect(journal.identities.attachments).toEqual({});
+    expect(journal.authorizationHash).toBe(original.authorizationHash);
+    const after = JSON.parse(
+      (await f.store.read(paths.controlAfterPath))!,
+    ) as MutableControlEnvelope<{
+      identities: { attachments: Record<string, { active: boolean }> };
+    }>;
+    expect(after.payload.identities.attachments["image-1"]?.active).toBe(true);
+    await repo.cleanup(journal);
+    for (let i = 0; i < 2; i++) await repo.assertTerminal(journal);
+  });
+  it.each([
+    "missing",
+    "operationId",
+    "transactionId",
+    "targetRevision",
+    "targetTreeHash",
+    "localPlanHash",
+    "identitiesHash",
+    "future",
+    "unknown",
+    "lower-identities",
+  ])(
+    "rejects %s local binding after canonical payload cleanup",
+    async (variant) => {
+      const f = await makeLocalOnlyFixture();
+      const { repo, journal, paths } = await completeLocalOnly(f);
+      await repo.cleanup(journal);
+      const path = paths.controlAfterBindingPath;
+      const binding = (
+        JSON.parse(
+          (await f.store.read(path))!,
+        ) as MutableControlEnvelope<NormalizedPushLocalBinding>
+      ).payload;
+      const changed: Record<string, unknown> = { ...binding };
+      if (variant === "missing") await f.store.remove(path);
+      else {
+        if (variant === "future") changed.schemaVersion = 2;
+        else if (variant === "unknown") changed.phase = "complete";
+        else if (variant === "lower-identities")
+          changed.identitiesHash = journal.localPlanHash;
+        else
+          changed[variant] = variant.endsWith("Hash")
+            ? journal.authorizationHash
+            : "foreign";
+        if (variant === "lower-identities") {
+          await f.store.write(path, await envelopeFor(binding, 2));
+          await f.store.write(`${path}.prev`, await envelopeFor(changed, 1));
+        } else await f.store.write(path, await envelopeFor(changed, 2));
+      }
+      const before = [...f.store.files];
+      for (let i = 0; i < 2; i++) {
+        await expect(repo.assertTerminal(journal)).rejects.toThrow();
+        expect([...f.store.files]).toEqual(before);
+      }
+    },
+  );
+  it("strictly guards the companion and retains no-child confirmed cancellation", async () => {
+    const f = await makeLocalOnlyFixture();
+    const plan = await sealNormalizedPushPlan(f.input);
+    const repo = new NormalizedPushRepository(f.store, NORMALIZED_ROOT);
+    await repo.stage(plan, f.push, f.candidate, f.rawPageBytes);
+    const cancelled = {
+      ...plan,
+      phase: "superseded" as const,
+      verifiedTarget: null,
+      completion: null,
+    };
+    for (let i = 0; i < 2; i++) {
+      await repo.write(cancelled);
+      await repo.assertTerminal(cancelled);
+    }
+    expect(
+      (await new PushJournalRouter(f.store, NORMALIZED_ROOT).read())!
+        .writeGeneration,
+    ).toBe(2);
+    expect(
+      isNormalizedPushLocalBinding({
+        schemaVersion: 1,
+        operationId: "op-1",
+        transactionId: "tx-1",
+        targetRevision: "rev-1",
+        targetTreeHash: plan.candidateHash,
+        localPlanHash: plan.localPlanHash,
+        identitiesHash: plan.authorizationHash,
+      }),
+    ).toBe(true);
+    expect(
+      isNormalizedPushLocalBinding({ schemaVersion: 1, phase: "complete" }),
+    ).toBe(false);
+  });
+  it("cannot supersede local_pending without a rolled-back child, even by dropping the target", async () => {
+    const f = await makeLocalOnlyFixture();
+    const plan = await sealNormalizedPushPlan(f.input);
+    const repo = new NormalizedPushRepository(f.store, NORMALIZED_ROOT);
+    await repo.stage(plan, f.push, f.candidate, f.rawPageBytes);
+    const pending = {
+      ...plan,
+      phase: "local_pending" as const,
+      verifiedTarget: {
+        revision: plan.sourceRevision,
+        revisionContentHash: plan.sourceTreeHash,
+      },
+      completion: null,
+    };
+    await repo.write(pending);
+    const before = [...f.store.files];
+    for (const verifiedTarget of [pending.verifiedTarget, null])
+      for (let i = 0; i < 2; i++) {
+        await expect(
+          repo.write({ ...pending, phase: "superseded", verifiedTarget }),
+        ).rejects.toThrow();
+        expect([...f.store.files]).toEqual(before);
+        expect(
+          (await new PushJournalRouter(f.store, NORMALIZED_ROOT).read())!
+            .writeGeneration,
+        ).toBe(2);
+      }
+  });
   it.each(["local", "remote", "control-after", "completion"])(
     "rejects foreign ownership even in a lower %s child candidate",
     async (kind) => {
@@ -220,6 +345,25 @@ describe("normalized push storage", () => {
       await envelopeFor(raw.payload, raw.writeGeneration + 1),
     );
     await expect(repo.assertTerminal(cancelled)).rejects.toThrow();
+    // A retained terminal must stand on rollback evidence after older parent candidates rotate out.
+    raw.payload.transactionId = plan.localTransactionId;
+    await f.store.write(
+      `${paths.localRoot}/journal.json`,
+      await envelopeFor(raw.payload, raw.writeGeneration + 2),
+    );
+    const router = new PushJournalRouter(f.store, NORMALIZED_ROOT);
+    const port = router.v3Port();
+    await port.read();
+    await port.write(makeV3Journal(f, { idempotencyKey: "after-cancel-1" }));
+    await port.write(makeV3Journal(f, { idempotencyKey: "after-cancel-2" }));
+    expect((await router.read())!.writeGeneration).toBe(5);
+    await repo.assertTerminal(cancelled);
+    await f.store.removeTree(paths.localRoot);
+    const withoutRollback = [...f.store.files];
+    for (let i = 0; i < 2; i++) {
+      await expect(repo.assertTerminal(cancelled)).rejects.toThrow();
+      expect([...f.store.files]).toEqual(withoutRollback);
+    }
   });
   it("refuses a shape-valid new confirmed journal without durable frozen sidecars", async () => {
     const f = await makeNormalizedFixture();

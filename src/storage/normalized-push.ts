@@ -12,6 +12,7 @@ import { canonicalBytes, contentHash, sha256Hex } from "../agentwiki/protocol";
 import {
   assertNormalizedPlan,
   isNormalizedPushJournal,
+  isNormalizedPushLocalBinding,
   normalizedPlan,
   normalizedPushPaths,
   NormalizedPushCompletionSchema,
@@ -216,6 +217,9 @@ export async function assertNormalizedEvidence(
   }
   if (j.phase === "superseded") {
     if (
+      (j.mode === "local_only" &&
+        j.verifiedTarget !== null &&
+        local?.state !== "rolled_back") ||
       (local && (j.mode !== "local_only" || local.state !== "rolled_back")) ||
       (child &&
         (child.remoteState !== "superseded" ||
@@ -242,6 +246,25 @@ export async function assertNormalizedEvidence(
     (child && child.localCommitPhase !== "verified")
   )
     throw new Error("Normalized transaction not completed");
+  const localBinding = (
+    await strictPushEnvelopeRead(
+      store,
+      p.controlAfterBindingPath,
+      isNormalizedPushLocalBinding,
+      (candidate) => {
+        if (
+          candidate.operationId !== j.binding.operationId ||
+          candidate.transactionId !== j.localTransactionId ||
+          candidate.targetRevision !== j.verifiedTarget!.revision ||
+          candidate.targetTreeHash !== j.candidateHash ||
+          candidate.localPlanHash !== j.localPlanHash ||
+          candidate.identitiesHash !== j.completion!.identitiesHash
+        )
+          throw new Error("Control-after binding ownership mismatch");
+      },
+    )
+  )?.payload;
+  if (!localBinding) throw new Error("Control-after binding missing");
   const after = (
     await strictPushEnvelopeRead(
       store,
@@ -250,7 +273,7 @@ export async function assertNormalizedEvidence(
       async (candidate) => {
         if (
           candidate.transactionId !== j.localTransactionId ||
-          (await digest(candidate.identities)) !== (await digest(j.identities))
+          (await digest(candidate.identities)) !== localBinding.identitiesHash
         )
           throw new Error("Control-after ownership mismatch");
       },
@@ -277,7 +300,7 @@ export async function assertNormalizedEvidence(
     completion.targetTreeHash !== j.candidateHash ||
     completion.localPlanHash !== j.localPlanHash ||
     completion.identitiesHash !== (await digest(after.identities)) ||
-    completion.identitiesHash !== (await digest(j.identities)) ||
+    completion.identitiesHash !== localBinding.identitiesHash ||
     (await digest(completion)) !== (await digest(j.completion))
   )
     throw new Error("Normalized completion evidence missing or changed");

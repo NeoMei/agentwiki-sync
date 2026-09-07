@@ -22,10 +22,15 @@ import {
   normalizedPushPaths,
   sealNormalizedPushPlan,
   type NormalizedPushJournal,
+  isNormalizedPushLocalBinding,
+  type NormalizedPushLocalBinding,
 } from "../../src/application/normalized-push-plan";
 import { NormalizedPushRepository } from "../../src/storage/normalized-push";
 import { MutableControlRepository } from "../../src/storage/envelope";
-import { isV3PullControlAfterState } from "../../src/application/tree-local-apply-v3";
+import {
+  desiredV3Identities,
+  isV3PullControlAfterState,
+} from "../../src/application/tree-local-apply-v3";
 import { NormalizedPushCompletionSchema } from "../../src/application/normalized-push-plan";
 import {
   isTreePushJournalV3,
@@ -301,6 +306,39 @@ export async function completeLocalOnly(
     completion: null,
   };
   await repo.write(pending);
+  const identities = desiredV3Identities(plan.identities, {
+    revision: targetRevision,
+    base: { attachments: [] },
+    remote: f.candidate,
+    resolvedFolders: f.candidate.folders,
+    resolvedPages: f.candidate.pages,
+    resolvedAttachments: f.candidate.attachments,
+  });
+  const localBinding: NormalizedPushLocalBinding = {
+    schemaVersion: 1,
+    operationId: plan.binding.operationId,
+    transactionId: plan.localTransactionId,
+    targetRevision,
+    targetTreeHash: plan.candidateHash,
+    localPlanHash: plan.localPlanHash,
+    identitiesHash: await sha256Hex(canonicalBytes(identities)),
+  };
+  await new MutableControlRepository(
+    f.store,
+    paths.controlAfterBindingPath,
+    isNormalizedPushLocalBinding,
+  ).write(localBinding);
+  const afterRepository = new MutableControlRepository(
+    f.store,
+    paths.controlAfterPath,
+    isV3PullControlAfterState,
+  );
+  await afterRepository.write({
+    schemaVersion: 2,
+    transactionId: plan.localTransactionId,
+    phase: "pending",
+    identities,
+  });
   const vault = new MemoryVault({ "Wiki/pages/note.md": "![A](photo.png)" });
   const transaction = new TreeTransaction(vault, f.store, paths.localRoot);
   await transaction.prepare(
@@ -323,21 +361,18 @@ export async function completeLocalOnly(
   );
   await transaction.apply();
   await transaction.markVerified();
-  await new MutableControlRepository(
-    f.store,
-    paths.controlAfterPath,
-    isV3PullControlAfterState,
-  ).write({
+  await afterRepository.write({
     schemaVersion: 2,
     transactionId: plan.localTransactionId,
     phase: "applied",
-    identities: plan.identities,
+    identities,
   });
+  await transaction.markCommitted();
   const completion = {
     transactionId: plan.localTransactionId,
     targetRevision,
     targetTreeHash: plan.candidateHash,
-    identitiesHash: await sha256Hex(canonicalBytes(plan.identities)),
+    identitiesHash: localBinding.identitiesHash,
     localPlanHash: plan.localPlanHash,
   };
   await new MutableControlRepository(
@@ -346,7 +381,6 @@ export async function completeLocalOnly(
     (v): v is typeof completion =>
       NormalizedPushCompletionSchema.safeParse(v).success,
   ).write(completion);
-  await transaction.markCommitted();
   if (child)
     await childRepository.write({ ...child, localCommitPhase: "verified" });
   const journal: NormalizedPushJournal = {

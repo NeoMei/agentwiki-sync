@@ -58,6 +58,10 @@ export interface NormalizedPushCompletion {
   identitiesHash: string;
   localPlanHash: string;
 }
+export interface NormalizedPushLocalBinding extends NormalizedPushCompletion {
+  schemaVersion: 1;
+  operationId: string;
+}
 export interface NormalizedPushJournal extends NormalizedPushPlan {
   phase:
     | "confirmed"
@@ -246,6 +250,16 @@ export const NormalizedPushCompletionSchema = z
     localPlanHash: hash,
   })
   .strict();
+export const NormalizedPushLocalBindingSchema =
+  NormalizedPushCompletionSchema.extend({
+    schemaVersion: z.literal(1),
+    operationId: id,
+  }).strict();
+export function isNormalizedPushLocalBinding(
+  value: unknown,
+): value is NormalizedPushLocalBinding {
+  return NormalizedPushLocalBindingSchema.safeParse(value).success;
+}
 const planSchema = z.object(planShape).strict().refine(consistent);
 const journalSchema = z
   .object({
@@ -353,6 +367,7 @@ export function normalizedPushPaths(controlRoot: string, operationId: string) {
     localRoot: `${operationRoot}/local`,
     payloadRoot: `${operationRoot}/payload`,
     controlAfterPath: `${operationRoot}/control-after.json`,
+    controlAfterBindingPath: `${operationRoot}/control-after-binding.json`,
     completionPath: `${operationRoot}/completion.json`,
   };
 }

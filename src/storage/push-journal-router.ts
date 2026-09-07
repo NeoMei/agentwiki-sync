@@ -174,6 +174,22 @@ function canReach(
   }
   return false;
 }
+function assertRetainedCancellationTarget(
+  old: NormalizedPushJournal,
+  next: NormalizedPushJournal,
+): void {
+  if (
+    old.mode === "local_only" &&
+    old.verifiedTarget !== null &&
+    next.phase === "superseded" &&
+    (next.verifiedTarget?.revision !== old.verifiedTarget.revision ||
+      next.verifiedTarget.revisionContentHash !==
+        old.verifiedTarget.revisionContentHash)
+  )
+    throw new Error(
+      "Local cancellation must retain its verified source target",
+    );
+}
 export class PushJournalRouter {
   private readonly path: string;
   private readonly repository: MutableControlRepository<Journal>;
@@ -240,6 +256,12 @@ export class PushJournalRouter {
         !canReach(j.phase, next.phase)
       )
         throw new Error("Normalized phase regressed");
+      if (
+        next?.schemaVersion === 4 &&
+        j.schemaVersion === 4 &&
+        owner(j) === owner(next)
+      )
+        assertRetainedCancellationTarget(j, next);
     }
     return highest;
   }
@@ -251,6 +273,7 @@ export class PushJournalRouter {
       if (existing) assertSameRootOwner(existing.payload, journal);
       if (existing && owner(existing.payload) === owner(journal)) {
         const old = existing.payload as NormalizedPushJournal;
+        assertRetainedCancellationTarget(old, journal);
         if (
           !transitions[old.phase].includes(journal.phase) ||
           (await sha256Hex(canonicalBytes(normalizedPlan(old)))) !==
