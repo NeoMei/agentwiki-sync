@@ -31,6 +31,7 @@ import type {
 } from "../ports/tree-remote";
 import { BlobStagingRepository } from "../storage/blob-staging";
 import { MutableControlRepository } from "../storage/envelope";
+import type { JournalPort } from "../storage/push-journal-router";
 import { BlobTransfer } from "./blob-transfer";
 import {
   progressCheckpoint,
@@ -354,7 +355,7 @@ function v3Manifest(
 
 /** Strict v3 coordinator; the frozen v1/v2 TreePushService stays unchanged. */
 export class TreePushServiceV3 {
-  private readonly journal: MutableControlRepository<TreePushJournalV3>;
+  private readonly journal: JournalPort<TreePushJournalV3>;
   private receiptWriteQueue: Promise<void> = Promise.resolve();
 
   constructor(
@@ -363,12 +364,15 @@ export class TreePushServiceV3 {
     private readonly root: string,
     private readonly local: TreePushLocalPortV3,
     private readonly ownership?: UpgradePushOwnership,
+    private readonly journalPort?: JournalPort<TreePushJournalV3>,
   ) {
-    this.journal = new MutableControlRepository(
-      store,
-      `${root}/journal.json`,
-      isTreePushJournalV3,
-    );
+    this.journal =
+      journalPort ??
+      new MutableControlRepository(
+        store,
+        `${root}/journal.json`,
+        isTreePushJournalV3,
+      );
   }
 
   private async save(journal: TreePushJournalV3): Promise<void> {
@@ -391,10 +395,12 @@ export class TreePushServiceV3 {
   }
 
   private async load(): Promise<TreePushJournalV3> {
-    const raw = await this.store.read(`${this.root}/journal.json`);
-    const version = readJournalSchemaVersion(raw);
-    if (version !== null && version !== 3)
-      throw new Error("不支持的推送日志版本");
+    if (!this.journalPort) {
+      const raw = await this.store.read(`${this.root}/journal.json`);
+      const version = readJournalSchemaVersion(raw);
+      if (version !== null && version !== 3)
+        throw new Error("不支持的推送日志版本");
+    }
     const value = await this.journal.read();
     if (!value) throw new Error("推送日志缺失或已损坏");
     const journal = value.payload;
