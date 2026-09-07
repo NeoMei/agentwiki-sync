@@ -8,12 +8,16 @@ import {
   sha256Hex,
 } from "../../src/agentwiki/protocol";
 import { normalizeLocalImageLinks } from "../../src/core/local-image-normalization";
+import { scanLocalTree } from "../../src/core/tree-scan";
 import { opaqueFileKey } from "../../src/core/identity-key";
 import type { TreeSnapshotV3 } from "../../src/core/tree-model";
 import type { NormalizedPushPlanInput } from "../../src/application/normalized-push-plan";
 import type { TreePushPreviewV3 } from "../../src/application/tree-push-service-v3";
 import { prepareTreePushChangesV3 } from "../../src/application/local-image-upgrade-plan";
-import { emptyTreeIdentityStateV2 } from "../../src/storage/tree-identities";
+import {
+  emptyTreeIdentityStateV2,
+  upgradeTreeIdentityState,
+} from "../../src/storage/tree-identities";
 import { FakeTreeRemoteV3 } from "./fake-tree-remote";
 import { MemoryControlStore } from "./memory-control-store";
 import { MemoryVault } from "./memory-vault";
@@ -39,6 +43,8 @@ import {
   isTreePushJournalV3,
   type TreePushJournalV3,
 } from "../../src/application/tree-push-service-v3";
+import { NormalizedPushCoordinator } from "../../src/application/normalized-push";
+import { readTreeSnapshotV3 } from "../../src/application/tree-snapshot-reader";
 
 export const NORMALIZED_ROOT = ".agentwiki/device-1/space-1";
 export async function makeNormalizedFixture(rawText = "![A](photo.png)") {
@@ -67,6 +73,7 @@ export async function makeNormalizedFixture(rawText = "![A](photo.png)") {
     updatedAt: "2026-09-07T00:00:00.000Z",
   };
   await remote.seedTree({
+    spaceId: "space-1",
     revision: "rev-1",
     pages: [page],
     attachments: [
@@ -370,6 +377,229 @@ export async function makeLocalOnlyFixture() {
   });
   f.input.wireConfirmationHash = f.push.confirmationHash;
   return f;
+}
+
+export async function makeNormalizedCoordinatorFixture(
+  mode: "remote_push" | "local_only",
+) {
+  const f =
+    mode === "local_only"
+      ? await makeLocalOnlyFixture()
+      : await makeNormalizedFixture();
+  const vault = new MemoryVault({ "Wiki/pages/note.md": "![A](photo.png)" });
+  vault.seedFile("Wiki/assets/photo.png", new Uint8Array([1, 2, 3]));
+  f.input.binding.operationId = "00000000-0000-4000-8000-000000000001";
+  for (const action of f.input.localPlan)
+    action.payloadPath = `${NORMALIZED_ROOT}/push/operations/${f.input.binding.operationId}/payload/${await opaqueFileKey(action.pageId)}.md`;
+  let sourceSnapshot = structuredClone(f.candidate);
+  if (mode === "remote_push") {
+    const oldBody = "![A](../assets/old.png)";
+    const source: TreeSnapshotV3 = {
+      ...structuredClone(f.candidate),
+      pages: [
+        {
+          ...structuredClone(f.candidate.pages[0]!),
+          body: oldBody,
+          contentHash: await contentHash(oldBody),
+        },
+      ],
+      attachments: [
+        {
+          ...structuredClone(f.candidate.attachments[0]!),
+          path: "assets/old.png",
+        },
+      ],
+    };
+    sourceSnapshot = source;
+    source.revisionContentHash = await treeRevisionContentHashV3({
+      protocolVersion: "3",
+      spaceId: source.spaceId,
+      folders: source.folders,
+      pages: source.pages,
+      attachments: source.attachments,
+    });
+    f.input.sourceTreeHash = source.revisionContentHash;
+    await f.remote.seedTree({
+      spaceId: "space-1",
+      revision: source.revision,
+      folders: source.folders,
+      pages: source.pages,
+      attachments: source.attachments,
+      blobs: { "image-1": new Uint8Array([1, 2, 3]) },
+    });
+  }
+  const plan = await sealNormalizedPushPlan(f.input);
+  const baseline = new TreeBaselineRepository(
+    f.store,
+    NORMALIZED_ROOT,
+    "space-1",
+    "Wiki",
+  );
+  await baseline.prepare(sourceSnapshot, "pull", "source-pull");
+  await baseline.recover("source-pull");
+  const identities = new TreeIdentityRepository(
+    f.store,
+    `${NORMALIZED_ROOT}/tree-identities.json`,
+  );
+  await identities.commitConfirmedV3Activation();
+  const repository = new NormalizedPushRepository(f.store, NORMALIZED_ROOT);
+  const local = new NormalizedPushLocalCommitter({
+    vault,
+    control: f.store,
+    controlRoot: NORMALIZED_ROOT,
+    baseline,
+    identities,
+  });
+  const authority = {
+    revalidate: async (expected: typeof plan) => {
+      const head = await f.remote.head();
+      const capabilitiesHash = await f.remote.capabilitiesHash;
+      const basenameCounts = new Map<string, number>();
+      const actualNormalizations: typeof expected.normalizations = [];
+      const actualActions: typeof expected.localPlan = [];
+      const actualCandidate = structuredClone(f.candidate);
+      const actualIdentities = upgradeTreeIdentityState(
+        (await identities.read())?.payload ?? expected.identities,
+      );
+      const scan = await scanLocalTree(
+        vault,
+        expected.binding.mappingRootKey,
+        sourceSnapshot,
+        structuredClone(actualIdentities),
+        {
+          maxFolders: f.push.capabilities.maxClientSpaceFolders,
+          maxPages: f.push.capabilities.maxClientSpacePages,
+          maxPageBytes: f.push.capabilities.maxPageBytes,
+          maxTotalBodyBytes: f.push.capabilities.maxClientTotalBodyBytes,
+          maxAttachmentBytes: f.push.capabilities.maxAttachmentBytes,
+          maxRevisionAttachments: f.push.capabilities.maxRevisionAttachments,
+          maxTransferBlobBytes: f.push.capabilities.maxTransferBlobBytes,
+          maxImageDimension: f.push.capabilities.maxImageDimension,
+          maxDecodedPixels: f.push.capabilities.maxDecodedPixels,
+          allowedMimeTypes: f.push.capabilities.allowedMimeTypes,
+        },
+      );
+      for await (const entry of vault.listTree(
+        expected.binding.mappingRootKey,
+      )) {
+        if (entry.kind === "file") {
+          const basename = entry.relativePath.split("/").at(-1);
+          if (basename) {
+            const key = basename.normalize("NFC").toLowerCase();
+            basenameCounts.set(key, (basenameCounts.get(key) ?? 0) + 1);
+          }
+        }
+      }
+      for (const action of expected.localPlan) {
+        const bytes = await vault.read(
+          `${expected.binding.mappingRootKey}/${action.path}`,
+        );
+        if (!bytes) continue;
+        const normalized = await normalizeLocalImageLinks({
+          pageId: action.pageId,
+          pagePath: action.path,
+          raw: bytes,
+          resolve: async (_pagePath, basename) => {
+            const replacement = expected.normalizations
+              .flatMap((item) => item.replacements)
+              .find(
+                (item) =>
+                  item.basenameKey === basename.normalize("NFC").toLowerCase(),
+              );
+            if (
+              !replacement ||
+              basenameCounts.get(basename.normalize("NFC").toLowerCase()) !==
+                1 ||
+              (await vault.pathStatus(
+                `${expected.binding.mappingRootKey}/${replacement.attachmentPath}`,
+              )) !== "file"
+            )
+              return { kind: "missing" as const };
+            return {
+              kind: "resolved" as const,
+              attachmentPath: replacement.attachmentPath,
+              basenameKey: replacement.basenameKey,
+            };
+          },
+        });
+        if (!normalized.evidence) continue;
+        actualNormalizations.push(normalized.evidence);
+        actualActions.push({
+          ...action,
+          beforeHash: normalized.evidence.rawHash,
+          contentHash: normalized.evidence.canonicalContentHash,
+          byteLength: new TextEncoder().encode(normalized.body).byteLength,
+        });
+        const page = actualCandidate.pages.find(
+          (item) => item.pageId === action.pageId,
+        );
+        if (page) {
+          page.body = normalized.body;
+          page.contentHash = normalized.evidence.canonicalContentHash;
+        }
+      }
+      actualCandidate.revisionContentHash = await treeRevisionContentHashV3({
+        protocolVersion: "3",
+        spaceId: actualCandidate.spaceId,
+        folders: actualCandidate.folders,
+        pages: actualCandidate.pages,
+        attachments: actualCandidate.attachments,
+      });
+      try {
+        const actual = await sealNormalizedPushPlan({
+          mode: expected.mode,
+          binding: structuredClone(expected.binding),
+          sourceRevision: head.revision,
+          sourceTreeHash: head.revisionContentHash,
+          capabilitiesHash,
+          wireConfirmationHash: expected.wireConfirmationHash,
+          candidateHash: actualCandidate.revisionContentHash,
+          localTransactionId: expected.localTransactionId,
+          localPlan: actualActions,
+          normalizations: actualNormalizations,
+          rawPathStates: scan.rawPathStates,
+          identities: structuredClone(actualIdentities),
+          scanEpoch: expected.scanEpoch,
+        });
+        return actual.authorizationHash;
+      } catch {
+        return sha256Hex(
+          canonicalBytes({
+            invalid: true,
+            head,
+            capabilitiesHash,
+            rawPathStates: scan.rawPathStates,
+            actualActions,
+            actualNormalizations,
+            candidateHash: actualCandidate.revisionContentHash,
+            identities: actualIdentities,
+          }),
+        );
+      }
+    },
+    readTarget: (revision: string) =>
+      readTreeSnapshotV3(f.remote, "space-1", revision),
+  };
+  const rebuild = () =>
+    new NormalizedPushCoordinator({
+      remote: f.remote,
+      vault,
+      control: f.store,
+      controlRoot: NORMALIZED_ROOT,
+      repository,
+      local,
+      authority,
+    });
+  return {
+    plan,
+    push: f.push,
+    candidate: f.candidate,
+    vault,
+    control: f.store,
+    remote: f.remote,
+    coordinator: rebuild(),
+    rebuild,
+  };
 }
 export function makeV3Journal(
   f: Awaited<ReturnType<typeof makeNormalizedFixture>>,

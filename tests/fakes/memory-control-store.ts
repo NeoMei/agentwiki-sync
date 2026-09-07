@@ -5,6 +5,7 @@ export class MemoryControlStore implements ControlStorePort {
   readonly binaryFiles = new Map<string, Uint8Array>();
   failNextTextWriteAt: string | null = null;
   failWhenTextPathIncludes: string | null = null;
+  failNextRemoveTreeAt: string | null = null;
   onTextWrite?: (path: string) => Promise<void> | void;
   async read(path: string): Promise<string | null> {
     return this.files.get(path) ?? null;
@@ -39,6 +40,10 @@ export class MemoryControlStore implements ControlStorePort {
     this.files.delete(from);
   }
   async removeTree(path: string): Promise<void> {
+    if (this.failNextRemoveTreeAt === path) {
+      this.failNextRemoveTreeAt = null;
+      throw new Error("injected remove tree failure");
+    }
     for (const key of [...this.files.keys()])
       if (key === path || key.startsWith(`${path}/`)) this.files.delete(key);
     for (const key of [...this.binaryFiles.keys()])

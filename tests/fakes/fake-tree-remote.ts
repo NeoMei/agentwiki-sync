@@ -500,7 +500,10 @@ export class FakeTreeRemoteV3 implements TreeRemotePortV3 {
   private currentSessionBatches: TreePushBatchV3[] = [];
   finalizeCalls = 0;
   abortCalls = 0;
+  loseCreateResponseOnce = false;
+  loseUploadBatchResponseOnce = false;
   loseFinalizeResponseOnce = false;
+  getSessionFailuresRemaining = 0;
   changeCapabilitiesOnCreate = 0;
   onFinalize?: () => Promise<void> | void;
   onUploadBlobChunk?: () => Promise<void> | void;
@@ -510,6 +513,7 @@ export class FakeTreeRemoteV3 implements TreeRemotePortV3 {
   onDownload?: () => Promise<void> | void;
   syncMode: TreeSpaceSummaryV3["syncMode"] = "native_v3";
   private revision = "rev-3";
+  private spaceId = "space";
   private folders: SyncFolderV2[] = [];
   private pages: SyncPageV3[] = [];
   private attachments: SyncAttachmentV3[] = [];
@@ -527,12 +531,14 @@ export class FakeTreeRemoteV3 implements TreeRemotePortV3 {
   } | null = null;
 
   async seedTree(input: {
+    spaceId?: string;
     revision?: string;
     folders?: SyncFolderV2[];
     pages?: SyncPageV3[];
     attachments?: SyncAttachmentV3[];
     blobs?: Record<string, Uint8Array>;
   }): Promise<void> {
+    this.spaceId = input.spaceId ?? "space";
     this.revision = input.revision ?? "rev-3";
     this.folders = (input.folders ?? []).map((item) => ({ ...item }));
     this.pages = (input.pages ?? []).map((item) => ({
@@ -571,7 +577,7 @@ export class FakeTreeRemoteV3 implements TreeRemotePortV3 {
   private async metrics() {
     const manifest = {
       protocolVersion: "3" as const,
-      spaceId: "space",
+      spaceId: this.spaceId,
       folders: this.folders,
       pages: this.pages,
       attachments: this.attachments,
@@ -594,7 +600,7 @@ export class FakeTreeRemoteV3 implements TreeRemotePortV3 {
     const value = await this.metrics();
     return [
       {
-        spaceId: "space",
+        spaceId: this.spaceId,
         displayName: "Space",
         role: "owner",
         canRead: true,
@@ -615,7 +621,7 @@ export class FakeTreeRemoteV3 implements TreeRemotePortV3 {
     const value = await this.metrics();
     return {
       protocolVersion: "3",
-      spaceId: "space",
+      spaceId: this.spaceId,
       revision: this.revision,
       sequence: 3,
       revisionContentHash: value.hash,
@@ -679,6 +685,16 @@ export class FakeTreeRemoteV3 implements TreeRemotePortV3 {
     input: CreateTreePushSessionRequestV3,
   ): Promise<TreePushSessionV3> {
     this.createInputs.push(structuredClone(input));
+    if (
+      this.pushSession?.input.idempotencyKey === input.idempotencyKey &&
+      JSON.stringify(this.pushSession.input) === JSON.stringify(input)
+    )
+      return {
+        sessionId: this.pushSession.sessionId,
+        status: this.pushSession.status,
+        expiresAt: "2099-01-01T00:00:00.000Z",
+        missingContentHashes: [...this.pushSession.missingContentHashes],
+      };
     if (this.changeCapabilitiesOnCreate > 0) {
       this.changeCapabilitiesOnCreate -= 1;
       this.capabilitiesValue.maxBatchItems -= 1;
@@ -701,6 +717,10 @@ export class FakeTreeRemoteV3 implements TreeRemotePortV3 {
       result: null,
     };
     this.currentSessionBatches = [];
+    if (this.loseCreateResponseOnce) {
+      this.loseCreateResponseOnce = false;
+      throw new Error("create response lost");
+    }
     return {
       sessionId: this.pushSession.sessionId,
       status: this.pushSession.status,
@@ -733,6 +753,10 @@ export class FakeTreeRemoteV3 implements TreeRemotePortV3 {
     );
     if (received === this.pushSession.input.changeCount)
       this.pushSession.status = "ready_to_finalize";
+    if (this.loseUploadBatchResponseOnce) {
+      this.loseUploadBatchResponseOnce = false;
+      throw new Error("batch response lost");
+    }
     return { receipt: `batch-${batch.batchIndex}` };
   }
   async finalize(
@@ -811,6 +835,10 @@ export class FakeTreeRemoteV3 implements TreeRemotePortV3 {
     return result;
   }
   async getSession(sessionId: string): Promise<TreePushSessionStatusV3> {
+    if (this.getSessionFailuresRemaining > 0) {
+      this.getSessionFailuresRemaining -= 1;
+      throw new Error("session status network unknown");
+    }
     if (!this.pushSession || this.pushSession.sessionId !== sessionId)
       throw new Error("PUSH_SESSION_NOT_FOUND");
     return {
