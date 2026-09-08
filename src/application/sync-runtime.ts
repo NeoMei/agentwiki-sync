@@ -1016,7 +1016,7 @@ export class SyncRuntime {
         false,
       );
       const repair = preview.sameRevisionMissingAttachmentIds?.length
-        ? this.repairSameRevisionMissingRemoteAttachments(
+        ? await this.repairSameRevisionMissingRemoteAttachments(
             scannedFresh,
             preview.base,
             preview.remote,
@@ -1697,11 +1697,28 @@ export class SyncRuntime {
     );
   }
 
-  private repairSameRevisionMissingRemoteAttachments(
+  private async isMissingAttachmentTargetCreatable(
+    relativePath: string,
+  ): Promise<boolean> {
+    const segments = relativePath.split("/");
+    for (let length = segments.length; length > 0; length -= 1) {
+      const path = joinRoot(
+        this.mapping.rootPath,
+        segments.slice(0, length).join("/"),
+      );
+      const status = await this.vault.pathStatus(path);
+      if (length === segments.length) {
+        if (status !== "missing") return false;
+      } else if (status === "file") return false;
+    }
+    return true;
+  }
+
+  private async repairSameRevisionMissingRemoteAttachments(
     local: LocalTreeScanV3,
     base: TreeSnapshotV3,
     remote: TreeSnapshotV3,
-  ): { local: LocalTreeScanV3; attachmentIds: string[] } {
+  ): Promise<{ local: LocalTreeScanV3; attachmentIds: string[] }> {
     if (
       base.revision === "0" ||
       base.revision !== remote.revision ||
@@ -1736,6 +1753,8 @@ export class SyncRuntime {
       )
         continue;
       const missingPath = blocker.path ?? `assets/${blocker.target!}`;
+      if (!(await this.isMissingAttachmentTargetCreatable(missingPath)))
+        continue;
       const localPage = candidate.pages.find(
         (page) => pathKey(page.path) === pathKey(blocker.pagePath!),
       );
@@ -1796,7 +1815,7 @@ export class SyncRuntime {
     const base = (await this.readBaseSnapshotV3()) ?? this.emptySnapshotV3();
     const scannedLocal = await this.scanV3(base, capabilities, options, true);
     const repair = behavior?.repairSameRevisionMissingRemoteAttachments
-      ? this.repairSameRevisionMissingRemoteAttachments(
+      ? await this.repairSameRevisionMissingRemoteAttachments(
           scannedLocal,
           base,
           remote,

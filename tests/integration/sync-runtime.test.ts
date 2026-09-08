@@ -487,6 +487,92 @@ describe("SyncRuntime", () => {
     expect(remote.finalizeCalls).toBe(0);
   });
 
+  it("does not repair or download a same-revision image when a directory occupies its path", async () => {
+    const attachmentId = "11111111-1111-4111-8111-111111111111";
+    const attachment = await v3Attachment(attachmentId, "assets/image.png");
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({
+      revision: "same-revision",
+      pages: [
+        await v3Page(
+          "22222222-2222-4222-8222-222222222222",
+          "pages/note.md",
+          "![[assets/image.png]]",
+          [attachmentId],
+        ),
+      ],
+      attachments: [attachment],
+      blobs: { [attachmentId]: PNG_2X3 },
+    });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    await runtime.applyPullV3(await runtime.previewPullV3());
+    await vault.trashFile("Wiki/assets/image.png");
+    await vault.createDirectory("Wiki/assets/image.png");
+    vault.operationLog.length = 0;
+    const downloadsBefore = remote.downloads.length;
+
+    const preview = await runtime.previewPullV3(undefined, {
+      repairSameRevisionMissingRemoteAttachments: true,
+    });
+
+    expect(preview.sameRevisionMissingAttachmentIds).toEqual([]);
+    expect(
+      preview.actions.some(
+        (action) =>
+          action.kind === "create_attachment" &&
+          action.attachment.attachmentId === attachmentId,
+      ),
+    ).toBe(false);
+    expect(remote.downloads).toHaveLength(downloadsBefore);
+    expect(await vault.pathStatus("Wiki/assets/image.png")).toBe("directory");
+    expect(vault.operationLog).toEqual([]);
+  });
+
+  it("does not repair or download a same-revision image below a file ancestor", async () => {
+    const attachmentId = "11111111-1111-4111-8111-111111111111";
+    const attachment = await v3Attachment(attachmentId, "assets/image.png");
+    const remote = new FakeTreeRemoteV3();
+    await remote.seedTree({
+      revision: "same-revision",
+      pages: [
+        await v3Page(
+          "22222222-2222-4222-8222-222222222222",
+          "pages/note.md",
+          "![[assets/image.png]]",
+          [attachmentId],
+        ),
+      ],
+      attachments: [attachment],
+      blobs: { [attachmentId]: PNG_2X3 },
+    });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+    await runtime.applyPullV3(await runtime.previewPullV3());
+    await vault.trashFile("Wiki/assets/image.png");
+    vault.seedFile("Wiki/assets", Uint8Array.of(1, 2, 3));
+    vault.operationLog.length = 0;
+    const downloadsBefore = remote.downloads.length;
+
+    const preview = await runtime.previewPullV3(undefined, {
+      repairSameRevisionMissingRemoteAttachments: true,
+    });
+
+    expect(preview.sameRevisionMissingAttachmentIds).toEqual([]);
+    expect(
+      preview.actions.some(
+        (action) =>
+          action.kind === "create_attachment" &&
+          action.attachment.attachmentId === attachmentId,
+      ),
+    ).toBe(false);
+    expect(remote.downloads).toHaveLength(downloadsBefore);
+    expect(await vault.pathStatus("Wiki/assets")).toBe("file");
+    expect(vault.operationLog).toEqual([]);
+  });
+
   it("does not repair a same-revision image after the local Page removes its last reference", async () => {
     const attachmentId = "11111111-1111-4111-8111-111111111111";
     const attachment = await v3Attachment(attachmentId, "assets/image.png");
