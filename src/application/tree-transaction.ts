@@ -1225,6 +1225,16 @@ export class TreeTransaction {
     operation: JournalOperation,
     journal: TreeTransactionJournal,
   ): Promise<void> {
+    if (operation.action.kind === "move_page") {
+      if ((await this.classifyOperation(operation)) === "before") return;
+      // Existing ports cannot conditionally restore the source and remove the
+      // target. Stop before either mutation, including after a lost CAS return.
+      journal.state = "ambiguous";
+      await this.save(journal);
+      throw new Error(
+        "TREE_TRANSACTION_AMBIGUOUS: Page move rollback requires manual recovery",
+      );
+    }
     for (const { item } of this.rollbackPathOrder(operation)) {
       const current = await this.readPathState(item.path);
       if (sameState(current, item.before)) continue;

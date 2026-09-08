@@ -2,6 +2,8 @@
 
 验证日期：2026-09-08（Asia/Shanghai）。候选分支：`codex/referenced-image-sync-v3`。本记录只证明受控 FakeTreeRemoteV3、MemoryControlStore 和 VaultPort 后的实际插件 Runtime/factory 入口；不等于真实服务器、设备、Vault 安装或发布验收。
 
+2026-09-08 追加确认后的 move_page 异常恢复语义：成功 rename/CAS 的返回丢失、需要回滚恢复源或删除目标时，现有端口不具备条件 mutation，故在该移动操作任何回滚业务写入前持久化 ambiguous，保留当前文件、before/result sidecar 和旧 baseline。两次重建恢复保持停止；不再承诺移动异常能自动回滚成功。完整 before 状态仍可无操作恢复，正常前向移动仍可完成。此前 `final-fix-report.md` 的 CAS 丢返回自动回滚记录属于旧候选历史，已由 `rollback-safe-stop-report.md` 的定向证据替代；下列普通 write_page CAS 用例不因此改变。
+
 ## Runtime 故障断点与可观测结果
 
 - published 后 Page 晚编辑：`normalized-push-runtime.test.ts` 的既有 `late edit=false/true` 参数化用例，并新增严格包裹真实 `finalize()` 成功返回后再编辑的用例。专用错误分别为 `TREE_TRANSACTION_AMBIGUOUS` / `STALE_PULL_PREVIEW`；用户正文保留，父 journal 维持 `local_pending`，原子 plan 和 fixed target 保留，old baseline 不前推，`Finalize` 仍只有 1 次。

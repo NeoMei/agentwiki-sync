@@ -6,6 +6,7 @@ import { contentHash } from "../../src/agentwiki/protocol";
 import type { PushPreviewV3 } from "../../src/application/sync-runtime";
 import type { NormalizedPushPlan } from "../../src/application/normalized-push-plan";
 import attachmentConformance from "../fixtures/attachment-reference.conformance.json";
+import { TreeTransaction } from "../../src/application/tree-transaction";
 
 const RUNTIME_ROOT = ".agentwiki/devices/d-device-1/spaces/s-space-1";
 
@@ -48,6 +49,147 @@ function baselineFor(
 ) {
   return new TreeBaselineRepository(f.control, RUNTIME_ROOT, "space-1", "Wiki");
 }
+
+it.each([
+  "CAS return lost",
+  "target edit before trash",
+  "target edit already present",
+  "source creation before restore",
+  "source creation already present",
+  "rename return lost",
+])(
+  "safely stops moved Page rollback before business mutations: %s",
+  async (boundary) => {
+    const f = await makeNormalizedRuntimeFixture("local_only");
+    const segments: TreeSnapshotSegmentV3[] = [];
+    for await (const segment of f.remote.snapshotPages("rev-1"))
+      segments.push(segment);
+    const original = segments[0]!;
+    await f.remote.seedTree({
+      spaceId: "space-1",
+      revision: "rev-2",
+      folders: original.folders,
+      pages: original.pages.map((page) => ({
+        ...page,
+        path: "pages/moved.md",
+      })),
+      attachments: original.attachments,
+      blobs: {
+        "11111111-1111-4111-8111-111111111111": (await f.vault.read(
+          "Wiki/assets/photo.png",
+        ))!,
+      },
+    });
+    const preview = await f.runtime.previewPullV3();
+    expect(preview.actions.map((action) => action.kind)).toEqual(["move_page"]);
+    const source = "Wiki/pages/note.md";
+    const target = "Wiki/pages/moved.md";
+    const cas = f.vault.compareAndSwap.bind(f.vault);
+    const rename = f.vault.rename.bind(f.vault);
+    const trash = f.vault.trashFile.bind(f.vault);
+    const write = f.vault.write.bind(f.vault);
+    let faultHit = false;
+    let trashCalls = 0;
+    let restoreCalls = 0;
+    f.vault.operationLog.length = 0;
+    if (boundary === "rename return lost") {
+      f.vault.rename = async (...args) => {
+        await rename(...args);
+        if (args[1] === target) {
+          faultHit = true;
+          throw new Error("accepted rename response lost");
+        }
+      };
+    } else {
+      f.vault.compareAndSwap = async (...args) => {
+        const applied = await cas(...args);
+        if (args[0] === target) {
+          expect(applied).toBe(true);
+          faultHit = true;
+          if (boundary === "target edit already present")
+            f.vault.seedMarkdown(target, "THIRD PARTY TARGET");
+          if (boundary === "source creation already present")
+            f.vault.seedMarkdown(source, "THIRD PARTY SOURCE");
+          throw new Error("accepted CAS response lost");
+        }
+        return applied;
+      };
+    }
+    f.vault.trashFile = async (path) => {
+      if (path === target) {
+        trashCalls++;
+        if (boundary === "target edit before trash")
+          f.vault.seedMarkdown(path, "THIRD PARTY AFTER CLASSIFICATION");
+      }
+      await trash(path);
+    };
+    f.vault.write = async (path, bytes) => {
+      if (path === source) {
+        restoreCalls++;
+        if (boundary === "source creation before restore")
+          f.vault.seedMarkdown(path, "THIRD PARTY BEFORE RESTORE");
+      }
+      await write(path, bytes);
+    };
+    const error: unknown = await f.runtime
+      .applyPullV3(preview)
+      .catch((failure: unknown) => failure);
+    expect(faultHit).toBe(true);
+    // The old race callbacks must become unreachable; independent edits above
+    // prove bytes that already exist are also retained, not merely un-injected.
+    expect(trashCalls).toBe(0);
+    expect(restoreCalls).toBe(0);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain("TREE_TRANSACTION_AMBIGUOUS");
+    const expectedSource =
+      boundary === "source creation already present"
+        ? "THIRD PARTY SOURCE"
+        : null;
+    const expectedTarget =
+      boundary === "target edit already present"
+        ? "THIRD PARTY TARGET"
+        : boundary === "rename return lost"
+          ? "![A](photo.png)"
+          : "![A](../assets/photo.png)";
+    const forwardOperations = [
+      `rename:${source}->${target}`,
+      ...(boundary === "rename return lost" ? [] : [`cas:${target}`]),
+    ];
+    const tx = () =>
+      new TreeTransaction(f.vault, f.control, `${RUNTIME_ROOT}/pull`);
+    const retained = new Map(
+      [...f.control.files].filter(
+        ([path]) =>
+          path.startsWith(`${RUNTIME_ROOT}/pull/before/`) ||
+          path.startsWith(`${RUNTIME_ROOT}/pull/results/`),
+      ),
+    );
+    expect(retained.size).toBeGreaterThan(0);
+    expect(retained.has(`${RUNTIME_ROOT}/pull/before/0-0.bin`)).toBe(true);
+    expect(retained.has(`${RUNTIME_ROOT}/pull/results/0.md`)).toBe(true);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      expect(f.vault.text(source)).toBe(expectedSource);
+      expect(f.vault.text(target)).toBe(expectedTarget);
+      expect(f.vault.operationLog).toEqual(forwardOperations);
+      expect(await tx().inspect()).toMatchObject({
+        state: "ambiguous",
+        baseRevision: "rev-1",
+        targetRevision: "rev-2",
+      });
+      await expect(f.rebuild().recover()).rejects.toThrow(
+        "TREE_TRANSACTION_AMBIGUOUS",
+      );
+      expect((await baselineFor(f).read()).baseRevision).toBe("rev-1");
+      for (const [path, bytes] of retained)
+        expect(f.control.files.get(path)).toBe(bytes);
+    }
+    expect(f.vault.text(source)).toBe(expectedSource);
+    expect(f.vault.text(target)).toBe(expectedTarget);
+    expect(f.vault.operationLog).toEqual(forwardOperations);
+    expect(trashCalls).toBe(0);
+    expect(restoreCalls).toBe(0);
+  },
+);
 
 async function loseConfirmedParent(
   f: Awaited<ReturnType<typeof makeNormalizedRuntimeFixture>>,

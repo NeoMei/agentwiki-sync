@@ -21,7 +21,7 @@ import { MemoryVault } from "../fakes/memory-vault";
 const IMAGE_BYTES = Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]);
 
 it.each([false, true])(
-  "recovers a moved Page after accepted CAS response loss without deleting a late edit (late=%s)",
+  "stops a moved Page after accepted CAS response loss before any rollback mutation (late=%s)",
   async (late) => {
     const vault = new MemoryVault({ "pages/A.md": "original source" });
     const control = new MemoryControlStore();
@@ -57,24 +57,53 @@ it.each([false, true])(
     );
     expect(hit).toBe(true);
     vault.compareAndSwap = cas;
+    const operations = [...vault.operationLog];
     for (let attempt = 0; attempt < 2; attempt++) {
       const rebuilt = new TreeTransaction(vault, control, root);
-      if (late) {
-        await expect(rebuilt.recover()).rejects.toThrow(
-          "TREE_TRANSACTION_AMBIGUOUS",
-        );
-        expect(vault.text("pages/B.md")).toBe("third party after accepted CAS");
-        expect((await rebuilt.inspect())?.state).toBe("ambiguous");
-        expect(control.files.has(`${root}/before/0-0.bin`)).toBe(true);
-      } else {
-        await rebuilt.recover();
-        expect(vault.text("pages/A.md")).toBe("original source");
-        expect(vault.exists("pages/B.md")).toBe(false);
-        expect((await rebuilt.inspect())?.state).toBe("rolled_back");
-      }
+      await expect(rebuilt.recover()).rejects.toThrow(
+        "TREE_TRANSACTION_AMBIGUOUS",
+      );
+      expect(vault.text("pages/B.md")).toBe(
+        late ? "third party after accepted CAS" : "approved result",
+      );
+      expect(vault.exists("pages/A.md")).toBe(false);
+      expect(vault.operationLog).toEqual(operations);
+      expect((await rebuilt.inspect())?.state).toBe("ambiguous");
+      expect(control.files.has(`${root}/before/0-0.bin`)).toBe(true);
     }
   },
 );
+
+it("recovers an untouched move Page in full before state without business mutations", async () => {
+  const vault = new MemoryVault({ "pages/A.md": "original source" });
+  const control = new MemoryControlStore();
+  control.files.set("tree-preview-body/move.md", "approved result");
+  const root = ".agentwiki/tx/untouched-move";
+  const tx = new TreeTransaction(vault, control, root);
+  await tx.prepare({
+    baseRevision: "base",
+    targetRevision: "target",
+    targetTreeHash: "0".repeat(64),
+    deferCommit: true,
+    actions: [
+      {
+        kind: "move_page",
+        pageId: "page",
+        fromPath: "pages/A.md",
+        path: "pages/B.md",
+        bodyPath: "tree-preview-body/move.md",
+      },
+    ],
+  });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const rebuilt = new TreeTransaction(vault, control, root);
+    await rebuilt.recover();
+    expect(vault.text("pages/A.md")).toBe("original source");
+    expect(vault.exists("pages/B.md")).toBe(false);
+    expect(vault.operationLog).toEqual([]);
+    expect((await rebuilt.inspect())?.state).toBe("rolled_back");
+  }
+});
 
 it.each(["pages/new", "pages/new/child"])(
   "refuses an unconfirmed opaque target or ancestor before creating %s",
@@ -788,7 +817,7 @@ describe("TreeTransaction", () => {
     expect((await tx.inspect())?.state).toBe("committed");
   });
 
-  it("rolls back an applied page move and directory trash from before images", async () => {
+  it("rolls back later directory actions but stops before restoring an applied page move", async () => {
     const vault = new MemoryVault({
       "pages/A.md": "moved",
       "pages/Doomed/Inner.md": "inner",
@@ -820,14 +849,20 @@ describe("TreeTransaction", () => {
     vault.failAfterOperations = 4;
     await expect(tx.apply()).rejects.toThrow();
     vault.failAfterOperations = null;
-    await tx.recover();
+    await expect(tx.recover()).rejects.toThrow("TREE_TRANSACTION_AMBIGUOUS");
 
-    expect((await tx.inspect())?.state).toBe("rolled_back");
-    expect(vault.text("pages/A.md")).toBe("moved");
-    expect(vault.exists("pages/B.md")).toBe(false);
+    expect((await tx.inspect())?.state).toBe("ambiguous");
+    expect(vault.exists("pages/A.md")).toBe(false);
+    expect(vault.text("pages/B.md")).toBe("moved-new");
     expect(vault.text("pages/Doomed/Inner.md")).toBe("inner");
     expect(vault.folders.has("pages/Extra")).toBe(false);
     expect(vault.hasUnexpectedTemporaryPaths()).toBe(false);
+    const operations = [...vault.operationLog];
+    await expect(tx.recover()).rejects.toThrow("TREE_TRANSACTION_AMBIGUOUS");
+    expect(vault.operationLog).toEqual(operations);
+    expect(
+      control.files.has(".agentwiki/tx/move-trash-rollback/before/0-0.bin"),
+    ).toBe(true);
   });
 
   it("refuses to prepare a new plan over an unfinished transaction", async () => {
