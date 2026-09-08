@@ -87,6 +87,36 @@ describe("parseAttachmentReferences", () => {
     ).toEqual(["assets/outside.png"]);
   });
 
+  it("uses the unescaped suffix of a multi-backtick run as an opener", () => {
+    const body =
+      "\\`` hidden ![inside](../assets/inside.png) ` " +
+      "![outside](../assets/outside.png)";
+    const target = "../assets/outside.png";
+    const targetStart = body.lastIndexOf(target);
+
+    expect(parseAttachmentReferences(body, "pages/note.md")).toMatchObject([
+      {
+        syntax: "markdown",
+        classification: "local",
+        target,
+        resolvedPath: "assets/outside.png",
+        targetStart,
+        targetEnd: targetStart + target.length,
+      },
+    ]);
+  });
+
+  it("keeps an image visible after an escaped single-backtick run", () => {
+    const body = "\\` ![visible](../assets/visible.png)";
+
+    expect(parseAttachmentReferences(body, "pages/note.md")).toMatchObject([
+      {
+        classification: "local",
+        resolvedPath: "assets/visible.png",
+      },
+    ]);
+  });
+
   it("preserves the exact target range after an equal-length mixed backtick span", () => {
     const body = "``a ``` b`` ![A](../assets/photo.png) `c`";
     expect(parseAttachmentReferences(body, "pages/note.md")).toMatchObject([

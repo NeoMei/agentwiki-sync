@@ -192,6 +192,8 @@ function activeFenceContent(
 interface BacktickRun {
   start: number;
   length: number;
+  openerStart: number;
+  openerLength: number;
   nextEqualStart: number;
 }
 
@@ -204,13 +206,23 @@ function indexBacktickRuns(body: string): BacktickRun[] {
     }
     const start = index;
     while (body[index] === "`") index += 1;
-    runs.push({ start, length: index - start, nextEqualStart: -1 });
+    const openerStart = start + (isEscaped(body, start) ? 1 : 0);
+    runs.push({
+      start,
+      length: index - start,
+      openerStart,
+      openerLength: index - openerStart,
+      nextEqualStart: -1,
+    });
   }
 
   const nextStartByLength = new Map<number, number>();
   for (let index = runs.length - 1; index >= 0; index -= 1) {
     const run = runs[index]!;
-    run.nextEqualStart = nextStartByLength.get(run.length) ?? -1;
+    run.nextEqualStart =
+      run.openerLength > 0
+        ? (nextStartByLength.get(run.openerLength) ?? -1)
+        : -1;
     nextStartByLength.set(run.length, run.start);
   }
   return runs;
@@ -278,9 +290,13 @@ function excludedMask(body: string): Uint8Array {
   }
 
   for (const run of indexBacktickRuns(body)) {
-    if (mask[run.start] || isEscaped(body, run.start) || run.nextEqualStart < 0)
+    if (
+      run.openerLength === 0 ||
+      mask[run.openerStart] ||
+      run.nextEqualStart < 0
+    )
       continue;
-    mark(mask, run.start, run.nextEqualStart + run.length);
+    mark(mask, run.openerStart, run.nextEqualStart + run.openerLength);
   }
   return mask;
 }
