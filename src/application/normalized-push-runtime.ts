@@ -83,7 +83,7 @@ export class NormalizedPushRuntimeAdapter {
       repository: this.repository,
       local: new NormalizedPushLocalCommitter(input),
       authority: {
-        revalidate: (plan) => this.revalidate(plan),
+        revalidate: (plan, mode) => this.revalidate(plan, mode),
         readTarget: (revision) =>
           readTreeSnapshotV3(input.remote, input.mapping.spaceId, revision),
       },
@@ -234,7 +234,10 @@ export class NormalizedPushRuntimeAdapter {
     return { plan, candidate };
   }
 
-  private async revalidate(plan: NormalizedPushPlan): Promise<string> {
+  private async revalidate(
+    plan: NormalizedPushPlan,
+    mode: "current_head" | "confirmed_local_only" = "current_head",
+  ): Promise<string> {
     const epoch = this.input.epoch();
     const authority = {
       ...this.input.authority,
@@ -259,6 +262,15 @@ export class NormalizedPushRuntimeAdapter {
       },
     );
     const journal = await this.repository.read();
+    if (
+      mode === "confirmed_local_only" &&
+      (!journal ||
+        journal.binding.operationId !== plan.binding.operationId ||
+        journal.mode !== "local_only" ||
+        journal.phase !== "confirmed" ||
+        plan.mode !== "local_only")
+    )
+      throw new Error("NORMALIZED_PUSH_RECOVERY_OWNERSHIP_MISMATCH");
     let stored;
     if (journal?.binding.operationId === plan.binding.operationId) {
       stored = await this.repository.loadConfirmed(journal);
@@ -280,12 +292,14 @@ export class NormalizedPushRuntimeAdapter {
       base.revisionContentHash !== plan.sourceTreeHash
     )
       throw new Error("BASE_STALE");
-    const head = await this.input.remote.head();
-    if (
-      head.revision !== plan.sourceRevision ||
-      head.revisionContentHash !== plan.sourceTreeHash
-    )
-      throw new Error("BASE_STALE");
+    if (mode !== "confirmed_local_only") {
+      const head = await this.input.remote.head();
+      if (
+        head.revision !== plan.sourceRevision ||
+        head.revisionContentHash !== plan.sourceTreeHash
+      )
+        throw new Error("BASE_STALE");
+    }
     const capabilities = await this.input.remote.capabilities();
     if (
       (await treeCapabilitiesHashV3(capabilities)) !== plan.capabilitiesHash ||

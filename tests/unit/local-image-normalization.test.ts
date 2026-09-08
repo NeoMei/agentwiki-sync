@@ -5,6 +5,27 @@ import { parseAttachmentReferences } from "../../src/core/attachment-reference";
 import { normalizeLocalImageLinks } from "../../src/core/local-image-normalization";
 
 describe("normalizeLocalImageLinks", () => {
+  it("normalizes the image outside mixed backtick runs and retains inner code byte ranges", async () => {
+    const body = "``a ``` ![hidden](hidden.png) b`` ![A](photo.png) `c`";
+    const result = await normalizeLocalImageLinks({
+      pageId: "page-1",
+      pagePath: "pages/note.md",
+      raw: new TextEncoder().encode(body),
+      resolve: async () => ({
+        kind: "resolved",
+        attachmentPath: "assets/photo.png",
+        basenameKey: "photo.png",
+      }),
+    });
+    expect(result.body).toBe(
+      "``a ``` ![hidden](hidden.png) b`` ![A](../assets/photo.png) `c`",
+    );
+    expect(
+      result.evidence?.replacements.map(
+        (replacement) => replacement.originalTarget,
+      ),
+    ).toEqual(["photo.png"]);
+  });
   it("canonicalizes only the valid image target and preserves raw evidence", async () => {
     const body = '![A](<photo.png> "T")\n`![code](photo.png)`';
     const raw = new TextEncoder().encode(body);

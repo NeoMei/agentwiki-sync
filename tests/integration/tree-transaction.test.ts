@@ -20,6 +20,62 @@ import { MemoryVault } from "../fakes/memory-vault";
 
 const IMAGE_BYTES = Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]);
 
+it.each([false, true])(
+  "recovers a moved Page after accepted CAS response loss without deleting a late edit (late=%s)",
+  async (late) => {
+    const vault = new MemoryVault({ "pages/A.md": "original source" });
+    const control = new MemoryControlStore();
+    control.files.set("tree-preview-body/move.md", "approved result");
+    const root = ".agentwiki/tx/move-cas-loss";
+    const tx = new TreeTransaction(vault, control, root);
+    await tx.prepare({
+      baseRevision: "base",
+      targetRevision: "target",
+      targetTreeHash: "0".repeat(64),
+      deferCommit: true,
+      actions: [
+        {
+          kind: "move_page",
+          pageId: "page",
+          fromPath: "pages/A.md",
+          path: "pages/B.md",
+          bodyPath: "tree-preview-body/move.md",
+        },
+      ],
+    });
+    const cas = vault.compareAndSwap.bind(vault);
+    let hit = false;
+    vault.compareAndSwap = async (...args) => {
+      const result = await cas(...args);
+      hit = true;
+      if (late)
+        vault.seedMarkdown("pages/B.md", "third party after accepted CAS");
+      throw new Error(`accepted CAS response lost: ${result}`);
+    };
+    await expect(tx.apply()).rejects.toThrow(
+      "accepted CAS response lost: true",
+    );
+    expect(hit).toBe(true);
+    vault.compareAndSwap = cas;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const rebuilt = new TreeTransaction(vault, control, root);
+      if (late) {
+        await expect(rebuilt.recover()).rejects.toThrow(
+          "TREE_TRANSACTION_AMBIGUOUS",
+        );
+        expect(vault.text("pages/B.md")).toBe("third party after accepted CAS");
+        expect((await rebuilt.inspect())?.state).toBe("ambiguous");
+        expect(control.files.has(`${root}/before/0-0.bin`)).toBe(true);
+      } else {
+        await rebuilt.recover();
+        expect(vault.text("pages/A.md")).toBe("original source");
+        expect(vault.exists("pages/B.md")).toBe(false);
+        expect((await rebuilt.inspect())?.state).toBe("rolled_back");
+      }
+    }
+  },
+);
+
 it.each(["pages/new", "pages/new/child"])(
   "refuses an unconfirmed opaque target or ancestor before creating %s",
   async (target) => {

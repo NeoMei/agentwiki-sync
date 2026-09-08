@@ -309,26 +309,20 @@ async function pageConflictPreview(): Promise<PullPreviewV3> {
   )) as PullPreviewV3;
 }
 
-async function attachmentConflictPreview(): Promise<PullPreviewV3> {
+async function attachmentConflictPreview(
+  singlePage = false,
+): Promise<PullPreviewV3> {
   const pageOne = await page("p1", "pages/First.md", "![[assets/image.png]]", [
     "a1",
   ]);
   const pageTwo = await page("p2", "pages/Second.md", "![[assets/image.png]]", [
     "a1",
   ]);
+  const pages = singlePage ? [pageOne] : [pageOne, pageTwo];
   return (await buildTreePullPreviewV3(
-    snapshot(
-      [pageOne, pageTwo],
-      [attachment("a1", "assets/image.png", "a".repeat(64))],
-    ),
-    scan(
-      [pageOne, pageTwo],
-      [attachment("a1", "assets/image.png", "b".repeat(64))],
-    ),
-    snapshot(
-      [pageOne, pageTwo],
-      [attachment("a1", "assets/image.png", "c".repeat(64))],
-    ),
+    snapshot(pages, [attachment("a1", "assets/image.png", "a".repeat(64))]),
+    scan(pages, [attachment("a1", "assets/image.png", "b".repeat(64))]),
+    snapshot(pages, [attachment("a1", "assets/image.png", "c".repeat(64))]),
   )) as PullPreviewV3;
 }
 
@@ -477,6 +471,57 @@ describe("rendered PreviewModal controls", () => {
     digest.resolve(remoteHash);
     await vi.waitFor(() => expect(currentConfirm.disabled).toBe(false));
   });
+
+  it.each(["local", "remote"])(
+    "offers only feasible single-Page image choices and executes %s",
+    async (choice) => {
+      const preview = await attachmentConflictPreview(true);
+      const conflict = preview.attachmentConflicts[0]!;
+      expect(conflict.affectedPageIds).toEqual(["p1"]);
+      let confirmed = false;
+      const modal = new PreviewModal(
+        app,
+        "Pull",
+        () => calculationSummary(preview),
+        async () => {
+          confirmed = true;
+        },
+        undefined,
+        [],
+        preview,
+      );
+      modal.open();
+      const mode = control(
+        setting(modal.contentEl, "图片：assets/image.png"),
+        "select",
+      );
+      expect(
+        findAll(mode, (item) => item.tag === "option").map(
+          (item) => item.value,
+        ),
+      ).toEqual(["", "local", "remote"]);
+      change(mode, "keep_both");
+      click(
+        button(
+          setting(modal.contentEl, "图片：assets/image.png"),
+          "应用图片选择",
+        ),
+      );
+      expect(
+        preview.attachmentConflictResolutions[conflict.conflictId],
+      ).toBeUndefined();
+      expect(button(modal.contentEl, "确认执行").disabled).toBe(true);
+      change(mode, choice);
+      await vi.waitFor(() =>
+        expect(button(modal.contentEl, "确认执行").disabled).toBe(false),
+      );
+      expect(
+        preview.attachmentConflictResolutions[conflict.conflictId],
+      ).toEqual({ choice });
+      click(button(modal.contentEl, "确认执行"));
+      await vi.waitFor(() => expect(confirmed).toBe(true));
+    },
+  );
 
   it("invalidates an applied attachment choice on every visible draft edit", async () => {
     const preview = await attachmentConflictPreview();

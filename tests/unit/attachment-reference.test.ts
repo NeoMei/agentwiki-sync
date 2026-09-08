@@ -26,6 +26,19 @@ function normalizedClassification(
 }
 
 describe("parseAttachmentReferences", () => {
+  it("preserves the exact target range after an equal-length mixed backtick span", () => {
+    const body = "``a ``` b`` ![A](../assets/photo.png) `c`";
+    expect(parseAttachmentReferences(body, "pages/note.md")).toMatchObject([
+      {
+        syntax: "markdown",
+        classification: "local",
+        target: "../assets/photo.png",
+        resolvedPath: "assets/photo.png",
+        targetStart: 17,
+        targetEnd: 36,
+      },
+    ]);
+  });
   it.each(conformanceCases)(
     "matches neutral conformance case $name",
     ({ body, expected }) => {

@@ -24,7 +24,10 @@ import {
 } from "./tree-push-service-v3";
 
 export interface NormalizedPushAuthority {
-  revalidate(plan: NormalizedPushPlan): Promise<string>;
+  revalidate(
+    plan: NormalizedPushPlan,
+    mode?: "current_head" | "confirmed_local_only",
+  ): Promise<string>;
   readTarget(revision: string): Promise<TreeSnapshotV3>;
 }
 
@@ -61,9 +64,13 @@ const sameBytes = (left: Uint8Array, right: Uint8Array) =>
 export class NormalizedPushCoordinator {
   constructor(private readonly input: CoordinatorInput) {}
 
-  private async revalidate(plan: NormalizedPushPlan): Promise<void> {
+  private async revalidate(
+    plan: NormalizedPushPlan,
+    mode: "current_head" | "confirmed_local_only" = "current_head",
+  ): Promise<void> {
     if (
-      (await this.input.authority.revalidate(plan)) !== plan.authorizationHash
+      (await this.input.authority.revalidate(plan, mode)) !==
+      plan.authorizationHash
     )
       throw new Error("NORMALIZED_PUSH_AUTHORIZATION_CHANGED");
   }
@@ -256,7 +263,7 @@ export class NormalizedPushCoordinator {
     if (journal.mode === "local_only") {
       if (journal.phase !== "confirmed")
         throw new Error("NORMALIZED_PUSH_PARENT_PHASE_MISMATCH");
-      await this.revalidate(frozen.plan);
+      await this.revalidate(frozen.plan, "confirmed_local_only");
       const target = await this.verifiedTarget(
         journal,
         frozen.candidate,

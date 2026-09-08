@@ -4,8 +4,38 @@ import type { TreeSnapshotSegmentV3 } from "../../src/ports/tree-remote";
 import { TreeBaselineRepository } from "../../src/storage/tree-baseline";
 import { contentHash } from "../../src/agentwiki/protocol";
 import type { PushPreviewV3 } from "../../src/application/sync-runtime";
+import type { NormalizedPushPlan } from "../../src/application/normalized-push-plan";
+import attachmentConformance from "../fixtures/attachment-reference.conformance.json";
 
 const RUNTIME_ROOT = ".agentwiki/devices/d-device-1/spaces/s-space-1";
+
+it.each(
+  attachmentConformance.filter((test) => test.name.startsWith("backtick-")),
+)(
+  "keeps the referenced image in actual Runtime scanning for $name",
+  async ({ body }) => {
+    const f = await makeNormalizedRuntimeFixture("local_only");
+    f.vault.seedMarkdown("Wiki/pages/note.md", body);
+    f.runtime.invalidate();
+    f.vault.readPaths.length = 0;
+    const preview = await f.runtime.previewPushV3();
+    expect(preview.publishable).toBe(true);
+    expect(preview.blockers).toEqual([]);
+    expect(preview.changes.map((change) => change.operation)).toEqual([
+      "upsert_page",
+    ]);
+    const pageChange = preview.changes.find(
+      (change) => change.operation === "upsert_page",
+    );
+    if (pageChange?.operation !== "upsert_page")
+      throw new Error("expected Page change");
+    expect(pageChange.page.referencedAttachmentIds).toEqual([
+      "11111111-1111-4111-8111-111111111111",
+    ]);
+    expect(f.vault.readPaths).toContain("Wiki/assets/photo.png");
+    expect(f.vault.readPaths).not.toContain("Wiki/assets/hidden.png");
+  },
+);
 
 function requireNormalizedPlan(preview: PushPreviewV3) {
   const plan = preview.normalizedPush?.plan;
@@ -18,6 +48,262 @@ function baselineFor(
 ) {
   return new TreeBaselineRepository(f.control, RUNTIME_ROOT, "space-1", "Wiki");
 }
+
+async function loseConfirmedParent(
+  f: Awaited<ReturnType<typeof makeNormalizedRuntimeFixture>>,
+  preview: PushPreviewV3,
+) {
+  const write = f.control.write.bind(f.control);
+  let hit = false;
+  f.control.write = async (path, value) => {
+    await write(path, value);
+    if (
+      !hit &&
+      path.endsWith("/push/journal.json.next") &&
+      (JSON.parse(value) as { payload?: { phase?: string } }).payload?.phase ===
+        "confirmed"
+    ) {
+      hit = true;
+      throw new Error("durable confirmed return lost");
+    }
+  };
+  await expect(f.runtime.applyPushV3(preview)).rejects.toThrow(
+    "durable confirmed return lost",
+  );
+  f.control.write = write;
+  expect(hit).toBe(true);
+}
+
+it("recovers durable confirmed local-only at its fixed revision after head advances, twice, before later Pull", async () => {
+  const f = await makeNormalizedRuntimeFixture("local_only");
+  f.runtime.invalidate();
+  const preview = await f.runtime.previewPushV3();
+  const plan = requireNormalizedPlan(preview);
+  expect(plan.scanEpoch).toBeGreaterThan(0);
+  const original: TreeSnapshotSegmentV3[] = [];
+  for await (const segment of f.remote.snapshotPages(plan.sourceRevision))
+    original.push(structuredClone(segment));
+  await loseConfirmedParent(f, preview);
+  const remoteBody = "new remote edit\n![A](../assets/photo.png)";
+  const remoteHash = await contentHash(remoteBody);
+  await f.remote.seedTree({
+    spaceId: "space-1",
+    revision: "rev-2",
+    folders: original[0]!.folders,
+    pages: original[0]!.pages.map((page) => ({
+      ...page,
+      body: remoteBody,
+      contentHash: remoteHash,
+    })),
+    attachments: original[0]!.attachments,
+    blobs: {
+      "11111111-1111-4111-8111-111111111111": (await f.vault.read(
+        "Wiki/assets/photo.png",
+      ))!,
+    },
+  });
+  const snapshots = f.remote.snapshotPages.bind(f.remote);
+  f.remote.snapshotPages = async function* (revision) {
+    if (revision === plan.sourceRevision) {
+      for (const segment of original) yield structuredClone(segment);
+      return;
+    }
+    yield* snapshots(revision);
+  };
+  expect((await f.remote.head()).revision).toBe("rev-2");
+  for (let attempt = 0; attempt < 2; attempt++) await f.rebuild().recover();
+  expect(await f.rebuild().inspectNormalizedPush()).toMatchObject({
+    ...plan,
+    phase: "complete",
+    verifiedTarget: {
+      revision: "rev-1",
+      revisionContentHash: plan.candidateHash,
+    },
+  });
+  expect(f.vault.text("Wiki/pages/note.md")).toBe("![A](../assets/photo.png)");
+  expect((await baselineFor(f).read()).baseRevision).toBe("rev-1");
+  expect(f.remote.createInputs).toEqual([]);
+  expect(f.remote.uploadedBatches).toEqual([]);
+  expect(f.remote.uploadedChunkIndexes).toEqual([]);
+  expect(f.remote.finalizeCalls).toBe(0);
+  const later = f.rebuild();
+  await later.applyPullV3(await later.previewPullV3());
+  expect(f.vault.text("Wiki/pages/note.md")).toBe(remoteBody);
+  expect((await baselineFor(f).read()).baseRevision).toBe("rev-2");
+});
+
+it("rejects a forged confirmed-local-only mode without a durable journal even with a live preview", async () => {
+  const f = await makeNormalizedRuntimeFixture("local_only");
+  const preview = await f.runtime.previewPushV3();
+  const plan = preview.normalizedPush!.plan;
+  // Invoke the authority boundary directly: a mode flag is not durable authorization.
+  const adapter = (
+    f.runtime as unknown as {
+      normalizedPush: {
+        revalidate(plan: NormalizedPushPlan, mode: string): Promise<string>;
+      };
+    }
+  ).normalizedPush;
+  await expect(
+    adapter.revalidate(plan, "confirmed_local_only"),
+  ).rejects.toThrow("NORMALIZED_PUSH_RECOVERY_OWNERSHIP_MISMATCH");
+  expect(f.vault.text("Wiki/pages/note.md")).toBe("![A](photo.png)");
+  expect(await f.runtime.inspectNormalizedPush()).toBeNull();
+  expect(f.remote.createInputs).toEqual([]);
+});
+
+it.each(["wrong operation", "wrong plan", "remote mode", "complete phase"])(
+  "rejects confirmed-local-only recovery authority with %s",
+  async (scenario) => {
+    const f = await makeNormalizedRuntimeFixture(
+      scenario === "remote mode" ? "remote_push" : "local_only",
+    );
+    const preview = await f.runtime.previewPushV3();
+    const plan = requireNormalizedPlan(preview);
+    if (scenario === "complete phase") await f.runtime.applyPushV3(preview);
+    else await loseConfirmedParent(f, preview);
+    if (scenario === "wrong operation")
+      plan.binding.operationId = "00000000-0000-4000-8000-000000000099";
+    if (scenario === "wrong plan") plan.scanEpoch++;
+    const adapter = (
+      f.rebuild() as unknown as {
+        normalizedPush: {
+          revalidate(plan: NormalizedPushPlan, mode: string): Promise<string>;
+        };
+      }
+    ).normalizedPush;
+    await expect(
+      adapter.revalidate(plan, "confirmed_local_only"),
+    ).rejects.toThrow(
+      scenario === "wrong plan"
+        ? "NORMALIZED_PUSH_AUTHORIZATION_CHANGED"
+        : "NORMALIZED_PUSH_RECOVERY_OWNERSHIP_MISMATCH",
+    );
+    expect(f.remote.createInputs).toEqual([]);
+    expect(f.remote.finalizeCalls).toBe(0);
+  },
+);
+
+it("rechecks raw local bytes on durable confirmed local-only recovery", async () => {
+  const f = await makeNormalizedRuntimeFixture("local_only");
+  const preview = await f.runtime.previewPushV3();
+  const plan = requireNormalizedPlan(preview);
+  await loseConfirmedParent(f, preview);
+  f.vault.seedMarkdown("Wiki/pages/note.md", "my late edit\n![A](photo.png)");
+  await expect(f.rebuild().recover()).rejects.toThrow(
+    "NORMALIZED_PUSH_AUTHORIZATION_CHANGED",
+  );
+  expect(f.vault.text("Wiki/pages/note.md")).toBe(
+    "my late edit\n![A](photo.png)",
+  );
+  expect(await f.rebuild().inspectNormalizedPush()).toMatchObject({
+    ...plan,
+    phase: "confirmed",
+  });
+  expect((await baselineFor(f).read()).baseRevision).toBe("rev-1");
+  expect(f.remote.createInputs).toEqual([]);
+});
+
+it.each(["local_only", "remote_push"] as const)(
+  "retains the fresh confirmation head gate for %s",
+  async (mode) => {
+    const f = await makeNormalizedRuntimeFixture(mode);
+    const preview = await f.runtime.previewPushV3();
+    const head = await f.remote.head();
+    f.remote.head = async () => ({ ...head, revision: "rev-2" });
+    await expect(f.runtime.applyPushV3(preview)).rejects.toThrow("BASE_STALE");
+    expect(await f.runtime.inspectNormalizedPush()).toBeNull();
+    expect(f.remote.createInputs).toEqual([]);
+    expect(f.vault.text("Wiki/pages/note.md")).toBe("![A](photo.png)");
+  },
+);
+
+it("retains the remote-push confirmed recovery head gate before create", async () => {
+  const f = await makeNormalizedRuntimeFixture("remote_push");
+  const preview = await f.runtime.previewPushV3();
+  await loseConfirmedParent(f, preview);
+  const head = await f.remote.head();
+  f.remote.head = async () => ({ ...head, revision: "rev-2" });
+  await f.rebuild().recover();
+  expect(await f.rebuild().inspectNormalizedPush()).toMatchObject({
+    phase: "superseded",
+  });
+  expect(f.remote.createInputs).toEqual([]);
+  expect(f.remote.finalizeCalls).toBe(0);
+  expect(f.vault.text("Wiki/pages/note.md")).toBe("![A](photo.png)");
+});
+
+it.each(["after rename", "before atomic replacement", "no late edit"])(
+  "preserves a moved normalized Pull Page edited %s and its old baseline",
+  async (boundary) => {
+    const f = await makeNormalizedRuntimeFixture("local_only");
+    const segments: TreeSnapshotSegmentV3[] = [];
+    for await (const segment of f.remote.snapshotPages("rev-1"))
+      segments.push(segment);
+    const current = segments[0]!;
+    await f.remote.seedTree({
+      spaceId: "space-1",
+      revision: "rev-2",
+      folders: current.folders,
+      pages: current.pages.map((page) => ({ ...page, path: "pages/moved.md" })),
+      attachments: current.attachments,
+      blobs: {
+        "11111111-1111-4111-8111-111111111111": (await f.vault.read(
+          "Wiki/assets/photo.png",
+        ))!,
+      },
+    });
+    const preview = await f.runtime.previewPullV3();
+    expect(preview.actions.map((action) => action.kind)).toEqual(["move_page"]);
+    if (boundary === "no late edit") {
+      await f.runtime.applyPullV3(preview);
+      await f.rebuild().recover();
+      expect(f.vault.text("Wiki/pages/moved.md")).toBe(
+        "![A](../assets/photo.png)",
+      );
+      expect(f.vault.exists("Wiki/pages/note.md")).toBe(false);
+      expect((await baselineFor(f).read()).baseRevision).toBe("rev-2");
+      return;
+    }
+    let hit = false;
+    if (boundary === "after rename") {
+      f.vault.onRename = (_from, to) => {
+        if (to === "Wiki/pages/moved.md") {
+          hit = true;
+          f.vault.seedMarkdown(to, "THIRD PARTY EDIT");
+        }
+      };
+    } else {
+      const cas = f.vault.compareAndSwap.bind(f.vault);
+      f.vault.compareAndSwap = async (path, expected, replacement) => {
+        if (path === "Wiki/pages/moved.md") {
+          expect(new TextDecoder().decode(expected!)).toBe("![A](photo.png)");
+          expect(await f.vault.read(path)).toEqual(expected);
+          hit = true;
+          f.vault.seedMarkdown(path, "THIRD PARTY EDIT");
+        }
+        return cas(path, expected, replacement);
+      };
+    }
+    await expect(f.runtime.applyPullV3(preview)).rejects.toThrow(
+      "TREE_TRANSACTION_AMBIGUOUS",
+    );
+    expect(hit).toBe(true);
+    expect(f.vault.text("Wiki/pages/moved.md")).toBe("THIRD PARTY EDIT");
+    expect((await baselineFor(f).read()).baseRevision).toBe("rev-1");
+    for (let attempt = 0; attempt < 2; attempt++)
+      await expect(f.rebuild().recover()).rejects.toThrow(
+        "TREE_TRANSACTION_AMBIGUOUS",
+      );
+    expect(f.vault.text("Wiki/pages/moved.md")).toBe("THIRD PARTY EDIT");
+    expect((await baselineFor(f).read()).baseRevision).toBe("rev-1");
+    expect(
+      [...f.control.files.values()].some((value) =>
+        value.includes('"state":"ambiguous"'),
+      ),
+    ).toBe(true);
+  },
+);
 
 it("retains confirmed private payload when an invalidated authority closes its original preview", async () => {
   const f = await makeNormalizedRuntimeFixture("local_only");

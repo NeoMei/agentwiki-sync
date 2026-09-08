@@ -1101,12 +1101,7 @@ export class TreeTransaction {
         break;
       case "move_page": {
         await this.vault.rename(action.fromPath, action.path);
-        const after = operation.paths.find((item) => item.path === action.path);
-        const current = await this.vault.read(action.path);
-        const currentHash = current ? await sha256Hex(current) : null;
-        if (after && currentHash !== after.after.hash) {
-          await this.vault.write(action.path, await this.resultBody(index));
-        }
+        await this.compareAndSwapPage(index, operation, false);
         break;
       }
       case "trash_page":
@@ -1145,14 +1140,16 @@ export class TreeTransaction {
     operation: JournalOperation,
     rollback: boolean,
   ): Promise<void> {
-    const path = operation.paths[0]!;
-    const before = await this.beforeBytes(index, operation, path.path);
+    const source = operation.paths[0]!;
+    const target =
+      operation.action.kind === "move_page" ? operation.paths[1]! : source;
+    const before = await this.beforeBytes(index, operation, source.path);
     const result = await this.resultBody(index);
-    if ((await sha256Hex(result)) !== path.after.hash)
+    if ((await sha256Hex(result)) !== target.after.hash)
       throw new Error("Page transaction result sidecar changed");
     if (
       !(await this.vault.compareAndSwap(
-        path.path,
+        target.path,
         rollback ? result : before,
         rollback ? before : result,
       ))

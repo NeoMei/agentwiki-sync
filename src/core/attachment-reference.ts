@@ -254,9 +254,23 @@ function excludedMask(body: string): Uint8Array {
     if (mask[index] || body[index] !== "`" || isEscaped(body, index)) continue;
     let runLength = 1;
     while (body[index + runLength] === "`") runLength += 1;
-    const delimiter = "`".repeat(runLength);
-    const close = body.indexOf(delimiter, index + runLength);
-    if (close < 0) continue;
+    let close = -1;
+    let cursor = index + runLength;
+    while (cursor < body.length) {
+      const start = body.indexOf("`", cursor);
+      if (start < 0) break;
+      let end = start + 1;
+      while (body[end] === "`") end += 1;
+      if (end - start === runLength) {
+        close = start;
+        break;
+      }
+      cursor = end;
+    }
+    if (close < 0) {
+      index += runLength - 1;
+      continue;
+    }
     mark(mask, index, close + runLength);
     index = close + runLength - 1;
   }

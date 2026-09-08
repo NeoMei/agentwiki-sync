@@ -1,5 +1,53 @@
 [
   {
+    "name": "backtick-equal-run-image-after-mixed-span",
+    "body": "``a ``` b`` ![A](../assets/photo.png) `c`",
+    "expected": [
+      {
+        "syntax": "markdown",
+        "classification": "managed",
+        "rawTarget": "../assets/photo.png",
+        "resolvedPath": "assets/photo.png"
+      }
+    ]
+  },
+  {
+    "name": "backtick-long-opening-short-inner-run",
+    "body": "text ```a `` b``` ![A](../assets/photo.png) `c`",
+    "expected": [
+      {
+        "syntax": "markdown",
+        "classification": "managed",
+        "rawTarget": "../assets/photo.png",
+        "resolvedPath": "assets/photo.png"
+      }
+    ]
+  },
+  {
+    "name": "backtick-unclosed-opening-keeps-following-image",
+    "body": "``unclosed ![A](../assets/photo.png) `c`",
+    "expected": [
+      {
+        "syntax": "markdown",
+        "classification": "managed",
+        "rawTarget": "../assets/photo.png",
+        "resolvedPath": "assets/photo.png"
+      }
+    ]
+  },
+  {
+    "name": "backtick-mixed-span-excludes-inside-image",
+    "body": "``a ``` ![hidden](../assets/hidden.png) b`` ![A](../assets/photo.png) `c`",
+    "expected": [
+      {
+        "syntax": "markdown",
+        "classification": "managed",
+        "rawTarget": "../assets/photo.png",
+        "resolvedPath": "assets/photo.png"
+      }
+    ]
+  },
+  {
     "name": "canonical",
     "body": "![[assets/a.png|320]]",
     "expected": [

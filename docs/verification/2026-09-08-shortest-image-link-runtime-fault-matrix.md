@@ -11,7 +11,7 @@
 - confirmed 父 journal `.next` 写成功后仅返回丢失：`replays the original Runtime plan when the confirmed parent write succeeds but its return is lost`。MemoryControlStore 真实写入先完成，已持久 `confirmed` 与原 plan 精确匹配，故障时 0 create 且 baseline 不前推；重建后仅发布一次。
 - Page CAS 写成功后仅返回丢失：`recovers the actual Runtime after the Page CAS succeeds but its return is lost`。真实 `compareAndSwap` 先修改 Vault，再丢弃返回；`operationLog` 证明命中 CAS，本地规范正文与原 plan 保留，baseline 在恢复完成后才前推，只有一个发布结果。
 - `local_only` 本地中断恢复后再 Pull 新 head：`recovers a local-only repair with zero remote mutations and then Pulls a new head`。pending 时 Pull / new Push 均以 `PUSH_RECOVERY_REQUIRED` 拒绝；本地恢复的 create/batch/chunk/finalize 计数全为 0；恢复后 Pull `rev-2` 并前推 baseline，再次 Push 为零动作。
-- terminal schema 4 后产生普通 schema 3 Push：`hands a terminal schema-4 repair forward to the ordinary schema-3 Push owner`。schema 4 `complete` 不阻断后续普通 Page edit；根 journal 由原 owner 产生合法 schema 3 `published/verified`，不清除旧终态证据。
+- terminal schema 4 后产生普通 schema 3 Push：`hands a terminal schema-4 repair forward to the ordinary schema-3 Push owner`。该 Runtime 用例证明 schema 4 `complete` 不阻断后续普通 Page edit，根 journal 由原 owner 产生合法 schema 3 `published/verified`。旧 terminal envelope/generation 留存另由 `src/storage/push-journal-router.ts` 的 retain 路径及 `tests/integration/normalized-push-storage.test.ts` 的留存回归证明，不能归为此 Runtime 单用例的断言。
 
 ## 生命周期矩阵
 
@@ -22,15 +22,15 @@
 
 ## 原遗留项逐项 triage
 
-- Task 19 I1 真实 production factory 协商：`COVERAGE_PRESENT / FINAL_VERDICT_PENDING`。`local-image-upgrade-entry.test.ts` 已有真实 `ProtocolNegotiator` + plugin factory + 受控 HTTP，覆盖 legacy 无图 strict v2、native 无图 strict v3、旧 v1/v2 图片拒绝及 v3 失败不降级。不重写 I1；等待 `de1582cc…HEAD` whole-branch reviewer 给出显式闭合 verdict。
+- Task 19 I1 真实 production factory 协商：`CLOSED`。wholebranch-review.md 已依据真实 `ProtocolNegotiator` + plugin factory + 受控 HTTP 覆盖 legacy 无图 strict v2、native 无图 strict v3、旧 v1/v2 图片拒绝及 v3 失败不降级，显式关闭原 finding；整体发布门仍未闭合。
 - Task 19 I2 / I3 与确定性 Finalize 冲突：`CLOSED`。引用 `.superpowers/sdd/2026-09-06-local-first-image-upgrade/task19-i2-i3-fix-review.md` 的独立闭合结论；本轮不重派、不重复修复。
-- Task 12 parser parity：`OPEN_CROSS_PROJECT_EVIDENCE`。plugin 本地 parser 的分类/路径/边界单元覆盖仍通过，但原 review 要求的 server/plugin 同一组分类/路径/ID 向量并未在本插件任务中产生；不将本地回归冒充跨仓闭合。
+- Task 12 parser parity：`OPEN_CROSS_PROJECT_EVIDENCE`。wholebranch-review.md 确认原 40 组分类/路径/range 与预绑定 ID 为限定向量 PASS，但新 I2 backtick 场景使最终 parser/parity 门重新 OPEN。新增中性向量仍需独立 server 修正与双端实际 resolver/scan 对照，插件本地回归不替代跨仓闭合。
 - Task 12 最后引用零读取：`COVERED / PASS`。`sync-runtime.test.ts` 的 `detaches the last reference without deleting local files or reading unreferenced images` 断言 detach、本地图保留、未引用图不读取且上传 requirement 为 0；完整门 1265/1265 包含该用例。
-- Task 16 Runtime 职责：`DEFERRED_COHESION_CONCERN`。`sync-runtime.ts` 当前 2846 行；后续已抽出 `tree-snapshot-reader.ts` 275 行和 `tree-local-apply-v3.ts` 311 行，原建议不可原样重发，但 Runtime 仍大且多故障域，留给 whole-branch 职责审查，不称已修复。
-- Task 18 async resolver + 分页重渲染：`COVERAGE_PRESENT / FINAL_VERDICT_PENDING`。`preview-modal-interactions.test.ts` 的 `keeps the full repair count across async resolution, small-page pagination and invalidation` 及 rapid latest-choice 用例覆盖当前行为。原 conservative detached-row minor 的最终闭合仍交 whole-branch review，不将“延后”写成“已修复”。
-- U6 entry 职责：`DEFERRED_COHESION_CONCERN`。`local-image-upgrade-entry.ts` 当前 1028 行；本轮只扩展消费它的真实 factory 矩阵，没有以测试任务名义重构产品。
+- Task 16 Runtime 职责：`ACCEPTED_NONBLOCKING_MAINTENANCE_DEBT`。wholebranch-review.md 确认已拆出 snapshot reader、shared local apply 与 normalized adapter，未见重复发布引擎；Runtime 仍大，不称已重构完。
+- Task 18 async resolver + 分页重渲染：`CLOSED`。wholebranch-review.md 依据 `preview-modal-interactions.test.ts` 实际挂起 digest、翻页后恢复并断言当前确认按钮启用的用例，以及 latest-choice generation，显式关闭 detached-row finding。repair-count 用例仅为补充证据。
+- U6 entry 职责：`ACCEPTED_NONBLOCKING_MAINTENANCE_DEBT`。wholebranch-review.md 接受现有职责拆分及原引擎持有事实，不要求按行数重构；本轮没有扩大产品重构范围。
 - 17 条 lint warnings：`BASELINE_RETAINED`。本轮 `npm run check` 仍为 0 errors / 17 warnings，文件和规则列表保存在 `fullcheck.log`；本轮改动的两个测试文件没有新 warning，未关闭规则或伪称 pristine lint。
-- single-Page keep-both 非空 proper subset：`SPEC_CONFORMING_LIMIT / FINAL_VERDICT_PENDING`。Core 要求 `0 < redirects < affectedPages`。对单引用 Page 不存在非空真子集；若全部 redirect，原 identity 将退出当前受管引用集合，不是规格中“保留两份”。因此当前限制与权威规格的原子引用集合和用户显式 Page 分流相符；这仍是可见产品限制，最终 verdict 由 whole-branch reviewer 确认，本轮不扩展语义。
+- single-Page keep-both 非空 proper subset：`CORE_SPEC_CONFORMING / UI_M3_FIX_REVIEW_PENDING`。wholebranch-review.md 确认 Core 的 `0 < redirects < affectedPages` 规则符合规格，发现单 Page 仍展示不可完成选项的 UI M3。最终 fix wave 已移除此不可行选项并保持两个可完成选择，待 scoped re-review；不扩展同 Page 单引用分流语义。
 
 ## 本地命令证据
 

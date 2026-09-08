@@ -960,30 +960,31 @@ export class PreviewModal extends Modal {
       }
     };
 
-    setting.addDropdown((dropdown) =>
+    const canKeepBoth = conflict.affectedPageIds.length >= 2;
+    if (!canKeepBoth && draft.mode === "keep_both") draft.mode = "";
+    setting.addDropdown((dropdown) => {
       dropdown
         .addOption("", "请选择…")
         .addOption("local", "保留本地")
-        .addOption("remote", "使用服务器")
-        .addOption("keep_both", "同时保留")
-        .setValue(draft.mode)
-        .onChange((value) => {
-          draft.mode =
-            value === "local" || value === "remote" || value === "keep_both"
-              ? value
-              : "";
-          if (draft.mode === "local" || draft.mode === "remote") applyDraft();
-          else
-            this.clearDecision(
-              `attachment:${conflict.conflictId}`,
-              () =>
-                delete preview.attachmentConflictResolutions[
-                  conflict.conflictId
-                ],
-              refreshActionState,
-            );
-        }),
-    );
+        .addOption("remote", "使用服务器");
+      if (canKeepBoth) dropdown.addOption("keep_both", "同时保留");
+      dropdown.setValue(draft.mode).onChange((value) => {
+        draft.mode =
+          value === "local" ||
+          value === "remote" ||
+          (value === "keep_both" && canKeepBoth)
+            ? value
+            : "";
+        if (draft.mode === "local" || draft.mode === "remote") applyDraft();
+        else
+          this.clearDecision(
+            `attachment:${conflict.conflictId}`,
+            () =>
+              delete preview.attachmentConflictResolutions[conflict.conflictId],
+            refreshActionState,
+          );
+      });
+    });
     setting.addDropdown((dropdown) =>
       dropdown
         .addOption("local", "主版本：本地")
