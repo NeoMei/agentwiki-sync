@@ -240,6 +240,11 @@ export interface PullPreviewV3 extends TreePullPreviewV3 {
   capabilities: TreeSyncCapabilitiesV3;
   transferId: string | null;
   expectedVaultPathStates: Record<string, TreeTransactionPathState>;
+  sameRevisionMissingAttachmentIds?: string[];
+}
+
+export interface PullPreviewV3Behavior {
+  repairSameRevisionMissingRemoteAttachments?: true;
 }
 
 export interface ApplyPullGuard {
@@ -1003,13 +1008,26 @@ export class SyncRuntime {
     if (preview.scanEpoch !== this.scanEpoch)
       throw new Error("STALE_PULL_PREVIEW");
     {
-      const fresh = await this.scanV3(
+      const scannedFresh = await this.scanV3(
         preview.base,
         preview.capabilities,
         undefined,
         preview.local.normalizations.length > 0,
         false,
       );
+      const repair = preview.sameRevisionMissingAttachmentIds?.length
+        ? this.repairSameRevisionMissingRemoteAttachments(
+            scannedFresh,
+            preview.base,
+            preview.remote,
+          )
+        : { local: scannedFresh, attachmentIds: [] };
+      const fresh = repair.local;
+      if (
+        JSON.stringify(repair.attachmentIds) !==
+        JSON.stringify(preview.sameRevisionMissingAttachmentIds ?? [])
+      )
+        throw new Error("STALE_PULL_PREVIEW");
       expectedV3PathStates(fresh, preview.actions);
       if (
         fresh.blockers.length ||
@@ -1679,7 +1697,90 @@ export class SyncRuntime {
     );
   }
 
-  async previewPullV3(options?: SyncOperationOptions): Promise<PullPreviewV3> {
+  private repairSameRevisionMissingRemoteAttachments(
+    local: LocalTreeScanV3,
+    base: TreeSnapshotV3,
+    remote: TreeSnapshotV3,
+  ): { local: LocalTreeScanV3; attachmentIds: string[] } {
+    if (
+      base.revision === "0" ||
+      base.revision !== remote.revision ||
+      base.revisionContentHash !== remote.revisionContentHash
+    )
+      throw new Error("SAME_REVISION_REPAIR_REQUIRES_MATCHING_BASE");
+    const candidate = structuredClone(local);
+    const baseAttachments = new Map(
+      base.attachments.map((attachment) => [
+        attachment.attachmentId,
+        attachment,
+      ]),
+    );
+    const remoteAttachments = new Map(
+      remote.attachments.map((attachment) => [
+        attachment.attachmentId,
+        attachment,
+      ]),
+    );
+    const basePages = new Map(base.pages.map((page) => [page.pageId, page]));
+    const remotePages = new Map(
+      remote.pages.map((page) => [page.pageId, page]),
+    );
+    const repairedBlockers = new Set<number>();
+    const repairedIds = new Set<string>();
+
+    for (const [index, blocker] of candidate.blockers.entries()) {
+      if (
+        blocker.code !== "ATTACHMENT_MISSING" ||
+        !blocker.pagePath ||
+        (!blocker.path && !blocker.target)
+      )
+        continue;
+      const missingPath = blocker.path ?? `assets/${blocker.target!}`;
+      const localPage = candidate.pages.find(
+        (page) => pathKey(page.path) === pathKey(blocker.pagePath!),
+      );
+      if (!localPage) continue;
+      const basePage = basePages.get(localPage.pageId);
+      const remotePage = remotePages.get(localPage.pageId);
+      if (!basePage || !remotePage) continue;
+      const matches = remotePage.referencedAttachmentIds.filter(
+        (attachmentId) => {
+          if (!basePage.referencedAttachmentIds.includes(attachmentId))
+            return false;
+          const baseAttachment = baseAttachments.get(attachmentId);
+          const remoteAttachment = remoteAttachments.get(attachmentId);
+          return (
+            !!baseAttachment &&
+            !!remoteAttachment &&
+            pathKey(baseAttachment.path) === pathKey(missingPath) &&
+            baseAttachment.path === remoteAttachment.path &&
+            baseAttachment.mimeType === remoteAttachment.mimeType &&
+            baseAttachment.sizeBytes === remoteAttachment.sizeBytes &&
+            baseAttachment.width === remoteAttachment.width &&
+            baseAttachment.height === remoteAttachment.height &&
+            baseAttachment.contentHash === remoteAttachment.contentHash &&
+            baseAttachment.updatedAt === remoteAttachment.updatedAt
+          );
+        },
+      );
+      if (matches.length !== 1) continue;
+      localPage.referencedAttachmentIds = [
+        ...new Set([...localPage.referencedAttachmentIds, matches[0]!]),
+      ].sort();
+      repairedBlockers.add(index);
+      repairedIds.add(matches[0]!);
+    }
+
+    candidate.blockers = candidate.blockers.filter(
+      (_blocker, index) => !repairedBlockers.has(index),
+    );
+    return { local: candidate, attachmentIds: [...repairedIds].sort() };
+  }
+
+  async previewPullV3(
+    options?: SyncOperationOptions,
+    behavior?: PullPreviewV3Behavior,
+  ): Promise<PullPreviewV3> {
     if (await this.hasUnfinishedPush())
       throw new Error("PUSH_RECOVERY_REQUIRED");
     await this.assertNoActiveV3PullTransaction();
@@ -1693,9 +1794,22 @@ export class SyncRuntime {
     const remote = await this.downloadRemoteSnapshotV3(head.revision, options);
     const capabilities = await remotePort.capabilities();
     const base = (await this.readBaseSnapshotV3()) ?? this.emptySnapshotV3();
-    const local = await this.scanV3(base, capabilities, options, true);
+    const scannedLocal = await this.scanV3(base, capabilities, options, true);
+    const repair = behavior?.repairSameRevisionMissingRemoteAttachments
+      ? this.repairSameRevisionMissingRemoteAttachments(
+          scannedLocal,
+          base,
+          remote,
+        )
+      : { local: scannedLocal, attachmentIds: [] };
+    const local = repair.local;
     const scanEpoch = this.scanEpoch;
     const missing = remote.attachments.filter((attachment) => {
+      if (
+        behavior?.repairSameRevisionMissingRemoteAttachments &&
+        !repair.attachmentIds.includes(attachment.attachmentId)
+      )
+        return false;
       const localAttachment = local.attachments.find(
         (item) => item.attachmentId === attachment.attachmentId,
       );
@@ -1747,6 +1861,7 @@ export class SyncRuntime {
         local,
         tree.actions,
       ),
+      sameRevisionMissingAttachmentIds: repair.attachmentIds,
     };
   }
 

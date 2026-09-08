@@ -698,7 +698,8 @@ describe("plugin settings lifecycle", () => {
           items: [],
         };
       },
-      previewPullV3: async () => {
+      previewPullV3: async (_options: unknown, behavior: unknown) => {
+        expect(behavior).toBeUndefined();
         calls.push("preview-pull-v3");
         return pullPreview;
       },
@@ -878,6 +879,165 @@ describe("plugin settings lifecycle", () => {
       "confirm-bootstrap-v3",
       "apply-pull-v3",
     ]);
+    open.mockRestore();
+  });
+
+  it("routes an explicit same-revision server Pull through a missing-attachment preview and confirmation", async () => {
+    const harness = await makePlugin({
+      data: {
+        schemaVersion: 2,
+        serverUrl: "https://wiki.example.com",
+        mappings: legacyWithMapping.mappings,
+      },
+    });
+    await harness.plugin.onload();
+    const pullPreview = {
+      capabilities: V3_CAPABILITIES,
+      blockers: [],
+      local: { normalizations: [] },
+      attachmentConflicts: [],
+      attachmentConflictResolutions: {},
+      folderConflicts: [],
+      folderConflictResolutions: {},
+      pageConflicts: [],
+      pageConflictResolutions: {},
+      actions: [
+        {
+          kind: "create_attachment" as const,
+          source: "remote" as const,
+          attachment: {
+            attachmentId: "a1",
+            path: "assets/image.png",
+          },
+        },
+      ],
+      sameRevisionMissingAttachmentIds: ["a1"],
+    } as unknown as PullPreviewV3;
+    const calls: string[] = [];
+    const runtime = {
+      protocolVersion: "3" as const,
+      inspectNormalizedPush: async () => null,
+      recover: async () => calls.push("recover"),
+      remoteDeltaV3: async () => {
+        calls.push("delta-v3");
+        return {
+          protocolVersion: "3" as const,
+          baseRevision: "r1",
+          remoteRevision: "r1",
+          ahead: false,
+          listed: false,
+          items: [],
+          resultingPages: [],
+        };
+      },
+      previewPullV3: async (_options: unknown, behavior: unknown) => {
+        expect(behavior).toEqual({
+          repairSameRevisionMissingRemoteAttachments: true,
+        });
+        calls.push("preview-pull-v3");
+        return pullPreview;
+      },
+      applyPullV3: async (value: unknown) => {
+        expect(value).toBe(pullPreview);
+        calls.push("apply-pull-v3");
+      },
+      discardPullPreviewV3: async () => calls.push("discard-pull-v3"),
+    };
+    const subject = harness.plugin as unknown as {
+      runtime: () => Promise<typeof runtime>;
+      runSyncStrategy: (
+        spaceId: string,
+        strategy: "server",
+        options: unknown,
+      ) => Promise<ModalTransition | void>;
+    };
+    subject.runtime = async () => runtime;
+    let opened: PreviewModal | null = null;
+    const open = vi
+      .spyOn(PreviewModal.prototype, "open")
+      .mockImplementation(function (this: PreviewModal) {
+        this.onOpen();
+      });
+
+    const transition = await subject.runSyncStrategy("s1", "server", {});
+    expect(transition).toBeTypeOf("function");
+    transition?.();
+    opened = open.mock.instances.at(-1) ?? null;
+    expect((opened as unknown as { preview: unknown } | null)?.preview).toBe(
+      pullPreview,
+    );
+    expect(calls).toEqual(["recover", "delta-v3", "preview-pull-v3"]);
+    modalButton(opened!, "确认执行").dispatchEvent({ type: "click" });
+    await vi.waitFor(() => expect(calls).toContain("apply-pull-v3"));
+    expect(calls).not.toContain("discard-pull-v3");
+    open.mockRestore();
+  });
+
+  it("keeps an intact explicit same-revision server Pull as a no-op", async () => {
+    const harness = await makePlugin({
+      data: {
+        schemaVersion: 2,
+        serverUrl: "https://wiki.example.com",
+        mappings: legacyWithMapping.mappings,
+      },
+    });
+    await harness.plugin.onload();
+    const calls: string[] = [];
+    const runtime = {
+      protocolVersion: "3" as const,
+      inspectNormalizedPush: async () => null,
+      recover: async () => calls.push("recover"),
+      remoteDeltaV3: async () => {
+        calls.push("delta-v3");
+        return {
+          protocolVersion: "3" as const,
+          baseRevision: "r1",
+          remoteRevision: "r1",
+          ahead: false,
+          listed: false,
+          items: [],
+          resultingPages: [],
+        };
+      },
+      previewPullV3: async (_options: unknown, behavior: unknown) => {
+        expect(behavior).toEqual({
+          repairSameRevisionMissingRemoteAttachments: true,
+        });
+        calls.push("preview-pull-v3");
+        return {
+          actions: [],
+          blockers: [],
+          attachmentConflicts: [],
+          folderConflicts: [],
+          pageConflicts: [],
+          sameRevisionMissingAttachmentIds: [],
+        } as unknown as PullPreviewV3;
+      },
+      applyPullV3: async () => calls.push("apply-pull-v3"),
+      discardPullPreviewV3: async () => calls.push("discard-pull-v3"),
+    };
+    const subject = harness.plugin as unknown as {
+      runtime: () => Promise<typeof runtime>;
+      runSyncStrategy: (
+        spaceId: string,
+        strategy: "server",
+        options: unknown,
+      ) => Promise<ModalTransition | void>;
+    };
+    subject.runtime = async () => runtime;
+    const open = vi.spyOn(PreviewModal.prototype, "open");
+
+    await expect(
+      subject.runSyncStrategy("s1", "server", {}),
+    ).resolves.toBeUndefined();
+
+    expect(calls).toEqual([
+      "recover",
+      "delta-v3",
+      "preview-pull-v3",
+      "discard-pull-v3",
+    ]);
+    expect(open).not.toHaveBeenCalled();
     open.mockRestore();
   });
 });

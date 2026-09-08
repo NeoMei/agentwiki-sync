@@ -1916,13 +1916,47 @@ export default class AgentWikiSyncPlugin extends Plugin {
     options: SyncOperationOptions,
   ): Promise<ModalTransition | void> {
     const delta = await runtime.remoteDeltaV3();
-    if (!delta.ahead) {
+    const sameRevisionAttachmentRepair =
+      !delta.ahead &&
+      delta.baseRevision !== "0" &&
+      preference === "remote" &&
+      !pushAfterPull;
+    if (!delta.ahead && !sameRevisionAttachmentRepair) {
       new Notice("服务器没有新的变更可应用。");
       flow.finish();
       return;
     }
     try {
-      const preview = await runtime.previewPullV3(options);
+      const preview = await runtime.previewPullV3(
+        options,
+        sameRevisionAttachmentRepair
+          ? { repairSameRevisionMissingRemoteAttachments: true }
+          : undefined,
+      );
+      if (sameRevisionAttachmentRepair) {
+        const attachmentIds = new Set(
+          preview.sameRevisionMissingAttachmentIds ?? [],
+        );
+        const missingOnly =
+          attachmentIds.size > 0 &&
+          preview.blockers.length === 0 &&
+          preview.attachmentConflicts.length === 0 &&
+          preview.folderConflicts.length === 0 &&
+          preview.pageConflicts.length === 0 &&
+          preview.actions.length === attachmentIds.size &&
+          preview.actions.every(
+            (action) =>
+              action.kind === "create_attachment" &&
+              action.source === "remote" &&
+              attachmentIds.has(action.attachment.attachmentId),
+          );
+        if (!missingOnly) {
+          await runtime.discardPullPreviewV3(preview);
+          new Notice("服务器没有新的变更可应用。");
+          flow.finish();
+          return;
+        }
+      }
       await this.resolveV3Preference(preview, preference);
       return this.openPreparedV3Pull(
         runtime,
