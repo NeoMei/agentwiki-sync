@@ -25,7 +25,68 @@ function normalizedClassification(
     : classification;
 }
 
+function increasingBacktickProbe(runCount: number): {
+  indexedReads: number;
+  raw: string;
+  references: ReturnType<typeof parseAttachmentReferences>;
+} {
+  const raw = `text ${Array.from({ length: runCount }, (_, index) =>
+    "`".repeat(index + 1),
+  ).join(" x ")} ![A](../assets/photo.png)`;
+  let indexedReads = 0;
+  const measured = new Proxy(Object(raw), {
+    get(target, property) {
+      if (typeof property === "string" && /^(?:0|[1-9]\d*)$/u.test(property))
+        indexedReads += 1;
+      const value = Reflect.get(target, property) as unknown;
+      if (typeof value !== "function") return value;
+      return (...parameters: unknown[]) =>
+        (value as (...args: unknown[]) => unknown).apply(raw, parameters);
+    },
+  }) as unknown as string;
+
+  const references = parseAttachmentReferences(measured, "pages/note.md");
+  return { indexedReads, raw, references };
+}
+
 describe("parseAttachmentReferences", () => {
+  it("bounds indexed reads across increasing unmatched backtick runs", () => {
+    const medium = increasingBacktickProbe(100);
+    const large = increasingBacktickProbe(200);
+
+    expect(large.indexedReads).toBeLessThanOrEqual(medium.indexedReads * 5);
+  });
+
+  it("retains the exact following image after increasing unmatched backtick runs", () => {
+    const { raw, references } = increasingBacktickProbe(200);
+    const target = "../assets/photo.png";
+    const targetStart = raw.length - target.length - 1;
+
+    expect(references).toMatchObject([
+      {
+        syntax: "markdown",
+        classification: "local",
+        target,
+        resolvedPath: "assets/photo.png",
+        targetStart,
+        targetEnd: targetStart + target.length,
+      },
+    ]);
+    expect(raw.slice(targetStart, targetStart + target.length)).toBe(target);
+  });
+
+  it("uses a complete run inside a comment to close an inline-code span", () => {
+    const body =
+      "`open ![inside](../assets/inside.png) <!-- ` --> " +
+      "![outside](../assets/outside.png)";
+
+    expect(
+      parseAttachmentReferences(body, "pages/note.md").map(
+        (reference) => reference.resolvedPath,
+      ),
+    ).toEqual(["assets/outside.png"]);
+  });
+
   it("preserves the exact target range after an equal-length mixed backtick span", () => {
     const body = "``a ``` b`` ![A](../assets/photo.png) `c`";
     expect(parseAttachmentReferences(body, "pages/note.md")).toMatchObject([

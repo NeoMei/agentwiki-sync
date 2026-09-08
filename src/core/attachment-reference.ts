@@ -189,6 +189,33 @@ function activeFenceContent(
   return { inside: true, content: line.slice(cursor) };
 }
 
+interface BacktickRun {
+  start: number;
+  length: number;
+  nextEqualStart: number;
+}
+
+function indexBacktickRuns(body: string): BacktickRun[] {
+  const runs: BacktickRun[] = [];
+  for (let index = 0; index < body.length;) {
+    if (body[index] !== "`") {
+      index += 1;
+      continue;
+    }
+    const start = index;
+    while (body[index] === "`") index += 1;
+    runs.push({ start, length: index - start, nextEqualStart: -1 });
+  }
+
+  const nextStartByLength = new Map<number, number>();
+  for (let index = runs.length - 1; index >= 0; index -= 1) {
+    const run = runs[index]!;
+    run.nextEqualStart = nextStartByLength.get(run.length) ?? -1;
+    nextStartByLength.set(run.length, run.start);
+  }
+  return runs;
+}
+
 function excludedMask(body: string): Uint8Array {
   const mask = new Uint8Array(body.length);
   for (const match of body.matchAll(/<!--[\s\S]*?(?:-->|$)/gu))
@@ -250,29 +277,10 @@ function excludedMask(body: string): Uint8Array {
     offset += lineWithBreak.length;
   }
 
-  for (let index = 0; index < body.length; index += 1) {
-    if (mask[index] || body[index] !== "`" || isEscaped(body, index)) continue;
-    let runLength = 1;
-    while (body[index + runLength] === "`") runLength += 1;
-    let close = -1;
-    let cursor = index + runLength;
-    while (cursor < body.length) {
-      const start = body.indexOf("`", cursor);
-      if (start < 0) break;
-      let end = start + 1;
-      while (body[end] === "`") end += 1;
-      if (end - start === runLength) {
-        close = start;
-        break;
-      }
-      cursor = end;
-    }
-    if (close < 0) {
-      index += runLength - 1;
+  for (const run of indexBacktickRuns(body)) {
+    if (mask[run.start] || isEscaped(body, run.start) || run.nextEqualStart < 0)
       continue;
-    }
-    mark(mask, index, close + runLength);
-    index = close + runLength - 1;
+    mark(mask, run.start, run.nextEqualStart + run.length);
   }
   return mask;
 }
