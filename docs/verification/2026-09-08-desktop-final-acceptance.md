@@ -1,6 +1,6 @@
 # Desktop final-candidate continuation
 
-Latest status: public six-case gate PASS 6/6; see the final section. Earlier NOT_RUN statements are historical. Distinct fresh native first-image/offline matrix and release gates remain open.
+Latest status: public six-case gate PASS 6/6; fresh final-bundle native first-image, whole-machine offline restart and detach/re-reference gates also PASS; see [final native gates](2026-09-08-final-native-release-gates.md). Earlier NOT_RUN statements are historical. GitHub publication and official asset verification are separate release-stage gates.
 
 2026-09-08. User explicitly authorized desktop Obsidian restart and continuation; later confirmed the exact Chinese-space-path test upload preview.
 
