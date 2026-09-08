@@ -1,5 +1,7 @@
 # Desktop final-candidate continuation
 
+Latest status: public six-case gate PASS 6/6; see the final section. Earlier NOT_RUN statements are historical. Distinct fresh native first-image/offline matrix and release gates remain open.
+
 2026-09-08. User explicitly authorized desktop Obsidian restart and continuation; later confirmed the exact Chinese-space-path test upload preview.
 
 ## Candidate and isolation
@@ -46,3 +48,17 @@ Actual v3 list reports all ten existing owner synthetic Spaces as native_v3; can
 Current browser is logged in as Admin; target membership shows distinct Synthetic desktop image acceptance account. Do not silently replace plugin authentication or use the Admin account to falsify original-owner fixture evidence. Need separately scoped fixture/auth preparation for four fresh legacy Spaces and six public tests. No four fixtures created or public six-case run this turn; NOT_RUN, not a product sync failure.
 
 Remaining Task7 includes public six-case response-loss gate, broader conflict/offline/fresh-first-image matrix, then GitHub0.4.0 release and actual release asset checks. No source fix, server redeploy, npm publish, tag or Release in this turn. Existing release workflow/CHANGELOG and user untracked evidence preserved.
+
+## Additional final-bundle UI and transport checks
+
+Mounted the installed production `PreviewModal` through `openPreparedV3Pull` with 101 explicitly synthetic Page-conflict records and a non-writing runtime. Desktop (1136 CSS pixels) and Android (360 CSS pixels) both show 100 conflicts on page 1, the final conflict on page 2, and return to page 1 correctly. Confirmation stays disabled with unresolved conflicts; no horizontal content overflow. Cancel releases the flow, performs no apply, and preserves all mappings. This is real mounted UI component acceptance, not a real remote conflict/merge transaction.
+
+Evidence: `/tmp/agentwiki-public-recovery.pgeSQl/desktop-pagination-ui.json`, `android-pagination-ui.json`, `pagination-ui.js`. Initial helper attempts failed because the synthetic preview omitted `local.normalizations`, then because close-animation completion was checked too early. The owned modal was closed and helper corrected; no product code or data changed. Successful final assertions include the completed cancel/release state.
+
+Desktop controlled transport outage also passed: the actual installed plugin `runSyncStrategy(..., 'server')` encountered a deliberately failing HttpPort, propagated the error, issued only three GET head attempts and never created a preview. Restored the exact transport/runtime hooks in `finally`; real public head then succeeded with sequence 4 / revision `cmtsjr85a00eq1368b4zhxl3f`. Note, image bytes and four mappings were unchanged. Evidence: `desktop-offline.js/json` in the same directory. This proves plugin entry behavior under a transport outage; it is not a whole-machine network disconnect or offline desktop process restart.
+
+## Public gate closure at 21:44
+
+The original public six-case verifier now passed **6/6** against four fresh synthetic legacy Spaces, with actual native Vault/control adapters and public device-authenticated requests. Both successful-response-loss cases retained one operation/session, advanced sequence only once and completed the local baseline. See [public recovery evidence](2026-09-08-public-recovery-setup.md) for exact candidate/log hashes, prior failed attempts, final revisions and credential cleanup. This supersedes the public NOT_RUN/FAIL status above, not the distinct native matrix.
+
+Native desktop read-only recheck still reports the authorized acceptance Vault, plugin 0.4.0 and four mappings. No authentication or mappings were replaced to bypass the original-owner boundary. Fresh final-bundle native first-image acceptance and whole-machine offline restart remain separate gaps; existing controlled-transport and restart evidence must not be relabeled as those cases.

@@ -1,5 +1,7 @@
 # 最终候选真机验收预检（未完成）
 
+最新状态：公网原版六项已 6/6 PASS；当前设备边界见末节。以下按时间保留旧候选和失败记录，不把旧 PASS 混作最终包验收，整体验收与发布仍未完成。
+
 日期：2026-09-08。产品候选 `81b4293b5ad8300d944a874000910a8d0a2b3ffc`，文档 HEAD `60d9761945fa19502dd0701b2dff2101eb839c9c`。
 
 用户在发布准备过程中说明真机已连接、可以开展验收，因此先继续 Task 7；未创建 0.4.0 tag 或 GitHub Release。
@@ -34,21 +36,21 @@
 
 用户明确答复“确认”，于 `2026-09-08T09:45:19.954Z` 点击精确匹配的预览确认按钮。
 
-| 检查 | 结果 | 权威证据 |
-| --- | --- | --- |
-| 原短链接自动修正 | PASS | 真实笔记变为 `![Android local image](../assets/u7-renamed.png)`，未手改正文 |
-| 原子发布一次 | PASS | sequence 3 → 4；新 revision `cmtshhmmw006l1368c5d8b50v`；session `104c3583-b698-445b-9bd9-1f80ef8b9a6d` create 201 / batch 200 / finalize 200 |
-| 图片内容去重 | PASS | 全部记录请求 binaryBytes=0，没有 Blob 上传请求；前后图片 hash 相同 |
-| 附件/页面身份保留 | PASS | 附件 ID 保持 `4190a38b-9498-45ab-8890-f25b8c8e4372`；Page ID 保持 `0eec16fc-e2aa-4ccb-b01b-d76534841a4c`，固定快照仍 1 Page/1 attachment |
-| 未引用文件与其他映射 | PASS | 未读取 `u7-unreferenced.png`，另一个映射序列化值不变 |
-| 本地事务终结 | PASS | schema 4 父日志 phase=complete，completion/verifiedTarget 指向同一新 revision |
-| 第二次同步 | PASS | 提示“本地没有待推送的变更。”；两次 GET head，无写请求 |
-| 手机与网页显示 | PASS | 手机阅读模式、刷新后的网页均加载 480×270 图片；网页变更时间 `2026/9/8 17:45:26`，本轮浏览器 error/warn 日志为空 |
-| 固定版本真实下载 | PASS（transport） | 原生 V3 remote 下载固定 revision 中 12997 B 图片并通过 hash 校验、480×270 解码；不冒充完整 Pull 本地应用 |
-| 单独插件重载 | PASS | unload/load 后 0.4.0，其他映射不变，同步仍无变更 |
-| 完整进程离线重启 | PASS | PID 29092 → 30994，重启时 wifi_on/mobile_data 均 0；本地图片 hash 相同、480×270 显示 |
-| WebView/原生离线请求 | PASS | fetch 返回 Failed to fetch；真实插件同步返回原生 UnknownHostException，未弹写入确认 |
-| 网络恢复后同步 | PASS | finally 恢复 wifi_on/mobile_data=1；实际同步再次返回无变更 |
+| 检查                 | 结果              | 权威证据                                                                                                                                      |
+| -------------------- | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| 原短链接自动修正     | PASS              | 真实笔记变为 `![Android local image](../assets/u7-renamed.png)`，未手改正文                                                                   |
+| 原子发布一次         | PASS              | sequence 3 → 4；新 revision `cmtshhmmw006l1368c5d8b50v`；session `104c3583-b698-445b-9bd9-1f80ef8b9a6d` create 201 / batch 200 / finalize 200 |
+| 图片内容去重         | PASS              | 全部记录请求 binaryBytes=0，没有 Blob 上传请求；前后图片 hash 相同                                                                            |
+| 附件/页面身份保留    | PASS              | 附件 ID 保持 `4190a38b-9498-45ab-8890-f25b8c8e4372`；Page ID 保持 `0eec16fc-e2aa-4ccb-b01b-d76534841a4c`，固定快照仍 1 Page/1 attachment      |
+| 未引用文件与其他映射 | PASS              | 未读取 `u7-unreferenced.png`，另一个映射序列化值不变                                                                                          |
+| 本地事务终结         | PASS              | schema 4 父日志 phase=complete，completion/verifiedTarget 指向同一新 revision                                                                 |
+| 第二次同步           | PASS              | 提示“本地没有待推送的变更。”；两次 GET head，无写请求                                                                                         |
+| 手机与网页显示       | PASS              | 手机阅读模式、刷新后的网页均加载 480×270 图片；网页变更时间 `2026/9/8 17:45:26`，本轮浏览器 error/warn 日志为空                               |
+| 固定版本真实下载     | PASS（transport） | 原生 V3 remote 下载固定 revision 中 12997 B 图片并通过 hash 校验、480×270 解码；不冒充完整 Pull 本地应用                                      |
+| 单独插件重载         | PASS              | unload/load 后 0.4.0，其他映射不变，同步仍无变更                                                                                              |
+| 完整进程离线重启     | PASS              | PID 29092 → 30994，重启时 wifi_on/mobile_data 均 0；本地图片 hash 相同、480×270 显示                                                          |
+| WebView/原生离线请求 | PASS              | fetch 返回 Failed to fetch；真实插件同步返回原生 UnknownHostException，未弹写入确认                                                           |
+| 网络恢复后同步       | PASS              | finally 恢复 wifi_on/mobile_data=1；实际同步再次返回无变更                                                                                    |
 
 上述对应证据均在 `/tmp/agentwiki-final-device-acceptance.iqmVnP/`：`android-confirm.json`、`android-after-confirm.json`、`android-remote-after.json`、`android-noop.json`、`android-render.json/png`、`android-download-reload.json`、`android-offline-round1.jsonl`、`android-offline-restarted.png`、`android-online-restored.json`。网页截图留在当前工具记录。
 
@@ -88,27 +90,27 @@ Controller 再次完整检查 exit 0：66 files / 1313 tests，format、typechec
 
 最终候选手机资产：
 
-| 文件 | SHA256 |
-| --- | --- |
-| main.js（1713839 B） | `277116a922367f65c34ec4bc235308876c8003e1d4da5918250c890b410b3c27` |
+| 文件                   | SHA256                                                             |
+| ---------------------- | ------------------------------------------------------------------ |
+| main.js（1713839 B）   | `277116a922367f65c34ec4bc235308876c8003e1d4da5918250c890b410b3c27` |
 | manifest.json（0.4.0） | `7b001849eafc37311a720c56d62f37704b1697ea75a4a5b801423d4be443daee` |
-| styles.css | `5dfe15839220724a57a64ad7ab136761ba2ffaaff3c0235faac1cf1238e762b8` |
+| styles.css             | `5dfe15839220724a57a64ad7ab136761ba2ffaaff3c0235faac1cf1238e762b8` |
 
 安装前确认前台 md.obsidian，三个旧文件备份在 `/tmp/agentwiki-reviewed-phone-Mv5fmV/`；未复制 data.json 或凭据。停止 Obsidian 后安装，逐文件比对哈希，启动后 PID 29365，实际 Vault NeoMei-Docs / 插件 0.4.0。
 
 注意：重启后的预检发现测试笔记末尾已有额外本地文字，非 controller 本轮写入。未删除、覆盖或上传它；确认前记录实际正文 hash，再验证修复后完全相同，不能用旧固定文本断言或手改正文掩盖差异。
 
-| 新候选真实操作 | 结果与事实 |
-| --- | --- |
-| 原失败场景复现 | 将已备份合成图片移入 Obsidian 回收站，确认原路径缺失；真实 `runSyncStrategy(..., 'server', {})` 打开新增一张图片的预览 |
-| 固定版本下载 | GET 原 revision `cmtshhmmw006l1368c5d8b50v` / attachment `4190a38b-9498-45ab-8890-f25b8c8e4372` / content，200、12997 B |
-| 窄屏预览与确认 | 图片文件名、大小、取消及确认执行均可见；严格匹配只有图片恢复的 modal，于 `2026-09-08T10:38:34.279Z` 点击确认 |
-| 真实文件应用 | 图片 exists=true，12997 B，SHA256 `73ec9c4efc4245505911494867b3f59a6ace2995f25866440a8198383b5a9bc4`；没有手工恢复 |
-| 本地文字及其他映射保留 | 正文确认前后 hash 均为 `8d4b8105370f2a9a448ecadfbe0d9d99b70100c3a2cfee7c363d5a7b21668a33`；otherMappingsUnchanged=true |
-| 零远端写入 | 所有审计请求均 GET；remote revision 不变、sequence 4、attachmentCount 1；complete 父日志 verifiedTarget 仍是该 revision |
-| 再次拉取 | “服务器没有新的变更可应用。”；无 modal、无 content 下载、全 GET |
-| 真机显示 | 阅读模式实际 Android local image 已加载，480×270；非仅文件存在 |
-| 完整进程重启后持久化 | PID 29365 → 31281；三个安装哈希仍一致，正文及图片哈希保持，480×270 显示，远端 sequence 4，无 modal |
+| 新候选真实操作         | 结果与事实                                                                                                              |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| 原失败场景复现         | 将已备份合成图片移入 Obsidian 回收站，确认原路径缺失；真实 `runSyncStrategy(..., 'server', {})` 打开新增一张图片的预览  |
+| 固定版本下载           | GET 原 revision `cmtshhmmw006l1368c5d8b50v` / attachment `4190a38b-9498-45ab-8890-f25b8c8e4372` / content，200、12997 B |
+| 窄屏预览与确认         | 图片文件名、大小、取消及确认执行均可见；严格匹配只有图片恢复的 modal，于 `2026-09-08T10:38:34.279Z` 点击确认            |
+| 真实文件应用           | 图片 exists=true，12997 B，SHA256 `73ec9c4efc4245505911494867b3f59a6ace2995f25866440a8198383b5a9bc4`；没有手工恢复      |
+| 本地文字及其他映射保留 | 正文确认前后 hash 均为 `8d4b8105370f2a9a448ecadfbe0d9d99b70100c3a2cfee7c363d5a7b21668a33`；otherMappingsUnchanged=true  |
+| 零远端写入             | 所有审计请求均 GET；remote revision 不变、sequence 4、attachmentCount 1；complete 父日志 verifiedTarget 仍是该 revision |
+| 再次拉取               | “服务器没有新的变更可应用。”；无 modal、无 content 下载、全 GET                                                         |
+| 真机显示               | 阅读模式实际 Android local image 已加载，480×270；非仅文件存在                                                          |
+| 完整进程重启后持久化   | PID 29365 → 31281；三个安装哈希仍一致，正文及图片哈希保持，480×270 显示，远端 sequence 4，无 modal                      |
 
 `verify-repair-evidence.mjs` 对原图字节、固定 revision、真实下载、正文不变、其他映射不变、父日志以及重复 no-op 的断言全部 PASS。证据在 `/tmp/agentwiki-final-device-acceptance.iqmVnP/`：`android-repair-preview.json/png`、`android-repair-confirm.json`、`android-repair-result.json`、`android-repair-noop.json`、`android-repair-render.json/png`、`android-repair-restarted.json`、`android-repair-restarted-render.json`。回收站图片及独立备份保留，可恢复；最终原路径已由插件恢复。
 
@@ -118,3 +120,17 @@ Controller 再次完整检查 exit 0：66 files / 1313 tests，format、typechec
 - 公网四个独立 legacy fixture 的六项升级/丢响应恢复：NOT_RUN，旧 renderer provider 不满足当前契约，且桌面通道不可用。
 - 更广的新候选设备场景（首次图片升级、特殊路径、冲突分页等）仍按 Task 7 待补；旧候选历史 PASS 不自动升级为新候选 PASS。
 - GitHub 0.4.0 发布与正式资产验收：未进行；服务器本轮未更改/重部署。本段关闭的是明确的同版本缺图恢复缺口，不代表全部发布任务完成。
+
+## 最终 277116a9 候选：完整进程离线补验
+
+在当前最终包再次执行真实 Android 断网与进程重启：PID 31281 → 20989，重启时 Wi-Fi 和移动数据均为 0；本地图片实际解码 480×270，SHA256 仍为 `73ec9c4efc4245505911494867b3f59a6ace2995f25866440a8198383b5a9bc4`。WebView fetch 失败，真实插件原生同步返回 UnknownHostException，无写入确认。脚本 finally 恢复两种网络为 1；独立复查也均为 1。
+
+恢复网络后，真实 v3 head 返回 sequence 4 / revision `cmtshhmmw006l1368c5d8b50v`，Push 预览可生成，笔记前后完全相同，两个映射保持。测试笔记已有用户后续本地文字，未删除、覆盖或确认上传；本轮因此只证明网络恢复和预览可用，不把它宣称为“无变更同步”。
+
+证据：`/tmp/agentwiki-public-recovery.pgeSQl/android-final-offline.jsonl`、`android-final-offline.png`、`phone-restored-check.js`。先前旧包离线记录仍单独保留，不混用候选。
+
+## 公网门关闭与当前设备边界
+
+2026-09-08 21:42:19 开始的原版公网六项验收已 **6/6 PASS**，最终候选 main.js 仍为 `277116a9…`；迁移、完整恢复日志、原失败记录及临时凭据撤销见 [公网恢复记录](2026-09-08-public-recovery-setup.md)。此结果不替代真实 Android 首图升级等设备场景。
+
+本轮末次 ADB 检查：`da9b6817` / PJE110 / transport 21 在线，但当前前台为抖音而非 Obsidian。未抢占应用、绕过锁屏或修改手机文件；已异步请用户方便时切回 NeoMei-Docs 并留出操作时间。剩余真机项和发布资产验收保持未完成，不将设备连接状态记为 PASS。
