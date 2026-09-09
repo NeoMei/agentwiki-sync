@@ -22,6 +22,7 @@ import { V3_CAPABILITIES } from "../fakes/fake-tree-remote";
 import { makeNormalizedRuntimeFixture } from "../fakes/normalized-push-fixture";
 import { FakeHttp } from "../fakes/fake-http";
 import { treeCapabilitiesHashV3 } from "@neomei/agentwiki-sync-protocol";
+import { AgentWikiSyncSettingTab } from "../../src/obsidian/settings-tab";
 
 const legacyWithMapping: AgentWikiSyncSettings = {
   schemaVersion: 1,
@@ -31,6 +32,157 @@ const legacyWithMapping: AgentWikiSyncSettings = {
 };
 
 describe("plugin settings lifecycle", () => {
+  it("renders browser authorization as the default connection action with a ten-minute manual fallback", async () => {
+    const harness = await makePlugin({ data: DEFAULT_SETTINGS });
+    await harness.plugin.onload();
+    const tab = new AgentWikiSyncSettingTab(
+      harness.app as never,
+      harness.plugin,
+    );
+
+    tab.display();
+
+    expect((tab.containerEl as unknown as MockElement).textContent).toContain(
+      "连接 AgentWiki",
+    );
+    expect((tab.containerEl as unknown as MockElement).textContent).toContain(
+      "打开浏览器授权",
+    );
+    expect((tab.containerEl as unknown as MockElement).textContent).toContain(
+      "手动连接码（兼容后备）",
+    );
+    expect((tab.containerEl as unknown as MockElement).textContent).toContain(
+      "有效期 10 分钟",
+    );
+    expect(
+      (tab.containerEl as unknown as MockElement).textContent,
+    ).not.toContain("人类凭据");
+  });
+
+  it("builds the manual guide URL only from an HTTPS or literal loopback server origin", async () => {
+    const harness = await makePlugin({ data: DEFAULT_SETTINGS });
+    await harness.plugin.onload();
+    harness.plugin.settings.serverUrl = "http://127.0.0.1:5198";
+    expect(harness.plugin.connectionGuideUrl()).toBe(
+      "http://127.0.0.1:5198/guide/obsidian#connect",
+    );
+    harness.plugin.settings.serverUrl = "javascript:alert(1)";
+    expect(() => harness.plugin.connectionGuideUrl()).toThrow(/Server URL/);
+  });
+
+  it("starts browser authorization, exposes only the user URL, and cancels polling on unload", async () => {
+    vi.useFakeTimers();
+    const harness = await makePlugin({
+      data: {
+        schemaVersion: 2,
+        serverUrl: "http://127.0.0.1:5198",
+        mappings: [],
+      },
+    });
+    const opened = vi
+      .spyOn(harness.plugin, "openExternal")
+      .mockImplementation(() => {});
+    requestUrlState.impl = async (request) => {
+      const input = request as { url: string };
+      if (new URL(input.url).pathname.endsWith("/device/start"))
+        return {
+          status: 200,
+          json: {
+            deviceCode: "awd_secret",
+            userCode: "ABCD-EFGH",
+            verificationUri: "http://127.0.0.1:5198/onboard/device",
+            verificationUriComplete:
+              "http://127.0.0.1:5198/onboard/device?user_code=ABCD-EFGH",
+            expiresIn: 600,
+            interval: 5,
+          },
+          headers: {},
+        };
+      throw new Error("poll must not run after unload");
+    };
+    await harness.plugin.onload();
+
+    const state = await harness.plugin.startBrowserAuthorization();
+
+    expect(state).toMatchObject({
+      status: "waiting",
+      authorizationUrl:
+        "http://127.0.0.1:5198/onboard/device?user_code=ABCD-EFGH",
+    });
+    expect(JSON.stringify(state)).not.toContain("awd_secret");
+    expect(opened).toHaveBeenCalledWith(
+      "http://127.0.0.1:5198/onboard/device?user_code=ABCD-EFGH",
+    );
+    harness.plugin.unload();
+    await vi.advanceTimersByTimeAsync(5_000);
+    opened.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it("restores a pending browser authorization after plugin reload", async () => {
+    vi.useFakeTimers();
+    const sharedLocal = new Map<string, unknown>();
+    const sharedSecrets = new Map<string, string>();
+    const first = await makePlugin({
+      data: {
+        schemaVersion: 2,
+        serverUrl: "https://wiki.example.com",
+        mappings: [],
+      },
+      local: sharedLocal,
+      secrets: sharedSecrets,
+    });
+    vi.spyOn(first.plugin, "openExternal").mockImplementation(() => {});
+    requestUrlState.impl = async () => ({
+      status: 200,
+      json: {
+        deviceCode: "awd_secret",
+        userCode: "ABCD-EFGH",
+        verificationUri: "https://wiki.example.com/onboard/device",
+        verificationUriComplete:
+          "https://wiki.example.com/onboard/device?user_code=ABCD-EFGH",
+        expiresIn: 600,
+        interval: 5,
+      },
+      headers: {},
+    });
+    await first.plugin.onload();
+    await first.plugin.startBrowserAuthorization();
+    first.plugin.unload();
+
+    const second = await makePlugin({
+      data: first.app.__pluginData,
+      local: sharedLocal,
+      secrets: sharedSecrets,
+    });
+    await second.plugin.onload();
+
+    expect(second.plugin.browserAuthorizationState()).toMatchObject({
+      status: "waiting",
+      userCode: "ABCD-EFGH",
+    });
+    second.plugin.unload();
+    vi.useRealTimers();
+  });
+  it("stops polling while settings are hidden and resumes the valid flow when reopened", async () => {
+    const harness = await makePlugin({ data: DEFAULT_SETTINGS });
+    await harness.plugin.onload();
+    const tab = new AgentWikiSyncSettingTab(
+      harness.app as never,
+      harness.plugin,
+    );
+    const stop = vi.spyOn(harness.plugin, "stopBrowserAuthorization");
+    const resume = vi
+      .spyOn(harness.plugin, "resumeBrowserAuthorization")
+      .mockResolvedValue({ status: "idle" });
+
+    tab.display();
+    tab.hide();
+    tab.display();
+
+    expect(stop).toHaveBeenCalledOnce();
+    expect(resume).toHaveBeenCalledOnce();
+  });
   it("unsubscribes an open real-runtime preview on plugin unload and detaches Vault events", async () => {
     const h = await makePlugin({ data: DEFAULT_SETTINGS });
     await h.plugin.onload();

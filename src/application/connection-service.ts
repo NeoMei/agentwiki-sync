@@ -23,6 +23,7 @@ interface ConnectInput {
   deviceName: string;
   vaultId: string;
   pluginVersion: string;
+  allowLoopbackDevelopment?: boolean;
 }
 interface ConnectionJournal {
   schemaVersion: 1;
@@ -183,7 +184,10 @@ export class ConnectionService {
     credentialId: string;
     serverInstanceId: string;
   }> {
-    const serverUrl = normalizeServerUrl(input.serverUrl);
+    const serverUrl = normalizeServerUrl(
+      input.serverUrl,
+      input.allowLoopbackDevelopment ?? false,
+    );
     const existing = await this.readJournal();
     if (existing) {
       const identityMatches =

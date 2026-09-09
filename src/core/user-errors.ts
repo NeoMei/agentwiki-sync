@@ -124,6 +124,10 @@ export function userErrorMessage(error: unknown): string {
     return "服务器地址格式不正确。请输入完整地址，如 https://agentwiki.quukk.com";
   }
   if (error instanceof Error) {
+    if (error.message === "Untrusted browser authorization URL")
+      return "授权链接与当前服务器不一致。请检查服务器地址后重试。";
+    if (error.message === "Invalid browser authorization response")
+      return "服务器返回的授权信息不兼容。请更新服务器或使用手动连接码。";
     const localCode = error.message.match(/^([A-Z][A-Z0-9_]*)(?::|$)/)?.[1];
     if (localCode) {
       const localMessage = localErrorMessages[localCode];

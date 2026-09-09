@@ -207,6 +207,7 @@ export class PluginSettingTab {
     public readonly app: unknown,
     public readonly plugin: unknown,
   ) {}
+  hide(): void {}
 }
 
 export class Modal {

@@ -146,15 +146,17 @@ export async function makePlugin(input: {
   legacy?: AgentWikiSyncSettings | null;
   connection?: ConnectionState | null;
   vaultFiles?: Record<string, string | Uint8Array>;
+  local?: Map<string, unknown>;
+  secrets?: Map<string, string>;
 }) {
-  const local = new Map<string, unknown>();
+  const local = input.local ?? new Map<string, unknown>();
   const adapter = memoryAdapter();
   for (const [path, value] of Object.entries(input.vaultFiles ?? {})) {
     if (typeof value === "string") adapter.files.set(path, value);
     else adapter.binaryFiles.set(path, value.slice());
     adapter.deriveParents(path);
   }
-  const secretValues = new Map<string, string>();
+  const secretValues = input.secrets ?? new Map<string, string>();
   if (input.connection)
     secretValues.set(input.connection.credentialSecretId, "test-secret");
   const vaultEvents = new Map<string, Array<(...args: unknown[]) => void>>();

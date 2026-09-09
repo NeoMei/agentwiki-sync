@@ -17,6 +17,8 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
   private availableSpaces: SyncSpaceSummary[] | null = null;
   private spacesError: string | null = null;
   private selectedSpaceId = "";
+  private unsubscribeAuthorization: (() => void) | null = null;
+  private resumeAuthorizationOnDisplay = false;
 
   constructor(
     app: App,
@@ -26,12 +28,22 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
   }
 
   display(): void {
+    if (this.resumeAuthorizationOnDisplay) {
+      this.resumeAuthorizationOnDisplay = false;
+      void this.plugin.resumeBrowserAuthorization();
+    }
+    this.unsubscribeAuthorization?.();
+    this.unsubscribeAuthorization = null;
     this.containerEl.empty();
     this.containerEl.addClass("agentwiki-sync-settings");
     if (this.plugin.settings.serverInstanceId === null) this.spacesError = null;
     this.renderConnectionSection();
     this.renderMappingSection();
     this.renderDisconnectSection();
+    if (this.plugin.settings.serverInstanceId === null)
+      this.unsubscribeAuthorization = this.plugin.subscribeBrowserAuthorization(
+        () => this.display(),
+      );
     if (
       this.plugin.settings.serverInstanceId !== null &&
       !this.availableSpaces &&
@@ -39,6 +51,14 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
     ) {
       void this.loadSpaces();
     }
+  }
+
+  override hide(): void {
+    this.unsubscribeAuthorization?.();
+    this.unsubscribeAuthorization = null;
+    this.plugin.stopBrowserAuthorization();
+    this.resumeAuthorizationOnDisplay = true;
+    super.hide();
   }
 
   private renderConnectionSection(): void {
@@ -70,13 +90,81 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
     if (this.plugin.settings.serverInstanceId !== null) {
       new Setting(this.containerEl)
         .setName("已连接")
-        .setDesc("此设备已通过人类凭据连接到 AgentWiki。");
+        .setDesc("此设备已连接 AgentWiki。下一步选择空间和本地文件夹。");
     } else {
+      const authorization = this.plugin.browserAuthorizationState();
+      if (
+        authorization.status === "waiting" ||
+        authorization.status === "connecting" ||
+        authorization.status === "error"
+      ) {
+        const statusText =
+          authorization.status === "connecting"
+            ? "正在连接…"
+            : authorization.status === "error"
+              ? "连接暂时中断，可重试。"
+              : "等待浏览器授权。";
+        new Setting(this.containerEl)
+          .setName("浏览器授权")
+          .setDesc(`${statusText} 授权码：${authorization.userCode}`)
+          .addButton((button) =>
+            button
+              .setButtonText("重新打开")
+              .onClick(() =>
+                this.plugin.openExternal(authorization.authorizationUrl),
+              ),
+          )
+          .addButton((button) =>
+            button.setButtonText("复制授权链接").onClick(async () => {
+              await this.plugin.copyText(authorization.authorizationUrl);
+              new Notice("授权链接已复制。");
+            }),
+          )
+          .addButton((button) =>
+            button.setButtonText("取消").onClick(async () => {
+              await this.plugin.cancelBrowserAuthorization();
+              this.display();
+            }),
+          );
+        if (authorization.status === "error")
+          new Setting(this.containerEl).addButton((button) =>
+            button.setButtonText("重试连接").onClick(() => {
+              this.plugin.retryBrowserAuthorization();
+            }),
+          );
+      } else {
+        const description =
+          authorization.status === "unsupported"
+            ? "当前服务器版本不支持浏览器授权，请更新服务器或使用下方连接码。"
+            : authorization.status === "denied"
+              ? "授权已拒绝，可重新发起。"
+              : authorization.status === "expired"
+                ? "授权已过期，可重新发起。"
+                : authorization.status === "cancelled"
+                  ? "授权已取消，可重新发起。"
+                  : "在浏览器中登录并确认，插件将自动完成连接。";
+        new Setting(this.containerEl)
+          .setName("连接 AgentWiki")
+          .setDesc(description)
+          .addButton((button) =>
+            button
+              .setButtonText("打开浏览器授权")
+              .setCta()
+              .onClick(async () => {
+                button.setDisabled(true);
+                try {
+                  await this.plugin.startBrowserAuthorization();
+                  this.display();
+                } catch (error) {
+                  new Notice(userErrorMessage(error));
+                  button.setDisabled(false);
+                }
+              }),
+          );
+      }
       new Setting(this.containerEl)
-        .setName("一次性连接码")
-        .setDesc(
-          "在 AgentWiki 网页的「集成 → Obsidian 设备」中生成连接码，粘贴到此处。",
-        )
+        .setName("手动连接码（兼容后备）")
+        .setDesc("连接码用于一次性绑定这台 Obsidian 设备，有效期 10 分钟。")
         .addText((text) =>
           text.setPlaceholder("粘贴连接码").onChange((value) => {
             this.connectionCode = value.trim();
@@ -109,6 +197,15 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
                 button.setButtonText("连接");
               }
             }),
+        )
+        .addButton((button) =>
+          button.setButtonText("查看连接指南").onClick(() => {
+            const destination =
+              authorization.status === "unsupported"
+                ? authorization.guideUrl
+                : this.plugin.connectionGuideUrl();
+            this.plugin.openExternal(destination);
+          }),
         );
     }
   }

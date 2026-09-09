@@ -87,6 +87,10 @@ import {
 } from "./application/space-sync-route";
 import type { TreeSpaceSummaryV3 } from "./ports/tree-remote";
 import { inspectLocalImageUpgrade } from "./storage/local-image-upgrade";
+import {
+  BrowserAuthorizationController,
+  type BrowserAuthorizationState,
+} from "./application/browser-authorization";
 
 const actionLabel = (kind: string): string => {
   const labels: Record<string, string> = {
@@ -174,6 +178,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
     }
   >();
   private statusBarEl: HTMLElement | null = null;
+  private browserAuthorization: BrowserAuthorizationController | null = null;
   private settingsRepo(): MutableControlRepository<AgentWikiSyncSettings> {
     return new MutableControlRepository(
       new ObsidianLocalControlStore(this.app),
@@ -182,6 +187,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
     );
   }
   override onunload(): void {
+    this.browserAuthorization?.stop();
     for (const cleanup of [...this.previewUnloadCleanups]) cleanup();
     this.previewUnloadCleanups.clear();
     for (const runtime of this.liveRuntimes.values()) runtime.invalidate();
@@ -220,6 +226,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       // throwing here would brick onload before any settings UI exists.
       this.settings.serverUrl = normalizeServerUrl(
         connection.payload.serverUrl,
+        true,
       );
       this.settings.serverInstanceId = connection.payload.serverInstanceId;
       await new VaultIdentityService(
@@ -228,6 +235,14 @@ export default class AgentWikiSyncPlugin extends Plugin {
       ).bind(connection.payload.vaultId);
       await this.saveSettings();
     }
+    this.browserAuthorization = new BrowserAuthorizationController({
+      http: new RequestUrlHttp(),
+      secrets: new ObsidianSecrets(this.app),
+      store: localStore,
+      connect: (code) => this.connect(code),
+      allowLoopbackDevelopment: true,
+    });
+    if (!connection) await this.browserAuthorization.resume();
     this.addSettingTab(new AgentWikiSyncSettingTab(this.app, this));
     this.initStatusBar();
     this.addRibbonIcon("refresh-cw", "AgentWiki Sync", () =>
@@ -311,6 +326,55 @@ export default class AgentWikiSyncPlugin extends Plugin {
     this.settings.serverUrl = value;
     await this.saveSettings();
   }
+  browserAuthorizationState(): BrowserAuthorizationState {
+    return this.browserAuthorization?.current() ?? { status: "idle" };
+  }
+  subscribeBrowserAuthorization(
+    listener: (state: BrowserAuthorizationState) => void,
+  ): () => void {
+    return this.browserAuthorization?.subscribe(listener) ?? (() => {});
+  }
+  async startBrowserAuthorization(): Promise<BrowserAuthorizationState> {
+    if (!this.browserAuthorization) throw new Error("插件尚未完成加载");
+    if (!this.settings.serverUrl) {
+      this.settings.serverUrl = DEFAULT_SETTINGS.serverUrl;
+      await this.saveSettings();
+    }
+    const state = await this.browserAuthorization.start(
+      this.settings.serverUrl,
+      this.manifest.version,
+    );
+    if (
+      state.status === "waiting" ||
+      state.status === "connecting" ||
+      state.status === "error"
+    )
+      this.openExternal(state.authorizationUrl);
+    return state;
+  }
+  async resumeBrowserAuthorization(): Promise<BrowserAuthorizationState> {
+    return (
+      (await this.browserAuthorization?.resume()) ?? { status: "idle" as const }
+    );
+  }
+  stopBrowserAuthorization(): void {
+    this.browserAuthorization?.stop();
+  }
+  async cancelBrowserAuthorization(): Promise<void> {
+    await this.browserAuthorization?.cancel();
+  }
+  retryBrowserAuthorization(): void {
+    this.browserAuthorization?.retry();
+  }
+  connectionGuideUrl(): string {
+    return `${normalizeServerUrl(this.settings.serverUrl, true)}/guide/obsidian#connect`;
+  }
+  openExternal(url: string): void {
+    window.open(url, "_blank", "noopener,noreferrer");
+  }
+  async copyText(value: string): Promise<void> {
+    await navigator.clipboard.writeText(value);
+  }
   async connect(code: string): Promise<void> {
     if (this.settings.serverInstanceId !== null) {
       new Notice("请先断开当前设备连接，再连接新的凭据。");
@@ -326,7 +390,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
     const deviceId = await deviceState.getOrCreateDeviceId();
     const identity = new VaultIdentityService(shared, local);
     const vaultId = await identity.getOrCreate();
-    const serverUrl = normalizeServerUrl(this.settings.serverUrl);
+    const serverUrl = normalizeServerUrl(this.settings.serverUrl, true);
     const result = await new ConnectionService(
       new RequestUrlHttp(),
       new ObsidianSecrets(this.app),
@@ -338,6 +402,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       deviceName: this.app.vault.getName(),
       vaultId,
       pluginVersion: this.manifest.version,
+      allowLoopbackDevelopment: true,
     });
     this.settings.serverUrl = serverUrl;
     this.settings.serverInstanceId = result.serverInstanceId;

@@ -25,6 +25,15 @@ describe("userErrorMessage", () => {
     expect(userErrorMessage(new TypeError("映射根路径重叠"))).toContain("重叠");
   });
 
+  it("does not expose browser authorization validation internals", () => {
+    expect(
+      userErrorMessage(new TypeError("Untrusted browser authorization URL")),
+    ).toMatch(/授权链接.*服务器/u);
+    expect(
+      userErrorMessage(new TypeError("Invalid browser authorization response")),
+    ).toMatch(/授权.*更新/u);
+  });
+
   it("falls back to raw message for unknown errors", () => {
     expect(userErrorMessage(new Error("custom"))).toBe("custom");
   });
