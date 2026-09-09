@@ -46,8 +46,13 @@ describe("plugin settings lifecycle", () => {
       "连接 AgentWiki",
     );
     expect((tab.containerEl as unknown as MockElement).textContent).toContain(
-      "打开浏览器授权",
+      "连接 AgentWiki",
     );
+    const connectButtons = (tab.containerEl as unknown as MockElement).queryAll(
+      (element) =>
+        element.tag === "button" && element.text === "连接 AgentWiki",
+    );
+    expect(connectButtons).toHaveLength(1);
     expect((tab.containerEl as unknown as MockElement).textContent).toContain(
       "手动连接码（兼容后备）",
     );

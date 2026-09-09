@@ -148,7 +148,7 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
           .setDesc(description)
           .addButton((button) =>
             button
-              .setButtonText("打开浏览器授权")
+              .setButtonText("连接 AgentWiki")
               .setCta()
               .onClick(async () => {
                 button.setDisabled(true);

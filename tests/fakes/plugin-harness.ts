@@ -176,7 +176,10 @@ export async function makePlugin(input: {
     },
     secretStorage: {
       getSecret: (id: string) => secretValues.get(id) ?? null,
-      setSecret: (id: string, value: string) => secretValues.set(id, value),
+      setSecret: (id: string, value: string) => {
+        if (!/^[a-z0-9-]{1,64}$/u.test(id)) throw new Error("密钥 ID 无效");
+        secretValues.set(id, value);
+      },
     },
     vault: {
       adapter,

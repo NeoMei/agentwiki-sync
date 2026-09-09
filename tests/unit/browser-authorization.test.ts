@@ -63,6 +63,16 @@ function fixture(now = 1_000_000) {
 }
 
 describe("browser authorization", () => {
+  it("uses an Obsidian-compatible secret ID for pending device codes", async () => {
+    const f = fixture();
+    f.http.enqueue({ status: 200, json: started });
+
+    await f.subject.start("https://wiki.example.com", "0.4.0");
+
+    const [secretId] = f.secrets.values.keys();
+    expect(secretId).toMatch(/^[a-z0-9-]{1,64}$/u);
+  });
+
   it("publishes one stable listener snapshot when a settings redraw resubscribes", async () => {
     const f = fixture();
     f.http.enqueue({ status: 404, json: {} });

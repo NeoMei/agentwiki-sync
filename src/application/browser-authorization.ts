@@ -5,7 +5,7 @@ import type { SecretPort } from "../ports/secrets";
 import { MutableControlRepository } from "../storage/envelope";
 
 const PENDING_PATH = "browser-authorization.json";
-const DEVICE_SECRET_PREFIX = "agentwiki-browser-device-code-v1-";
+const DEVICE_SECRET_PREFIX = "agentwiki-device-";
 const MAX_RESPONSE_BYTES = 64 * 1024;
 
 interface PendingAuthorization {
