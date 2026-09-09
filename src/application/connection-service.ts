@@ -24,6 +24,7 @@ interface ConnectInput {
   vaultId: string;
   pluginVersion: string;
   allowLoopbackDevelopment?: boolean;
+  signal?: AbortSignal;
 }
 interface ConnectionJournal {
   schemaVersion: 1;
@@ -101,6 +102,10 @@ function base64url(bytes: Uint8Array): string {
 }
 function uuid(): string {
   return crypto.randomUUID();
+}
+
+function assertNotAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new DOMException("连接已取消", "AbortError");
 }
 
 export class ConnectionService {
@@ -184,11 +189,13 @@ export class ConnectionService {
     credentialId: string;
     serverInstanceId: string;
   }> {
+    assertNotAborted(input.signal);
     const serverUrl = normalizeServerUrl(
       input.serverUrl,
       input.allowLoopbackDevelopment ?? false,
     );
     const existing = await this.readJournal();
+    assertNotAborted(input.signal);
     if (existing) {
       const identityMatches =
         existing.serverUrl === serverUrl &&
@@ -207,7 +214,7 @@ export class ConnectionService {
         if (input.code && storedCode !== input.code) {
           await this.discardPendingConnection(existing);
         } else {
-          return this.resume(existing, input.code);
+          return this.resume(existing, input.code, input.signal);
         }
       }
     }
@@ -234,6 +241,7 @@ export class ConnectionService {
       pluginVersion: input.pluginVersion,
     };
     await this.writeJournal(journal);
+    assertNotAborted(input.signal);
     let client = new AgentWikiClient(serverUrl, this.http, () =>
       this.secrets.get(credentialSecretId),
     );
@@ -255,16 +263,14 @@ export class ConnectionService {
         supportedProtocolVersions: ["3", "2", "1"],
       });
       try {
-        const value = ExchangeResponseSchema.parse(
-          (
-            await client.raw(
-              "POST",
-              "/api/integrations/obsidian/exchange",
-              request,
-              false,
-            )
-          ).json,
+        const exchangeResponse = await client.raw(
+          "POST",
+          "/api/integrations/obsidian/exchange",
+          request,
+          false,
         );
+        assertNotAborted(input.signal);
+        const value = ExchangeResponseSchema.parse(exchangeResponse.json);
         parseCapabilities(value.capabilities);
         exchanged = value;
       } catch (error) {
@@ -292,15 +298,18 @@ export class ConnectionService {
       serverInstanceId: exchanged.serverInstanceId,
     };
     await this.writeJournal(journal);
+    assertNotAborted(input.signal);
     if ((await this.journal.read()) === null)
       throw new Error("连接日志验证失败");
     this.secrets.set(codeSecretId, "");
     const session = SessionResponseSchema.parse(
       (await client.raw("GET", "/api/integrations/obsidian/session")).json,
     );
+    assertNotAborted(input.signal);
     this.assertSession(session, journal, exchanged);
     journal = { ...journal, phase: "activating" };
     await this.writeJournal(journal);
+    assertNotAborted(input.signal);
     await client.raw(
       "POST",
       "/api/integrations/obsidian/credentials/current/activate",
@@ -364,11 +373,13 @@ export class ConnectionService {
   private async resume(
     journal: ConnectionJournal,
     code: string,
+    signal?: AbortSignal,
   ): Promise<{
     credentialSecretId: string;
     credentialId: string;
     serverInstanceId: string;
   }> {
+    assertNotAborted(signal);
     void code;
     const credential = this.secrets.get(journal.credentialSecretId);
     if (!credential) throw new Error("待处理凭据缺失");
@@ -386,6 +397,7 @@ export class ConnectionService {
         serverInstanceId: session.serverInstanceId,
       };
       this.assertSession(session, journal, exchanged);
+      if (session.credentialStatus === "provisional") assertNotAborted(signal);
       if (session.credentialStatus === "provisional")
         await client.raw(
           "POST",
@@ -453,7 +465,8 @@ export class ConnectionService {
             serverInstanceId: value.serverInstanceId,
           };
           await this.writeJournal(prepared);
-          return this.resume(prepared, "");
+          assertNotAborted(signal);
+          return this.resume(prepared, "", signal);
         } catch (exchangeError) {
           const exchangeCode =
             exchangeError instanceof AgentWikiHttpError &&

@@ -169,6 +169,77 @@ describe("plugin settings lifecycle", () => {
     second.plugin.unload();
     vi.useRealTimers();
   });
+  it("cancels pending authorization before saving a different server", async () => {
+    vi.useFakeTimers();
+    const harness = await makePlugin({
+      data: {
+        schemaVersion: 2,
+        serverUrl: "http://127.0.0.1:5198",
+        mappings: [],
+      },
+    });
+    vi.spyOn(harness.plugin, "openExternal").mockImplementation(() => {});
+    requestUrlState.impl = async () => ({
+      status: 200,
+      json: {
+        deviceCode: "awd_secret",
+        userCode: "ABCD-EFGH",
+        verificationUri: "http://127.0.0.1:5198/onboard/device",
+        verificationUriComplete:
+          "http://127.0.0.1:5198/onboard/device?user_code=ABCD-EFGH",
+        expiresIn: 600,
+        interval: 5,
+      },
+      headers: {},
+    });
+    await harness.plugin.onload();
+    await harness.plugin.startBrowserAuthorization();
+
+    await harness.plugin.setServerUrl("http://127.0.0.1:5299");
+
+    expect(harness.plugin.settings.serverUrl).toBe("http://127.0.0.1:5299");
+    expect(harness.plugin.browserAuthorizationState()).toEqual({
+      status: "cancelled",
+    });
+    harness.plugin.unload();
+    vi.useRealTimers();
+  });
+  it("does not overwrite the connected server when cancellation finishes a connection", async () => {
+    const harness = await makePlugin({ data: DEFAULT_SETTINGS });
+    await harness.plugin.onload();
+    vi.spyOn(harness.plugin, "browserAuthorizationState").mockReturnValue({
+      status: "connecting",
+      authorizationUrl:
+        "https://wiki.example.com/onboard/device?user_code=ABCD-EFGH",
+      userCode: "ABCD-EFGH",
+      expiresAt: Date.now() + 600_000,
+    });
+    vi.spyOn(harness.plugin, "cancelBrowserAuthorization").mockImplementation(
+      async () => {
+        harness.plugin.settings.serverUrl = "https://wiki.example.com";
+        harness.plugin.settings.serverInstanceId = "server-instance";
+      },
+    );
+
+    await expect(
+      harness.plugin.setServerUrl("https://other.example.com"),
+    ).rejects.toThrow("请先断开连接");
+    expect(harness.plugin.settings.serverUrl).toBe("https://wiki.example.com");
+  });
+  it("allows the connected server field to save its unchanged value", async () => {
+    const harness = await makePlugin({
+      data: {
+        ...DEFAULT_SETTINGS,
+        serverInstanceId: "server-instance",
+      },
+    });
+    await harness.plugin.onload();
+
+    await expect(
+      harness.plugin.setServerUrl("https://wiki.example.com"),
+    ).resolves.toBeUndefined();
+    expect(harness.plugin.settings.serverUrl).toBe("https://wiki.example.com");
+  });
   it("stops polling while settings are hidden and resumes the valid flow when reopened", async () => {
     const harness = await makePlugin({ data: DEFAULT_SETTINGS });
     await harness.plugin.onload();

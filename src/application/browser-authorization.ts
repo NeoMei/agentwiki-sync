@@ -40,7 +40,11 @@ interface BrowserAuthorizationOptions {
   http: HttpPort;
   secrets: SecretPort;
   store: ControlStorePort;
-  connect: (code: string) => Promise<void>;
+  connect: (
+    code: string,
+    serverUrl: string,
+    signal: AbortSignal,
+  ) => Promise<void>;
   now?: () => number;
   scheduler?: BrowserAuthorizationScheduler;
   allowLoopbackDevelopment?: boolean;
@@ -125,7 +129,9 @@ export class BrowserAuthorizationController {
   private state: BrowserAuthorizationState = { status: "idle" };
   private pending: PendingAuthorization | null = null;
   private timer: unknown = null;
-  private polling = false;
+  private pollingGeneration: number | null = null;
+  private connectionAbort: AbortController | null = null;
+  private pollPromise: Promise<void> | null = null;
   private generation = 0;
 
   constructor(private readonly options: BrowserAuthorizationOptions) {
@@ -158,6 +164,7 @@ export class BrowserAuthorizationController {
     pluginVersion: string,
   ): Promise<BrowserAuthorizationState> {
     await this.clearPending();
+    const generation = this.generation;
     const serverUrl = normalizeServerUrl(
       serverInput,
       this.options.allowLoopbackDevelopment ?? false,
@@ -170,6 +177,7 @@ export class BrowserAuthorizationController {
       responseType: "bounded-json",
       maxResponseBytes: MAX_RESPONSE_BYTES,
     });
+    if (generation !== this.generation) return this.state;
     if (response.status === 404)
       return this.publish({
         status: "unsupported",
@@ -217,14 +225,28 @@ export class BrowserAuthorizationController {
       intervalSeconds,
       deviceSecretId,
     };
+    this.pending = pending;
     this.options.secrets.set(deviceSecretId, deviceCode);
     try {
       await this.repository.write(pending);
     } catch (error) {
       this.options.secrets.set(deviceSecretId, "");
+      const ownsPending = this.pending === pending;
+      if (ownsPending) this.pending = null;
+      if (generation !== this.generation) {
+        if (ownsPending) await this.repository.clear();
+        return this.state;
+      }
       throw error;
     }
-    this.pending = pending;
+    if (generation !== this.generation) {
+      this.options.secrets.set(deviceSecretId, "");
+      if (this.pending === pending) {
+        await this.repository.clear();
+        this.pending = null;
+      }
+      return this.state;
+    }
     this.publish(this.visiblePending("waiting"));
     this.schedule(intervalSeconds);
     return this.state;
@@ -249,7 +271,12 @@ export class BrowserAuthorizationController {
   }
 
   retry(): void {
-    if (!this.pending || this.timer !== null || this.polling) return;
+    if (
+      !this.pending ||
+      this.timer !== null ||
+      this.pollingGeneration === this.generation
+    )
+      return;
     if (this.pending.expiresAt <= this.now()) {
       void this.finish({ status: "expired" });
       return;
@@ -259,14 +286,21 @@ export class BrowserAuthorizationController {
   }
 
   async cancel(): Promise<void> {
+    if (this.state.status === "connecting" && this.connectionAbort) {
+      this.connectionAbort.abort();
+      await this.pollPromise;
+      if ((this.state as BrowserAuthorizationState).status === "connected")
+        return;
+    }
     await this.finish({ status: "cancelled" });
   }
 
   stop(): void {
     this.generation += 1;
+    this.connectionAbort?.abort();
+    this.connectionAbort = null;
     if (this.timer !== null) this.scheduler.clear(this.timer);
     this.timer = null;
-    this.polling = false;
   }
 
   private visiblePending(
@@ -284,17 +318,31 @@ export class BrowserAuthorizationController {
   }
 
   private schedule(intervalSeconds: number): void {
-    if (!this.pending || this.timer !== null || this.polling) return;
+    if (
+      !this.pending ||
+      this.timer !== null ||
+      this.pollingGeneration === this.generation
+    )
+      return;
     const generation = this.generation;
     this.timer = this.scheduler.set(intervalSeconds * 1000, () => {
       this.timer = null;
       if (generation !== this.generation) return;
-      void this.poll(generation);
+      const poll = this.poll(generation);
+      this.pollPromise = poll;
+      void poll.finally(() => {
+        if (this.pollPromise === poll) this.pollPromise = null;
+      });
     });
   }
 
   private async poll(generation: number): Promise<void> {
-    if (this.polling || !this.pending || generation !== this.generation) return;
+    if (
+      this.pollingGeneration === generation ||
+      !this.pending ||
+      generation !== this.generation
+    )
+      return;
     if (this.pending.expiresAt <= this.now()) {
       await this.finish({ status: "expired" });
       return;
@@ -304,7 +352,7 @@ export class BrowserAuthorizationController {
       await this.finish({ status: "expired" });
       return;
     }
-    this.polling = true;
+    this.pollingGeneration = generation;
     try {
       const response = await this.options.http.request({
         method: "POST",
@@ -346,8 +394,13 @@ export class BrowserAuthorizationController {
       } else if (status === "authorized") {
         const code = requiredString(body, "code");
         positiveSeconds(body, "expiresIn");
+        const serverUrl = this.pending.serverUrl;
+        const abort = new AbortController();
+        this.connectionAbort = abort;
         this.publish(this.visiblePending("connecting"));
-        await this.options.connect(code);
+        await this.options.connect(code, serverUrl, abort.signal);
+        if (generation !== this.generation) return;
+        this.connectionAbort = null;
         await this.finish({ status: "connected" });
         return;
       } else {
@@ -355,6 +408,7 @@ export class BrowserAuthorizationController {
       }
     } catch (error) {
       if (generation !== this.generation) return;
+      if (error instanceof DOMException && error.name === "AbortError") return;
       this.publish(
         this.visiblePending(
           "error",
@@ -362,7 +416,7 @@ export class BrowserAuthorizationController {
         ),
       );
     } finally {
-      this.polling = false;
+      if (this.pollingGeneration === generation) this.pollingGeneration = null;
     }
     if (generation === this.generation && this.pending)
       this.schedule(this.pending.intervalSeconds);
@@ -370,7 +424,6 @@ export class BrowserAuthorizationController {
 
   private async clearPending(): Promise<void> {
     this.stop();
-    this.polling = false;
     const stored =
       this.pending ?? (await this.repository.read())?.payload ?? null;
     if (stored) this.options.secrets.set(stored.deviceSecretId, "");

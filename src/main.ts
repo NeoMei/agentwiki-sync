@@ -239,7 +239,8 @@ export default class AgentWikiSyncPlugin extends Plugin {
       http: new RequestUrlHttp(),
       secrets: new ObsidianSecrets(this.app),
       store: localStore,
-      connect: (code) => this.connect(code),
+      connect: (code, serverUrl, signal) =>
+        this.connect(code, { serverUrl, signal }),
       allowLoopbackDevelopment: true,
     });
     if (!connection) await this.browserAuthorization.resume();
@@ -318,10 +319,22 @@ export default class AgentWikiSyncPlugin extends Plugin {
     await this.saveData(toVaultSettings(this.settings));
   }
   async setServerUrl(value: string): Promise<void> {
+    if (value === this.settings.serverUrl) {
+      await this.saveSettings();
+      return;
+    }
     if (
       this.settings.serverInstanceId !== null &&
       value !== this.settings.serverUrl
     )
+      throw new Error("请先断开连接再更改 AgentWiki 服务器");
+    if (
+      this.settings.serverInstanceId === null &&
+      value !== this.settings.serverUrl &&
+      this.browserAuthorizationState().status !== "idle"
+    )
+      await this.cancelBrowserAuthorization();
+    if (this.settings.serverInstanceId !== null)
       throw new Error("请先断开连接再更改 AgentWiki 服务器");
     this.settings.serverUrl = value;
     await this.saveSettings();
@@ -375,7 +388,10 @@ export default class AgentWikiSyncPlugin extends Plugin {
   async copyText(value: string): Promise<void> {
     await navigator.clipboard.writeText(value);
   }
-  async connect(code: string): Promise<void> {
+  async connect(
+    code: string,
+    options?: { serverUrl?: string; signal?: AbortSignal },
+  ): Promise<void> {
     if (this.settings.serverInstanceId !== null) {
       new Notice("请先断开当前设备连接，再连接新的凭据。");
       return;
@@ -390,7 +406,10 @@ export default class AgentWikiSyncPlugin extends Plugin {
     const deviceId = await deviceState.getOrCreateDeviceId();
     const identity = new VaultIdentityService(shared, local);
     const vaultId = await identity.getOrCreate();
-    const serverUrl = normalizeServerUrl(this.settings.serverUrl, true);
+    const serverUrl = normalizeServerUrl(
+      options?.serverUrl ?? this.settings.serverUrl,
+      true,
+    );
     const result = await new ConnectionService(
       new RequestUrlHttp(),
       new ObsidianSecrets(this.app),
@@ -403,6 +422,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       vaultId,
       pluginVersion: this.manifest.version,
       allowLoopbackDevelopment: true,
+      signal: options?.signal,
     });
     this.settings.serverUrl = serverUrl;
     this.settings.serverInstanceId = result.serverInstanceId;

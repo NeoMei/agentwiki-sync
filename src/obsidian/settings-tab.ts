@@ -82,8 +82,7 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
           .setDisabled(this.plugin.settings.serverInstanceId !== null)
           .onChange(async (value) => {
             if (this.plugin.settings.serverInstanceId !== null) return;
-            this.plugin.settings.serverUrl = value.trim().replace(/\/+$/, "");
-            await this.plugin.saveSettings();
+            await this.plugin.setServerUrl(value.trim().replace(/\/+$/, ""));
           }),
       );
 
