@@ -161,17 +161,13 @@ export class ConnectionService {
     await this.journal.clear();
   }
 
-  private isTerminalResumeError(error: unknown): boolean {
+  private isTerminalCredentialResumeError(error: unknown): boolean {
     if (!(error instanceof AgentWikiHttpError)) return false;
-    if (error.status === 401 || error.status === 403) return true;
     const code = (error.body as { error?: { code?: string } } | undefined)
       ?.error?.code;
     return (
       code === "DEVICE_CREDENTIAL_EXPIRED" ||
       code === "DEVICE_CREDENTIAL_REVOKED" ||
-      code === "INSTALLATION_CODE_EXPIRED" ||
-      code === "INSTALLATION_CODE_INVALID" ||
-      code === "INSTALLATION_ALREADY_EXCHANGED" ||
       code === "USER_INACTIVE"
     );
   }
@@ -224,7 +220,7 @@ export class ConnectionService {
             if (
               existing.phase === "exchange_prepared" ||
               !input.code ||
-              !this.isTerminalResumeError(error)
+              !this.isTerminalCredentialResumeError(error)
             )
               throw error;
             assertNotAborted(input.signal);

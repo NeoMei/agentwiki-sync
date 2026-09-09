@@ -841,4 +841,66 @@ describe("connection cancellation", () => {
     expect(result.credentialId).toBe(session.credentialId);
     expect(secrets.get(oldCredentialSecretId)).toBe("");
   });
+
+  it.each([
+    { status: 403, code: "ACCESS_DENIED" },
+    { status: 401, code: "UNKNOWN_AUTH_ERROR" },
+    { status: 503, code: "SERVICE_UNAVAILABLE" },
+  ])(
+    "preserves an advanced journal for unknown $status/$code responses",
+    async ({ status, code }) => {
+      const http = new FakeHttp();
+      const control = new MemoryControlStore();
+      const secrets = new MemorySecrets();
+      const oldCredentialSecretId = "agentwiki-sync-secret-old-credential";
+      const oldCodeSecretId = "agentwiki-sync-secret-old-code";
+      secrets.set(oldCredentialSecretId, "old-credential");
+      secrets.set(oldCodeSecretId, "");
+      await control.write(
+        "connection-journal.json",
+        JSON.stringify({
+          schemaVersion: 1,
+          phase: "credential_stored",
+          serverUrl: "https://wiki.example.com",
+          exchangeId: "55555555-5555-4555-8555-555555555555",
+          codeSecretId: oldCodeSecretId,
+          credentialSecretId: oldCredentialSecretId,
+          credentialId: "22222222-2222-4222-8222-222222222222",
+          serverInstanceId: "11111111-1111-4111-8111-111111111111",
+          deviceId: "33333333-3333-4333-8333-333333333333",
+          deviceName: "Phone",
+          vaultId: "44444444-4444-4444-8444-444444444444",
+          pluginVersion: "0.5.0",
+        }),
+      );
+      http.enqueue({
+        status,
+        json: {
+          protocolVersion: "1",
+          error: {
+            code,
+            message: "unknown policy response",
+            retryable: false,
+          },
+        },
+      });
+
+      await expect(
+        new ConnectionService(http, secrets, control).connect({
+          serverUrl: "https://wiki.example.com",
+          code: "fresh-authorized-code-1234567",
+          deviceId: "33333333-3333-4333-8333-333333333333",
+          deviceName: "Phone",
+          vaultId: "44444444-4444-4444-8444-444444444444",
+          pluginVersion: "0.5.0",
+        }),
+      ).rejects.toMatchObject({ status });
+
+      expect(http.calls.map((call) => call.path)).toEqual([
+        "/api/integrations/obsidian/session",
+      ]);
+      expect(secrets.get(oldCredentialSecretId)).toBe("old-credential");
+      expect(await control.read("connection-journal.json")).not.toBeNull();
+    },
+  );
 });
