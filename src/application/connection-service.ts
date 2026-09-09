@@ -218,7 +218,19 @@ export class ConnectionService {
         ) {
           await this.discardPendingConnection(existing);
         } else {
-          return this.resume(existing, input.code, input.signal);
+          try {
+            return await this.resume(existing, input.code, input.signal);
+          } catch (error) {
+            if (
+              existing.phase === "exchange_prepared" ||
+              !input.code ||
+              !this.isTerminalResumeError(error)
+            )
+              throw error;
+            assertNotAborted(input.signal);
+            await this.discardPendingConnection(existing);
+            assertNotAborted(input.signal);
+          }
         }
       }
     }
