@@ -211,7 +211,11 @@ export class ConnectionService {
         // A fresh, different code supersedes the failed attempt: discard
         // dead secrets instead of replaying them and getting stuck.
         const storedCode = this.secrets.get(existing.codeSecretId);
-        if (input.code && storedCode !== input.code) {
+        if (
+          existing.phase === "exchange_prepared" &&
+          input.code &&
+          storedCode !== input.code
+        ) {
           await this.discardPendingConnection(existing);
         } else {
           return this.resume(existing, input.code, input.signal);

@@ -374,6 +374,54 @@ describe("browser authorization", () => {
     expect([...f.secrets.values.values()]).toEqual([]);
   });
 
+  it("does not start HTTP after stop invalidates a delayed pending cleanup", async () => {
+    const f = fixture();
+    let release!: () => void;
+    let blocked = false;
+    f.store.onTextRead = async (path) => {
+      if (blocked || path !== "browser-authorization.json") return;
+      blocked = true;
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    };
+
+    const starting = f.subject.start("https://wiki.example.com", "0.5.0");
+    await vi.waitFor(() => expect(blocked).toBe(true));
+    f.subject.stop();
+    release();
+    await starting;
+
+    expect(f.http.calls).toHaveLength(0);
+    expect(f.subject.current()).toEqual({ status: "idle" });
+    expect(f.scheduler.tasks.size).toBe(0);
+  });
+
+  it("does not revive a delayed resume after stop invalidates it", async () => {
+    const f = fixture();
+    f.http.enqueue({ status: 200, json: started });
+    await f.subject.start("https://wiki.example.com", "0.5.0");
+    f.subject.stop();
+    let release!: () => void;
+    let blocked = false;
+    f.store.onTextRead = async (path) => {
+      if (blocked || path !== "browser-authorization.json") return;
+      blocked = true;
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    };
+
+    const resuming = f.subject.resume();
+    await vi.waitFor(() => expect(blocked).toBe(true));
+    f.subject.stop();
+    release();
+    await resuming;
+
+    expect(f.subject.current()).toMatchObject({ status: "waiting" });
+    expect(f.scheduler.tasks.size).toBe(0);
+  });
+
   it("removes a start invalidated while its pending record is being persisted", async () => {
     const f = fixture();
     f.http.enqueue({ status: 200, json: started });
@@ -519,6 +567,37 @@ describe("browser authorization", () => {
     await cancelling;
 
     expect(f.subject.current()).toEqual({ status: "connected" });
+  });
+
+  it("reports a stopped connection that settles successfully instead of polling again", async () => {
+    const f = fixture();
+    let release!: () => void;
+    f.http.enqueue({ status: 200, json: started });
+    f.http.enqueue({
+      status: 200,
+      json: { status: "authorized", code: "awo_install_once", expiresIn: 600 },
+    });
+    f.connect.mockImplementation(
+      async () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    await f.subject.start("https://wiki.example.com", "0.5.0");
+    await f.scheduler.runNext();
+    await vi.waitFor(() =>
+      expect(f.subject.current()).toMatchObject({ status: "connecting" }),
+    );
+
+    f.subject.stop();
+    const resuming = f.subject.resume();
+    await Promise.resolve();
+    expect(f.scheduler.tasks.size).toBe(0);
+    release();
+    await resuming;
+
+    expect(f.subject.current()).toEqual({ status: "connected" });
+    expect(f.scheduler.tasks.size).toBe(0);
   });
 
   it("keeps the current poll owner when an older stopped poll returns", async () => {

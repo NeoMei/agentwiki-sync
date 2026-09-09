@@ -6,8 +6,10 @@ export class MemoryControlStore implements ControlStorePort {
   failNextTextWriteAt: string | null = null;
   failWhenTextPathIncludes: string | null = null;
   failNextRemoveTreeAt: string | null = null;
+  onTextRead?: (path: string) => Promise<void> | void;
   onTextWrite?: (path: string) => Promise<void> | void;
   async read(path: string): Promise<string | null> {
+    await this.onTextRead?.(path);
     return this.files.get(path) ?? null;
   }
   async write(path: string, value: string): Promise<void> {

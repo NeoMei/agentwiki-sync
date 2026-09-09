@@ -132,6 +132,7 @@ export class BrowserAuthorizationController {
   private pollingGeneration: number | null = null;
   private connectionAbort: AbortController | null = null;
   private pollPromise: Promise<void> | null = null;
+  private completedConnectionGeneration: number | null = null;
   private generation = 0;
 
   constructor(private readonly options: BrowserAuthorizationOptions) {
@@ -163,8 +164,10 @@ export class BrowserAuthorizationController {
     serverInput: string,
     pluginVersion: string,
   ): Promise<BrowserAuthorizationState> {
-    await this.clearPending();
-    const generation = this.generation;
+    const generation = this.generation + 1;
+    await this.clearPending(generation);
+    if (generation !== this.generation) return this.state;
+    this.completedConnectionGeneration = null;
     const serverUrl = normalizeServerUrl(
       serverInput,
       this.options.allowLoopbackDevelopment ?? false,
@@ -253,8 +256,18 @@ export class BrowserAuthorizationController {
   }
 
   async resume(): Promise<BrowserAuthorizationState> {
+    const previousConnection =
+      this.state.status === "connecting" ? this.pollPromise : null;
     this.stop();
+    const generation = this.generation;
+    await previousConnection;
+    if (generation !== this.generation) return this.state;
+    if (previousConnection && this.completedConnectionGeneration !== null) {
+      await this.finish({ status: "connected" });
+      return this.state;
+    }
     const stored = await this.repository.read();
+    if (generation !== this.generation) return this.state;
     const pending = stored?.payload ?? null;
     if (!pending || !this.options.secrets.get(pending.deviceSecretId)) {
       this.pending = null;
@@ -399,6 +412,7 @@ export class BrowserAuthorizationController {
         this.connectionAbort = abort;
         this.publish(this.visiblePending("connecting"));
         await this.options.connect(code, serverUrl, abort.signal);
+        this.completedConnectionGeneration = generation;
         if (generation !== this.generation) return;
         this.connectionAbort = null;
         await this.finish({ status: "connected" });
@@ -422,17 +436,23 @@ export class BrowserAuthorizationController {
       this.schedule(this.pending.intervalSeconds);
   }
 
-  private async clearPending(): Promise<void> {
+  private async clearPending(expectedGeneration?: number): Promise<void> {
     this.stop();
+    const generation = this.generation;
+    if (expectedGeneration !== undefined && generation !== expectedGeneration)
+      return;
     const stored =
       this.pending ?? (await this.repository.read())?.payload ?? null;
+    if (generation !== this.generation) return;
     if (stored) this.options.secrets.set(stored.deviceSecretId, "");
     await this.repository.clear();
+    if (generation !== this.generation) return;
     this.pending = null;
   }
 
   private async finish(state: BrowserAuthorizationState): Promise<void> {
-    await this.clearPending();
-    this.publish(state);
+    const generation = this.generation + 1;
+    await this.clearPending(generation);
+    if (generation === this.generation) this.publish(state);
   }
 }

@@ -685,4 +685,62 @@ describe("connection cancellation", () => {
     ]);
     expect(await control.read("connection-state.json")).toBeNull();
   });
+
+  it("resumes an activating journal without discarding its credential or exchanging again", async () => {
+    const http = new FakeHttp();
+    const control = new MemoryControlStore();
+    const secrets = new MemorySecrets();
+    const credentialSecretId = "agentwiki-sync-secret-existing";
+    const codeSecretId = "agentwiki-sync-secret-cleared-code";
+    secrets.set(credentialSecretId, "existing-credential");
+    secrets.set(codeSecretId, "");
+    await control.write(
+      "connection-journal.json",
+      JSON.stringify({
+        schemaVersion: 1,
+        phase: "activating",
+        serverUrl: "https://wiki.example.com",
+        exchangeId: "55555555-5555-4555-8555-555555555555",
+        codeSecretId,
+        credentialSecretId,
+        credentialId: "22222222-2222-4222-8222-222222222222",
+        serverInstanceId: "11111111-1111-4111-8111-111111111111",
+        deviceId: "33333333-3333-4333-8333-333333333333",
+        deviceName: "Phone",
+        vaultId: "44444444-4444-4444-8444-444444444444",
+        pluginVersion: "0.5.0",
+      }),
+    );
+    const activeSession = {
+      protocolVersion: "1",
+      serverInstanceId: "11111111-1111-4111-8111-111111111111",
+      credentialId: "22222222-2222-4222-8222-222222222222",
+      credentialStatus: "active",
+      deviceId: "33333333-3333-4333-8333-333333333333",
+      deviceName: "Phone",
+      vaultId: "44444444-4444-4444-8444-444444444444",
+      createdAt: "2026-08-14T00:00:00.000Z",
+      lastUsedAt: "2026-08-14T00:00:00.000Z",
+      provisionalExpiresAt: null,
+      user: { id: "u", displayName: "U" },
+      capabilities: FakeHttp.capabilities,
+    };
+    http.enqueue({ status: 200, json: activeSession });
+    http.enqueue({ status: 200, json: activeSession });
+
+    await new ConnectionService(http, secrets, control).connect({
+      serverUrl: "https://wiki.example.com",
+      code: "new-authorized-code-123456789",
+      deviceId: "33333333-3333-4333-8333-333333333333",
+      deviceName: "Phone",
+      vaultId: "44444444-4444-4444-8444-444444444444",
+      pluginVersion: "0.5.0",
+    });
+
+    expect(http.calls.map((call) => call.path)).toEqual([
+      "/api/integrations/obsidian/session",
+      "/api/integrations/obsidian/session",
+    ]);
+    expect(secrets.get(credentialSecretId)).toBe("existing-credential");
+  });
 });
