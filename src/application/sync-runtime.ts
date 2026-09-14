@@ -220,6 +220,7 @@ export interface RemoteDeltaV3 {
 }
 
 export interface PullPreview extends TreePullPreview {
+  restoreServer?: true;
   artifactRoots: string[];
   scanEpoch: number;
   conflicts: StructuredConflict[];
@@ -361,6 +362,7 @@ export class SyncRuntime {
     PushPreviewV3,
     { epoch: number; authority: NormalizedRuntimeAuthority | null }
   >();
+  private readonly restoreGuards = new WeakMap<PullPreview, ApplyPullGuard>();
   private readonly root: string;
   private readonly treeBaseline: TreeBaselineRepository;
   private readonly legacyBaseline: BaselineRepository;
@@ -418,6 +420,7 @@ export class SyncRuntime {
       control,
       this.root + "/v3-pull-control-after.json",
       isV3PullControlAfterState,
+      [2],
     );
   }
 
@@ -2452,7 +2455,58 @@ export class SyncRuntime {
       );
   }
 
-  async previewPull(options?: SyncOperationOptions): Promise<PullPreview> {
+  private staleRestorePreview(): Error {
+    return new Error(
+      "STALE_PULL_PREVIEW: 本地文件或目录已变化，请重新预览服务器恢复。 / Local files or directories changed; preview server restore again.",
+    );
+  }
+
+  private async captureRestoreSnapshot(): Promise<
+    Record<string, TreeTransactionPathState>
+  > {
+    const root = joinRoot(this.mapping.rootPath, "pages");
+    const states: Record<string, TreeTransactionPathState> = {
+      [root]: await this.readVaultPathState(root),
+    };
+    for await (const entry of this.vault.listTree(root, {
+      metadataOnly: true,
+      includeControlDirectories: true,
+    })) {
+      const path = `${root}/${entry.relativePath}`;
+      const state = await this.readVaultPathState(path);
+      if (
+        state.kind !== (entry.kind === "directory" ? "directory" : "file") ||
+        (state.kind === "file" && state.hash === null)
+      )
+        throw this.staleRestorePreview();
+      states[path] = state;
+    }
+    return states;
+  }
+
+  private async assertRestoreSnapshot(
+    expected: Record<string, TreeTransactionPathState>,
+  ): Promise<void> {
+    const actual = await this.captureRestoreSnapshot();
+    if (
+      canonicalBytes(actual).toString() !== canonicalBytes(expected).toString()
+    )
+      throw this.staleRestorePreview();
+  }
+
+  serverRestoreGuard(preview: PullPreview): ApplyPullGuard {
+    const guard = this.restoreGuards.get(preview);
+    if (!guard) throw this.staleRestorePreview();
+    return {
+      ...guard,
+      expectedPathStates: structuredClone(guard.expectedPathStates),
+    };
+  }
+
+  async previewPull(
+    options?: SyncOperationOptions,
+    behavior?: { restoreServer?: boolean },
+  ): Promise<PullPreview> {
     const base = await this.readBaseSnapshot();
     const head = await this.legacyTreeRemote.head();
     const remote = await this.downloadRemoteSnapshot(head.revision, options);
@@ -2461,14 +2515,30 @@ export class SyncRuntime {
       (await this.hasLocalImageCandidate())
     )
       throw new Error("SYNC_PROTOCOL_UPGRADE_REQUIRED");
+    const restoreSnapshot = behavior?.restoreServer
+      ? await this.captureRestoreSnapshot()
+      : null;
     const local = await this.scan(options, base ? undefined : remote.pages);
+    if (restoreSnapshot) await this.assertRestoreSnapshot(restoreSnapshot);
+    // Explicit restore compares the observed local tree directly with the
+    // server, including deletions without conflicts. The durable baseline is
+    // retained below for transaction ownership; auto merge remains three-way.
     const tree = await buildTreePullPreview(
-      base ?? emptySnapshot(remote.protocolVersion, remote.spaceId),
+      behavior?.restoreServer
+        ? {
+            ...remote,
+            revision: base?.revision ?? "0",
+            folders: local.folders,
+            pages: local.pages,
+          }
+        : (base ?? emptySnapshot(remote.protocolVersion, remote.spaceId)),
       local,
       remote,
     );
-    return {
+    const preview: PullPreview = {
       ...tree,
+      ...(restoreSnapshot ? { restoreServer: true as const } : {}),
+      base: base ?? emptySnapshot(remote.protocolVersion, remote.spaceId),
       artifactRoots: [],
       scanEpoch: this.scanEpoch,
       conflicts: tree.pageConflicts,
@@ -2482,6 +2552,46 @@ export class SyncRuntime {
         vaultByteHash: page.contentHash,
       })),
     };
+    if (restoreSnapshot) {
+      const managedFiles = new Set(
+        local.pages.map((page) => joinRoot(this.mapping.rootPath, page.path)),
+      );
+      for (const action of preview.actions) {
+        if (
+          action.kind !== "trash_directory" &&
+          action.kind !== "move_directory"
+        )
+          continue;
+        const root = joinRoot(
+          this.mapping.rootPath,
+          action.kind === "move_directory" ? action.fromPath : action.path,
+        );
+        for (const [path, state] of Object.entries(restoreSnapshot)) {
+          if (
+            path.startsWith(`${root}/`) &&
+            ((state.kind === "file" && !managedFiles.has(path)) ||
+              path.split("/").includes(".agentwiki"))
+          )
+            throw new Error(
+              `SERVER_RESTORE_UNMANAGED_DESCENDANT: ${path} — 目录包含未托管文件，恢复已阻止。请先将文件移出待删除或移动的目录，再重新预览。 / Restore blocked by unmanaged descendants. Move them out of the affected directory and preview again.`,
+            );
+        }
+      }
+      const expectedPathStates = structuredClone(restoreSnapshot);
+      for (const action of preview.actions) {
+        const path = joinRoot(this.mapping.rootPath, action.path);
+        expectedPathStates[path] ??= { kind: "missing", hash: null };
+      }
+      const epoch = this.scanEpoch;
+      this.restoreGuards.set(preview, {
+        expectedPathStates,
+        revalidate: async () => {
+          if (epoch !== this.scanEpoch) throw this.staleRestorePreview();
+          await this.assertRestoreSnapshot(restoreSnapshot);
+        },
+      });
+    }
+    return preview;
   }
 
   private hasLegacyManagedImageCandidate(page: TreePage): boolean {
@@ -2547,6 +2657,10 @@ export class SyncRuntime {
     options?: SyncOperationOptions,
     guard?: ApplyPullGuard,
   ): Promise<void> {
+    // A restore preview always carries its original binding, even when called
+    // outside the UI. A copied/reconstructed preview cannot authorize restore.
+    if (preview.restoreServer || this.restoreGuards.has(preview))
+      guard = this.serverRestoreGuard(preview);
     const expectedPathStates = guard
       ? Object.freeze(
           Object.fromEntries(
@@ -2566,6 +2680,7 @@ export class SyncRuntime {
       completed: 0,
       cancellable: true,
     });
+    if (guard) await guard.revalidate();
     if (expectedPathStates)
       await this.assertVaultPathStates(expectedPathStates);
     for (const conflict of [...preview.pageConflicts]) {
@@ -2580,6 +2695,7 @@ export class SyncRuntime {
     }
     if (pendingTreeDecisionCount(preview) > 0)
       throw new Error("拉取存在未解决的结构化冲突");
+    if (guard) await guard.revalidate();
     if (expectedPathStates)
       await this.assertVaultPathStates(expectedPathStates);
     const snapshot: TreeSnapshot = {
@@ -2618,6 +2734,7 @@ export class SyncRuntime {
       },
       baselineTx.transactionId,
     );
+    if (guard) await guard.revalidate();
     await this.withoutRenameHints(() => tx.apply());
     await this.treeBaseline.commit();
     await this.commitIdentities(
@@ -2853,6 +2970,15 @@ export class SyncRuntime {
   }
 
   async discardPullPreview(preview: PullPreview): Promise<void> {
+    // A failed preparation/application still owns these bodies. Closing a
+    // preview must not erase the evidence needed to diagnose or recover it.
+    const journal = await this.treeBaseline.inspectJournal();
+    if (
+      journal &&
+      journal.phase !== "committed" &&
+      journal.phase !== "rolled_back"
+    )
+      return;
     for (const page of preview.resolvedPages)
       await this.control.remove(
         this.root + "/tree-preview-body/" + page.pageId + ".md",

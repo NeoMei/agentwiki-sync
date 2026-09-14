@@ -1165,3 +1165,37 @@ describe("TreeTransaction", () => {
     expect((await tx.inspect())?.state).toBe("committed");
   });
 });
+
+it("moves an ordinary V2 directory with a pre-existing static control subtree", async () => {
+  const vault = new MemoryVault({
+    "pages/A/note.md": "managed",
+    "pages/A/.agentwiki/private.bin": "unmanaged",
+  });
+  const control = new MemoryControlStore();
+  const transaction = new TreeTransaction(
+    vault,
+    control,
+    ".agentwiki/static-control-move",
+  );
+  await transaction.prepare({
+    baseRevision: "base",
+    targetRevision: "target",
+    targetTreeHash: "0".repeat(64),
+    deferCommit: true,
+    actions: [
+      {
+        kind: "move_directory",
+        folderId: "folder",
+        fromPath: "pages/A",
+        path: "pages/B",
+      },
+    ],
+  });
+  await transaction.apply();
+  expect(vault.text("pages/B/note.md")).toBe("managed");
+  expect(vault.text("pages/B/.agentwiki/private.bin")).toBe("unmanaged");
+  expect((await transaction.inspect())?.state).toBe("applied");
+  await transaction.recover();
+  expect((await transaction.inspect())?.state).toBe("rolled_back");
+  expect(vault.text("pages/A/.agentwiki/private.bin")).toBe("unmanaged");
+});

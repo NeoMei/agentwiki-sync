@@ -86,6 +86,7 @@ export class TreeBaselineRepository {
       store,
       `${this.treeRoot}/baseline-journal.json`,
       isTreeBaselineJournal,
+      [2],
     );
   }
 

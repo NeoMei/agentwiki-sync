@@ -395,6 +395,49 @@ describe("normalized push storage", () => {
         ).toBe(2);
       }
   });
+  it.each([true, false])(
+    "accepts the persisted boolean directory inventory mode %s",
+    async (mode) => {
+      const f = await makeLocalOnlyFixture();
+      const { repo, journal, paths } = await completeLocalOnly(f);
+      const root = `${paths.localRoot}/journal.json`;
+      const current = JSON.parse(
+        (await f.store.read(root))!,
+      ) as MutableControlEnvelope<Record<string, unknown>>;
+      await f.store.write(
+        root,
+        await envelopeFor(
+          { ...current.payload, includeControlDirectories: mode },
+          current.writeGeneration + 1,
+        ),
+      );
+      await expect(repo.assertTerminal(journal)).resolves.toBeUndefined();
+    },
+  );
+
+  it.each(["non-boolean", "unknown-key"])(
+    "rejects invalid local inventory metadata: %s",
+    async (variant) => {
+      const f = await makeLocalOnlyFixture();
+      const { repo, journal, paths } = await completeLocalOnly(f);
+      const root = `${paths.localRoot}/journal.json`;
+      const current = JSON.parse(
+        (await f.store.read(root))!,
+      ) as MutableControlEnvelope<Record<string, unknown>>;
+      const changed =
+        variant === "non-boolean"
+          ? { ...current.payload, includeControlDirectories: "true" }
+          : { ...current.payload, unrecognizedInventoryMode: true };
+      await f.store.write(
+        root,
+        await envelopeFor(changed, current.writeGeneration + 1),
+      );
+      const saved = new Map(f.store.files);
+      await expect(repo.assertTerminal(journal)).rejects.toThrow();
+      expect(f.store.files).toEqual(saved);
+    },
+  );
+
   it.each(["local", "remote", "control-after", "completion"])(
     "rejects foreign ownership even in a lower %s child candidate",
     async (kind) => {

@@ -423,3 +423,91 @@ describe("tree attachment identities", () => {
     ).not.toThrow();
   });
 });
+
+describe("Q3 control diagnostics", () => {
+  const guard = (value: unknown): value is { schemaVersion: 2; name: string } =>
+    !!value &&
+    typeof value === "object" &&
+    (value as { schemaVersion?: unknown }).schemaVersion === 2 &&
+    typeof (value as { name?: unknown }).name === "string";
+  it.each(["hash", "shape", "future"] as const)(
+    "retains all evidence and distinguishes %s rejection",
+    async (failure) => {
+      const store = new MemoryControlStore();
+      const repo = new MutableControlRepository(
+        store,
+        "state.json",
+        guard,
+        [2],
+      );
+      await repo.write({ schemaVersion: 2, name: "old" });
+      const payload =
+        failure === "shape"
+          ? { schemaVersion: 2, name: 42 }
+          : {
+              schemaVersion: failure === "future" ? 99 : 2,
+              name: "private document contents",
+            };
+      const raw = JSON.stringify({
+        envelopeSchemaVersion: 1,
+        writeGeneration: 2,
+        payloadHash:
+          failure === "hash"
+            ? "0".repeat(64)
+            : await sha256Hex(canonicalBytes(payload)),
+        payload,
+      });
+      await store.write("state.json.next", raw);
+      const before = await Promise.all(
+        ["state.json", "state.json.prev", "state.json.next"].map((p) =>
+          store.read(p),
+        ),
+      );
+      const error = await repo.read().catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(Error);
+      const message = (error as Error).message;
+      expect(message).toContain(
+        failure === "hash"
+          ? "CONTROL_PAYLOAD_HASH_MISMATCH"
+          : failure === "shape"
+            ? "CONTROL_PAYLOAD_INVALID"
+            : "CONTROL_PAYLOAD_VERSION_UNSUPPORTED",
+      );
+      expect(message).toContain("state.json.next");
+      expect(message).not.toContain("private document contents");
+      await expect(
+        repo.write({ schemaVersion: 2, name: "new" }),
+      ).rejects.toThrow();
+      expect(
+        await Promise.all(
+          ["state.json", "state.json.prev", "state.json.next"].map((p) =>
+            store.read(p),
+          ),
+        ),
+      ).toEqual(before);
+    },
+  );
+});
+
+it("does not poison a new mapping with a rejected control write", async () => {
+  const store = new MemoryControlStore();
+  const repository = new TreeIdentityRepository(store, "tree-identities.json");
+  await repository.commitConfirmedV3Activation();
+  const repo = new MutableControlRepository(
+    store,
+    "new-mapping.json",
+    (value): value is { schemaVersion: 2; phase: "pending" } =>
+      !!value &&
+      typeof value === "object" &&
+      (value as { schemaVersion?: unknown }).schemaVersion === 2 &&
+      (value as { phase?: unknown }).phase === "pending",
+    [2],
+  );
+  await expect(
+    repo.write({ schemaVersion: 2, phase: "invalid" as "pending" }),
+  ).rejects.toThrow();
+  expect(await store.read("new-mapping.json.next")).toBeNull();
+  await expect(
+    repo.write({ schemaVersion: 2, phase: "pending" }),
+  ).resolves.toMatchObject({ writeGeneration: 1 });
+});

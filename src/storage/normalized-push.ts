@@ -90,6 +90,7 @@ function isOwnedTreeJournal(value: unknown): value is TreeTransactionJournal {
       "nextOperation",
       "operations",
       "deferCommit",
+      "includeControlDirectories",
     ]) ||
     !isTreeTransactionJournal(value)
   )

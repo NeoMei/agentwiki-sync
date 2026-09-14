@@ -247,6 +247,7 @@ export async function verifyResolvedV3Vault(input: {
       ...input.capabilities,
       maxFolders: input.capabilities.maxClientSpaceFolders,
       maxPages: input.capabilities.maxClientSpacePages,
+      maxTotalBodyBytes: input.capabilities.maxClientTotalBodyBytes,
     },
   );
   const folders = new Map(actual.folders.map((item) => [item.folderId, item]));
@@ -254,46 +255,69 @@ export async function verifyResolvedV3Vault(input: {
   const attachments = new Map(
     actual.attachments.map((item) => [item.attachmentId, item]),
   );
+  const fail = (detail: object): never => {
+    throw new Error(
+      `V3_VAULT_VERIFY_FAILED: ${JSON.stringify(detail)} — 校验未通过，请保留控制文件并重新预览；不要删除基线。 / Verification failed; retain control files and preview again. Do not delete the baseline.`,
+    );
+  };
+  if (actual.blockers.length)
+    fail({
+      kind: "scan",
+      blockers: actual.blockers.map(({ code, pagePath, path }) => ({
+        code,
+        pagePath,
+        path,
+      })),
+    });
+  const verify = <T extends { path: string }>(
+    kind: string,
+    expected: T,
+    value: T | undefined,
+    fields: (keyof T)[],
+  ) => {
+    if (!value) fail({ kind, path: expected.path, mismatch: "missing" });
+    const mismatches = fields.filter(
+      (field) =>
+        JSON.stringify(value![field]) !== JSON.stringify(expected[field]),
+    );
+    if (mismatches.length)
+      fail({ kind, path: expected.path, fields: mismatches });
+  };
+  for (const expected of preview.resolvedFolders)
+    verify("folder", expected, folders.get(expected.folderId), [
+      "path",
+      "parentFolderId",
+    ]);
+  for (const expected of preview.resolvedPages)
+    verify("page", expected, pages.get(expected.pageId), [
+      "path",
+      "folderId",
+      "contentHash",
+      "referencedAttachmentIds",
+    ]);
+  for (const expected of preview.resolvedAttachments)
+    verify("attachment", expected, attachments.get(expected.attachmentId), [
+      "path",
+      "contentHash",
+      "sizeBytes",
+      "mimeType",
+      "width",
+      "height",
+    ]);
   if (
-    actual.blockers.length ||
     folders.size !== preview.resolvedFolders.length ||
     pages.size !== preview.resolvedPages.length ||
     attachments.size !== preview.resolvedAttachments.length
   )
-    throw new Error("V3_VAULT_VERIFY_FAILED");
-  for (const expected of preview.resolvedFolders) {
-    const value = folders.get(expected.folderId);
-    if (
-      !value ||
-      value.path !== expected.path ||
-      value.parentFolderId !== expected.parentFolderId
-    )
-      throw new Error("V3_VAULT_VERIFY_FAILED");
-  }
-  for (const expected of preview.resolvedPages) {
-    const value = pages.get(expected.pageId);
-    if (
-      !value ||
-      value.path !== expected.path ||
-      value.contentHash !== expected.contentHash ||
-      JSON.stringify(value.referencedAttachmentIds) !==
-        JSON.stringify(expected.referencedAttachmentIds)
-    )
-      throw new Error("V3_VAULT_VERIFY_FAILED");
-  }
-  for (const expected of preview.resolvedAttachments) {
-    const value = attachments.get(expected.attachmentId);
-    if (
-      !value ||
-      value.path !== expected.path ||
-      value.contentHash !== expected.contentHash ||
-      value.sizeBytes !== expected.sizeBytes ||
-      value.mimeType !== expected.mimeType ||
-      value.width !== expected.width ||
-      value.height !== expected.height
-    )
-      throw new Error("V3_VAULT_VERIFY_FAILED");
-  }
+    fail({
+      kind: "count",
+      expected: [
+        preview.resolvedFolders.length,
+        preview.resolvedPages.length,
+        preview.resolvedAttachments.length,
+      ],
+      actual: [folders.size, pages.size, attachments.size],
+    });
 }
 
 export async function applyV3ControlAfter(

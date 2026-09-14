@@ -411,6 +411,7 @@ async function writeLocalJournal(
     nextOperation: 0,
     operations: [],
     deferCommit: true,
+    includeControlDirectories: false,
     ...overrides,
   };
   await new MutableControlRepository(

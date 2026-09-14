@@ -1673,23 +1673,15 @@ export default class AgentWikiSyncPlugin extends Plugin {
         false,
         options,
       );
-    const delta = await runtime.remoteDelta();
-    if (!delta.ahead) {
-      new Notice("服务器没有新的变更可应用。");
+    const preview = await runtime.previewPull(options, { restoreServer: true });
+    if (!preview.actions.length && preview.base.revision === preview.revision) {
+      await runtime.discardPullPreview(preview);
+      new Notice(
+        "本地已与服务器一致。 / Local files already match the server.",
+      );
       flow.finish();
       return;
     }
-    const preview = await runtime.previewPull(options);
-    for (const conflict of preview.conflicts)
-      preview.conflictResolutions[conflict.conflictId] = {
-        choice: "remote",
-      };
-    for (const conflict of preview.folderConflicts)
-      preview.folderConflictResolutions[conflict.conflictId] = {
-        choice: "remote",
-      };
-    for (const binding of preview.initialBindings)
-      if (binding.resolution === null) binding.resolution = "remote";
     return () =>
       new PreviewModal(
         this.app,
@@ -1706,7 +1698,11 @@ export default class AgentWikiSyncPlugin extends Plugin {
           ),
         ],
         async (applyOptions) => {
-          await runtime.applyPull(preview, applyOptions);
+          await runtime.applyPull(
+            preview,
+            applyOptions,
+            runtime.serverRestoreGuard(preview),
+          );
           await this.saveSettings();
           new Notice("已按服务器内容更新本地。");
         },

@@ -16,9 +16,10 @@ export interface VaultPort {
   listMarkdown(
     rootPath: string,
   ): AsyncIterable<{ relativePath: string; bytes: Uint8Array }>;
+  /** includeControlDirectories is only for destructive-operation ownership checks, never sync content discovery. */
   listTree(
     rootPath: string,
-    options?: { metadataOnly?: boolean },
+    options?: { metadataOnly?: boolean; includeControlDirectories?: boolean },
   ): AsyncIterable<VaultTreeEntry>;
   pathStatus(path: string): Promise<"directory" | "file" | "missing">;
   createDirectory(path: string): Promise<void>;

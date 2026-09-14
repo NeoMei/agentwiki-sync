@@ -57,6 +57,7 @@ export class MutableControlRepository<T> {
     private readonly store: ControlStorePort,
     private readonly path: string,
     private readonly guard: TypeGuard<T>,
+    private readonly supportedPayloadVersions?: readonly number[],
   ) {}
 
   async candidates(): Promise<MutableControlEnvelope<T>[]> {
@@ -79,23 +80,56 @@ export class MutableControlRepository<T> {
     );
     for (let index = 0; index < raws.length; index += 1) {
       if (candidates[index] !== null || raws[index] === null) continue;
+      let rejected: {
+        envelopeSchemaVersion?: unknown;
+        writeGeneration?: unknown;
+        payload?: { schemaVersion?: unknown };
+      } | null;
       try {
-        const rejected = JSON.parse(raws[index]!) as {
-          envelopeSchemaVersion?: unknown;
-          writeGeneration?: unknown;
-          payload?: { schemaVersion?: unknown };
-        };
-        if (
-          rejected.envelopeSchemaVersion === 1 &&
-          Number.isSafeInteger(rejected.writeGeneration) &&
-          (rejected.writeGeneration as number) >= highestValidGeneration &&
-          typeof rejected.payload?.schemaVersion === "number"
-        )
-          throw new Error("检测到未知或未来的控制 payload 版本");
-      } catch (error) {
-        if (error instanceof Error && error.message.includes("payload"))
-          throw error;
+        rejected = JSON.parse(raws[index]!) as typeof rejected;
+      } catch {
+        continue;
       }
+      const version = rejected?.payload?.schemaVersion;
+      if (
+        rejected?.envelopeSchemaVersion !== 1 ||
+        !Number.isSafeInteger(rejected.writeGeneration) ||
+        typeof version !== "number"
+      )
+        continue;
+      const unsupported =
+        this.supportedPayloadVersions !== undefined &&
+        !this.supportedPayloadVersions.includes(version);
+      if (
+        !unsupported &&
+        (rejected.writeGeneration as number) < highestValidGeneration
+      )
+        continue;
+      let accepted = false;
+      try {
+        accepted = this.guard(rejected.payload);
+      } catch {
+        /* Invalid shape. */
+      }
+      const code = unsupported
+        ? "CONTROL_PAYLOAD_VERSION_UNSUPPORTED"
+        : accepted
+          ? "CONTROL_PAYLOAD_HASH_MISMATCH"
+          : this.supportedPayloadVersions
+            ? "CONTROL_PAYLOAD_INVALID"
+            : "CONTROL_PAYLOAD_GUARD_REJECTED";
+      const reason =
+        unsupported || (!accepted && !this.supportedPayloadVersions)
+          ? "检测到未知或未来的控制 payload 版本，或格式不受支持 / Unsupported payload version or shape"
+          : "控制 payload 已损坏 / Corrupt control payload";
+      const candidatePath = [
+        this.path,
+        `${this.path}.prev`,
+        `${this.path}.next`,
+      ][index];
+      throw new Error(
+        `${code}: ${reason}; ${JSON.stringify({ path: candidatePath, generation: rejected.writeGeneration, schemaVersion: version })}; 保留主文件、prev、next，不要删除基线。 / Retain main, prev and next; do not delete the baseline.`,
+      );
     }
     if (
       candidates.every((candidate) => candidate === null) &&
@@ -122,6 +156,10 @@ export class MutableControlRepository<T> {
   }
 
   async write(payload: T): Promise<MutableControlEnvelope<T>> {
+    if (!this.guard(payload))
+      throw new Error(
+        "CONTROL_PAYLOAD_INVALID: 控制写入格式无效，未修改存储。 / Invalid control payload; storage unchanged.",
+      );
     const candidates = await this.candidates();
     const generation =
       Math.max(0, ...candidates.map((candidate) => candidate.writeGeneration)) +

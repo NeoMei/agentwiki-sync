@@ -265,6 +265,7 @@ export class TreeIdentityRepository {
       store,
       path,
       isTreeIdentityState,
+      [1, 2],
     );
   }
 

@@ -60,6 +60,7 @@ export interface TreeTransactionJournal {
   nextOperation: number;
   operations: JournalOperation[];
   deferCommit?: boolean;
+  includeControlDirectories?: boolean;
 }
 
 export interface TreeTransactionInput {
@@ -151,7 +152,9 @@ export function isTreeTransactionJournal(
     (item.nextOperation ?? -1) >= 0 &&
     Array.isArray(item.operations) &&
     item.operations.every(isJournalOperation) &&
-    (item.deferCommit === undefined || typeof item.deferCommit === "boolean")
+    (item.deferCommit === undefined || typeof item.deferCommit === "boolean") &&
+    (item.includeControlDirectories === undefined ||
+      typeof item.includeControlDirectories === "boolean")
   );
 }
 
@@ -250,6 +253,7 @@ export class TreeTransaction {
       control,
       `${root}/journal.json`,
       isTreeTransactionJournal,
+      [2, 3],
     );
   }
 
@@ -349,7 +353,9 @@ export class TreeTransaction {
             return entries;
           for await (const entry of this.vault.listTree(
             path,
-            input.expectedPathStates ? { metadataOnly: true } : undefined,
+            input.expectedPathStates
+              ? { metadataOnly: true, includeControlDirectories: true }
+              : undefined,
           )) {
             if (input.expectedPathStates && entry.kind !== "directory") {
               const expected =
@@ -425,6 +431,7 @@ export class TreeTransaction {
       nextOperation: 0,
       operations,
       deferCommit: input.deferCommit ?? false,
+      includeControlDirectories: !!input.expectedPathStates,
     });
   }
 
@@ -471,6 +478,8 @@ export class TreeTransaction {
               operation,
               journal.operations,
               index,
+              false,
+              journal.includeControlDirectories === true,
             ))
           ) {
             journal.state = "ambiguous";
@@ -486,6 +495,8 @@ export class TreeTransaction {
             operation,
             journal.operations,
             index + 1,
+            false,
+            journal.includeControlDirectories === true,
           ))
         ) {
           journal.state = "ambiguous";
@@ -1038,6 +1049,7 @@ export class TreeTransaction {
     allOperations: JournalOperation[],
     appliedCount: number,
     transactionWide = false,
+    includeControlDirectories = false,
   ): Promise<boolean> {
     const closure =
       operation.directoryClosure ?? this.legacyDirectoryClosure(operation);
@@ -1062,7 +1074,10 @@ export class TreeTransaction {
           expected.set(pathKey(path), kind);
       const actual = new Map<string, PathKind>();
       if ((await this.vault.pathStatus(root)) === "directory")
-        for await (const entry of this.vault.listTree(root))
+        for await (const entry of this.vault.listTree(root, {
+          metadataOnly: true,
+          includeControlDirectories,
+        }))
           actual.set(
             pathKey(`${root}/${entry.relativePath}`),
             entry.kind === "directory" ? "directory" : "file",
@@ -1168,6 +1183,7 @@ export class TreeTransaction {
           journal.operations,
           journal.operations.length,
           true,
+          journal.includeControlDirectories === true,
         ))
       )
         return false;
@@ -1189,6 +1205,8 @@ export class TreeTransaction {
               operation,
               journal.operations,
               index + 1,
+              false,
+              journal.includeControlDirectories === true,
             ))
           ) {
             journal.state = "ambiguous";
@@ -1246,6 +1264,8 @@ export class TreeTransaction {
             operation,
             journal.operations,
             index + 1,
+            false,
+            journal.includeControlDirectories === true,
           ))
         ) {
           journal.state = "ambiguous";

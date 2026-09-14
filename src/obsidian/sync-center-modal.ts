@@ -371,7 +371,7 @@ export class SyncCenterModal extends Modal {
       return;
     }
     this.contentEl.createEl("p", {
-      text: "自动合并保留双方不冲突的修改，冲突时可在预览中逐项选择；使用本地/服务器内容会在冲突处直接采用所选一侧。",
+      text: "自动合并会同步本地删除，冲突可逐项选择；使用本地内容在冲突处保留本地。Sync v2 使用服务器内容会恢复本地删除并覆盖本地修改，执行前请检查预览。 / Auto merge includes local deletions; resolve conflicts in preview. Use local keeps local conflict values. In Sync v2, use server restores deleted files and replaces local changes; review before confirming.",
       cls: "agentwiki-sync-strategy-description",
     });
     const actions = new Setting(this.contentEl)

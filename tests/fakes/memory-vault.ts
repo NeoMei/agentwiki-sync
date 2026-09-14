@@ -69,7 +69,7 @@ export class MemoryVault implements VaultPort {
   }
   async *listTree(
     rootPath: string,
-    options?: { metadataOnly?: boolean },
+    options?: { metadataOnly?: boolean; includeControlDirectories?: boolean },
   ): AsyncIterable<VaultTreeEntry> {
     const prefix = rootPath.length > 0 ? `${rootPath}/` : "";
     const entries: VaultTreeEntry[] = [];
@@ -77,13 +77,21 @@ export class MemoryVault implements VaultPort {
       if (dir === rootPath) continue;
       if (!dir.startsWith(prefix)) continue;
       const relativePath = dir.slice(prefix.length);
-      if (relativePath.split("/").includes(".agentwiki")) continue;
+      if (
+        !options?.includeControlDirectories &&
+        relativePath.split("/").includes(".agentwiki")
+      )
+        continue;
       entries.push({ kind: "directory", relativePath });
     }
     for (const [path, bytes] of this.files) {
       if (!path.startsWith(prefix)) continue;
       const relativePath = path.slice(prefix.length);
-      if (relativePath.split("/").includes(".agentwiki")) continue;
+      if (
+        !options?.includeControlDirectories &&
+        relativePath.split("/").includes(".agentwiki")
+      )
+        continue;
       if (relativePath.toLowerCase().endsWith(".md"))
         entries.push({
           kind: "markdown",

@@ -909,3 +909,31 @@ describe("RequestUrlHttp", () => {
     ).rejects.toBeInstanceOf(HttpResponseTooLargeError);
   });
 });
+
+it("includes excluded descendants only for explicit ownership inventories", async () => {
+  const vault = new FakeVault({
+    "Wiki/pages/Only/.agentwiki/private.bin": "private",
+    "Wiki/pages/Only/draft.md": "draft",
+  });
+  const port = new ObsidianVaultPort(
+    vault as unknown as Vault,
+    {} as unknown as FileManager,
+    "Wiki",
+  );
+  const paths = (
+    await collect(
+      port.listTree("Wiki/pages/Only", {
+        metadataOnly: true,
+        includeControlDirectories: true,
+      }),
+    )
+  ).map((entry) => entry.relativePath);
+  expect(paths).toContain(".agentwiki/private.bin");
+  expect(paths).toContain("draft.md");
+  expect(vault.readPaths).toEqual([]);
+  expect(
+    (
+      await collect(port.listTree("Wiki/pages/Only", { metadataOnly: true }))
+    ).map((entry) => entry.relativePath),
+  ).toEqual(["draft.md"]);
+});
