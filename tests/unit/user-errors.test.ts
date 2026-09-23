@@ -47,6 +47,12 @@ describe("userErrorMessage", () => {
     );
   });
 
+  it("explains how to repair a mapping after reconnecting with a different account", () => {
+    expect(
+      userErrorMessage(new Error("SPACE_FORBIDDEN: stale mapping")),
+    ).toMatch(/移除旧映射.*当前可访问的空间/u);
+  });
+
   it("maps bare protocol codes without a colon to Chinese", () => {
     expect(userErrorMessage(new Error("PATH_COLLISION"))).toContain("占用");
     expect(userErrorMessage(new Error("PATH_COLLISION"))).not.toBe(

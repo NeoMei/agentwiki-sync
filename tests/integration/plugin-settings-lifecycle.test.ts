@@ -793,6 +793,49 @@ describe("plugin settings lifecycle", () => {
     expect(harness.plugin.settings.mappings).toHaveLength(1);
   });
 
+  it("removes an active mapping when the current credential no longer accesses its space", async () => {
+    const harness = await makePlugin({
+      data: {
+        schemaVersion: 2,
+        serverUrl: "https://wiki.example.com",
+        mappings: legacyWithMapping.mappings,
+      },
+    });
+    await harness.plugin.onload();
+    const subject = harness.plugin as unknown as {
+      runtime: () => Promise<never>;
+    };
+    subject.runtime = async () => {
+      throw new Error("SPACE_FORBIDDEN");
+    };
+
+    await harness.plugin.removeMapping("s1");
+
+    expect(harness.plugin.settings.mappings).toHaveLength(0);
+  });
+
+  it("keeps the mapping when runtime fails for a reason other than access", async () => {
+    const harness = await makePlugin({
+      data: {
+        schemaVersion: 2,
+        serverUrl: "https://wiki.example.com",
+        mappings: legacyWithMapping.mappings,
+      },
+    });
+    await harness.plugin.onload();
+    const subject = harness.plugin as unknown as {
+      runtime: () => Promise<never>;
+    };
+    subject.runtime = async () => {
+      throw new Error("network unavailable");
+    };
+
+    await expect(harness.plugin.removeMapping("s1")).rejects.toThrow(
+      "network unavailable",
+    );
+    expect(harness.plugin.settings.mappings).toHaveLength(1);
+  });
+
   it("hands a structured blocked Push preview to the rendered unified modal", async () => {
     const harness = await makePlugin({
       data: {

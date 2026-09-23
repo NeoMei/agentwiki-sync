@@ -13,7 +13,8 @@ const errorMessages: Record<string, string> = {
   CREDENTIAL_COLLISION: "凭据冲突。请重试，插件会自动重新生成。",
   RATE_LIMITED: "请求过于频繁。请稍后再试。",
   BASE_STALE: "远端已有更新。请先执行拉取（Pull）再推送。",
-  SPACE_FORBIDDEN: "没有此空间的访问权限。",
+  SPACE_FORBIDDEN:
+    "当前凭据没有此空间的访问权限。重新授权后请移除旧映射，再选择当前可访问的空间。",
   SPACE_READ_ONLY: "此空间只读，无法推送。请联系管理员获取编辑权限。",
   SPACE_TOO_LARGE: "空间超出同步限制（5000 页 / 100MB）。",
   PAGE_TOO_LARGE: "单页超出大小限制（1MB）。",

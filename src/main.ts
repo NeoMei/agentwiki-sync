@@ -512,8 +512,28 @@ export default class AgentWikiSyncPlugin extends Plugin {
     if (mapping.status === "active") {
       const release = this.locks.acquire(spaceId);
       try {
-        const runtime = await this.runtime(mapping);
-        if (!runtime) throw new Error("请先连接 AgentWiki 再移除活跃映射");
+        let runtime: SyncRuntime | null;
+        try {
+          runtime = await this.runtime(mapping);
+        } catch (error) {
+          // A reconnected device may lose access to an old mapping. Runtime
+          // construction then fails during the space lookup, but removing
+          // the stale mapping remains the safe local escape hatch.
+          if (error instanceof Error && error.message === "SPACE_FORBIDDEN") {
+            runtime = null;
+          } else {
+            throw error;
+          }
+        }
+        if (!runtime) {
+          this.settings.mappings = removeMapping(
+            this.settings.mappings,
+            spaceId,
+            gate,
+          );
+          await this.saveSettings();
+          return;
+        }
         if (this.runtimeRoutes.get(runtime)?.route === "recover_upgrade")
           throw new Error(`Space ${spaceId} 有未完成的图片同步升级`);
         await runtime.recover();
@@ -1009,7 +1029,17 @@ export default class AgentWikiSyncPlugin extends Plugin {
   ): Promise<SyncDiff> {
     const mapping = this.selectedMapping(spaceId);
     if (!mapping) throw new Error("请先连接并在设置中添加空间映射。");
-    const runtime = await this.runtime(mapping);
+    let runtime: SyncRuntime | null;
+    try {
+      runtime = await this.runtime(mapping);
+    } catch (error) {
+      if (error instanceof Error && error.message === "SPACE_FORBIDDEN") {
+        throw new Error(
+          "SPACE_FORBIDDEN: 重新授权后，此映射空间已不再属于当前账号。请在设置中移除旧映射，再选择当前可访问的空间。",
+        );
+      }
+      throw error;
+    }
     if (!runtime) throw new Error("请先连接并在设置中添加空间映射。");
     if (runtime.protocolVersion === "3") {
       const pending = await runtime.inspectNormalizedPush();
@@ -1370,7 +1400,17 @@ export default class AgentWikiSyncPlugin extends Plugin {
     if (!mapping) throw new Error("请先连接并在设置中添加空间映射。");
     const flow = new SyncFlowLock(this.locks.acquire(mapping.spaceId));
     try {
-      const runtime = await this.runtime(mapping);
+      let runtime: SyncRuntime | null;
+      try {
+        runtime = await this.runtime(mapping);
+      } catch (error) {
+        if (error instanceof Error && error.message === "SPACE_FORBIDDEN") {
+          throw new Error(
+            "SPACE_FORBIDDEN: 重新授权后，此映射空间已不再属于当前账号。请在设置中移除旧映射，再选择当前可访问的空间。",
+          );
+        }
+        throw error;
+      }
       if (!runtime) throw new Error("请先连接并在设置中添加空间映射。");
       if (runtime.protocolVersion === "3") {
         const pending = await runtime.inspectNormalizedPush();
