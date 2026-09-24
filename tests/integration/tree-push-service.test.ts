@@ -425,6 +425,60 @@ describe("TreePushService", () => {
     expect(remote.receivedOperations()).toEqual(["upsert_page", "upsert_page"]);
   });
 
+  it("rebuilds an expired remote session from the durable page push", async () => {
+    const remote = new FakeTreeRemote();
+    remote.loseFirstUploadOnce = true;
+    store = new MemoryControlStore();
+    const service = new TreePushService(
+      remote,
+      store,
+      ".agentwiki/tree/expired-resume",
+    );
+    await expect(
+      service.publishPrepared(
+        await prepared([upsertPage("p1", null, "pages/A.md")]),
+      ),
+    ).rejects.toThrow(/interrupted/);
+
+    const sessions = (
+      remote as unknown as {
+        sessions: Map<string, TreePushSession>;
+      }
+    ).sessions;
+    const session = sessions.get("session-1");
+    if (!session) throw new Error("fixture session missing");
+    sessions.set("session-1", { ...session, status: "expired" });
+
+    await expect(service.resume()).resolves.toMatchObject({
+      status: "published",
+    });
+    expect(remote.createCount).toBe(2);
+  });
+
+  it("does not rebuild an explicitly aborted remote session", async () => {
+    const remote = new FakeTreeRemote();
+    remote.loseFirstUploadOnce = true;
+    store = new MemoryControlStore();
+    const service = new TreePushService(
+      remote,
+      store,
+      ".agentwiki/tree/aborted-resume",
+    );
+    await expect(
+      service.publishPrepared(
+        await prepared([upsertPage("p1", null, "pages/A.md")]),
+      ),
+    ).rejects.toThrow(/interrupted/);
+    const sessions = (
+      remote as unknown as { sessions: Map<string, TreePushSession> }
+    ).sessions;
+    const session = sessions.get("session-1");
+    if (!session) throw new Error("fixture session missing");
+    sessions.set("session-1", { ...session, status: "aborted" });
+    await expect(service.resume()).rejects.toThrow(/推送会话无法恢复/);
+    expect(remote.createCount).toBe(1);
+  });
+
   it("supersedes a failed push and refuses to resume", async () => {
     const remote = new FakeTreeRemote();
     remote.changeCapabilitiesOnCreate = 2;

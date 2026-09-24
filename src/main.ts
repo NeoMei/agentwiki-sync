@@ -1077,6 +1077,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
           remoteListed: false,
           remoteFirstBind: false,
           recoveryPending: true,
+          recoveryKind: "image_upgrade",
         };
     }
     const routed = this.runtimeRoutes.get(runtime);
@@ -1114,6 +1115,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
         remoteListed: false,
         remoteFirstBind: false,
         recoveryPending: true,
+        recoveryKind: legacyPending ? "push" : "image_upgrade",
       };
     }
     if (routed?.route === "upgrade" && routed.upgrade) {

@@ -92,4 +92,29 @@ describe("rendered SyncCenterModal image details", () => {
     expect(rows).toHaveLength(100);
     expect(rows[0]?.text).toContain("assets/0100.png");
   });
+
+  it("labels a pending page push as page recovery", async () => {
+    const modal = new SyncCenterModal({} as App, {
+      targets: [{ spaceId: "space", label: "Space" }],
+      initialSpaceId: "space",
+      loadDiff: async () => ({
+        ...baseDiff([]),
+        protocolLabel: "Sync v2",
+        recoveryPending: true,
+        recoveryKind: "push",
+      }),
+      runStrategy: async () => undefined,
+    });
+
+    modal.open();
+    await vi.waitFor(() =>
+      expect((modal.contentEl as unknown as MockElement).textContent).toContain(
+        "页面同步尚未完成",
+      ),
+    );
+
+    expect((modal.contentEl as unknown as MockElement).textContent).toContain(
+      "恢复已确认同步",
+    );
+  });
 });

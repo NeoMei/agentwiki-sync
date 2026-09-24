@@ -61,6 +61,7 @@ export interface SyncDiff {
   remoteListed: boolean;
   remoteFirstBind: boolean;
   recoveryPending?: boolean;
+  recoveryKind?: "push" | "image_upgrade";
 }
 
 export interface SyncTarget {
@@ -358,12 +359,21 @@ export class SyncCenterModal extends Modal {
   private renderActions(diff: SyncDiff): void {
     if (diff.recoveryPending) {
       this.contentEl.createEl("p", {
-        text: "已有确认过的图片同步升级尚未完成。恢复会继续使用已持久化的确认内容，不会重新请求确认。",
+        text:
+          diff.recoveryKind === "push"
+            ? "已有确认过的页面同步尚未完成。恢复会继续使用已持久化的确认内容，不会重复上传已接收的数据。"
+            : "已有确认过的图片同步升级尚未完成。恢复会继续使用已持久化的确认内容，不会重新请求确认。",
         cls: "agentwiki-sync-strategy-description",
       });
       new Setting(this.contentEl).addButton((button) =>
         button
-          .setButtonText(this.running ? "恢复中…" : "恢复已确认升级")
+          .setButtonText(
+            this.running
+              ? "恢复中…"
+              : diff.recoveryKind === "push"
+                ? "恢复已确认同步"
+                : "恢复已确认升级",
+          )
           .setCta()
           .setDisabled(this.running)
           .onClick(() => void this.run("server")),

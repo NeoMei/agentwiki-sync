@@ -26,6 +26,7 @@ import type {
   TreeFinalizeResult,
   TreePushBatch,
   TreePushSession,
+  TreePushSessionStatus,
   TreeRemotePort,
   TreeSyncLimits,
 } from "../ports/tree-remote";
@@ -652,11 +653,62 @@ export class TreePushService {
       journal.remoteState = "uploading";
       await this.save(journal);
     } else {
-      const session = await this.remote.getSession(journal.sessionId);
+      let session: TreePushSessionStatus;
+      try {
+        session = await this.remote.getSession(journal.sessionId);
+      } catch (error) {
+        const code = syncErrorCode(error);
+        if (
+          code !== "PUSH_SESSION_EXPIRED" &&
+          code !== "PUSH_SESSION_NOT_FOUND"
+        )
+          throw error;
+        session = {
+          sessionId: journal.sessionId,
+          status: "expired",
+          expiresAt: new Date(0).toISOString(),
+          receivedBatchIndexes: [],
+          result: null,
+        };
+      }
       if (session.status === "published" && session.result)
         return this.commitResult(journal, session.result);
-      if (session.status === "aborted" || session.status === "expired")
-        throw new Error("推送会话无法恢复");
+      if (session.status === "aborted") throw new Error("推送会话无法恢复");
+      if (session.status === "expired") {
+        // The staged manifest and body are durable locally. Once the
+        // server-side TTL has elapsed, create a fresh idempotency session
+        // and resume from those sidecars instead of stranding the page.
+        journal.sessionId = null;
+        journal.idempotencyKey = crypto.randomUUID();
+        journal.remoteState = "not_created";
+        await this.save(journal);
+        const created = await this.createWithRebuild(journal);
+        journal.sessionId = created.sessionId;
+        journal.remoteState = "uploading";
+        await this.save(journal);
+        received = new Set();
+        await this.uploadBatches(journal, received);
+        journal.remoteState = "finalizing";
+        await this.save(journal);
+        return this.commitResult(
+          journal,
+          await this.remote.finalize(
+            journal.sessionId,
+            journal.confirmationHash,
+          ),
+        );
+      }
+      if (session.status === "finalizing") {
+        journal.remoteState = "finalizing";
+        await this.save(journal);
+        return this.commitResult(
+          journal,
+          await this.remote.finalize(
+            journal.sessionId,
+            journal.confirmationHash,
+          ),
+        );
+      }
       received = new Set(session.receivedBatchIndexes);
     }
     await this.uploadBatches(journal, received);

@@ -114,7 +114,12 @@ export interface TreeFinalizeResult {
 }
 
 export type TreePushSessionStatusValue =
-  "uploading" | "ready_to_finalize" | "published" | "aborted" | "expired";
+  | "uploading"
+  | "ready_to_finalize"
+  | "finalizing"
+  | "published"
+  | "aborted"
+  | "expired";
 
 export interface TreePushSession {
   sessionId: string;

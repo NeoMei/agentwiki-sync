@@ -524,6 +524,28 @@ describe("V2TreeRemote", () => {
     expect(result.status).toBe("published");
   });
 
+  it("accepts a v2 finalizing session while recovering a lost finalize response", async () => {
+    const http = new FakeHttp();
+    http.responses.push({
+      status: 200,
+      json: {
+        protocolVersion: "2",
+        sessionId: UID,
+        status: "finalizing",
+        expiresAt: "2099-01-01T00:00:00.000Z",
+        receivedBatchIndexes: [0],
+        result: null,
+      },
+    });
+
+    const remote = new V2TreeRemote(client(http), "space", v2Selection());
+    await expect(remote.getSession(UID)).resolves.toMatchObject({
+      sessionId: UID,
+      status: "finalizing",
+      receivedBatchIndexes: [0],
+    });
+  });
+
   it("rejects a v2 delta that exceeds maxDeltaItems", async () => {
     const http = new FakeHttp();
     const items = Array.from(

@@ -340,17 +340,31 @@ export class V2TreeRemote implements TreeRemotePort {
   }
 
   async getSession(sessionId: string): Promise<TreePushSessionStatus> {
-    const value = TreePushSessionStatusResponseV2Schema.parse(
-      (
-        await this.client.raw(
-          "GET",
-          `/api/sync/v2/spaces/${encodeURIComponent(this.spaceId)}/push-sessions/${encodeURIComponent(sessionId)}`,
-        )
-      ).json,
-    );
+    const raw = (
+      await this.client.raw(
+        "GET",
+        `/api/sync/v2/spaces/${encodeURIComponent(this.spaceId)}/push-sessions/${encodeURIComponent(sessionId)}`,
+      )
+    ).json;
+    // The published v2 package predates the server's recoverable
+    // `finalizing` state. Validate the stable response shape with the
+    // published schema while temporarily substituting its closest state.
+    const candidate =
+      typeof raw === "object" &&
+      raw !== null &&
+      (raw as { status?: unknown }).status === "finalizing"
+        ? { ...(raw as Record<string, unknown>), status: "uploading" }
+        : raw;
+    const value = TreePushSessionStatusResponseV2Schema.parse(candidate);
+    const status =
+      typeof raw === "object" &&
+      raw !== null &&
+      (raw as { status?: unknown }).status === "finalizing"
+        ? "finalizing"
+        : value.status;
     return {
       sessionId: value.sessionId,
-      status: value.status,
+      status,
       expiresAt: value.expiresAt,
       receivedBatchIndexes: value.receivedBatchIndexes,
       result: value.result ? toFinalizeResult(value.result) : null,
