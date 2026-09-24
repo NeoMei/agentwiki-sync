@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { SyncRuntime } from "../../src/application/sync-runtime";
+import { AgentWikiHttpError } from "../../src/agentwiki/client";
 import { resolvePageConflictV3 } from "../../src/application/tree-diff";
 import {
   canonicalBytes,
@@ -2321,6 +2322,28 @@ describe("SyncRuntime", () => {
     remote.canPublish = true;
     await runtime.recover();
     expect(await control.read(journalPath)).not.toBeNull();
+  });
+
+  it("unblocks a fresh Pull preview after a pending Push becomes stale", async () => {
+    const remote = new FakeTreeRemote();
+    const vault = new MemoryVault({ "Wiki/pages/A.md": "local edit" });
+    const control = new MemoryControlStore();
+    const runtime = new SyncRuntime(vault, control, remote, mapping());
+    await runtime.establishEmptyBase();
+    remote.createPushSession = async () => {
+      throw new Error("offline");
+    };
+    await expect(
+      runtime.applyPush(await runtime.previewPush()),
+    ).rejects.toThrow(/offline/);
+    remote.createPushSession = async () => {
+      throw new AgentWikiHttpError(409, { error: { code: "BASE_STALE" } });
+    };
+    await remote.seed([await page("remote", "pages/B.md", "remote edit")]);
+    await expect(runtime.recover()).resolves.toBeUndefined();
+    expect(await runtime.hasUnfinishedPush()).toBe(false);
+    expect(vault.text("Wiki/pages/A.md")).toBe("local edit");
+    await expect(runtime.previewPull()).resolves.toBeDefined();
   });
 
   it("fails closed on an unknown future push journal version", async () => {

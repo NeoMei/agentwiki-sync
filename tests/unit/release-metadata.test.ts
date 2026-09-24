@@ -13,7 +13,7 @@ describe("release metadata", () => {
   });
 
   it("keeps package, lockfile, manifest, and release versions aligned", () => {
-    expect(pkg.version).toBe("0.5.3");
+    expect(pkg.version).toBe("0.5.4");
     expect(lock.version).toBe(pkg.version);
     expect(lock.packages[""].version).toBe(pkg.version);
     expect(manifest.version).toBe(pkg.version);

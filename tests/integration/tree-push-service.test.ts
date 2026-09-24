@@ -52,6 +52,7 @@ import type {
 } from "../../src/ports/tree-remote";
 import { FakePushRemote } from "../fakes/fake-push-remote";
 import { MemoryControlStore } from "../fakes/memory-control-store";
+import { readPushProtocolRequirement } from "../../src/storage/push-journal-router";
 
 const HELLO_HASH =
   "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
@@ -455,6 +456,33 @@ describe("TreePushService", () => {
     expect(remote.createCount).toBe(2);
   });
 
+  it("retains a terminal predecessor when rebuilding an expired session", async () => {
+    const remote = new FakeTreeRemote();
+    remote.loseFirstUploadOnce = true;
+    store = new MemoryControlStore();
+    const root = ".agentwiki/tree/expired-router";
+    const service = new TreePushService(remote, store, root + "/push");
+    await expect(
+      service.publishPrepared(
+        await prepared([upsertPage("p1", null, "pages/A.md")]),
+      ),
+    ).rejects.toThrow(/interrupted/);
+    const sessions = (
+      remote as unknown as { sessions: Map<string, TreePushSession> }
+    ).sessions;
+    const session = sessions.get("session-1");
+    if (!session) throw new Error("fixture session missing");
+    sessions.set("session-1", { ...session, status: "expired" });
+
+    remote.createPushSession = async () => {
+      throw new Error("network unavailable");
+    };
+    await expect(service.resume()).rejects.toThrow("network unavailable");
+    await expect(
+      readPushProtocolRequirement(store, root, { spaceId: "space" }),
+    ).resolves.toMatchObject({ schemaVersion: 2 });
+  });
+
   it("does not rebuild an explicitly aborted remote session", async () => {
     const remote = new FakeTreeRemote();
     remote.loseFirstUploadOnce = true;
@@ -475,8 +503,68 @@ describe("TreePushService", () => {
     const session = sessions.get("session-1");
     if (!session) throw new Error("fixture session missing");
     sessions.set("session-1", { ...session, status: "aborted" });
-    await expect(service.resume()).rejects.toThrow(/推送会话无法恢复/);
+    await expect(service.resume()).resolves.toBeNull();
     expect(remote.createCount).toBe(1);
+    expect(await service.inspect()).toMatchObject({
+      remoteState: "superseded",
+    });
+  });
+
+  it("releases stale uncreated pushes for a fresh merge and retains staged content", async () => {
+    const remote = new FakeTreeRemote();
+    store = new MemoryControlStore();
+    const service = new TreePushService(
+      remote,
+      store,
+      ".agentwiki/tree/stale-create",
+    );
+    remote.createPushSession = async () => {
+      throw new Error("offline");
+    };
+    await expect(
+      service.publishPrepared(
+        await prepared([upsertPage("p1", null, "pages/A.md")]),
+      ),
+    ).rejects.toThrow("offline");
+    remote.createPushSession = async () => {
+      throw new AgentWikiHttpError(409, { error: { code: "BASE_STALE" } });
+    };
+    await expect(service.resume()).resolves.toBeNull();
+    expect(await service.inspect()).toMatchObject({
+      remoteState: "superseded",
+    });
+    expect(
+      (await store.list(".agentwiki/tree/stale-create/payload")).files.length,
+    ).toBe(1);
+  });
+
+  it("releases a finalizing push when the remote head advances", async () => {
+    const remote = new FakeTreeRemote();
+    remote.loseFirstUploadOnce = true;
+    store = new MemoryControlStore();
+    const service = new TreePushService(
+      remote,
+      store,
+      ".agentwiki/tree/stale-finalize",
+    );
+    await expect(
+      service.publishPrepared(
+        await prepared([upsertPage("p1", null, "pages/A.md")]),
+      ),
+    ).rejects.toThrow(/interrupted/);
+    const sessions = (
+      remote as unknown as { sessions: Map<string, TreePushSession> }
+    ).sessions;
+    const session = sessions.get("session-1");
+    if (!session) throw new Error("fixture session missing");
+    sessions.set("session-1", { ...session, status: "finalizing" });
+    remote.finalize = async () => {
+      throw new AgentWikiHttpError(409, { error: { code: "BASE_STALE" } });
+    };
+    await expect(service.resume()).resolves.toBeNull();
+    expect(await service.inspect()).toMatchObject({
+      remoteState: "superseded",
+    });
   });
 
   it("supersedes a failed push and refuses to resume", async () => {

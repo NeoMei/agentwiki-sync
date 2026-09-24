@@ -640,6 +640,40 @@ export class TreePushService {
     }
   }
 
+  private async createForResume(
+    journal: TreePushJournal,
+  ): Promise<TreePushSession | null> {
+    try {
+      return await this.createWithRebuild(journal);
+    } catch (error) {
+      if (syncErrorCode(error) !== "BASE_STALE") throw error;
+      // No new session was created. Preserve local edits and let the next
+      // explicit sync prepare a fresh three-way merge against the new head.
+      journal.remoteState = "superseded";
+      await this.save(journal);
+      return null;
+    }
+  }
+
+  private async finalizeForResume(
+    journal: TreePushJournal,
+  ): Promise<TreeFinalizeResult | null> {
+    try {
+      return await this.commitResult(
+        journal,
+        await this.remote.finalize(
+          journal.sessionId!,
+          journal.confirmationHash,
+        ),
+      );
+    } catch (error) {
+      if (syncErrorCode(error) !== "BASE_STALE") throw error;
+      journal.remoteState = "superseded";
+      await this.save(journal);
+      return null;
+    }
+  }
+
   async resume(): Promise<TreeFinalizeResult | null> {
     const journal = await this.load();
     if (journal.remoteState === "superseded")
@@ -648,7 +682,8 @@ export class TreePushService {
       return journal.result;
     let received = new Set<number>();
     if (!journal.sessionId) {
-      const created = await this.createWithRebuild(journal);
+      const created = await this.createForResume(journal);
+      if (!created) return null;
       journal.sessionId = created.sessionId;
       journal.remoteState = "uploading";
       await this.save(journal);
@@ -673,16 +708,26 @@ export class TreePushService {
       }
       if (session.status === "published" && session.result)
         return this.commitResult(journal, session.result);
-      if (session.status === "aborted") throw new Error("推送会话无法恢复");
+      if (session.status === "aborted") {
+        journal.remoteState = "superseded";
+        await this.save(journal);
+        return null;
+      }
       if (session.status === "expired") {
         // The staged manifest and body are durable locally. Once the
         // server-side TTL has elapsed, create a fresh idempotency session
         // and resume from those sidecars instead of stranding the page.
+        // Retain the old idempotency owner as a terminal operation before
+        // rotating its key; the journal router must be able to prove that
+        // the predecessor was intentionally superseded.
+        journal.remoteState = "superseded";
+        await this.save(journal);
         journal.sessionId = null;
         journal.idempotencyKey = crypto.randomUUID();
         journal.remoteState = "not_created";
         await this.save(journal);
-        const created = await this.createWithRebuild(journal);
+        const created = await this.createForResume(journal);
+        if (!created) return null;
         journal.sessionId = created.sessionId;
         journal.remoteState = "uploading";
         await this.save(journal);
@@ -690,34 +735,19 @@ export class TreePushService {
         await this.uploadBatches(journal, received);
         journal.remoteState = "finalizing";
         await this.save(journal);
-        return this.commitResult(
-          journal,
-          await this.remote.finalize(
-            journal.sessionId,
-            journal.confirmationHash,
-          ),
-        );
+        return this.finalizeForResume(journal);
       }
       if (session.status === "finalizing") {
         journal.remoteState = "finalizing";
         await this.save(journal);
-        return this.commitResult(
-          journal,
-          await this.remote.finalize(
-            journal.sessionId,
-            journal.confirmationHash,
-          ),
-        );
+        return this.finalizeForResume(journal);
       }
       received = new Set(session.receivedBatchIndexes);
     }
     await this.uploadBatches(journal, received);
     journal.remoteState = "finalizing";
     await this.save(journal);
-    return this.commitResult(
-      journal,
-      await this.remote.finalize(journal.sessionId, journal.confirmationHash),
-    );
+    return this.finalizeForResume(journal);
   }
 
   private async commitResult(

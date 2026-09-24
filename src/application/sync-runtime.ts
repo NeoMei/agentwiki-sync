@@ -1308,7 +1308,10 @@ export class SyncRuntime {
       push.remoteState === "published" && push.result
         ? push.result
         : await pushService.resume();
-    if (!result) throw new Error("PUSH_RECOVERY_REQUIRED");
+    if (!result) {
+      if ((await pushService.inspect())?.remoteState === "superseded") return;
+      throw new Error("PUSH_RECOVERY_REQUIRED");
+    }
     const base = await this.readBaseSnapshot();
     if (!base || base.revision !== result.revision) {
       await this.commitBaseline(
