@@ -1806,6 +1806,40 @@ describe("SyncRuntime", () => {
     expect(remote.tree().folders[0]?.path).toBe("pages/B");
   });
 
+  it("uses the remote folder version when a stable folder identity moves locally", async () => {
+    const folderId = "11111111-1111-4111-8111-111111111111";
+    const remote = new FakeTreeRemote();
+    await remote.seedTree({
+      folders: [folder(folderId, null, "pages/A")],
+      pages: [],
+    });
+    const vault = new MemoryVault({});
+    const control = new MemoryControlStore();
+    const runtime = new SyncRuntime(vault, control, remote, mapping());
+    await runtime.applyPull(await runtime.previewPull());
+    await vault.rename("Wiki/pages/A", "Wiki/pages/B");
+    await new TreeIdentityRepository(
+      control,
+      ".agentwiki/devices/d-local/spaces/s-space/tree-identities.json",
+    ).write({
+      schemaVersion: 1,
+      folders: {
+        [folderId]: { folderId, path: "pages/B", pathKey: "pages/b" },
+      },
+      pendingFolders: {},
+      pendingPages: {},
+    });
+    const preview = await runtime.previewPush();
+    expect(preview.changes).toEqual([
+      {
+        operation: "upsert_folder",
+        folder: folder(folderId, null, "pages/B"),
+      },
+    ]);
+    await runtime.applyPush(preview);
+    expect(remote.tree().folders[0]?.path).toBe("pages/B");
+  });
+
   it("reports remote delta items since the base revision", async () => {
     const remote = new FakeTreeRemote();
     await remote.seed([await page("p1", "pages/Guide.md", "hello")]);

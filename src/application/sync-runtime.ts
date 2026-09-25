@@ -2813,7 +2813,15 @@ export class SyncRuntime {
           before.parentFolderId !== folder.parentFolderId ||
           before.name !== folder.name)
       )
-        changes.push({ operation: "upsert_folder", folder });
+        changes.push({
+          operation: "upsert_folder",
+          folder: {
+            ...folder,
+            // Existing folders use their baseline timestamp as the
+            // optimistic-concurrency token; scan time is for new folders.
+            updatedAt: before?.updatedAt ?? folder.updatedAt,
+          },
+        });
       prepared += 1;
       if (prepared % 50 === 0)
         await progressCheckpoint(options, {
@@ -2861,6 +2869,11 @@ export class SyncRuntime {
           operation: "upsert_page",
           page: {
             ...metadata,
+            // For an existing remote page, updatedAt is the server-side
+            // optimistic-concurrency token. Local scan time is only valid
+            // for a newly created page; sending it for an existing page
+            // makes the server reject an otherwise valid local edit as stale.
+            updatedAt: before?.updatedAt ?? page.updatedAt,
             payloadPath,
             bodyBytes: new TextEncoder().encode(page.body).byteLength,
           },

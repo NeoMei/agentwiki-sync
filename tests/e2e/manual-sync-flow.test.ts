@@ -100,6 +100,12 @@ describe("manual multi-device sync", () => {
 
     const push = await runtime.previewPush();
     expect(push.changes).toHaveLength(1);
+    // Sync v2 treats updatedAt as the remote concurrency precondition,
+    // not the time at which the local file was scanned.
+    expect(push.changes[0]).toMatchObject({
+      operation: "upsert_page",
+      page: { updatedAt: "2026-08-14T00:00:00.000Z" },
+    });
     await runtime.applyPush(push);
     expect((await remote.snapshot()).items[0]?.body).toBe("one\nTWO");
   });
