@@ -491,12 +491,19 @@ export default class AgentWikiSyncPlugin extends Plugin {
 
   async addMapping(spaceId: string, rootPath: string): Promise<void> {
     const next = [
-      ...this.settings.mappings,
+      ...this.settings.mappings.map((mapping) => ({ ...mapping })),
       { spaceId, rootPath, status: "pending" as const },
     ];
     validateMappings(next);
+    const mapping = next[next.length - 1]!;
+    await new ObsidianVaultPort(
+      this.app.vault,
+      this.app.fileManager,
+      mapping.rootPath,
+    ).createDirectory(mapping.rootPath);
+    // Only expose the mapping once its folder and persisted settings are ready.
+    await this.saveData(toVaultSettings({ ...this.settings, mappings: next }));
     this.settings.mappings = next;
-    await this.saveSettings();
   }
   async removeMapping(spaceId: string): Promise<void> {
     const mapping = this.settings.mappings.find(

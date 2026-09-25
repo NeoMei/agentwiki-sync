@@ -279,7 +279,9 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
     const rootPathInput = { value: "" };
     new Setting(this.containerEl)
       .setName("添加映射")
-      .setDesc("选择要同步的空间和本地文件夹。")
+      .setDesc(
+        "选择远端空间，输入本地文件夹路径。已有文件夹会直接使用，不存在则自动创建；支持多级路径，如 知识库/项目。",
+      )
       .addDropdown((dropdown) => {
         const spaces = this.availableSpaces ?? [];
         dropdown.addOption("", "选择空间…");
@@ -320,7 +322,10 @@ export class AgentWikiSyncSettingTab extends PluginSettingTab {
               this.selectedSpaceId,
               rootPathInput.value,
             );
-            new Notice("映射已添加。执行拉取（Pull）后开始同步。");
+            this.selectedSpaceId = "";
+            new Notice(
+              "本地文件夹已就绪，映射已添加。点击左侧 AgentWiki Sync 查看差异并开始同步。",
+            );
             this.display();
           } catch (error) {
             new Notice(userErrorMessage(error));
