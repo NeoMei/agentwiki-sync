@@ -13,11 +13,13 @@ describe("release metadata", () => {
   });
 
   it("keeps package, lockfile, manifest, and release versions aligned", () => {
-    expect(pkg.version).toBe("0.5.6");
+    expect(pkg.version).toBe("0.5.7");
     expect(lock.version).toBe(pkg.version);
     expect(lock.packages[""].version).toBe(pkg.version);
     expect(manifest.version).toBe(pkg.version);
-    expect(versions["0.5.3"]).toBe("1.11.5");
+    expect(versions[pkg.version as keyof typeof versions]).toBe(
+      manifest.minAppVersion,
+    );
   });
 
   it("uses Obsidian Setting headings in the settings tab", async () => {
