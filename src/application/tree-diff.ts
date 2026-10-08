@@ -240,7 +240,7 @@ export function validateResolvedTree(
       throw new TypeError("UNKNOWN_PARENT: 目录缺少父目录");
     if (resolutions?.has(folderId))
       throw new TypeError(
-        "FOLDER_HAS_DEPENDENTS: 目录仍有后代，无法删除；请选择保留目录，或填写新路径移动目录及其后代",
+        "FOLDER_HAS_DEPENDENTS: 目录仍有后代，无法删除；请选择保留目录，或填写新路径移动目录及其后代。Cannot delete a folder with descendants. Keep the folder, or enter a new path to move it and its descendants.",
       );
     resolvedFolders.push(candidate);
     keptIds.add(folderId);

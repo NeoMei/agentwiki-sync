@@ -22,6 +22,7 @@ import type {
   TreeSnapshotV3,
 } from "../../src/core/tree-model";
 import type { LocalTreeScan, LocalTreeScanV3 } from "../../src/core/tree-scan";
+import { userErrorMessage } from "../../src/core/user-errors";
 
 function folder(
   folderId: string,
@@ -1155,19 +1156,32 @@ describe("deleted parent with new remote descendants", () => {
           pages.map((p) => p.pageId),
         );
         const before = JSON.stringify(preview);
-        if (version === "2") {
-          expect(() =>
+        let deletionError: unknown;
+        try {
+          if (version === "2")
             resolveFolderConflict(preview as TreePullPreview, "folder:f", {
               choice: "local",
-            }),
-          ).toThrow(/FOLDER_HAS_DEPENDENTS.*后代/);
-        } else {
-          await expect(
-            resolveFolderConflictV3(preview as TreePullPreviewV3, "folder:f", {
-              choice: "local",
-            }),
-          ).rejects.toThrow(/FOLDER_HAS_DEPENDENTS.*后代/);
+            });
+          else
+            await resolveFolderConflictV3(
+              preview as TreePullPreviewV3,
+              "folder:f",
+              { choice: "local" },
+            );
+        } catch (error) {
+          deletionError = error;
         }
+        expect(deletionError).toBeInstanceOf(TypeError);
+        const message = userErrorMessage(deletionError);
+        expect(message).toMatch(/^FOLDER_HAS_DEPENDENTS:/);
+        expect(message).toContain("目录仍有后代，无法删除");
+        expect(message).toContain(
+          "请选择保留目录，或填写新路径移动目录及其后代",
+        );
+        expect(message).toContain("Cannot delete a folder with descendants");
+        expect(message).toContain(
+          "Keep the folder, or enter a new path to move it and its descendants",
+        );
         expect(JSON.stringify(preview)).toBe(before);
         for (const id of ["f", "g"]) {
           if (version === "2")
