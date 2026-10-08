@@ -1683,9 +1683,10 @@ export default class AgentWikiSyncPlugin extends Plugin {
       new PreviewModal(
         this.app,
         "Sync v2 文字合并",
-        preview.pull.actions.map(
-          (action) => `${actionLabel(action.kind)}: ${action.path}`,
-        ),
+        (resolved = preview.pull) =>
+          resolved.actions.map(
+            (action) => `${actionLabel(action.kind)}: ${action.path}`,
+          ),
         async (applyOptions) => {
           await runtime.applyPull(structuredClone(preview.pull), applyOptions, {
             expectedPathStates: preview.expectedPathStates,
@@ -1800,11 +1801,11 @@ export default class AgentWikiSyncPlugin extends Plugin {
       new PreviewModal(
         this.app,
         "以本地内容为准 — 先合并服务器更新",
-        [
-          ...preview.actions.map(
+        (resolved = preview) => [
+          ...resolved.actions.map(
             (item) => `${actionLabel(item.kind)}: ${item.path}`,
           ),
-          ...preview.conflicts.map(
+          ...resolved.conflicts.map(
             (item) => `冲突以本地为准: ${item.field} ${item.pageId}`,
           ),
           ...preview.initialBindings.map(
@@ -1867,17 +1868,17 @@ export default class AgentWikiSyncPlugin extends Plugin {
       new PreviewModal(
         this.app,
         needsResolution ? "自动合并 — 处理冲突与绑定" : "自动合并 — 拉取预览",
-        [
-          ...preview.actions.map(
+        (resolved = preview) => [
+          ...resolved.actions.map(
             (item) => `${actionLabel(item.kind)}: ${item.path}`,
           ),
           ...preview.initialBindings
             .filter((item) => item.resolution === null)
             .map((item) => `远端新页面待绑定: ${item.remotePath}`),
-          ...preview.conflicts.map(
+          ...resolved.conflicts.map(
             (item) => `冲突待处理: ${item.field} ${item.pageId}`,
           ),
-          ...preview.folderConflicts.map(
+          ...resolved.folderConflicts.map(
             (item) => `目录冲突待处理: ${item.folderId}`,
           ),
         ],

@@ -24,7 +24,9 @@ type CalculationPreviewV3 = TreePullPreviewV3<TreeContentV3>;
 import type { TreeBootstrapPreviewV3 } from "../ports/tree-remote";
 import {
   resolveAttachmentConflict,
+  resolveFolderConflict,
   resolveFolderConflictV3,
+  resolvePageConflict,
   resolvePageConflictV3,
 } from "../application/tree-diff";
 import {
@@ -110,6 +112,10 @@ export class PreviewModal extends Modal {
   private readonly decisionGenerations = new Map<string, number>();
   private readonly unsettledDecisions = new Set<string>();
   private readonly resolutionSourcePreview: CalculationPreviewV3 | null;
+  private readonly v2ResolutionSourcePreview: PullPreview | null;
+  private v2DisplayPreview: PullPreview | undefined;
+  private v2ResolutionGeneration = 0;
+  private v2ResolutionPending = false;
   private resolutionQueue: Promise<void> = Promise.resolve();
   private operation: AbortController | null = null;
   private running = false;
@@ -120,7 +126,8 @@ export class PreviewModal extends Modal {
   constructor(
     app: App,
     private readonly title: string,
-    private readonly lines: readonly string[] | (() => readonly string[]),
+    private readonly lines:
+      readonly string[] | ((resolvedPull?: PullPreview) => readonly string[]),
     private readonly confirm: (
       options: SyncOperationOptions,
     ) => Promise<ModalTransition | void>,
@@ -133,6 +140,10 @@ export class PreviewModal extends Modal {
     this.resolutionSourcePreview = isPullPreviewV3(preview)
       ? structuredClone(preview)
       : null;
+    this.v2ResolutionSourcePreview =
+      isPullPreview(preview) && !isPullPreviewV3(preview)
+        ? structuredClone(preview)
+        : null;
     this.modalEl.addClass("agentwiki-sync-modal");
   }
   onClose(): void {
@@ -153,6 +164,13 @@ export class PreviewModal extends Modal {
   }
   onOpen(): void {
     this.render();
+    if (
+      this.v2ResolutionSourcePreview &&
+      (Object.keys(this.v2ResolutionSourcePreview.conflictResolutions).length ||
+        Object.keys(this.v2ResolutionSourcePreview.folderConflictResolutions)
+          .length)
+    )
+      this.refreshV2Resolution();
     this.unsubscribeInvalidation =
       this.actionOptions.subscribeInvalidation?.(() => this.render()) ?? null;
   }
@@ -251,8 +269,57 @@ export class PreviewModal extends Modal {
     this.preview.resolvedAttachments = candidate.resolvedAttachments;
     this.refreshCurrentSummary?.();
   }
+  private refreshV2Resolution(): void {
+    const preview = this.preview;
+    if (
+      !isPullPreview(preview) ||
+      isPullPreviewV3(preview) ||
+      !this.v2ResolutionSourcePreview
+    )
+      return;
+    const generation = ++this.v2ResolutionGeneration;
+    this.v2ResolutionPending = true;
+    this.refreshCurrentActionState?.();
+    const candidate = structuredClone(this.v2ResolutionSourcePreview);
+    // Preserve the original preview and its authorization identity. Only this
+    // display copy is materialized; applyPull repeats validation on confirmation.
+    candidate.pageConflictResolutions = structuredClone(
+      preview.conflictResolutions,
+    );
+    candidate.conflictResolutions = candidate.pageConflictResolutions;
+    candidate.folderConflictResolutions = structuredClone(
+      preview.folderConflictResolutions,
+    );
+    void (async () => {
+      // Keep the same ordering as SyncRuntime.applyPull, including choices that
+      // were preselected before the modal opened.
+      for (const conflict of [...candidate.pageConflicts]) {
+        const resolution =
+          candidate.pageConflictResolutions[conflict.conflictId];
+        if (resolution)
+          await resolvePageConflict(candidate, conflict.conflictId, resolution);
+      }
+      for (const conflict of [...candidate.folderConflicts]) {
+        const resolution =
+          candidate.folderConflictResolutions[conflict.conflictId];
+        if (resolution)
+          resolveFolderConflict(candidate, conflict.conflictId, resolution);
+      }
+      if (this.v2ResolutionGeneration !== generation) return;
+      candidate.conflicts = candidate.pageConflicts;
+      candidate.conflictResolutions = candidate.pageConflictResolutions;
+      this.v2DisplayPreview = candidate;
+      this.v2ResolutionPending = false;
+      this.refreshCurrentSummary?.();
+    })()
+      .catch((error) => {
+        if (this.v2ResolutionGeneration === generation)
+          new Notice(userErrorMessage(error));
+      })
+      .finally(() => this.refreshCurrentActionState?.());
+  }
   private unsettledDecisionCount(): number {
-    if (!isPullPreviewV3(this.preview)) return 0;
+    if (!isPullPreviewV3(this.preview)) return this.v2ResolutionPending ? 1 : 0;
     let count = 0;
     for (const key of this.unsettledDecisions) {
       const separator = key.indexOf(":");
@@ -284,7 +351,9 @@ export class PreviewModal extends Modal {
     const refreshSummary = () => {
       summary.empty();
       const originalLines =
-        typeof this.lines === "function" ? this.lines() : this.lines;
+        typeof this.lines === "function"
+          ? this.lines(this.v2DisplayPreview)
+          : this.lines;
       const localLines =
         this.preview &&
         ("normalizedPush" in this.preview || isPullPreviewV3(this.preview))
@@ -685,6 +754,7 @@ export class PreviewModal extends Modal {
               value,
               conflictManualValue(this.preview, conflict.conflictId),
             );
+            this.refreshV2Resolution();
             refreshActionState();
           }
         }),
@@ -718,6 +788,7 @@ export class PreviewModal extends Modal {
               "manual",
               value,
             );
+            this.refreshV2Resolution();
             refreshActionState();
           }
         }),
@@ -834,6 +905,7 @@ export class PreviewModal extends Modal {
             setting.setDesc(baseDescription);
             textArea?.setDisabled(true);
           }
+          if (!("attachmentConflicts" in preview)) this.refreshV2Resolution();
           refreshActionState();
         }),
     );
@@ -863,6 +935,7 @@ export class PreviewModal extends Modal {
               value,
             );
           showValidation(value);
+          if (!("attachmentConflicts" in preview)) this.refreshV2Resolution();
           refreshActionState();
         });
     });
