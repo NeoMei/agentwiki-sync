@@ -219,6 +219,7 @@ function materializePagePaths(
 export function validateResolvedTree(
   folderPlan: FolderMergePlan,
   pagePlan: PageMergePlan,
+  resolutions?: ReadonlyMap<string, FolderConflictResolution>,
 ): {
   resolved: ResolvedTree;
   folderConflicts: FolderConflict[];
@@ -234,10 +235,17 @@ export function validateResolvedTree(
   const promote = (folderId: string): void => {
     if (keptIds.has(folderId)) return;
     const info = deletedById.get(folderId);
-    if (!info || !info.local)
+    const candidate = info?.local ?? info?.remote;
+    if (!info || !candidate)
       throw new TypeError("UNKNOWN_PARENT: 目录缺少父目录");
-    resolvedFolders.push(info.local);
+    if (resolutions?.has(folderId))
+      throw new TypeError(
+        "FOLDER_HAS_DEPENDENTS: 目录仍有后代，无法删除；请选择保留目录，或填写新路径移动目录及其后代",
+      );
+    resolvedFolders.push(candidate);
     keptIds.add(folderId);
+    if (folderConflicts.some((conflict) => conflict.folderId === folderId))
+      return;
     folderConflicts.push({
       conflictId: `folder:${folderId}`,
       objectType: "folder",
@@ -319,15 +327,16 @@ function computeActions(
     if (conflictedFolders.has(folder.folderId)) continue;
     const before =
       baseFolders.get(folder.folderId) ?? localFolders.get(folder.folderId);
-    if (!before)
+    if (!localFolders.has(folder.folderId))
       actions.push({
         kind: "create_directory",
         folderId: folder.folderId,
         path: folder.path,
       });
     else if (
-      before.parentFolderId !== folder.parentFolderId ||
-      before.name !== folder.name
+      before &&
+      (before.parentFolderId !== folder.parentFolderId ||
+        before.name !== folder.name)
     ) {
       const parentPath = resolvedFolderPath(before.parentFolderId);
       const fromPath =
@@ -441,6 +450,7 @@ function computePreview<TTree extends TreeContentV2>(
   const { resolved, folderConflicts, pageConflicts } = validateResolvedTree(
     folderPlan,
     pagePlan,
+    resolutions,
   );
   const actions = computeActions(
     base,

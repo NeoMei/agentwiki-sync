@@ -218,6 +218,7 @@ export interface DeletedFolderInfo {
   localParentPath: string | null;
   remoteParentPath: string | null;
   local: ResolvedFolderLocation | null;
+  remote: ResolvedFolderLocation | null;
 }
 
 export interface FolderMergePlan {
@@ -350,7 +351,7 @@ export function mergeFoldersById(
     let location = merged.value;
     let conflict = merged.conflict;
     let manualPath: string | undefined;
-    if (merged.conflict && resolutions?.has(id)) {
+    if (resolutions?.has(id)) {
       const applied = applyFolderResolution(
         localFolder,
         remoteFolder,
@@ -376,19 +377,17 @@ export function mergeFoldersById(
     }
 
     if (location === null) {
-      if (localFolder)
-        deleted.push({
-          folderId: id,
-          basePath: baseFolder?.path ?? null,
-          localPath: localFolder.path,
-          remotePath: remoteFolder?.path ?? null,
-          baseParentPath: baseFolder ? folderParentPath(baseFolder) : null,
-          localParentPath: folderParentPath(localFolder),
-          remoteParentPath: remoteFolder
-            ? folderParentPath(remoteFolder)
-            : null,
-          local: localFolderLocation(id, localFolder),
-        });
+      deleted.push({
+        folderId: id,
+        basePath: baseFolder?.path ?? null,
+        localPath: localFolder?.path ?? null,
+        remotePath: remoteFolder?.path ?? null,
+        baseParentPath: baseFolder ? folderParentPath(baseFolder) : null,
+        localParentPath: localFolder ? folderParentPath(localFolder) : null,
+        remoteParentPath: remoteFolder ? folderParentPath(remoteFolder) : null,
+        local: localFolder ? localFolderLocation(id, localFolder) : null,
+        remote: remoteFolder ? localFolderLocation(id, remoteFolder) : null,
+      });
       continue;
     }
 

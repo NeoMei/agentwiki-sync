@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { SyncRuntime } from "../../src/application/sync-runtime";
 import { AgentWikiHttpError } from "../../src/agentwiki/client";
-import { resolvePageConflictV3 } from "../../src/application/tree-diff";
+import {
+  resolveFolderConflict,
+  resolveFolderConflictV3,
+  resolvePageConflictV3,
+} from "../../src/application/tree-diff";
 import {
   canonicalBytes,
   confirmationHash,
@@ -2784,4 +2788,123 @@ describe("SyncRuntime", () => {
       ),
     ).toBe(true);
   });
+});
+
+describe("parent restoration transactions", () => {
+  async function* childrenFirst<
+    T extends { folders: TreeFolder[]; pages: TreePage[] },
+  >(segments: AsyncIterable<T>): AsyncIterable<T> {
+    for await (const segment of segments) {
+      yield { ...segment, folders: [] };
+      for (const folder of [...segment.folders].reverse())
+        yield { ...segment, folders: [folder], pages: [] };
+    }
+  }
+  for (const version of ["2", "3"] as const) {
+    it(`v${version} clones nested first-pull content from child-first snapshot pages`, async () => {
+      const remote =
+        version === "2" ? new FakeTreeRemote() : new FakeTreeRemoteV3();
+      const folders = [
+        folder("f", null, "pages/F"),
+        folder("c", "f", "pages/F/C"),
+      ];
+      const added = await page("p", "pages/F/C/New.md", "first pull", {
+        folderId: "c",
+      });
+      if (remote instanceof FakeTreeRemote)
+        await remote.seedTree({ folders, pages: [added] });
+      else
+        await remote.seedTree({
+          folders,
+          pages: [{ ...added, referencedAttachmentIds: [] }],
+        });
+      if (remote instanceof FakeTreeRemote) {
+        const snapshotPages = remote.snapshotPages.bind(remote);
+        remote.snapshotPages = (revision) =>
+          childrenFirst(snapshotPages(revision));
+      } else {
+        const snapshotPages = remote.snapshotPages.bind(remote);
+        remote.snapshotPages = (revision) =>
+          childrenFirst(snapshotPages(revision));
+      }
+      const vault = new MemoryVault({});
+      const control = new MemoryControlStore();
+      if (remote instanceof FakeTreeRemote) {
+        const runtime = new SyncRuntime(vault, control, remote, mapping());
+        const preview = await runtime.previewPull();
+        expect(preview.folderConflicts).toEqual([]);
+        await runtime.applyPull(preview);
+      } else {
+        const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+        const preview = await runtime.previewPullV3();
+        expect(preview.folderConflicts).toEqual([]);
+        await runtime.applyPullV3(preview);
+      }
+      expect(vault.hasDirectory("Wiki/pages/F/C")).toBe(true);
+      expect(vault.text("Wiki/pages/F/C/New.md")).toBe("first pull");
+    });
+    it(`v${version} restores a locally deleted parent before writing remote descendants`, async () => {
+      const remote =
+        version === "2" ? new FakeTreeRemote() : new FakeTreeRemoteV3();
+      if (remote instanceof FakeTreeRemote) {
+        const snapshotPages = remote.snapshotPages.bind(remote);
+        remote.snapshotPages = (revision) =>
+          childrenFirst(snapshotPages(revision));
+      } else {
+        const snapshotPages = remote.snapshotPages.bind(remote);
+        remote.snapshotPages = (revision) =>
+          childrenFirst(snapshotPages(revision));
+      }
+      const parent = folder("f", null, "pages/F");
+      const child = folder("c", "f", "pages/F/C");
+      await remote.seedTree({ folders: [parent], pages: [] });
+      const vault = new MemoryVault({ "Wiki/pages/Keep.md": "local existing" });
+      const control = new MemoryControlStore();
+      const runtime =
+        version === "2"
+          ? new SyncRuntime(vault, control, remote as FakeTreeRemote, mapping())
+          : SyncRuntime.v3(
+              vault,
+              control,
+              remote as FakeTreeRemoteV3,
+              mapping(),
+            );
+      if (version === "2") await runtime.applyPull(await runtime.previewPull());
+      else await runtime.applyPullV3(await runtime.previewPullV3());
+      await vault.trashDirectory("Wiki/pages/F");
+      const added = await page("p", "pages/F/C/New.md", "remote new", {
+        folderId: "c",
+      });
+      if (remote instanceof FakeTreeRemote)
+        await remote.seedTree({ folders: [parent, child], pages: [added] });
+      else
+        await remote.seedTree({
+          folders: [parent, child],
+          pages: [{ ...added, referencedAttachmentIds: [] }],
+        });
+      if (version === "2") {
+        const preview = await runtime.previewPull();
+        await expect(runtime.applyPull(preview)).rejects.toThrow(/冲突/);
+        resolveFolderConflict(preview, "folder:f", { choice: "remote" });
+        await runtime.applyPull(preview);
+      } else {
+        const preview = await runtime.previewPullV3();
+        await expect(runtime.applyPullV3(preview)).rejects.toThrow(/冲突/);
+        await resolveFolderConflictV3(preview, "folder:f", {
+          choice: "remote",
+        });
+        await runtime.applyPullV3(preview);
+      }
+      expect(vault.hasDirectory("Wiki/pages/F")).toBe(true);
+      expect(vault.hasDirectory("Wiki/pages/F/C")).toBe(true);
+      expect(vault.text("Wiki/pages/F/C/New.md")).toBe("remote new");
+      expect(vault.text("Wiki/pages/Keep.md")).toBe("local existing");
+      const operations = vault.operationLog.slice(
+        vault.operationLog.lastIndexOf("trash-dir:Wiki/pages/F") + 1,
+      );
+      expect(operations.indexOf("mkdir:Wiki/pages/F")).toBeLessThan(
+        operations.indexOf("mkdir:Wiki/pages/F/C"),
+      );
+    });
+  }
 });

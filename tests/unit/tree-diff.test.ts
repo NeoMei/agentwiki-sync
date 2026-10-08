@@ -1110,3 +1110,186 @@ describe("fix round 2 regressions", () => {
     expect(pendingTreeDecisionCount(preview)).toBe(1);
   });
 });
+
+describe("deleted parent with new remote descendants", () => {
+  for (const version of ["2", "3"] as const) {
+    for (const childKind of ["folder", "page"] as const) {
+      it(`v${version} preserves a new remote ${childKind} and restores missing ancestors`, async () => {
+        const ancestors = [
+          folder("f", null, "pages/F"),
+          folder("g", "f", "pages/F/G"),
+        ];
+        const folders =
+          childKind === "folder"
+            ? [...ancestors, folder("c", "g", "pages/F/G/C")]
+            : ancestors;
+        const pages =
+          childKind === "page" ? [page("p", "g", "pages/F/G/New.md")] : [];
+        const preview =
+          version === "2"
+            ? await buildTreePullPreview(
+                snapshot({ folders: ancestors }),
+                localScan([], []),
+                snapshot({ folders, pages }),
+              )
+            : await buildTreePullPreviewV3(
+                snapshotV3([], [], { folders: ancestors }),
+                localScanV3([], []),
+                snapshotV3(
+                  pages.map((p) => ({ ...p, referencedAttachmentIds: [] })),
+                  [],
+                  { folders },
+                ),
+              );
+        expect(preview.folderConflicts.map((c) => c.folderId).sort()).toEqual([
+          "f",
+          "g",
+        ]);
+        expect(
+          preview.folderConflicts.find((c) => c.folderId === "f"),
+        ).toMatchObject({ localPath: null, remotePath: "pages/F" });
+        expect(preview.resolvedFolders.map((f) => f.folderId)).toEqual(
+          folders.map((f) => f.folderId),
+        );
+        expect(preview.resolvedPages.map((p) => p.pageId)).toEqual(
+          pages.map((p) => p.pageId),
+        );
+        const before = JSON.stringify(preview);
+        if (version === "2") {
+          expect(() =>
+            resolveFolderConflict(preview as TreePullPreview, "folder:f", {
+              choice: "local",
+            }),
+          ).toThrow(/FOLDER_HAS_DEPENDENTS.*后代/);
+        } else {
+          await expect(
+            resolveFolderConflictV3(preview as TreePullPreviewV3, "folder:f", {
+              choice: "local",
+            }),
+          ).rejects.toThrow(/FOLDER_HAS_DEPENDENTS.*后代/);
+        }
+        expect(JSON.stringify(preview)).toBe(before);
+        for (const id of ["f", "g"]) {
+          if (version === "2")
+            resolveFolderConflict(preview as TreePullPreview, `folder:${id}`, {
+              choice: "remote",
+            });
+          else
+            await resolveFolderConflictV3(
+              preview as TreePullPreviewV3,
+              `folder:${id}`,
+              { choice: "remote" },
+            );
+        }
+        expect(pendingTreeDecisionCount(preview)).toBe(0);
+        expect(
+          preview.actions.flatMap((a) =>
+            a.kind === "create_directory" ? [a.path] : [],
+          ),
+        ).toEqual(folders.map((f) => f.path));
+        if (childKind === "page")
+          expect(preview.actions).toContainEqual(
+            expect.objectContaining({
+              kind: "create_page",
+              pageId: "p",
+              path: "pages/F/G/New.md",
+            }),
+          );
+      });
+    }
+  }
+
+  for (const version of ["2", "3"] as const) {
+    it(`v${version} allows an explicit manual relocation after refusing deletion`, async () => {
+      const parent = folder("f", null, "pages/F");
+      const added = page("p", "f", "pages/F/New.md");
+      const preview =
+        version === "2"
+          ? await buildTreePullPreview(
+              snapshot({ folders: [parent] }),
+              localScan([], []),
+              snapshot({ folders: [parent], pages: [added] }),
+            )
+          : await buildTreePullPreviewV3(
+              snapshotV3([], [], { folders: [parent] }),
+              localScanV3([], []),
+              snapshotV3([{ ...added, referencedAttachmentIds: [] }], [], {
+                folders: [parent],
+              }),
+            );
+      if (version === "2") {
+        expect(() =>
+          resolveFolderConflict(preview as TreePullPreview, "folder:f", {
+            choice: "local",
+          }),
+        ).toThrow(/FOLDER_HAS_DEPENDENTS/);
+        resolveFolderConflict(preview as TreePullPreview, "folder:f", {
+          choice: "manual",
+          manualPath: "pages/Recovered",
+        });
+      } else {
+        await expect(
+          resolveFolderConflictV3(preview as TreePullPreviewV3, "folder:f", {
+            choice: "local",
+          }),
+        ).rejects.toThrow(/FOLDER_HAS_DEPENDENTS/);
+        await resolveFolderConflictV3(
+          preview as TreePullPreviewV3,
+          "folder:f",
+          { choice: "manual", manualPath: "pages/Recovered" },
+        );
+      }
+      expect(pendingTreeDecisionCount(preview)).toBe(0);
+      expect(preview.resolvedPages[0]?.path).toBe("pages/Recovered/New.md");
+      expect(preview.actions).toContainEqual({
+        kind: "create_directory",
+        folderId: "f",
+        path: "pages/Recovered",
+      });
+    });
+  }
+
+  it("keeps local additions when the remote deleted their parent", async () => {
+    const parent = folder("f", null, "pages/F");
+    const preview = await buildTreePullPreview(
+      snapshot({ folders: [parent] }),
+      localScan([parent], [page("p", "f", "pages/F/Local.md")]),
+      snapshot(),
+    );
+    expect(() =>
+      resolveFolderConflict(preview, "folder:f", { choice: "remote" }),
+    ).toThrow(/FOLDER_HAS_DEPENDENTS/);
+    resolveFolderConflict(preview, "folder:f", { choice: "local" });
+    expect(pendingTreeDecisionCount(preview)).toBe(0);
+    expect(preview.resolvedPages[0]?.pageId).toBe("p");
+    expect(preview.actions).toEqual([]);
+  });
+
+  it("creates a complete nested tree on a first pull without a baseline", async () => {
+    const folders = [
+      folder("f", null, "pages/F"),
+      folder("g", "f", "pages/F/G"),
+    ];
+    const preview = await buildTreePullPreview(
+      snapshot(),
+      localScan([], []),
+      snapshot({ folders, pages: [page("p", "g", "pages/F/G/P.md")] }),
+    );
+    expect(pendingTreeDecisionCount(preview)).toBe(0);
+    expect(preview.actions.map((a) => a.kind)).toEqual([
+      "create_directory",
+      "create_directory",
+      "create_page",
+    ]);
+  });
+
+  it("still rejects a genuinely unknown parent", async () => {
+    await expect(
+      buildTreePullPreview(
+        snapshot(),
+        localScan([], []),
+        snapshot({ folders: [folder("c", "missing", "pages/F/C")] }),
+      ),
+    ).rejects.toThrow(/UNKNOWN_PARENT/);
+  });
+});
