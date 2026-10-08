@@ -2011,7 +2011,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       new PreviewModal(
         this.app,
         title,
-        this.v3PullLines(preview),
+        () => this.v3PullLines(preview),
         async (applyOptions) => {
           await runtime.applyPullV3(preview, applyOptions);
           await this.saveSettings();

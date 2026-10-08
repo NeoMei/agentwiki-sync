@@ -14,6 +14,8 @@ import { DeviceStateRepository } from "../../src/storage/device-state";
 import { V3TreeRemote } from "../../src/agentwiki/v3-tree-remote";
 import { PreviewModal } from "../../src/obsidian/preview-modal";
 import type { PullPreviewV3 } from "../../src/application/sync-runtime";
+import { buildTreePullPreviewV3 } from "../../src/application/tree-diff";
+import type { TreeSnapshotV3 } from "../../src/core/tree-model";
 import type { ModalTransition } from "../../src/obsidian/modal-handoff";
 import { requestUrlState } from "../fakes/obsidian-mock";
 import type { MockElement } from "../fakes/obsidian-mock";
@@ -912,7 +914,7 @@ describe("plugin settings lifecycle", () => {
     open.mockRestore();
   });
 
-  it("drives the real auto strategy from v3 Pull preview confirmation to a fresh Push preview", async () => {
+  it("refreshes the real auto strategy Pull summary after a manual folder resolution before confirming and opening Push", async () => {
     const harness = await makePlugin({
       data: {
         schemaVersion: 2,
@@ -921,18 +923,70 @@ describe("plugin settings lifecycle", () => {
       },
     });
     await harness.plugin.onload();
-    const pullPreview = {
+    const parentFolder = {
+      folderId: "f",
+      parentFolderId: null,
+      name: "F",
+      path: "pages/F",
+      sortOrder: 0,
+      updatedAt: "2026-10-09T00:00:00Z",
+    };
+    const base: TreeSnapshotV3 = {
+      protocolVersion: "3",
+      spaceId: "s1",
+      revision: "r1",
+      revisionContentHash: "0".repeat(64),
+      folders: [parentFolder],
+      pages: [],
+      attachments: [],
+    };
+    const tree = await buildTreePullPreviewV3(
+      base,
+      {
+        rootPath: "AgentWiki",
+        folders: [],
+        pages: [],
+        attachments: [],
+        blockers: [],
+        normalizations: [],
+        rawPathStates: {},
+      },
+      {
+        ...base,
+        revision: "r2",
+        folders: [
+          parentFolder,
+          {
+            ...parentFolder,
+            folderId: "c",
+            parentFolderId: "f",
+            name: "C",
+            path: "pages/F/C",
+          },
+        ],
+        pages: [
+          {
+            pageId: "p",
+            folderId: "c",
+            path: "pages/F/C/New.md",
+            title: "New",
+            body: "",
+            contentHash:
+              "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            updatedAt: "2026-10-09T00:00:00Z",
+            referencedAttachmentIds: [],
+          },
+        ],
+      },
+    );
+    const pullPreview: PullPreviewV3 = {
+      ...tree,
       capabilities: V3_CAPABILITIES,
-      local: { normalizations: [] },
-      blockers: [],
-      attachmentConflicts: [],
-      attachmentConflictResolutions: {},
-      folderConflicts: [],
-      folderConflictResolutions: {},
-      pageConflicts: [],
-      pageConflictResolutions: {},
-      actions: [],
-    } as unknown as PullPreviewV3;
+      artifactRoots: [],
+      scanEpoch: 0,
+      transferId: null,
+      expectedVaultPathStates: {},
+    };
     const pushPreview = {
       protocolVersion: "3" as const,
       publishable: true as const,
@@ -976,6 +1030,16 @@ describe("plugin settings lifecycle", () => {
       },
       applyPullV3: async (preview: PullPreviewV3) => {
         expect(preview).toBe(pullPreview);
+        expect(preview.actions).toContainEqual(
+          expect.objectContaining({
+            kind: "create_page",
+            path: "pages/Recovered/C/New.md",
+          }),
+        );
+        expect(preview.resolvedFolders.map((folder) => folder.path)).toEqual([
+          "pages/Recovered",
+          "pages/Recovered/C",
+        ]);
         calls.push("apply-pull-v3");
       },
       discardPullPreviewV3: async () => undefined,
@@ -1021,6 +1085,30 @@ describe("plugin settings lifecycle", () => {
     expect((opened as unknown as { preview: unknown } | null)?.preview).toBe(
       pullPreview,
     );
+    const content = (opened as unknown as { contentEl: MockElement }).contentEl;
+    const summary = content.queryAll((element) =>
+      element.classes.has("agentwiki-sync-preview-summary"),
+    )[0]!;
+    expect(summary.textContent).toContain("pages/F/C/New.md");
+    const confirm = modalButton(opened!, "确认执行");
+    expect(confirm.disabled).toBe(true);
+    const folderSetting = content.queryAll((element) =>
+      element.classes.has("agentwiki-sync-folder-setting"),
+    )[0]!;
+    const choice = folderSetting.queryAll(
+      (element) => element.tag === "select",
+    )[0]!;
+    choice.value = "manual";
+    choice.dispatchEvent({ type: "change" });
+    const manualPath = folderSetting.queryAll(
+      (element) => element.tag === "textarea",
+    )[0]!;
+    manualPath.value = "pages/Recovered";
+    manualPath.dispatchEvent({ type: "change" });
+    modalButton(opened!, "应用手动路径").dispatchEvent({ type: "click" });
+    await vi.waitFor(() => expect(confirm.disabled).toBe(false));
+    expect(summary.textContent).toContain("pages/Recovered/C/New.md");
+    expect(summary.textContent).not.toContain("pages/F");
     modalButton(opened!, "确认执行").dispatchEvent({ type: "click" });
     await vi.waitFor(() => expect(open).toHaveBeenCalledTimes(2));
     opened = open.mock.instances.at(-1) ?? null;
