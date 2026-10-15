@@ -126,7 +126,7 @@ export class SyncCenterModal extends Modal {
   private diff: SyncDiff | null = null;
   private loadError: string | null = null;
   private running: boolean = false;
-  private readonly selection: SyncTargetSelection;
+  private readonly targetSelection: SyncTargetSelection;
   private operation: AbortController | null = null;
   private progress: SyncProgress | null = null;
   private refreshGeneration = 0;
@@ -137,7 +137,7 @@ export class SyncCenterModal extends Modal {
     private readonly handlers: SyncCenterHandlers,
   ) {
     super(app);
-    this.selection = new SyncTargetSelection(
+    this.targetSelection = new SyncTargetSelection(
       handlers.targets.map((target) => target.spaceId),
       handlers.initialSpaceId,
     );
@@ -162,7 +162,7 @@ export class SyncCenterModal extends Modal {
     this.operation = new AbortController();
     this.renderLoading();
     try {
-      const diff = await this.handlers.loadDiff(this.selection.current, {
+      const diff = await this.handlers.loadDiff(this.targetSelection.current, {
         signal: this.operation.signal,
         onProgress: (progress) => {
           if (generation !== this.refreshGeneration) return;
@@ -201,27 +201,36 @@ export class SyncCenterModal extends Modal {
 
   private render(): void {
     this.contentEl.empty();
-    if (this.loadError) {
-      this.renderError();
-      return;
-    }
     const diff = this.diff;
-    if (!diff) return;
+    if (!diff && !this.loadError) return;
     this.contentEl.createEl("h2", { text: "AgentWiki 同步" });
     new Setting(this.contentEl)
       .setName("同步空间")
-      .setDesc(`${diff.displayName} · ${diff.rootPath} · ${diff.roleLabel}`)
+      .setDesc(
+        diff
+          ? `${diff.displayName} · ${diff.rootPath} · ${diff.roleLabel}`
+          : `当前目标：${
+              this.handlers.targets.find(
+                (target) => target.spaceId === this.targetSelection.current,
+              )?.label ?? this.targetSelection.current
+            }`,
+      )
       .addDropdown((dropdown) => {
         for (const target of this.handlers.targets)
           dropdown.addOption(target.spaceId, target.label);
         dropdown
-          .setValue(this.selection.current)
+          .setValue(this.targetSelection.current)
           .setDisabled(this.running)
           .onChange((spaceId) => {
-            this.selection.select(spaceId);
+            this.targetSelection.select(spaceId);
             void this.refresh();
           });
       });
+    if (this.loadError) {
+      this.renderError();
+      return;
+    }
+    if (!diff) return;
     this.contentEl.createEl("p", {
       text: `协议：${diff.protocolLabel}`,
       cls: "agentwiki-sync-protocol-label",
@@ -282,7 +291,6 @@ export class SyncCenterModal extends Modal {
   }
 
   private renderError(): void {
-    this.contentEl.createEl("h2", { text: "AgentWiki 同步" });
     this.contentEl.createEl("p", {
       text: `加载差异失败：${this.loadError}`,
     });
@@ -439,7 +447,7 @@ export class SyncCenterModal extends Modal {
     try {
       await completeModalAction(
         () =>
-          this.handlers.runStrategy(this.selection.current, strategy, {
+          this.handlers.runStrategy(this.targetSelection.current, strategy, {
             signal: this.operation!.signal,
             onProgress: (progress) => {
               this.progress = progress;

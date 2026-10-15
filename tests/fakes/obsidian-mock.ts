@@ -215,6 +215,13 @@ export class Modal {
   modalEl = new MockElement("div");
   constructor(public readonly app: unknown) {}
   open(): void {
+    // Obsidian 1.14.4 saves the host DOM selection before calling onOpen.
+    Reflect.set(this, "selection", {
+      win: null,
+      range: null,
+      focusEl: null,
+      focusVisible: false,
+    });
     (this as { onOpen?: () => void }).onOpen?.();
   }
   close(): void {

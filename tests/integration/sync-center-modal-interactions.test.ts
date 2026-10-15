@@ -46,6 +46,91 @@ const baseDiff = (
 const findAll = (root: unknown, predicate: (item: MockElement) => boolean) =>
   (root as MockElement).queryAll(predicate);
 
+describe("rendered SyncCenterModal target recovery", () => {
+  it("preserves its target when the host saves DOM selection, then recovers from a missing folder", async () => {
+    const loadedSpaces: string[] = [];
+    const startedSyncs: string[] = [];
+    let operationSignal: AbortSignal | undefined;
+    const modal = new SyncCenterModal({} as App, {
+      targets: [
+        { spaceId: "wiki", label: "我的知识库 · Wiki" },
+        { spaceId: "projects", label: "项目管理 · AgentWiki-项目管理" },
+      ],
+      initialSpaceId: "wiki",
+      loadDiff: async (spaceId) => {
+        loadedSpaces.push(spaceId);
+        if (spaceId === "wiki") throw new Error("MAPPING_ROOT_MISSING");
+        return {
+          ...baseDiff([]),
+          displayName: "项目管理",
+          rootPath: "AgentWiki-项目管理",
+          remoteAhead: true,
+          remoteFirstBind: true,
+        };
+      },
+      runStrategy: async (spaceId, strategy, { signal }) => {
+        startedSyncs.push(`${spaceId}:${strategy}`);
+        operationSignal = signal;
+        await new Promise<void>((resolve) =>
+          signal?.addEventListener("abort", () => resolve(), { once: true }),
+        );
+      },
+    });
+
+    modal.open();
+    expect(loadedSpaces).toEqual(["wiki"]);
+    await vi.waitFor(() =>
+      expect((modal.contentEl as unknown as MockElement).textContent).toContain(
+        "映射的本地文件夹不存在",
+      ),
+    );
+
+    const selectors = findAll(modal.contentEl, (item) => item.tag === "select");
+    expect(selectors).toHaveLength(1);
+    const selector = selectors[0]!;
+    expect(selector.value).toBe("wiki");
+    expect(selector.disabled).toBe(false);
+    expect(
+      findAll(modal.contentEl, (item) =>
+        item.classes.has("setting-item-description"),
+      ).map((item) => item.textContent),
+    ).toContain("当前目标：我的知识库 · Wiki");
+    expect(startedSyncs).toEqual([]);
+
+    selector.value = "projects";
+    selector.dispatchEvent({ type: "change" });
+    await vi.waitFor(() =>
+      expect((modal.contentEl as unknown as MockElement).textContent).toContain(
+        "首次同步",
+      ),
+    );
+    expect(loadedSpaces).toEqual(["wiki", "projects"]);
+    expect(
+      (modal.contentEl as unknown as MockElement).textContent,
+    ).not.toContain("加载差异失败");
+    expect(
+      findAll(modal.contentEl, (item) => item.tag === "select")[0]?.value,
+    ).toBe("projects");
+    expect(startedSyncs).toEqual([]);
+
+    findAll(
+      modal.contentEl,
+      (item) => item.tag === "button" && item.text === "使用服务器内容",
+    )[0]!.dispatchEvent({ type: "click" });
+    expect(startedSyncs).toEqual(["projects:server"]);
+    const runningSelector = findAll(
+      modal.contentEl,
+      (item) => item.tag === "select",
+    )[0]!;
+    expect(runningSelector.disabled).toBe(true);
+    runningSelector.value = "wiki";
+    runningSelector.dispatchEvent({ type: "change" });
+    expect(loadedSpaces).toEqual(["wiki", "projects"]);
+    modal.close();
+    expect(operationSignal?.aborted).toBe(true);
+  });
+});
+
 describe("rendered SyncCenterModal image details", () => {
   it("sorts and pages one thousand image rows with a bounded render", async () => {
     const items = Array.from({ length: 1_000 }, (_, index) => {

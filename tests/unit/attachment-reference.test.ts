@@ -87,6 +87,121 @@ describe("parseAttachmentReferences", () => {
     ).toEqual(["assets/outside.png"]);
   });
 
+  it.each([
+    ["backtick fence", "```html\n<div><!-- unfinished\n```"],
+    ["tilde fence", "~~~html\n<div><!-- unfinished\n~~~"],
+    ["nested fence", "> - ```html\n>   <!-- unfinished\n>   ```"],
+    ["indented code", "    <!-- unfinished"],
+    ["inline code", "text `<!-- unfinished`"],
+  ])(
+    "keeps images after an unfinished comment marker in %s",
+    (_label, code) => {
+      const body = [
+        code,
+        "![outside](../assets/outside.png)",
+        "<!-- ![[assets/comment.png]] -->",
+        "![[assets/last.png]]",
+      ].join("\n");
+
+      expect(
+        parseAttachmentReferences(body, "pages/note.md").map(
+          (reference) => reference.resolvedPath,
+        ),
+      ).toEqual(["assets/outside.png", "assets/last.png"]);
+    },
+  );
+
+  it.each(["```", "~~~", "- ```", "> ```"])(
+    "does not open a %s fence inside a real comment",
+    (marker) => {
+      const body = [
+        "<!--",
+        marker,
+        "![[assets/comment.png]]",
+        "-->",
+        "![outside](../assets/outside.png)",
+        "```md",
+        "![[assets/code.png]]",
+        "```",
+        "![[assets/last.png]]",
+      ].join("\n");
+
+      expect(
+        parseAttachmentReferences(body, "pages/note.md").map(
+          (reference) => reference.resolvedPath,
+        ),
+      ).toEqual(["assets/outside.png", "assets/last.png"]);
+    },
+  );
+
+  it("does not pair a backtick inside a real comment with one outside", () => {
+    const body =
+      "<!-- ` ![[assets/comment.png]] --> " +
+      "![outside](../assets/outside.png) ` unmatched";
+
+    expect(
+      parseAttachmentReferences(body, "pages/note.md").map(
+        (reference) => reference.resolvedPath,
+      ),
+    ).toEqual(["assets/outside.png"]);
+  });
+
+  it.each([
+    ["backtick fence", "```md\nclose ` ![[assets/code.png]]\n```"],
+    ["tilde fence", "~~~md\nclose ` ![[assets/code.png]]\n~~~"],
+    ["nested fence", "> - ```md\n>   close ` ![[assets/code.png]]\n>   ```"],
+    ["indented code", "    close ` ![[assets/code.png]]"],
+  ])("still excludes %s after an inline-code opener", (_label, code) => {
+    const body = ["text `open", code, "![[assets/outside.png]]"].join("\n");
+
+    expect(
+      parseAttachmentReferences(body, "pages/note.md").map(
+        (reference) => reference.resolvedPath,
+      ),
+    ).toEqual(["assets/outside.png"]);
+  });
+
+  it.each([
+    ["backtick fence", "```md\nliteral\n```"],
+    ["tilde fence", "~~~md\nliteral\n~~~"],
+    ["indented code", "    literal"],
+  ])(
+    "recognizes real comments after an inline opener crosses %s",
+    (_label, code) => {
+      const body = [
+        "text `open",
+        code,
+        "<!-- real comment `",
+        "![[assets/comment.png]]",
+        "-->",
+        "![[assets/outside.png]]",
+      ].join("\n");
+
+      expect(
+        parseAttachmentReferences(body, "pages/note.md").map(
+          (reference) => reference.resolvedPath,
+        ),
+      ).toEqual(["assets/outside.png"]);
+    },
+  );
+
+  it("recognizes a real comment before a block interrupts an inline opener", () => {
+    const body = [
+      "text `open <!-- real comment",
+      "```md",
+      "literal `",
+      "![[assets/comment.png]]",
+      "-->",
+      "![[assets/outside.png]]",
+    ].join("\n");
+
+    expect(
+      parseAttachmentReferences(body, "pages/note.md").map(
+        (reference) => reference.resolvedPath,
+      ),
+    ).toEqual(["assets/outside.png"]);
+  });
+
   it("uses the unescaped suffix of a multi-backtick run as an opener", () => {
     const body =
       "\\`` hidden ![inside](../assets/inside.png) ` " +

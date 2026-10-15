@@ -189,6 +189,45 @@ function activeFenceContent(
   return { inside: true, content: line.slice(cursor) };
 }
 
+interface Fence {
+  marker: "`" | "~";
+  length: number;
+  container: FenceContainerToken[];
+}
+
+function lineBlock(
+  line: string,
+  previousListContainer: FenceContainerToken[],
+): {
+  fence: Fence | null;
+  indented: boolean;
+  listContainer: FenceContainerToken[];
+} {
+  let listContainer = previousListContainer;
+  let opening = lineContainer(line, listContainer);
+  const pendingList = listContainer.findIndex(
+    (token) => token.kind === "list" && token.awaitingFirstBlock,
+  );
+  if (pendingList >= 0 && isBlankListContent(opening.inheritedContent)) {
+    listContainer = inheritedListContainer(listContainer.slice(0, pendingList));
+    opening = lineContainer(line, listContainer);
+  }
+  if (line.trim().length > 0)
+    listContainer = inheritedListContainer(opening.container);
+  const fenceMatch = opening.content.match(/^ {0,3}(`{3,}|~{3,})/u);
+  return {
+    fence: fenceMatch
+      ? {
+          marker: fenceMatch[1]![0] as "`" | "~",
+          length: fenceMatch[1]!.length,
+          container: opening.container,
+        }
+      : null,
+    indented: /^(?: {4}|\t)/u.test(opening.content),
+    listContainer,
+  };
+}
+
 interface BacktickRun {
   start: number;
   length: number;
@@ -230,27 +269,59 @@ function indexBacktickRuns(body: string): BacktickRun[] {
 
 function excludedMask(body: string): Uint8Array {
   const mask = new Uint8Array(body.length);
-  for (const match of body.matchAll(/<!--[\s\S]*?(?:-->|$)/gu))
-    mark(mask, match.index, match.index + match[0].length);
+  const backtickRuns = new Map(
+    indexBacktickRuns(body).map((run) => [run.openerStart, run]),
+  );
+  let inlineOrCommentEnd = 0;
+  let commentEnd = 0;
+  const lines = [...body.matchAll(/[^\n]*(?:\n|$)/gu)]
+    .filter((match) => match[0].length > 0)
+    .map((match) => ({
+      offset: match.index,
+      end: match.index + match[0].length,
+      text: match[0].endsWith("\n") ? match[0].slice(0, -1) : match[0],
+    }));
+  const blockBoundaryCache = new Map<string, number>();
 
-  let fence: {
-    marker: "`" | "~";
-    length: number;
-    container: FenceContainerToken[];
-  } | null = null;
+  // A multiline span must close before the next code block. Cache each
+  // traversed container context so repeated candidates share the lookahead.
+  function nextCodeBlockStart(
+    start: number,
+    previousListContainer: FenceContainerToken[],
+  ): number {
+    let container = previousListContainer;
+    let boundary = body.length;
+    const visited: string[] = [];
+    for (let index = start; index < lines.length; index += 1) {
+      const key = `${index}:${JSON.stringify(container)}`;
+      const cached = blockBoundaryCache.get(key);
+      if (cached !== undefined) {
+        boundary = cached;
+        break;
+      }
+      visited.push(key);
+      const line = lines[index]!;
+      const block = lineBlock(line.text, container);
+      if (block.fence || block.indented) {
+        boundary = line.offset;
+        break;
+      }
+      container = block.listContainer;
+    }
+    for (const key of visited) blockBoundaryCache.set(key, boundary);
+    return boundary;
+  }
+
+  let fence: Fence | null = null;
   let listContainer: FenceContainerToken[] = [];
-  let offset = 0;
-  for (const lineWithBreak of body.match(/[^\n]*(?:\n|$)/gu) ?? []) {
-    if (lineWithBreak.length === 0) continue;
-    const line = lineWithBreak.endsWith("\n")
-      ? lineWithBreak.slice(0, -1)
-      : lineWithBreak;
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const { offset, end, text: line } = lines[lineIndex]!;
     if (fence) {
       const active = activeFenceContent(line, fence.container);
       if (!active.inside) fence = null;
       else {
         const fenceMatch = active.content.match(/^ {0,3}(`{3,}|~{3,})/u);
-        mark(mask, offset, offset + lineWithBreak.length);
+        mark(mask, offset, end);
         if (
           fenceMatch &&
           fenceMatch[1]![0] === fence.marker &&
@@ -258,45 +329,46 @@ function excludedMask(body: string): Uint8Array {
           active.content.slice(fenceMatch[0].length).trim().length === 0
         )
           fence = null;
-        offset += lineWithBreak.length;
         continue;
       }
     }
-    let opening = lineContainer(line, listContainer);
-    const pendingList = listContainer.findIndex(
-      (token) => token.kind === "list" && token.awaitingFirstBlock,
-    );
-    if (pendingList >= 0 && isBlankListContent(opening.inheritedContent)) {
-      listContainer = inheritedListContainer(
-        listContainer.slice(0, pendingList),
-      );
-      opening = lineContainer(line, listContainer);
+    // Comments own contained block markers; inline spans still allow the
+    // block parser to recognize subsequent fences and indented code.
+    if (offset >= commentEnd) {
+      const block = lineBlock(line, listContainer);
+      listContainer = block.listContainer;
+      fence = block.fence;
+      if (fence || block.indented) {
+        mark(mask, offset, end);
+        continue;
+      }
     }
-    if (line.trim().length > 0)
-      listContainer = inheritedListContainer(opening.container);
-    const fenceMatch = opening.content.match(/^ {0,3}(`{3,}|~{3,})/u);
-    if (fenceMatch) {
-      fence = {
-        marker: fenceMatch[1]![0] as "`" | "~",
-        length: fenceMatch[1]!.length,
-        container: opening.container,
-      };
-      mark(mask, offset, offset + lineWithBreak.length);
-    } else {
-      if (/^(?: {4}|\t)/u.test(opening.content))
-        mark(mask, offset, offset + lineWithBreak.length);
+    let followingCodeBlock: number | undefined;
+    for (
+      let index = Math.max(offset, inlineOrCommentEnd);
+      index < end;
+      index += 1
+    ) {
+      if (body.startsWith("<!--", index)) {
+        const close = body.indexOf("-->", index + 4);
+        inlineOrCommentEnd = close < 0 ? body.length : close + 3;
+        commentEnd = inlineOrCommentEnd;
+      } else {
+        const run = backtickRuns.get(index);
+        if (!run || run.openerLength === 0 || run.nextEqualStart < 0) continue;
+        const runEnd = run.nextEqualStart + run.openerLength;
+        if (runEnd > end) {
+          followingCodeBlock ??= nextCodeBlockStart(
+            lineIndex + 1,
+            listContainer,
+          );
+          if (runEnd > followingCodeBlock) continue;
+        }
+        inlineOrCommentEnd = runEnd;
+      }
+      mark(mask, index, inlineOrCommentEnd);
+      index = inlineOrCommentEnd - 1;
     }
-    offset += lineWithBreak.length;
-  }
-
-  for (const run of indexBacktickRuns(body)) {
-    if (
-      run.openerLength === 0 ||
-      mask[run.openerStart] ||
-      run.nextEqualStart < 0
-    )
-      continue;
-    mark(mask, run.openerStart, run.nextEqualStart + run.openerLength);
   }
   return mask;
 }
