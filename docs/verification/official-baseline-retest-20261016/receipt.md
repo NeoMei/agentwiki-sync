@@ -40,3 +40,11 @@
 新增断开/缺连接两项回归先红，日志 `/tmp/agentwiki-official-runtime-retirement-red.log`。修复后并发组 10 项全绿，另覆盖身份错误清缓存，及真实连接服务 exchange/session/activate 后重新绑定不同根、构造新 v3 runtime、原正文保持、退休 runtime 不再写入。
 
 补修完整检查：`npm run check` 退出 0，74 文件 1526 测试、格式、typecheck、production build、bundle/release 校验通过；19 个既有 lint warning。日志 `/tmp/agentwiki-official-baseline-check-retirement.log`。
+
+## 0.5.11 发布准备
+
+产品源码 `becc0a1` 独立复审 PASS，回执 `/tmp/agentwiki-official-baseline-review-becc0a1.md`，包含独立竞态回放及恢复兼容检查。随后仅更新版本、发布说明、元数据断言与验收文档；0.5.11 完整 `npm run check` 再次退出 0，仍为 74 文件 1526 项通过、19 个已有 lint warning。日志 `/tmp/agentwiki-0511-release-preparation.log`。
+
+候选 main.js 1781422 B，SHA-256 `95bf589b188c31850df105440ff0c766856339248382e0ed49cde411f5512e66`；manifest.json `25b54b8a5acb87a80807c5f3931a423ee262b11639ae7897479ed83943417cfa`；styles.css `5dfe15839220724a57a64ad7ab136761ba2ffaaff3c0235faac1cf1238e762b8`。
+
+准备时远端 main 仍为 `2df7cfab531d04282b57cc1e3fce0ba1bd368f6d`，最新正式 Release 仍为 0.5.10，没有 0.5.11 tag。feature branch 可供 Windows 固定 SHA 独立检出；尚未创建正式 tag/Release，也未安装到用户 Vault。Windows 步骤见 [windows-acceptance.md](windows-acceptance.md)，执行结果需要另记。
