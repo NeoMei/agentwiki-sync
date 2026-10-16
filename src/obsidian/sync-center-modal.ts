@@ -61,6 +61,7 @@ export interface SyncDiff {
   remoteListed: boolean;
   remoteFirstBind: boolean;
   recoveryPending?: boolean;
+  recoveryCanCancel?: boolean;
   recoveryKind?: "push" | "image_upgrade";
 }
 
@@ -76,6 +77,7 @@ export interface SyncCenterHandlers {
     spaceId: string,
     options: SyncOperationOptions,
   ) => Promise<SyncDiff>;
+  cancelPendingPush?: (spaceId: string) => Promise<void>;
   runStrategy: (
     spaceId: string,
     strategy: SyncStrategy,
@@ -95,6 +97,8 @@ const countFolderDiff = (diff: SyncDiff): number =>
   diff.localFoldersDeleted.length;
 
 export function syncSummary(diff: SyncDiff): string {
+  if (diff.recoveryPending && diff.recoveryKind === "push")
+    return `待恢复的已确认操作 ${countDiff(diff) + countFolderDiff(diff)} 项：归档目录 ${diff.localFoldersDeleted.length} · 归档页面 ${diff.localDeleted.length} · 写入目录 ${diff.localFoldersAdded.length + diff.localFoldersMoved.length} · 写入页面 ${diff.localAdded.length + diff.localModified.length + diff.localRenamed.length}。目录归档包含其全部后代。`;
   const localCount = countDiff(diff);
   const localFolderCount = countFolderDiff(diff);
   const remoteCount = diff.remoteUpdated.length + diff.remoteArchived.length;
@@ -373,6 +377,17 @@ export class SyncCenterModal extends Modal {
             : "已有确认过的图片同步升级尚未完成。恢复会继续使用已持久化的确认内容，不会重新请求确认。",
         cls: "agentwiki-sync-strategy-description",
       });
+      if (diff.recoveryCanCancel && this.handlers.cancelPendingPush) {
+        this.contentEl.createEl("p", {
+          text: "归档会删除服务器内容。取消此任务并重新预览会先核对服务器状态；已发布的结果会完成恢复核对。取消不会自动执行新的同步。",
+        });
+        new Setting(this.contentEl).addButton((button) =>
+          button
+            .setButtonText("取消此任务并重新预览")
+            .setDisabled(this.running)
+            .onClick(() => void this.cancelPending()),
+        );
+      }
       new Setting(this.contentEl).addButton((button) =>
         button
           .setButtonText(
@@ -431,6 +446,20 @@ export class SyncCenterModal extends Modal {
           .setDisabled(this.progress?.cancellable === false)
           .onClick(() => this.operation?.abort()),
       );
+  }
+
+  private async cancelPending(): Promise<void> {
+    if (this.running || !this.handlers.cancelPendingPush) return;
+    this.running = true;
+    this.render();
+    try {
+      await this.handlers.cancelPendingPush(this.targetSelection.current);
+      await this.refresh();
+    } catch (error) {
+      new Notice(`取消未完成：${userErrorMessage(error)}`);
+      this.running = false;
+      this.render();
+    }
   }
 
   private async run(strategy: SyncStrategy): Promise<void> {

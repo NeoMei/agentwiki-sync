@@ -69,13 +69,13 @@ async function deletedTree() {
 }
 
 describe("Q3 regression", () => {
-  it("keeps 2 folder / 5 page local deletions as a deliberate publishable change", async () => {
+  it("publishes 2 recursive folder archives for 5 deleted pages", async () => {
     const { runtime, remote, vault } = await deletedTree();
     expect((await runtime.remoteDelta()).ahead).toBe(false);
     const preview = await runtime.previewPush();
     expect(
       preview.changes.filter((x) => x.operation === "archive_page"),
-    ).toHaveLength(5);
+    ).toHaveLength(0);
     expect(
       preview.changes.filter((x) => x.operation === "archive_folder"),
     ).toHaveLength(2);

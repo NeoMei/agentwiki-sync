@@ -202,4 +202,39 @@ describe("rendered SyncCenterModal image details", () => {
       "恢复已确认同步",
     );
   });
+  it("shows persisted archives and cancels only the selected task before refreshing", async () => {
+    let cancelled = false;
+    const runStrategy = vi.fn();
+    const cancelPendingPush = vi.fn(async (spaceId: string) => {
+      expect(spaceId).toBe("wiki");
+      cancelled = true;
+    });
+    const modal = new SyncCenterModal({} as App, {
+      targets: [{ spaceId: "wiki", label: "Wiki" }],
+      initialSpaceId: "wiki",
+      loadDiff: async () => ({
+        ...baseDiff([]),
+        protocolLabel: "Sync v2",
+        recoveryKind: "push",
+        recoveryPending: !cancelled,
+        recoveryCanCancel: !cancelled,
+        localFoldersDeleted: cancelled ? [] : ["pages/A"],
+        localDeleted: cancelled ? [] : ["pages/root.md"],
+      }),
+      runStrategy,
+      cancelPendingPush,
+    });
+    modal.open();
+    const text = () => (modal.contentEl as unknown as MockElement).textContent;
+    await vi.waitFor(() => expect(text()).toContain("归档目录 1 · 归档页面 1"));
+    const button = findAll(
+      modal.contentEl,
+      (node) =>
+        node.tag === "button" && node.textContent === "取消此任务并重新预览",
+    )[0]!;
+    button.dispatchEvent({ type: "click" });
+    await vi.waitFor(() => expect(text()).toContain("自动合并（推荐）"));
+    expect(cancelPendingPush).toHaveBeenCalledTimes(1);
+    expect(runStrategy).not.toHaveBeenCalled();
+  });
 });

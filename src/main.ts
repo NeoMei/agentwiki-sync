@@ -1027,6 +1027,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       loadDiff: (spaceId, options) => this.collectSyncDiff(spaceId, options),
       runStrategy: (spaceId, strategy, options) =>
         this.runSyncStrategy(spaceId, strategy, options),
+      cancelPendingPush: (spaceId) => this.cancelPendingPush(spaceId),
     }).open();
   }
 
@@ -1094,6 +1095,9 @@ export default class AgentWikiSyncPlugin extends Plugin {
       legacyPending ||
       (routed?.route === "recover_upgrade" && routed.upgrade)
     ) {
+      const pending = legacyPending
+        ? await runtime.pendingLegacyPushChanges()
+        : [];
       return {
         canPublish: true,
         displayName: mapping.spaceId,
@@ -1107,21 +1111,30 @@ export default class AgentWikiSyncPlugin extends Plugin {
           : "Sync v2 → Sync v3",
         attachmentChanges: null,
         localFoldersAdded: [],
-        localFoldersMoved: [],
-        localFoldersDeleted: [],
+        localFoldersMoved: pending.flatMap((c) =>
+          c.operation === "upsert_folder" ? [c.path] : [],
+        ),
+        localFoldersDeleted: pending.flatMap((c) =>
+          c.operation === "archive_folder" ? [c.path] : [],
+        ),
         remoteFoldersUpdated: [],
         remoteFoldersArchived: [],
         folderCount: 0,
         pageCount: 0,
         localAdded: [],
-        localModified: [],
+        localModified: pending.flatMap((c) =>
+          c.operation === "upsert_page" ? [c.path] : [],
+        ),
         localRenamed: [],
-        localDeleted: [],
+        localDeleted: pending.flatMap((c) =>
+          c.operation === "archive_page" ? [c.path] : [],
+        ),
         remoteUpdated: [],
         remoteArchived: [],
         remoteListed: false,
         remoteFirstBind: false,
         recoveryPending: true,
+        recoveryCanCancel: legacyPending && runtime.protocolVersion === "2",
         recoveryKind: legacyPending ? "push" : "image_upgrade",
       };
     }
@@ -1398,6 +1411,19 @@ export default class AgentWikiSyncPlugin extends Plugin {
       remoteListed: delta.listed,
       remoteFirstBind: delta.ahead && delta.baseRevision === "0",
     };
+  }
+
+  private async cancelPendingPush(spaceId: string): Promise<void> {
+    const mapping = this.selectedMapping(spaceId);
+    if (!mapping) throw new Error("请先选择空间映射。");
+    const release = this.locks.acquire(mapping.spaceId);
+    try {
+      const runtime = await this.runtime(mapping);
+      if (!runtime) throw new Error("请先连接空间。");
+      await runtime.cancelPendingTreePush();
+    } finally {
+      release();
+    }
   }
 
   private async runSyncStrategy(

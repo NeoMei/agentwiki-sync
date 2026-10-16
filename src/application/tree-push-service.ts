@@ -72,6 +72,7 @@ export interface TreePushJournal {
   remoteState:
     "not_created" | "uploading" | "finalizing" | "published" | "superseded";
   result: TreeFinalizeResult | null;
+  finalizeRejectionCode?: "PAYLOAD_INVALID";
   localCommitPhase: "not_started" | "verified";
 }
 
@@ -158,6 +159,8 @@ export function isTreePushJournal(value: unknown): value is TreePushJournal {
       "published",
       "superseded",
     ].includes(item.remoteState ?? "") &&
+    (item.finalizeRejectionCode === undefined ||
+      item.finalizeRejectionCode === "PAYLOAD_INVALID") &&
     (item.result === null || typeof item.result === "object") &&
     (item.localCommitPhase === "not_started" ||
       item.localCommitPhase === "verified")
@@ -282,6 +285,10 @@ export class TreePushService {
     return value.payload;
   }
 
+  async pendingChanges(): Promise<PreparedTreePushChange[] | null> {
+    return (await this.journal.read())?.payload.changes ?? null;
+  }
+
   async inspect(): Promise<Pick<
     TreePushJournal,
     "remoteState" | "result" | "localCommitPhase" | "credentialIdAtCreation"
@@ -297,8 +304,11 @@ export class TreePushService {
       : null;
   }
 
-  private async payloadPath(pageId: string): Promise<string> {
-    return `${this.root}/payload/${await opaqueFileKey(pageId)}.md`;
+  private async payloadPath(
+    pageId: string,
+    operationId: string,
+  ): Promise<string> {
+    return `${this.root}/payload/${await opaqueFileKey(operationId)}-${await opaqueFileKey(pageId)}.md`;
   }
 
   private async hydrateChange(
@@ -531,6 +541,19 @@ export class TreePushService {
     if (capabilitiesHashValue !== (await this.remote.capabilitiesHash))
       throw new Error("能力集与服务器不一致");
 
+    if (existing) {
+      // Retain the original confirmed manifest before any later operation can
+      // rotate the journal files. Payload paths are unique per confirmation.
+      const historyPath = `${this.root}/operations/history-2-${await opaqueFileKey(existing.payload.idempotencyKey)}/terminal.json`;
+      const raw = JSON.stringify(existing);
+      const prior = await this.store.read(historyPath);
+      if (prior !== null && prior !== raw)
+        throw new Error("Terminal history mismatch");
+      if (prior === null) await this.store.write(historyPath, raw);
+      if ((await this.store.read(historyPath)) !== raw)
+        throw new Error("Terminal history not durable");
+    }
+    const operationId = crypto.randomUUID();
     const staged: PreparedTreePushChange[] = [];
     let totalBodyBytes = 0;
     try {
@@ -545,7 +568,10 @@ export class TreePushService {
           const bytes = encoder.encode(body).byteLength;
           if (bytes !== change.page.bodyBytes)
             throw new Error("推送预览数据长度变化");
-          const payloadPath = await this.payloadPath(change.page.pageId);
+          const payloadPath = await this.payloadPath(
+            change.page.pageId,
+            operationId,
+          );
           await this.store.write(payloadPath, body);
           totalBodyBytes += bytes;
           staged.push({
@@ -580,7 +606,7 @@ export class TreePushService {
       schemaVersion: 2,
       spaceId: input.spaceId,
       baseRevision: input.baseRevision,
-      idempotencyKey: crypto.randomUUID(),
+      idempotencyKey: operationId,
       confirmationHash: confirmationHashValue,
       capabilitiesHash: capabilitiesHashValue,
       capabilities,
@@ -612,10 +638,9 @@ export class TreePushService {
         completed: 0,
         cancellable: false,
       });
-      return this.commitResult(
-        journal,
-        await this.remote.finalize(session.sessionId, journal.confirmationHash),
-      );
+      const result = await this.finalize(journal);
+      if (!result) throw new Error("推送已取消，请刷新差异后重新预览");
+      return result;
     } catch (error) {
       const isPreFinalize =
         journal.remoteState === "not_created" ||
@@ -655,8 +680,94 @@ export class TreePushService {
     }
   }
 
-  private async finalizeForResume(
+  private async persistSuperseded(journal: TreePushJournal): Promise<void> {
+    if (journal.result || journal.remoteState === "published")
+      throw new Error("已发布的推送无法被替代");
+    journal.remoteState = "superseded";
+    await this.save(journal);
+    // Both main and .prev must be terminal: a missing main after a crash
+    // must never resurrect this confirmed deletion for automatic replay.
+    await this.save(journal);
+  }
+
+  private async sessionStatus(
     journal: TreePushJournal,
+  ): Promise<TreePushSessionStatus> {
+    try {
+      return await this.remote.getSession(journal.sessionId!);
+    } catch (error) {
+      // NOT_FOUND also hides credential/Space ownership mismatch. It is
+      // not evidence that the original confirmation cannot still publish.
+      if (syncErrorCode(error) === "PUSH_SESSION_NOT_FOUND")
+        throw new Error(
+          "无法核对原推送会话的归属或终态。已保留原确认，请恢复原连接后重试取消。",
+        );
+      if (syncErrorCode(error) !== "PUSH_SESSION_EXPIRED") throw error;
+      return {
+        sessionId: journal.sessionId!,
+        status: "expired",
+        expiresAt: new Date(0).toISOString(),
+        receivedBatchIndexes: [],
+        result: null,
+      };
+    }
+  }
+
+  private async cancelJournal(
+    journal: TreePushJournal,
+  ): Promise<TreeFinalizeResult | null> {
+    if (journal.result) return this.commitResult(journal, journal.result);
+    if (journal.remoteState === "published")
+      throw new Error("已发布的推送缺少结果，必须恢复核对");
+    if (journal.remoteState === "superseded") return null;
+    if (!journal.sessionId) {
+      // A lost create response could still own a server session, but no
+      // finalize can have started without a durable sessionId.
+      await this.persistSuperseded(journal);
+      return null;
+    }
+    let status = await this.sessionStatus(journal);
+    if (status.result) return this.commitResult(journal, status.result);
+    if (status.status === "published")
+      throw new Error("已发布的会话缺少结果，必须恢复核对");
+    if (status.status !== "aborted") {
+      if (status.status === "finalizing" || !this.remote.abort)
+        throw new Error("服务端发布状态尚未确定，请稍后恢复核对");
+      try {
+        await this.remote.abort(journal.sessionId);
+      } catch (error) {
+        // Abort may race a publisher or lose its response. Only terminal
+        // readback can authorize retiring the confirmation.
+        status = await this.sessionStatus(journal);
+        if (status.result) return this.commitResult(journal, status.result);
+        const fencedExpiry =
+          status.status === "expired" &&
+          syncErrorCode(error) === "PUSH_SESSION_EXPIRED";
+        if (status.status !== "aborted" && !fencedExpiry) {
+          if (syncErrorCode(error) === "PUSH_SESSION_NOT_FOUND")
+            throw new Error(
+              "无法核对原推送会话的归属或终态。已保留原确认，请恢复原连接后重试取消。",
+            );
+          throw error;
+        }
+      }
+      status = await this.sessionStatus(journal);
+      if (status.result) return this.commitResult(journal, status.result);
+      if (status.status !== "aborted" && status.status !== "expired")
+        throw new Error("服务端尚未确认取消，请稍后恢复核对");
+    }
+    await this.persistSuperseded(journal);
+    return null;
+  }
+
+  /** Explicitly abandon an unpublished confirmation, without creating or finalizing. */
+  async cancelPending(): Promise<TreeFinalizeResult | null> {
+    return this.cancelJournal(await this.load());
+  }
+
+  private async finalize(
+    journal: TreePushJournal,
+    resume = false,
   ): Promise<TreeFinalizeResult | null> {
     try {
       return await this.commitResult(
@@ -667,11 +778,36 @@ export class TreePushService {
         ),
       );
     } catch (error) {
-      if (syncErrorCode(error) !== "BASE_STALE") throw error;
-      journal.remoteState = "superseded";
-      await this.save(journal);
-      return null;
+      if (
+        syncErrorCode(error) === "PAYLOAD_INVALID" &&
+        error instanceof AgentWikiHttpError &&
+        error.status >= 400 &&
+        error.status < 500
+      ) {
+        journal.finalizeRejectionCode = "PAYLOAD_INVALID";
+        await this.save(journal);
+        let result: TreeFinalizeResult | null;
+        try {
+          result = await this.cancelJournal(journal);
+        } catch {
+          throw error;
+        }
+        if (result) return result;
+        if (resume) return null;
+        throw error;
+      }
+      if (resume && syncErrorCode(error) === "BASE_STALE") {
+        await this.persistSuperseded(journal);
+        return null;
+      }
+      throw error;
     }
+  }
+
+  private async finalizeForResume(
+    journal: TreePushJournal,
+  ): Promise<TreeFinalizeResult | null> {
+    return this.finalize(journal, true);
   }
 
   async resume(): Promise<TreeFinalizeResult | null> {
@@ -680,6 +816,7 @@ export class TreePushService {
       throw new Error("已取消的推送无法恢复");
     if (journal.remoteState === "published" && journal.result)
       return journal.result;
+    if (journal.finalizeRejectionCode) return this.cancelJournal(journal);
     let received = new Set<number>();
     if (!journal.sessionId) {
       const created = await this.createForResume(journal);
@@ -706,14 +843,24 @@ export class TreePushService {
           result: null,
         };
       }
-      if (session.status === "published" && session.result)
-        return this.commitResult(journal, session.result);
+      if (session.result) return this.commitResult(journal, session.result);
+      if (session.status === "published")
+        throw new Error("已发布的会话缺少结果，必须恢复核对");
       if (session.status === "aborted") {
         journal.remoteState = "superseded";
         await this.save(journal);
         return null;
       }
       if (session.status === "expired") {
+        if (
+          journal.changes.some(
+            (change) =>
+              change.operation === "archive_folder" ||
+              change.operation === "archive_page",
+          )
+        ) {
+          return this.cancelJournal(journal);
+        }
         // The staged manifest and body are durable locally. Once the
         // server-side TTL has elapsed, create a fresh idempotency session
         // and resume from those sidecars instead of stranding the page.
@@ -766,7 +913,14 @@ export class TreePushService {
       throw new Error("推送结果未发布");
     journal.localCommitPhase = "verified";
     await this.save(journal);
-    for (const dir of ["payload", "receipts"]) {
+    for (const change of journal.changes)
+      if (change.operation === "upsert_page")
+        try {
+          await this.store.remove(change.page.payloadPath);
+        } catch {
+          // Verified payload cleanup must not turn reconciliation into failure.
+        }
+    for (const dir of ["receipts"]) {
       try {
         await this.store.removeTree?.(`${this.root}/${dir}`);
       } catch {

@@ -315,7 +315,9 @@ export class FakeTreeRemote implements TreeRemotePort {
     sessionId: string,
     batch: TreePushBatchV2,
   ): Promise<{ receipt: string }> {
-    this.sessions.get(sessionId)!.batches.push(batch);
+    const session = this.sessions.get(sessionId)!;
+    session.batches.push(batch);
+    session.status = "ready_to_finalize";
     return { receipt: "r-" + batch.batchIndex };
   }
 
@@ -325,14 +327,69 @@ export class FakeTreeRemote implements TreeRemotePort {
   ): Promise<TreeFinalizeResult> {
     if (!this.canPublish) throw new Error("SPACE_READ_ONLY");
     const session = this.sessions.get(sessionId)!;
+    if (session.status === "published" && session.result) return session.result;
     if (session.baseRevision !== String(this.revision))
       throw new Error("BASE_STALE");
+    if (session.status === "aborted") throw new Error("PUSH_SESSION_ABORTED");
+    const changes = session.batches.flatMap((batch) => batch.changes);
+    const archivedFolders = new Set<string>();
+    const subtree = (root: string): Set<string> => {
+      const ids = new Set([root]);
+      let previous = 0;
+      while (previous !== ids.size) {
+        previous = ids.size;
+        for (const folder of this.folders.values())
+          if (folder.parentFolderId && ids.has(folder.parentFolderId))
+            ids.add(folder.folderId);
+      }
+      return ids;
+    };
+    const invalid = () =>
+      new AgentWikiHttpError(400, {
+        error: { code: "PAYLOAD_INVALID", retryable: false },
+      });
+    // Match server preflight against the OLD tree before applying any upserts.
+    for (const change of changes)
+      if (change.operation === "archive_folder") {
+        const ids = subtree(change.folderId);
+        if ([...ids].some((id) => archivedFolders.has(id))) throw invalid();
+        for (const id of ids) archivedFolders.add(id);
+      }
+    for (const change of changes) {
+      if (
+        change.operation === "upsert_folder" &&
+        (archivedFolders.has(change.folder.folderId) ||
+          (change.folder.parentFolderId &&
+            archivedFolders.has(change.folder.parentFolderId)))
+      )
+        throw invalid();
+      if (
+        change.operation === "archive_page" ||
+        change.operation === "upsert_page"
+      ) {
+        const pageId =
+          change.operation === "archive_page"
+            ? change.pageId
+            : change.page.pageId;
+        const before = this.pages.get(pageId);
+        if (
+          (before?.folderId && archivedFolders.has(before.folderId)) ||
+          (change.operation === "upsert_page" &&
+            change.page.folderId &&
+            archivedFolders.has(change.page.folderId))
+        )
+          throw invalid();
+      }
+    }
+    for (const id of archivedFolders) this.folders.delete(id);
+    for (const [id, page] of this.pages)
+      if (page.folderId && archivedFolders.has(page.folderId))
+        this.pages.delete(id);
     for (const batch of [...session.batches].sort(
       (a, b) => a.batchIndex - b.batchIndex,
     ))
       for (const change of batch.changes) {
-        if (change.operation === "archive_folder")
-          this.folders.delete(change.folderId);
+        if (change.operation === "archive_folder") continue;
         else if (change.operation === "upsert_folder")
           this.folders.set(change.folder.folderId, { ...change.folder });
         else if (change.operation === "archive_page")
@@ -415,7 +472,7 @@ export class FakeTreeRemote implements TreeRemotePort {
 
   async abort(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (session) session.status = "aborted";
+    if (session && session.status !== "published") session.status = "aborted";
   }
 
   async seed(pages: SyncPage[]): Promise<void> {

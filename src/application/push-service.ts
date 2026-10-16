@@ -109,6 +109,9 @@ export class PushService {
     if (!value) throw new Error("推送日志缺失或已损坏");
     return value.payload;
   }
+  async pendingChanges(): Promise<PushJournal["changes"] | null> {
+    return (await this.journal.read())?.payload.changes ?? null;
+  }
   async inspect(): Promise<Pick<
     PushJournal,
     "remoteState" | "result" | "localCommitPhase" | "credentialIdAtCreation"

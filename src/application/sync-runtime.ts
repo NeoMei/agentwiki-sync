@@ -1558,6 +1558,62 @@ export class SyncRuntime {
     }
   }
 
+  async pendingLegacyPushChanges(): Promise<
+    Array<{
+      operation: PreparedTreePushChange["operation"];
+      path: string;
+    }>
+  > {
+    const version = await this.readJournalSchemaVersion(
+      this.root + "/push/journal.json",
+    );
+    if (version === 2) {
+      const changes = await new TreePushService(
+        this.legacyTreeRemote,
+        this.control,
+        this.root + "/push",
+      ).pendingChanges();
+      return (changes ?? []).map((change) => ({
+        operation: change.operation,
+        path:
+          change.operation === "upsert_folder"
+            ? change.folder.path
+            : change.operation === "upsert_page"
+              ? change.page.path
+              : change.previousPath,
+      }));
+    }
+    if (version === 1 && this.legacyRemote) {
+      const changes = await new PushService(
+        this.legacyRemote,
+        this.control,
+        this.root + "/push",
+      ).pendingChanges();
+      return (changes ?? []).map((change) => ({
+        operation:
+          change.operation === "archive" ? "archive_page" : "upsert_page",
+        path:
+          change.operation === "archive" ? change.previousPath : change.path,
+      }));
+    }
+    return [];
+  }
+
+  async cancelPendingTreePush(): Promise<void> {
+    if (this.remoteV3) throw new Error("仅支持取消旧版目录同步任务");
+    const version = await this.readJournalSchemaVersion(
+      this.root + "/push/journal.json",
+    );
+    if (version !== 2) throw new Error("仅支持取消 Sync v2 推送日志");
+    const service = new TreePushService(
+      this.legacyTreeRemote,
+      this.control,
+      this.root + "/push",
+    );
+    const result = await service.cancelPending();
+    if (result) await this.recoverTreePush();
+  }
+
   async hasUnfinishedPush(): Promise<boolean> {
     const version = await this.readJournalSchemaVersion(
       this.root + "/push/journal.json",
@@ -2796,6 +2852,39 @@ export class SyncRuntime {
     const localFolders = new Map(local.folders.map((f) => [f.folderId, f]));
     const basePages = new Map(base.pages.map((p) => [p.pageId, p]));
     const localPages = new Map(local.pages.map((p) => [p.pageId, p]));
+    // Archives recursively own the BASE subtree, even when a descendant has
+    // moved locally. Such a move cannot be combined with this archive in v2.
+    const missingFolders = new Set(
+      isV1
+        ? []
+        : base.folders
+            .filter((f) => !localFolders.has(f.folderId))
+            .map((f) => f.folderId),
+    );
+    const hasMissingAncestor = (folderId: string | null): boolean => {
+      const visited = new Set<string>();
+      while (folderId !== null) {
+        if (missingFolders.has(folderId)) return true;
+        if (visited.has(folderId))
+          throw new Error("基线目录树存在循环，无法安全归档");
+        visited.add(folderId);
+        folderId = baseFolders.get(folderId)?.parentFolderId ?? null;
+      }
+      return false;
+    };
+    for (const folder of base.folders)
+      if (
+        localFolders.has(folder.folderId) &&
+        hasMissingAncestor(folder.parentFolderId)
+      )
+        throw new Error(
+          "无法归档含有本地保留或移出子目录的父目录。请先单独同步子目录移动，再删除父目录。",
+        );
+    for (const page of base.pages)
+      if (localPages.has(page.pageId) && hasMissingAncestor(page.folderId))
+        throw new Error(
+          "无法归档含有本地保留或移出页面的目录。请先单独同步页面移动，再删除目录。",
+        );
     const changes: PreparedTreePushChange[] = [];
     const previewId = crypto.randomUUID();
     let prepared = 0;
@@ -2832,7 +2921,10 @@ export class SyncRuntime {
         });
     }
     for (const folder of base.folders) {
-      if (!isV1 && !localFolders.has(folder.folderId))
+      if (
+        missingFolders.has(folder.folderId) &&
+        !hasMissingAncestor(folder.parentFolderId)
+      )
         changes.push({
           operation: "archive_folder",
           folderId: folder.folderId,
@@ -2889,7 +2981,7 @@ export class SyncRuntime {
         });
     }
     for (const page of base.pages) {
-      if (!localPages.has(page.pageId))
+      if (!localPages.has(page.pageId) && !hasMissingAncestor(page.folderId))
         changes.push({
           operation: "archive_page",
           pageId: page.pageId,
