@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { FakeAgentWiki } from "../fakes/fake-agentwiki";
 import { FakeTreeRemote, FakeTreeRemoteV3 } from "../fakes/fake-tree-remote";
 import { PushService } from "../../src/application/push-service";
+import { TreeIdentityRepository } from "../../src/storage/tree-identities";
 import { MemoryControlStore } from "../fakes/memory-control-store";
 import { mergeBody } from "../../src/core/merge";
 import { contentHash, sha256Hex } from "../../src/agentwiki/protocol";
@@ -275,6 +276,7 @@ describe("manual multi-device sync", () => {
     const remote = new FakeTreeRemote();
     const desktopVault = new MemoryVault({});
     const mobileVault = new MemoryVault({});
+    const mobileControl = new MemoryControlStore();
     const desktop = new SyncRuntime(
       desktopVault,
       new MemoryControlStore(),
@@ -284,7 +286,7 @@ describe("manual multi-device sync", () => {
     );
     const mobile = new SyncRuntime(
       mobileVault,
-      new MemoryControlStore(),
+      mobileControl,
       remote,
       mapping,
       "mobile",
@@ -302,12 +304,51 @@ describe("manual multi-device sync", () => {
     expect(mobileVault.text("Wiki/pages/Guides/A.md")).toBe("desktop");
     expect(mobileVault.hasDirectory("Wiki/pages/Empty")).toBe(true);
 
+    const before = await remote.head();
+    const original = remote.tree();
+    const guide = original.folders.find(
+      (folder) => folder.path === "pages/Guides",
+    )!;
+    const originalPage = original.pages[0]!;
     await mobileVault.rename("Wiki/pages/Guides", "Wiki/pages/Manuals");
     await mobileVault.write(
       "Wiki/pages/Manuals/A.md",
       new TextEncoder().encode("mobile"),
     );
-    await mobile.applyPush(await mobile.previewPush());
+    await expect(mobile.previewPush()).rejects.toThrow(
+      /新增\/移动与目录归档请分开同步/,
+    );
+    expect(await remote.head()).toEqual(before);
+    expect(remote.tree()).toEqual(original);
+
+    // Supply an explicit trusted identity mapping, as an identity-aware move
+    // would. The safety refusal must not force archive/recreate identities.
+    const identityPath = [...mobileControl.files.keys()].find((path) =>
+      path.endsWith("/tree-identities.json"),
+    )!;
+    const identities = new TreeIdentityRepository(mobileControl, identityPath);
+    const state = (await identities.read())!.payload;
+    state.folders[guide.folderId] = {
+      folderId: guide.folderId,
+      path: "pages/Manuals",
+      pathKey: "pages/manuals",
+    };
+    for (const [id, pending] of Object.entries(state.pendingPages))
+      if (pending.path === "pages/Manuals/A.md") delete state.pendingPages[id];
+    for (const [id, pending] of Object.entries(state.pendingFolders))
+      if (pending.path === "pages/Manuals") delete state.pendingFolders[id];
+    state.pendingPages[originalPage.pageId] = {
+      pageId: originalPage.pageId,
+      path: "pages/Manuals/A.md",
+      contentHash: await contentHash("mobile"),
+    };
+    await identities.write(state);
+    const moved = await mobile.previewPush();
+    expect(moved.changes.map((change) => change.operation).sort()).toEqual([
+      "upsert_folder",
+      "upsert_page",
+    ]);
+    await mobile.applyPush(moved);
 
     await desktop.applyPull(await desktop.previewPull());
     expect(desktopVault.text("Wiki/pages/Manuals/A.md")).toBe("mobile");
@@ -323,5 +364,11 @@ describe("manual multi-device sync", () => {
     ]);
     expect(tree.pages.map((page) => page.path)).toEqual(["pages/Manuals/A.md"]);
     expect(tree.pages[0]?.body).toBe("mobile");
+    expect(
+      tree.folders.find((folder) => folder.path === "pages/Manuals")?.folderId,
+    ).toBe(guide.folderId);
+    expect(tree.pages[0]?.pageId).toBe(originalPage.pageId);
+    expect((await desktop.previewPush()).changes).toEqual([]);
+    expect((await mobile.previewPush()).changes).toEqual([]);
   });
 });
