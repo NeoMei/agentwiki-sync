@@ -30,3 +30,13 @@
 - 完整 `npm run check`：格式、lint、typecheck、74 文件 1523 测试、production build、bundle safety、release metadata 全通过。lint 为 19 个已有 warning；版本仍 0.5.10。最终日志 `/tmp/agentwiki-official-baseline-check-final.log`。
 
 后续门禁：独立代码审查、独立测试 Vault 原生验收，以及用户原黄金书屋环境回放。本文不把 fixture 当原 Vault 验收。
+
+## 独立审查补修：断开连接后的后台 writer
+
+对 `4b6b44b` 的独立审查复现了一条 P2：真实 rename hint 写暂停时，`disconnect` 直接清空缓存；随后移除映射失去对旧 writer 的引用，归档期间旧 writer 重建原控制目录，触发 `MAPPING_DETACH_RECOVERY_REQUIRED`。独立证据为 `/tmp/agentwiki-official-disconnect-race.test.ts` 和同名 `.log`，该版本未放行。
+
+所有缓存删除现在统一退役：先停止新 rename、从事件目标摘除，保留 `retiringRuntimes` 的排空 Promise，等在途 writer 结束后才允许断开、重新创建 runtime 或归档。错误失效、v3 身份替换、同 Space runtime key 替换和正常移除共用此路径；同步卸载钩子启动退役并保留 Promise，不宣称宿主会等待该钩子。
+
+新增断开/缺连接两项回归先红，日志 `/tmp/agentwiki-official-runtime-retirement-red.log`。修复后并发组 10 项全绿，另覆盖身份错误清缓存，及真实连接服务 exchange/session/activate 后重新绑定不同根、构造新 v3 runtime、原正文保持、退休 runtime 不再写入。
+
+补修完整检查：`npm run check` 退出 0，74 文件 1526 测试、格式、typecheck、production build、bundle/release 校验通过；19 个既有 lint warning。日志 `/tmp/agentwiki-official-baseline-check-retirement.log`。

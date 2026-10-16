@@ -185,6 +185,38 @@ export default class AgentWikiSyncPlugin extends Plugin {
     );
   }
   private readonly liveRuntimes = new Map<string, SyncRuntime>();
+  private readonly retiringRuntimes = new Map<SyncRuntime, Promise<void>>();
+  private retireRuntime(runtime: SyncRuntime): Promise<void> {
+    const existing = this.retiringRuntimes.get(runtime);
+    if (existing) return existing;
+    // Stop selecting this runtime for Vault events before waiting for a writer
+    // already in flight. Keep its drain tracked after removing the cache key.
+    for (const [key, cached] of this.liveRuntimes)
+      if (cached === runtime) this.liveRuntimes.delete(key);
+    this.runtimeRoutes.get(runtime)?.upgrade?.invalidate();
+    const pending = runtime.retire();
+    this.retiringRuntimes.set(runtime, pending);
+    void pending.then(
+      () => this.retiringRuntimes.delete(runtime),
+      () => undefined,
+    );
+    return pending;
+  }
+  private async retireRuntimes(
+    spaceId?: string,
+    keep?: SyncRuntime,
+  ): Promise<void> {
+    const matches = (runtime: SyncRuntime) =>
+      runtime !== keep &&
+      (spaceId === undefined || runtime.spaceId === spaceId);
+    for (const runtime of new Set(this.liveRuntimes.values()))
+      if (matches(runtime)) void this.retireRuntime(runtime);
+    await Promise.all(
+      [...this.retiringRuntimes]
+        .filter(([runtime]) => matches(runtime))
+        .map(([, pending]) => pending),
+    );
+  }
   private readonly previewUnloadCleanups = new Set<() => void>();
   private readonly runtimeRoutes = new WeakMap<
     SyncRuntime,
@@ -207,8 +239,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
     this.browserAuthorization?.stop();
     for (const cleanup of [...this.previewUnloadCleanups]) cleanup();
     this.previewUnloadCleanups.clear();
-    for (const runtime of this.liveRuntimes.values()) runtime.invalidate();
-    this.liveRuntimes.clear();
+    void this.retireRuntimes().catch(() => undefined);
     this.shortestImageIndex?.invalidate();
   }
 
@@ -607,17 +638,9 @@ export default class AgentWikiSyncPlugin extends Plugin {
         }
         const next = removeMapping(this.settings.mappings, spaceId, gate);
         // Keep the same Space lock through directory archival and settings commit.
-        const retiring: SyncRuntime[] = [];
-        for (const [key, runtime] of this.liveRuntimes)
-          if (runtime.spaceId === spaceId) {
-            runtime.invalidate();
-            this.runtimeRoutes.get(runtime)?.upgrade?.invalidate();
-            this.liveRuntimes.delete(key);
-            retiring.push(runtime);
-          }
         // Vault rename callbacks already queued before removal can write identity
         // hints. Remove their event targets first, then drain them before archival.
-        await Promise.all(retiring.map((runtime) => runtime.retire()));
+        await this.retireRuntimes(spaceId);
         detaching = true;
         if (deviceId) await this.detachRepository().begin(mapping, deviceId);
         await this.saveData(
@@ -679,6 +702,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
           throw new Error(`Space ${mapping.spaceId} 有未完成的推送`);
       }
     }
+    await this.retireRuntimes();
     const local = new ObsidianLocalControlStore(this.app);
     const state = await new MutableControlRepository(
       local,
@@ -693,7 +717,6 @@ export default class AgentWikiSyncPlugin extends Plugin {
       isConnectionState,
     ).clear();
     this.settings.serverInstanceId = null;
-    this.liveRuntimes.clear();
     await this.saveData(toVaultSettings(this.settings));
     new Notice(
       "已在本地断开连接。如服务器不可达，请在 AgentWiki 网页中撤销该设备。",
@@ -784,14 +807,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
     assertCurrentMapping();
     await this.detachRepository().assertIdle(mapping.spaceId);
     assertCurrentMapping();
-    const invalidateCached = () => {
-      for (const [key, runtime] of this.liveRuntimes) {
-        if (runtime.spaceId !== mapping.spaceId) continue;
-        runtime.invalidate();
-        this.runtimeRoutes.get(runtime)?.upgrade?.invalidate();
-        this.liveRuntimes.delete(key);
-      }
-    };
+    const invalidateCached = () => this.retireRuntimes(mapping.spaceId);
     try {
       const local = new ObsidianLocalControlStore(this.app);
       const shared = new ObsidianControlStore(this.app.vault.adapter);
@@ -805,7 +821,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       const deviceState = new DeviceStateRepository(local);
       const deviceId = (await deviceState.read())?.deviceId;
       if (!secretId || !deviceId) {
-        invalidateCached();
+        await invalidateCached();
         return null;
       }
       const secrets = new ObsidianSecrets(this.app);
@@ -1030,7 +1046,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
         route +
         "\0" +
         protocolSuffix;
-      for (const [key, cached] of this.liveRuntimes) {
+      for (const cached of this.liveRuntimes.values()) {
         if (cached.protocolVersion !== "3") continue;
         try {
           cached.configureNormalizedPush({
@@ -1041,12 +1057,12 @@ export default class AgentWikiSyncPlugin extends Plugin {
             vaultId: session.vaultId,
           });
         } catch {
-          cached.invalidate();
-          this.runtimeRoutes.get(cached)?.upgrade?.invalidate();
-          this.liveRuntimes.delete(key);
+          await this.retireRuntime(cached);
         }
       }
       const existing = this.liveRuntimes.get(runtimeKey);
+      assertCurrentMapping();
+      await this.retireRuntimes(mapping.spaceId, existing);
       assertCurrentMapping();
       if (existing) {
         if (existing.protocolVersion === "3")
@@ -1081,7 +1097,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       });
       return runtime;
     } catch (error) {
-      invalidateCached();
+      await invalidateCached();
       throw error;
     }
   }

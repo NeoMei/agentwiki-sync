@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { makePlugin } from "../fakes/plugin-harness";
 import { SyncRuntime } from "../../src/application/sync-runtime";
-import { FakeTreeRemote } from "../fakes/fake-tree-remote";
+import { FakeTreeRemote, V3_CAPABILITIES } from "../fakes/fake-tree-remote";
 import {
   ObsidianControlStore,
   ObsidianVaultPort,
@@ -11,6 +11,9 @@ import { idFileKey } from "../../src/core/identity-key";
 import type { SpaceMapping } from "../../src/application/sync-coordinator";
 import type { SyncDiff } from "../../src/obsidian/sync-center-modal";
 import { contentHash } from "../../src/agentwiki/protocol";
+import { treeCapabilitiesHashV3 } from "@neomei/agentwiki-sync-protocol";
+import { FakeHttp } from "../fakes/fake-http";
+import { requestUrlState } from "../fakes/obsidian-mock";
 
 function gate() {
   let resolve!: () => void;
@@ -102,7 +105,16 @@ async function fixture() {
       revisionBodyBytes: "0",
     },
   ]);
-  return { ...h, subject, runtime, root, mapping, baseline, control };
+  return {
+    ...h,
+    subject,
+    runtime,
+    root,
+    mapping,
+    baseline,
+    control,
+    connection,
+  };
 }
 
 describe("mapping detachment and diff concurrency", () => {
@@ -285,4 +297,208 @@ describe("mapping detachment and diff concurrency", () => {
     await h.runtime.recordRename("Wiki/pages/new.md", "Wiki/pages/third.md");
     expect(h.adapter.files).toEqual(before);
   });
+
+  it.each(["disconnect", "missing_connection", "identity_error"] as const)(
+    "drains queued rename writers during %s before a later remap",
+    async (reason) => {
+      const h = await fixture();
+      const body = "rename before cache eviction";
+      await h.baseline.prepare(
+        {
+          protocolVersion: "2",
+          spaceId: "s1",
+          revision: "r2",
+          revisionContentHash: "",
+          folders: [],
+          pages: [
+            {
+              pageId: "p1",
+              folderId: null,
+              path: "pages/old.md",
+              title: "old",
+              body,
+              contentHash: await contentHash(body),
+              updatedAt: "2026-10-16T00:00:00.000Z",
+            },
+          ],
+        },
+        "pull",
+      );
+      await h.baseline.commit();
+      h.adapter.files.set("Wiki/pages/new.md", body);
+      h.adapter.deriveParents("Wiki/pages/new.md");
+      const registry = h.plugin as unknown as {
+        liveRuntimes: Map<string, SyncRuntime>;
+      };
+      registry.liveRuntimes.set("fixture", h.runtime);
+      const entered = gate(),
+        resume = gate();
+      const write = h.control.write.bind(h.control);
+      vi.spyOn(h.control, "write").mockImplementation(async (path, bytes) => {
+        if (path.endsWith("/move-hints.json.next")) {
+          entered.resolve();
+          await resume.promise;
+        }
+        await write(path, bytes);
+      });
+      const rename = h.runtime.recordRename(
+        "Wiki/pages/old.md",
+        "Wiki/pages/new.md",
+      );
+      await entered.promise;
+      const retire = vi.spyOn(h.runtime, "retire");
+      const constructRuntime = h.subject.runtime;
+      if (reason === "disconnect") h.subject.runtime = async () => h.runtime;
+      else if (reason === "missing_connection") {
+        for (const key of [...h.local.keys()])
+          if (key.includes("connection-state")) h.local.delete(key);
+      } else
+        h.adapter.files.set(
+          ".agentwiki/vault.json",
+          JSON.stringify({
+            schemaVersion: 1,
+            vaultId: "55555555-5555-4555-8555-555555555555",
+          }),
+        );
+      let settled = false;
+      const operation = (
+        reason === "disconnect"
+          ? h.plugin.disconnect()
+          : h.subject.runtime(h.plugin.settings.mappings[0]!)
+      )
+        .catch((error: unknown) => {
+          if (reason !== "identity_error") throw error;
+          expect(error).toBeInstanceOf(Error);
+          expect((error as Error).message).toBe("库身份不匹配");
+        })
+        .finally(() => {
+          settled = true;
+        });
+      try {
+        await vi.waitFor(() =>
+          expect(settled || retire.mock.calls.length > 0).toBe(true),
+        );
+        expect(retire).toHaveBeenCalled();
+        expect(settled).toBe(false);
+        expect(await h.adapter.exists(h.root)).toBe(true);
+      } finally {
+        resume.resolve();
+        await rename;
+        await operation;
+      }
+      expect(registry.liveRuntimes.size).toBe(0);
+      await h.plugin.removeMapping("s1");
+      await h.plugin.addMapping("s1", "NewWiki");
+      expect(await h.adapter.exists(h.root)).toBe(false);
+      expect(h.adapter.files.get("Wiki/pages/new.md")).toBe(body);
+      expect(h.plugin.settings.mappings).toMatchObject([
+        { spaceId: "s1", rootPath: "NewWiki", status: "pending" },
+      ]);
+      if (reason === "disconnect") {
+        h.subject.runtime = constructRuntime;
+        const serverInstanceId = "33333333-3333-4333-8333-333333333333";
+        const credentialId = "44444444-4444-4444-8444-444444444444";
+        const user = { id: "fixture-user", displayName: "Fixture User" };
+        const capabilitiesHash = await treeCapabilitiesHashV3(V3_CAPABILITIES);
+        requestUrlState.impl = async (request) => {
+          const path = new URL((request as { url: string }).url).pathname;
+          if (path === "/api/integrations/obsidian/exchange")
+            return {
+              status: 201,
+              headers: {},
+              json: {
+                protocolVersion: "1",
+                serverInstanceId,
+                credentialId,
+                credentialStatus: "provisional",
+                provisionalExpiresAt: "2026-10-16T08:00:00.000Z",
+                user,
+                capabilities: FakeHttp.capabilities,
+              },
+            };
+          if (path === "/api/integrations/obsidian/session")
+            return {
+              status: 200,
+              headers: {},
+              json: {
+                protocolVersion: "1",
+                serverInstanceId,
+                credentialId,
+                deviceId: h.connection.deviceId,
+                vaultId: h.connection.vaultId,
+                deviceName: "Test Vault",
+                createdAt: "2026-10-16T00:00:00.000Z",
+                lastUsedAt: "2026-10-16T00:00:00.000Z",
+                credentialStatus: "active",
+                provisionalExpiresAt: null,
+                user,
+                capabilities: FakeHttp.capabilities,
+              },
+            };
+          if (
+            path === "/api/integrations/obsidian/credentials/current/activate"
+          )
+            return {
+              status: 200,
+              headers: {},
+              json: { protocolVersion: "1", credentialStatus: "active" },
+            };
+          if (path === "/api/sync/v3/capabilities")
+            return {
+              status: 200,
+              headers: {},
+              json: {
+                protocolVersion: "3",
+                capabilities: V3_CAPABILITIES,
+                capabilitiesHash,
+              },
+            };
+          if (path === "/api/sync/v3/spaces")
+            return {
+              status: 200,
+              headers: {},
+              json: {
+                protocolVersion: "3",
+                spaces: [
+                  {
+                    spaceId: "s1",
+                    displayName: "Fixture",
+                    role: "owner",
+                    canRead: true,
+                    canPublish: true,
+                    syncMode: "native_v3",
+                    currentRevision: "r1",
+                    folderCount: "0",
+                    pageCount: "0",
+                    attachmentCount: "0",
+                    revisionManifestByteLength: "0",
+                    revisionBodyBytes: "0",
+                    revisionAttachmentBytes: "0",
+                  },
+                ],
+              },
+            };
+          throw new Error(`unexpected fixture request ${path}`);
+        };
+        await h.plugin.connect("fixture-reconnect-code".repeat(2));
+        expect(h.plugin.settings.serverInstanceId).toBe(serverInstanceId);
+        const reconnected = await h.subject.runtime(
+          h.plugin.settings.mappings[0]!,
+        );
+        expect(reconnected?.protocolVersion).toBe("3");
+        expect(reconnected).not.toBe(h.runtime);
+        expect(
+          await new TreeBaselineRepository(
+            h.control,
+            h.root,
+            "s1",
+            "NewWiki",
+          ).readOptional(),
+        ).toBeNull();
+      }
+      const before = new Map(h.adapter.files);
+      await h.runtime.recordRename("Wiki/pages/new.md", "Wiki/pages/third.md");
+      expect(h.adapter.files).toEqual(before);
+    },
+  );
 });
