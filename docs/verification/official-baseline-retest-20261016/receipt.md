@@ -1,6 +1,6 @@
 # 官方 0.5.10 基线重映射复测与 0.5.11 发布回执
 
-日期：2026-10-16。源码基线为正式 `2df7cfa`（0.5.10）。修复以 `7e81b9f1163083928033dc311fd14d87e5d3d055` 发布为 0.5.11；本文保留初始红测、审查补修和发布各阶段的证据。真实用户 Vault 的正式升级由主协调者另行验证，不以这里的临时 Vault 验收替代。
+日期：2026-10-16。源码基线为正式 `2df7cfa`（0.5.10）。修复以 `7e81b9f1163083928033dc311fd14d87e5d3d055` 发布为 0.5.11；本文保留初始红测、审查补修和发布各阶段的证据。临时 Vault 验收与真实用户 Vault 的正式升级/只读差异回验分别记录，不互相替代。
 
 ## 可复现问题与边界
 
@@ -79,4 +79,25 @@ Windows 上述门禁通过后，主协调者明确放行发布。以无强推的
 
 三个资产分别执行 `gh attestation verify`，限定仓库 `NeoMei/agentwiki-sync`、签名工作流 `.github/workflows/release.yml`、source ref `refs/tags/0.5.11`、source digest 为固定候选，并拒绝 self-hosted runner，均退出 0。资产、哈希比较和验证 JSON 保存在 `/tmp/agentwiki-0511-official-release-38863788453/`，CI 完整日志为 `/tmp/agentwiki-0511-official-ci.log`。
 
-本次回执更正属于发布后的独立 docs commit，正式 tag 与被验收的候选源码保持不变。真实 Windows 用户 Vault 的官方升级和只读差异回验由主协调者另记。
+本次回执更正属于发布后的独立 docs commit，正式 tag 与被验收的候选源码保持不变。第一轮 docs commit `1b8cff9a3ccc1487b02874ce1560d33e1221992a` 已独立审查 PASS，回执 `/tmp/agentwiki-0511-docs-review-1b8cff9.md`；reviewer 另外重算了正式三资产哈希并核对来源证明和 tag。
+
+## 真实 Windows Vault 正式升级与两 Space 只读差异
+
+以下为主协调者读取远程实际命令输出后确认的脱敏回执，窗口为 `2026-10-16T07:00:39.051Z` 至 `2026-10-16T07:07:39.929Z`。结果标识：`PASS_OFFICIAL_0511_UPGRADE_AND_TWO_NATIVE_READ_ONLY_DIFFS`。
+
+- 正式资产安装到真实 NeoMei-Docs Vault，运行时 `loaded=true`、`enabled=true`、版本 0.5.11，实际加载目录与指定 Vault 插件目录一致。升级后最终三资产哈希仍全部匹配上表。styles.css 原本相同，因此 `pluginChanges` 仅列 main.js 和 manifest.json。
+- NeoMei-Space 原生只读差异 PASS：本地变更 0，服务端有更新但没有记录数量。插件实际授权为 `role=owner`、`canPublish=true`，三种策略按钮可用，均未点击。
+- 黄金书屋原生只读差异 PASS：本地变更 24、远端变更 0，没有 identity/hash 错误。插件实际授权为 `role=viewer`、`canPublish=false`，头部显示只读，自动合并和本地优先禁用，服务端优先可用；没有点击同步或更改权限。这些是插件/Space 的实际授权，不推断浏览器账号具有相同角色。
+- 备份 131 文件校验通过。前后正文快照共 113 文件（NeoMei 2、黄金书屋 111），正文、data.json、映射和 baseline manifests 均不变。
+- 控制文件并非全部字节不变：只有 tree-identities.json 及其 .prev 的代次更新，NeoMei 当前代次 7→8、prev 6→7；黄金书屋当前代次 6→7、prev 5→6。对应 payloadHash 和序列化 payload 的哈希全部不变。该只读扫描更新不能误记为正文或基线改写。
+- 本轮没有新增 instrumentation，没有重试删除旧 inactive 诊断文件。临时验收窗口均正常关闭，没有临时验收 session 在运行，开发者工具已关闭；只保留真实 Vault 的黄金书屋只读差异窗口。
+
+远程原始证据位置：
+
+- `C:\Users\1\AppData\Local\Temp\agentwiki-0510-acceptance-20261016-132543\official-0511-upgrade-20261016\receipt.json`
+- 同目录 `backup\`、`before.json`、`final.json`。
+- 较早官方 0.5.10 与 Web 0.12.45 的成功只读回执为 `C:\Users\1\AppData\Local\Temp\agentwiki-0510-acceptance-20261016-132543\neomei-post01245-readonly\receipt.json`，不混为 0.5.11 升级证据。
+
+保留的清理限制：此前删除受限 TEMP 验收目录下 `diagnostic-once/main.instrumented.js` 和 `diagnostic-once/validate.cjs` 时，自动审批拒绝了操作，仅返回 `rejected: blocked by policy`，没有更具体原因。两个文件已不被当前正式插件加载；没有绕过拒绝，升级 0.5.11 时也未重试删除。最终安全回执为 `inactiveDiagnosticDeletionRetried=false`、`instrumentationAdded=false`、`temporaryAcceptanceWindowsClosedNormally=true`、`onlyRealVaultWindowRemains=true`。
+
+本轮证明正式包安装、原生只读差异和正文/映射/基线保全。没有执行合并、Push、Pull、删除映射或重绑，也没有执行真实 DataAdapter 的重绑/排队 rename 竞态 fixture；这些边界不因原生只读 PASS 而改变。黄金书屋在 0.5.10 已能打开只读差异，本次仍不将其原始问题归因为已确认的重映射机制。
