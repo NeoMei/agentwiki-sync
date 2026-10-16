@@ -38,7 +38,9 @@ interface TreeBaselineJournal {
   newGenerationId: string;
 }
 
-function isTreeBaselineJournal(value: unknown): value is TreeBaselineJournal {
+export function isTreeBaselineJournal(
+  value: unknown,
+): value is TreeBaselineJournal {
   if (!value || typeof value !== "object") return false;
   const item = value as Partial<TreeBaselineJournal>;
   return (
@@ -96,13 +98,15 @@ export class TreeBaselineRepository {
     const manifest = await this.generations.readManifest(
       current.payload.generationId,
     );
+    if (manifest.spaceId !== this.spaceId)
+      throw new Error("BASELINE_SPACE_MISMATCH");
+    if (manifest.rootPath !== this.rootPath)
+      throw new Error("BASELINE_ROOT_MISMATCH");
     if (
-      manifest.spaceId !== this.spaceId ||
-      manifest.rootPath !== this.rootPath ||
       (await sha256Hex(canonicalBytes(manifest))) !==
-        current.payload.manifestHash
+      current.payload.manifestHash
     )
-      throw new Error("基线损坏: 指针身份/哈希不匹配");
+      throw new Error("BASELINE_MANIFEST_HASH_MISMATCH");
     return manifest;
   }
 

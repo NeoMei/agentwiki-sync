@@ -1,0 +1,32 @@
+# 官方 0.5.10 基线重映射复测与修复候选
+
+日期：2026-10-16。源码基线为正式 `2df7cfa`（0.5.10）。本候选未升级版本、未安装到用户 Vault、未发布。
+
+## 可复现问题与边界
+
+- 官方代码可复现：已有合法基线的映射被允许移除后，设备/Space 控制目录仍原样存在。以另一根目录重新添加同一 Space 后，真实 `collectSyncDiff` → `runtime` → `TreeBaselineRepository.requiredProtocolVersion` 在首次 HTTP 请求前报“基线损坏: 指针身份/哈希不匹配”。
+- 改成仅大小写不同的根 `Wiki` → `wiki` 也会触发；这是旧根控制状态被新映射复用，不是 Windows 路径分隔符自动转换。
+- 新建连接/映射且没有旧基线的对照可以到达 HTTP；移除后使用完全相同根的对照也可以到达 HTTP。`Wiki\\Sub`、绝对盘符路径、前后 `/` 在映射校验时被拒绝；Unicode 组合形式统一为 NFC。
+- 初始官方复现运行：10 项中 8 通过、2 失败，二者均是上述换根后基线身份错误。移除使用真实 SyncRuntime、真实 Vault adapter、真实基线/状态扫描，只将远端替换为确定性 fixture。
+- 原报告没有记录之前是否移除/重建映射，黄金书屋原 Vault 尚未定位，因此这是同错误的已确认机制修复，不能宣称原案已完成复验。
+- Windows 正式插件当前发现的 `/api/sync/v2/spaces/.../head` 410 是另一个问题，不由本候选更改服务端或基线绕过。
+
+## 实现
+
+- 同 Space 操作锁覆盖差异刷新获取 runtime、恢复及扫描，也覆盖移除到设置落盘/恢复的完整过程。移除过程中无法启动旧映射刷新；刷新等待网络时不能移除。
+- 移除前严格检查 v1/v2/v3 Push、Pull、基线、Pull 控制收尾及图片升级事务，保留原连接和设备双身份检查。未完成或损坏的事务证据不清理。
+- 移除只将当前设备/Space 控制目录迁入 `detached`，保留所有 generation、journal、prev/next 和二进制；不删除或写入用户 Markdown。
+- 使用设备本地写前意图，以持久设置决定提交还是回滚；设置先成功后报错、目录迁移故障和重启均有恢复用例。保留严格 Space、根目录和清单哈希校验，并拆分错误提示。
+- add/remove/saveSettings 串行。添加其他 Space 保留现有 runtime 的映射对象，避免首次 Pull 后 active 状态丢失。失败恢复也保留未移除映射的对象。
+- 断开连接同样取得映射操作锁。移除清空该 Space 的缓存 runtime，并等待已经排队的 Vault rename hint 落盘，再移动控制目录，避免后台写重建旧目录。
+
+存储事务实现参考已撤回候选 `85b4078`；以官方 0.5.10 为父提交重新整合，保留官方目录归档/旧任务恢复修复，补齐其并发缺口。旧集成候选没有复活或安装。
+
+## 验证
+
+- 官方初始红测日志：`/tmp/agentwiki-official-baseline-retest-red.log`。
+- 刷新/移除并发补丁前红测：2 项均失败；其中真实 scan 重建已归档目录，导致 `MAPPING_DETACH_RECOVERY_REQUIRED`。日志 `/tmp/agentwiki-official-detach-race-red.log`。
+- 修复后：重映射 10 项、可恢复归档 37 项、并发/后台写 7 项全部通过。
+- 完整 `npm run check`：格式、lint、typecheck、74 文件 1523 测试、production build、bundle safety、release metadata 全通过。lint 为 19 个已有 warning；版本仍 0.5.10。最终日志 `/tmp/agentwiki-official-baseline-check-final.log`。
+
+后续门禁：独立代码审查、独立测试 Vault 原生验收，以及用户原黄金书屋环境回放。本文不把 fixture 当原 Vault 验收。

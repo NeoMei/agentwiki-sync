@@ -82,7 +82,10 @@ export class ObsidianControlStore implements ControlStorePort {
     if (await this.adapter.exists(safe)) await this.adapter.remove(safe);
   }
   async rename(from: string, to: string): Promise<void> {
-    await this.adapter.rename(safeControlPath(from), safeControlPath(to));
+    const source = safeControlPath(from);
+    const target = safeControlPath(to);
+    await this.ensureParents(target);
+    await this.adapter.rename(source, target);
   }
   async removeTree(path: string): Promise<void> {
     const safe = safeControlPath(path);

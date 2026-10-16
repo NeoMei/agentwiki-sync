@@ -114,6 +114,27 @@ export function memoryAdapter() {
     rename: async (from: string, to: string) => {
       const text = files.get(from);
       const binary = binaryFiles.get(from);
+      if (folders.has(from)) {
+        if (files.has(to) || binaryFiles.has(to) || folders.has(to))
+          throw new Error(`destination exists ${to}`);
+        for (const [path, value] of [...files])
+          if (path.startsWith(`${from}/`)) {
+            files.set(to + path.slice(from.length), value);
+            files.delete(path);
+          }
+        for (const [path, value] of [...binaryFiles])
+          if (path.startsWith(`${from}/`)) {
+            binaryFiles.set(to + path.slice(from.length), value);
+            binaryFiles.delete(path);
+          }
+        for (const path of [...folders])
+          if (path === from || path.startsWith(`${from}/`)) {
+            folders.add(to + path.slice(from.length));
+            folders.delete(path);
+          }
+        deriveParents(to);
+        return;
+      }
       if (text === undefined && binary === undefined)
         throw new Error(`missing ${from}`);
       if (text !== undefined) files.set(to, text);

@@ -56,6 +56,17 @@ const errorMessages: Record<string, string> = {
 };
 
 const localErrorMessages: Record<string, string> = {
+  MAPPING_CHANGED: "空间映射已更改。请关闭当前预览并重新打开同步中心。",
+  BASELINE_ROOT_MISMATCH:
+    "基线属于其他映射目录。请在设置中取消待首次拉取的映射，再重新添加所需目录并重新首次绑定。取消时会保留 Markdown 并归档旧控制数据。",
+  BASELINE_SPACE_MISMATCH:
+    "基线的空间身份不匹配。已停止同步，请保留控制目录并检查映射的空间，不要修改基线身份。",
+  BASELINE_MANIFEST_HASH_MISMATCH:
+    "基线清单哈希不匹配。已停止同步，请保留主文件、prev、next 和 generation，不要删除或重写基线。",
+  MAPPING_TRANSACTION_PENDING:
+    "映射有未完成的同步事务。请先在同步中心恢复已确认操作，再取消或移除映射。",
+  MAPPING_DETACH_RECOVERY_REQUIRED:
+    "映射移除尚未恢复。请重启插件后重试；控制数据已保留，不要手动删除或移动。",
   TREE_TRANSACTION_AMBIGUOUS: "同步事务状态不明确。请按恢复指引处理。",
   FOLDER_CYCLE: "目录层级存在循环。请选择其他目标路径。",
   MANUAL_PATH_REQUIRED: "请填写目标路径。",

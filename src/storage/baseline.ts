@@ -36,7 +36,7 @@ interface BaselineJournal {
   oldGenerationId: string | null;
   newGenerationId: string;
 }
-function isJournal(value: unknown): value is BaselineJournal {
+export function isBaselineJournal(value: unknown): value is BaselineJournal {
   if (!value || typeof value !== "object") return false;
   const item = value as Partial<BaselineJournal>;
   return (
@@ -76,7 +76,7 @@ export class BaselineRepository {
     this.journal = new MutableControlRepository(
       store,
       `${root}/baseline-journal.json`,
-      isJournal,
+      isBaselineJournal,
     );
   }
   /**
@@ -89,13 +89,15 @@ export class BaselineRepository {
     const manifest = await this.generations.readManifest(
       current.payload.generationId,
     );
+    if (manifest.spaceId !== this.spaceId)
+      throw new Error("BASELINE_SPACE_MISMATCH");
+    if (manifest.rootPath !== this.rootPath)
+      throw new Error("BASELINE_ROOT_MISMATCH");
     if (
-      manifest.spaceId !== this.spaceId ||
-      manifest.rootPath !== this.rootPath ||
       (await sha256Hex(canonicalBytes(manifest))) !==
-        current.payload.manifestHash
+      current.payload.manifestHash
     )
-      throw new Error("基线损坏: 指针身份/哈希不匹配");
+      throw new Error("BASELINE_MANIFEST_HASH_MISMATCH");
     const pages: BaselineState["pages"] = {};
     for (const page of Object.values(manifest.pages))
       pages[page.pageId] = { ...page };

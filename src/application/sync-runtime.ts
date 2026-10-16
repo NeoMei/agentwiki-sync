@@ -324,7 +324,7 @@ interface PullControlAfterState {
   moveHints: MoveHintsState;
 }
 
-const isPullControlAfterState = (
+export const isPullControlAfterState = (
   value: unknown,
 ): value is PullControlAfterState => {
   if (!value || typeof value !== "object") return false;
@@ -371,6 +371,7 @@ export class SyncRuntime {
   private readonly pullControlAfter: MutableControlRepository<PullControlAfterState>;
   private readonly v3PullControlAfter: MutableControlRepository<V3PullControlAfterState>;
   private renameQueue: Promise<void> = Promise.resolve();
+  private retired = false;
   private suppressRenameHints = 0;
   private remoteV3: TreeRemotePortV3 | null;
 
@@ -547,12 +548,19 @@ export class SyncRuntime {
   }
 
   async recordRename(fromPath: string, toPath: string): Promise<void> {
-    if (this.suppressRenameHints > 0) return;
+    if (this.retired || this.suppressRenameHints > 0) return;
     const operation = this.renameQueue.then(() =>
       this.recordRenameNow(fromPath, toPath),
     );
     this.renameQueue = operation.catch(() => undefined);
     return operation;
+  }
+
+  /** Stop background hint writes before this mapping's control root is moved. */
+  async retire(): Promise<void> {
+    this.retired = true;
+    this.invalidate();
+    await this.renameQueue;
   }
 
   private async withoutRenameHints<T>(operation: () => Promise<T>): Promise<T> {

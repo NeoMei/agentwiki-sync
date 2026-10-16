@@ -63,7 +63,7 @@ export interface PullJournal {
     expectedHash: string | null;
   }>;
 }
-function isPullJournal(value: unknown): value is PullJournal {
+export function isPullJournal(value: unknown): value is PullJournal {
   return (
     !!value &&
     typeof value === "object" &&

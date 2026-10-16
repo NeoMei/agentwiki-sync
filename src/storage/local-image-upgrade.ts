@@ -192,7 +192,7 @@ function assertPrivateRoot(root: string): void {
     throw new TypeError("Local image upgrade requires a private control root");
 }
 
-function isUpgradeIntent(value: unknown): value is UpgradeIntent {
+export function isUpgradeIntent(value: unknown): value is UpgradeIntent {
   return UpgradeIntentSchema.safeParse(value).success;
 }
 

@@ -1,5 +1,10 @@
 import { Notice, Plugin } from "obsidian";
 import {
+  MappingDetachRepository,
+  mappingControlRoot,
+} from "./storage/mapping-detach";
+import { assertNoRecoverableMappingTransaction } from "./storage/mapping-transactions";
+import {
   DEFAULT_SETTINGS,
   migrateVaultSettings,
   parseSettings,
@@ -122,20 +127,6 @@ const roleLabel: Record<SyncSpaceSummary["role"], string> = {
   owner: "所有者",
 };
 
-const localImageUpgradeControlRoot = async (
-  deviceId: string,
-  spaceId: string,
-): Promise<string> => {
-  const deviceKey = await idFileKey(deviceId);
-  const spaceKey = await idFileKey(spaceId);
-  return (
-    ".agentwiki/devices/d-" +
-    deviceKey.replace(/[^A-Za-z0-9_-]/gu, "_") +
-    "/spaces/s-" +
-    spaceKey.replace(/[^A-Za-z0-9_-]/gu, "_")
-  );
-};
-
 const DEFAULT_V1_CAPABILITIES: SyncCapabilities = {
   maxPageBytes: 1048576,
   maxBatchBytes: 4194304,
@@ -167,6 +158,32 @@ export default class AgentWikiSyncPlugin extends Plugin {
   private shortestImageIndex: ObsidianShortestImageIndex | null = null;
   settings: AgentWikiSyncSettings = DEFAULT_SETTINGS;
   private readonly locks = new OperationLock();
+  private mappingChanges: Promise<void> = Promise.resolve();
+  private withMappingChange<T>(work: () => Promise<T>): Promise<T> {
+    const result = this.mappingChanges.then(work);
+    this.mappingChanges = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+  private detachRepository(): MappingDetachRepository {
+    return new MappingDetachRepository(
+      new ObsidianLocalControlStore(this.app),
+      new ObsidianControlStore(this.app.vault.adapter),
+      (path) => this.app.vault.adapter.exists(path),
+    );
+  }
+  private async recoverMappingDetach(): Promise<void> {
+    await this.detachRepository().recover(
+      this.settings.mappings,
+      (
+        await new DeviceStateRepository(
+          new ObsidianLocalControlStore(this.app),
+        ).read()
+      )?.deviceId,
+    );
+  }
   private readonly liveRuntimes = new Map<string, SyncRuntime>();
   private readonly previewUnloadCleanups = new Set<() => void>();
   private readonly runtimeRoutes = new WeakMap<
@@ -210,6 +227,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       serverInstanceId: null,
       mappings: vaultSettings.mappings,
     };
+    await this.recoverMappingDetach();
     await this.saveData(vaultSettings);
 
     // Run storage migration to convert hash filenames to readable paths
@@ -315,8 +333,10 @@ export default class AgentWikiSyncPlugin extends Plugin {
   }
 
   async saveSettings(): Promise<void> {
-    validateMappings(this.settings.mappings);
-    await this.saveData(toVaultSettings(this.settings));
+    await this.withMappingChange(async () => {
+      validateMappings(this.settings.mappings);
+      await this.saveData(toVaultSettings(this.settings));
+    });
   }
   async setServerUrl(value: string): Promise<void> {
     if (value === this.settings.serverUrl) {
@@ -490,99 +510,159 @@ export default class AgentWikiSyncPlugin extends Plugin {
   }
 
   async addMapping(spaceId: string, rootPath: string): Promise<void> {
-    const next = [
-      ...this.settings.mappings.map((mapping) => ({ ...mapping })),
-      { spaceId, rootPath, status: "pending" as const },
-    ];
-    validateMappings(next);
-    const mapping = next[next.length - 1]!;
-    await new ObsidianVaultPort(
-      this.app.vault,
-      this.app.fileManager,
-      mapping.rootPath,
-    ).createDirectory(mapping.rootPath);
-    // Only expose the mapping once its folder and persisted settings are ready.
-    await this.saveData(toVaultSettings({ ...this.settings, mappings: next }));
-    this.settings.mappings = next;
+    await this.withMappingChange(async () => {
+      await this.recoverMappingDetach();
+      const validated = [
+        ...this.settings.mappings.map((mapping) => ({ ...mapping })),
+        { spaceId, rootPath, status: "pending" as const },
+      ];
+      validateMappings(validated);
+      const mapping = validated[validated.length - 1]!;
+      // Live runtimes promote their own mapping to active after a confirmed
+      // Pull. Preserve those objects when adding an unrelated Space.
+      const next = [...this.settings.mappings, mapping];
+      await new ObsidianVaultPort(
+        this.app.vault,
+        this.app.fileManager,
+        mapping.rootPath,
+      ).createDirectory(mapping.rootPath);
+      await this.saveData(
+        toVaultSettings({ ...this.settings, mappings: next }),
+      );
+      this.settings.mappings = next;
+    });
   }
   async removeMapping(spaceId: string): Promise<void> {
-    const mapping = this.settings.mappings.find(
-      (item) => item.spaceId === spaceId,
-    );
-    if (!mapping) return;
-    await this.assertNoPendingLocalImageUpgrade(mapping);
-    let gate = {
-      activeTransaction: false,
-      localClean: true,
-      remoteAtBase: true,
-    };
-    if (mapping.status === "active") {
-      const release = this.locks.acquire(spaceId);
+    await this.withMappingChange(async () => {
+      let release: (() => void) | undefined;
+      let detaching = false;
       try {
-        let runtime: SyncRuntime | null;
-        try {
-          runtime = await this.runtime(mapping);
-        } catch (error) {
-          // A reconnected device may lose access to an old mapping. Runtime
-          // construction then fails during the space lookup, but removing
-          // the stale mapping remains the safe local escape hatch.
-          if (error instanceof Error && error.message === "SPACE_FORBIDDEN") {
-            runtime = null;
-          } else {
-            throw error;
+        release = this.locks.acquire(spaceId);
+        await this.recoverMappingDetach();
+        const mapping = this.settings.mappings.find(
+          (item) => item.spaceId === spaceId,
+        );
+        if (!mapping) return;
+        const deviceId = (
+          await new DeviceStateRepository(
+            new ObsidianLocalControlStore(this.app),
+          ).read()
+        )?.deviceId;
+        const control = new ObsidianControlStore(this.app.vault.adapter);
+        if (deviceId)
+          await assertNoRecoverableMappingTransaction(
+            control,
+            await mappingControlRoot(deviceId, spaceId),
+          );
+        await this.assertNoPendingLocalImageUpgrade(mapping);
+        let gate = {
+          activeTransaction: false,
+          localClean: true,
+          remoteAtBase: true,
+        };
+        if (mapping.status === "active") {
+          let runtime: SyncRuntime | null;
+          try {
+            runtime = await this.runtime(mapping);
+          } catch (error) {
+            if (error instanceof Error && error.message === "SPACE_FORBIDDEN")
+              runtime = null;
+            else throw error;
+          }
+          if (runtime) {
+            if (this.runtimeRoutes.get(runtime)?.route === "recover_upgrade")
+              throw new Error(`Space ${spaceId} 有未完成的图片同步升级`);
+            const status =
+              runtime.protocolVersion === "3"
+                ? await runtime.statusV3()
+                : await runtime.status();
+            const attachmentDirty =
+              "attachmentsAdded" in status.local
+                ? status.local.attachmentsAdded.length +
+                  status.local.attachmentsModified.length +
+                  status.local.attachmentsRenamed.length +
+                  status.local.attachmentsDetached.length +
+                  status.local.attachmentBlockers.length
+                : 0;
+            const folderDirty =
+              "foldersAdded" in status.local
+                ? status.local.foldersAdded.length +
+                  status.local.foldersMoved.length +
+                  status.local.foldersDeleted.length
+                : 0;
+            gate = {
+              activeTransaction: false,
+              localClean:
+                status.local.added.length +
+                  status.local.modified.length +
+                  status.local.renamed.length +
+                  status.local.deleted.length +
+                  attachmentDirty +
+                  folderDirty +
+                  status.local.ambiguous.length ===
+                0,
+              remoteAtBase: status.remoteRevision === status.baseRevision,
+            };
           }
         }
-        if (!runtime) {
-          this.settings.mappings = removeMapping(
-            this.settings.mappings,
-            spaceId,
-            gate,
+        const next = removeMapping(this.settings.mappings, spaceId, gate);
+        // Keep the same Space lock through directory archival and settings commit.
+        const retiring: SyncRuntime[] = [];
+        for (const [key, runtime] of this.liveRuntimes)
+          if (runtime.spaceId === spaceId) {
+            runtime.invalidate();
+            this.runtimeRoutes.get(runtime)?.upgrade?.invalidate();
+            this.liveRuntimes.delete(key);
+            retiring.push(runtime);
+          }
+        // Vault rename callbacks already queued before removal can write identity
+        // hints. Remove their event targets first, then drain them before archival.
+        await Promise.all(retiring.map((runtime) => runtime.retire()));
+        detaching = true;
+        if (deviceId) await this.detachRepository().begin(mapping, deviceId);
+        await this.saveData(
+          toVaultSettings({ ...this.settings, mappings: next }),
+        );
+        this.settings.mappings = next;
+        await this.recoverMappingDetach();
+      } catch (error) {
+        if (!detaching) throw error;
+        // saveData may persist and then reject. Read durable settings before deciding.
+        try {
+          const persisted = migrateVaultSettings(await this.loadData(), null);
+          this.settings.mappings = persisted.mappings.map((saved) =>
+            saved.spaceId === spaceId
+              ? saved
+              : (this.settings.mappings.find(
+                  (current) =>
+                    current.spaceId === saved.spaceId &&
+                    current.rootPath === saved.rootPath,
+                ) ?? saved),
           );
-          await this.saveSettings();
-          return;
+          await this.recoverMappingDetach();
+        } catch {
+          throw new Error("MAPPING_DETACH_RECOVERY_REQUIRED", { cause: error });
         }
-        if (this.runtimeRoutes.get(runtime)?.route === "recover_upgrade")
-          throw new Error(`Space ${spaceId} 有未完成的图片同步升级`);
-        await runtime.recover();
-        const status =
-          runtime.protocolVersion === "3"
-            ? await runtime.statusV3()
-            : await runtime.status();
-        const attachmentDirty =
-          "attachmentsAdded" in status.local
-            ? status.local.attachmentsAdded.length +
-              status.local.attachmentsModified.length +
-              status.local.attachmentsRenamed.length +
-              status.local.attachmentsDetached.length +
-              status.local.attachmentBlockers.length
-            : 0;
-        gate = {
-          activeTransaction: false,
-          localClean:
-            status.local.added.length +
-              status.local.modified.length +
-              status.local.renamed.length +
-              status.local.deleted.length +
-              attachmentDirty >
-            0
-              ? false
-              : true,
-          remoteAtBase: status.remoteRevision === status.baseRevision,
-        };
+        throw error;
       } finally {
-        release();
+        release?.();
       }
-    }
-    this.settings.mappings = removeMapping(
-      this.settings.mappings,
-      spaceId,
-      gate,
-    );
-    for (const [key, runtime] of this.liveRuntimes)
-      if (runtime.spaceId === spaceId) this.liveRuntimes.delete(key);
-    await this.saveSettings();
+    });
   }
   async disconnect(): Promise<void> {
+    await this.withMappingChange(async () => {
+      const releases: Array<() => void> = [];
+      try {
+        for (const mapping of this.settings.mappings)
+          releases.push(this.locks.acquire(mapping.spaceId));
+        await this.disconnectLocked();
+      } finally {
+        for (const release of releases.reverse()) release();
+      }
+    });
+  }
+
+  private async disconnectLocked(): Promise<void> {
     for (const mapping of this.settings.mappings) {
       await this.assertNoPendingLocalImageUpgrade(mapping);
       let runtime: SyncRuntime | null = null;
@@ -614,7 +694,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
     ).clear();
     this.settings.serverInstanceId = null;
     this.liveRuntimes.clear();
-    await this.saveSettings();
+    await this.saveData(toVaultSettings(this.settings));
     new Notice(
       "已在本地断开连接。如服务器不可达，请在 AgentWiki 网页中撤销该设备。",
     );
@@ -635,7 +715,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
     const candidateDeviceIds = new Set([state.deviceId]);
     if (deviceId) candidateDeviceIds.add(deviceId);
     for (const candidateDeviceId of candidateDeviceIds) {
-      const controlRoot = await localImageUpgradeControlRoot(
+      const controlRoot = await mappingControlRoot(
         candidateDeviceId,
         mapping.spaceId,
       );
@@ -666,7 +746,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       }
       const pending = await inspectLocalImageUpgrade(
         new ObsidianControlStore(this.app.vault.adapter),
-        await localImageUpgradeControlRoot(candidateDeviceId, mapping.spaceId),
+        await mappingControlRoot(candidateDeviceId, mapping.spaceId),
         {
           serverInstanceId: state.serverInstanceId,
           spaceId: mapping.spaceId,
@@ -690,6 +770,20 @@ export default class AgentWikiSyncPlugin extends Plugin {
   private async runtime(
     mapping: NonNullable<ReturnType<AgentWikiSyncPlugin["selectedMapping"]>>,
   ): Promise<SyncRuntime | null> {
+    const expectedRoot = mapping.rootPath;
+    const assertCurrentMapping = () => {
+      if (
+        !this.settings.mappings.some(
+          (current) =>
+            current.spaceId === mapping.spaceId &&
+            current.rootPath === expectedRoot,
+        )
+      )
+        throw new Error("MAPPING_CHANGED");
+    };
+    assertCurrentMapping();
+    await this.detachRepository().assertIdle(mapping.spaceId);
+    assertCurrentMapping();
     const invalidateCached = () => {
       for (const [key, runtime] of this.liveRuntimes) {
         if (runtime.spaceId !== mapping.spaceId) continue;
@@ -732,10 +826,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
         throw new Error("连接身份不匹配");
       const deviceKey = await idFileKey(deviceId);
       const spaceKey = await idFileKey(mapping.spaceId);
-      const controlRoot = await localImageUpgradeControlRoot(
-        deviceId,
-        mapping.spaceId,
-      );
+      const controlRoot = await mappingControlRoot(deviceId, mapping.spaceId);
       const pushRequirement = await readPushProtocolRequirement(
         shared,
         controlRoot,
@@ -768,6 +859,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
         mapping.spaceId,
         mapping.rootPath,
       ).requiredProtocolVersion();
+      assertCurrentMapping();
       const requiredVersion =
         pushRequirement?.minimumProtocolVersion === "3"
           ? "3"
@@ -834,6 +926,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
       const session = SessionResponseSchema.parse(
         (await client.raw("GET", "/api/integrations/obsidian/session")).json,
       );
+      assertCurrentMapping();
       if (
         session.serverInstanceId !== state.serverInstanceId ||
         session.credentialId !== state.credentialId ||
@@ -954,6 +1047,7 @@ export default class AgentWikiSyncPlugin extends Plugin {
         }
       }
       const existing = this.liveRuntimes.get(runtimeKey);
+      assertCurrentMapping();
       if (existing) {
         if (existing.protocolVersion === "3")
           existing.configureNormalizedPush({
@@ -1032,6 +1126,18 @@ export default class AgentWikiSyncPlugin extends Plugin {
   }
 
   private async collectSyncDiff(
+    spaceId: string,
+    options: SyncOperationOptions,
+  ): Promise<SyncDiff> {
+    const release = this.locks.acquire(spaceId);
+    try {
+      return await this.collectLockedSyncDiff(spaceId, options);
+    } finally {
+      release();
+    }
+  }
+
+  private async collectLockedSyncDiff(
     spaceId: string,
     options: SyncOperationOptions,
   ): Promise<SyncDiff> {
