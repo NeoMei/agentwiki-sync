@@ -317,9 +317,12 @@ describe("unpublished PAYLOAD_INVALID recovery", () => {
     const terminalPath = [...control.files.keys()].find(
       (p) => p.includes("/operations/") && p.endsWith("/terminal.json"),
     )!;
-    expect(
-      JSON.parse((await control.read(terminalPath))!).payload,
-    ).toMatchObject({
+    const terminal = await new MutableControlRepository(
+      control,
+      terminalPath,
+      isTreePushJournal,
+    ).read();
+    expect(terminal?.payload).toMatchObject({
       confirmationHash: original.confirmationHash,
       changes: original.changes,
       remoteState: "superseded",
