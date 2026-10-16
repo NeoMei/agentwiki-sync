@@ -1788,7 +1788,7 @@ describe("SyncRuntime", () => {
 
     await expect(runtime.previewPull()).resolves.toBeDefined();
   });
-  it("pulls, moves, pushes, and re-pulls an empty folder tree", async () => {
+  it("refuses an identity-losing empty-folder rename before publication", async () => {
     const remote = new FakeTreeRemote();
     await remote.seedTree({
       folders: [folder("f1", null, "pages/A")],
@@ -1803,11 +1803,14 @@ describe("SyncRuntime", () => {
     );
     await runtime.applyPull(await runtime.previewPull());
     expect(vault.hasDirectory("Wiki/pages/A")).toBe(true);
+    const before = await remote.head();
     await vault.rename("Wiki/pages/A", "Wiki/pages/B");
-    await runtime.applyPush(await runtime.previewPush());
-    expect(remote.tree().folders[0]?.path).toBe("pages/B");
-    await runtime.applyPull(await runtime.previewPull());
-    expect(remote.tree().folders[0]?.path).toBe("pages/B");
+    await expect(runtime.previewPush()).rejects.toThrow(
+      /无法确定原有身份.*分步同步/,
+    );
+    expect(await remote.head()).toEqual(before);
+    expect(remote.tree().folders).toEqual([folder("f1", null, "pages/A")]);
+    expect(vault.hasDirectory("Wiki/pages/B")).toBe(true);
   });
 
   it("uses the remote folder version when a stable folder identity moves locally", async () => {

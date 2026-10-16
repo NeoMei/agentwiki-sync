@@ -158,27 +158,60 @@ describe("recursive Wiki archives", () => {
       });
     },
   );
-  it("preserves moved folder contents when the existing scanner assigns new IDs", async () => {
+  it.each([false, true])(
+    "rejects identity-losing subtree moves before publication (rename event=%s)",
+    async (recorded) => {
+      const { remote, vault, runtime } = await fixture();
+      const before = await remote.head();
+      const create = vi.spyOn(remote, "createPushSession");
+      const finalize = vi.spyOn(remote, "finalize");
+      await vault.rename("Wiki/pages/A/B", "Wiki/pages/B");
+      if (recorded)
+        await runtime.recordRename("Wiki/pages/A/B", "Wiki/pages/B");
+      await vault.trashDirectory("Wiki/pages/A");
+      await expect(runtime.previewPush()).rejects.toThrow(
+        /归档.*新.*身份.*分步/,
+      );
+      expect(create).not.toHaveBeenCalled();
+      expect(finalize).not.toHaveBeenCalled();
+      expect(await remote.head()).toEqual(before);
+      const segments = [];
+      for await (const segment of remote.snapshotPages())
+        segments.push(segment);
+      expect(segments.flatMap((segment) => segment.folders)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ folderId: "b", path: "pages/A/B" }),
+        ]),
+      );
+      expect(segments.flatMap((segment) => segment.pages)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            pageId: "nested",
+            path: "pages/A/B/nested.md",
+            body: "nested",
+          }),
+        ]),
+      );
+      expect(vault.text("Wiki/pages/B/nested.md")).toBe("nested");
+    },
+  );
+  it("rejects an offline page move with a new ID outside an archived subtree", async () => {
     const { remote, vault, runtime } = await fixture();
-    await vault.rename("Wiki/pages/A/B", "Wiki/pages/B");
-    await runtime.recordRename("Wiki/pages/A/B", "Wiki/pages/B");
+    const before = await remote.head();
+    const create = vi.spyOn(remote, "createPushSession");
+    const finalize = vi.spyOn(remote, "finalize");
+    await vault.rename("Wiki/pages/A/B/nested.md", "Wiki/pages/moved.md");
     await vault.trashDirectory("Wiki/pages/A");
-    const preview = await runtime.previewPush();
-    await runtime.applyPush(preview);
-    const segments = [];
-    for await (const segment of remote.snapshotPages()) segments.push(segment);
-    expect(segments.flatMap((segment) => segment.pages)).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ path: "pages/B/nested.md", body: "nested" }),
-        expect.objectContaining({ path: "pages/root.md", body: "root" }),
-      ]),
-    );
-    expect(await remote.head()).toMatchObject({
-      folderCount: "1",
-      pageCount: "2",
-    });
-    expect(vault.text("Wiki/pages/B/nested.md")).toBe("nested");
-    expect((await runtime.previewPush()).changes).toEqual([]);
+    await expect(runtime.previewPush()).rejects.toThrow(/归档.*新.*身份.*分步/);
+    expect(create).not.toHaveBeenCalled();
+    expect(finalize).not.toHaveBeenCalled();
+    expect(await remote.head()).toEqual(before);
+  });
+  it("conservatively refuses independent new folders combined with folder archives", async () => {
+    const { vault, runtime } = await fixture();
+    await vault.trashDirectory("Wiki/pages/A");
+    await vault.createDirectory("Wiki/pages/New");
+    await expect(runtime.previewPush()).rejects.toThrow(/归档.*新.*身份.*分步/);
   });
   it("fake server rejects descendant operations before mutating any content", async () => {
     const { remote } = await fixture();

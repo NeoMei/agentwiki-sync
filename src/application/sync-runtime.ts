@@ -2885,6 +2885,18 @@ export class SyncRuntime {
         throw new Error(
           "无法归档含有本地保留或移出页面的目录。请先单独同步页面移动，再删除目录。",
         );
+    // A new ID is not proof of an intentional delete/create: an offline
+    // folder/page move loses path-based identity. Without a reliable mapping,
+    // publishing these together could erase the original subtree's history.
+    // Refuse the ambiguous combination even when bodies or names changed.
+    if (
+      missingFolders.size > 0 &&
+      (local.folders.some((folder) => !baseFolders.has(folder.folderId)) ||
+        local.pages.some((page) => !basePages.has(page.pageId)))
+    )
+      throw new Error(
+        "无法同时归档目录和写入新目录或页面：新增/移动与目录归档请分开同步，当前无法确定原有身份。请分步同步；如需移动，先恢复原目录并核对身份，勿用归档加新建替代移动。",
+      );
     const changes: PreparedTreePushChange[] = [];
     const previewId = crypto.randomUUID();
     let prepared = 0;
