@@ -1,5 +1,6 @@
 import {
   recoveryDiagnostic,
+  RecoveryDiagnosticError,
   recoveryStateLabel,
   type SafeSyncDiagnostic,
 } from "../core/sync-diagnostics";
@@ -187,7 +188,10 @@ export class SyncCenterModal extends Modal {
     } catch (error) {
       if (generation !== this.refreshGeneration) return;
       this.loadError = userErrorMessage(error);
-      this.diagnostic = recoveryDiagnostic(error, this.targetSelection.current);
+      this.diagnostic =
+        error instanceof RecoveryDiagnosticError
+          ? recoveryDiagnostic(error, this.targetSelection.current)
+          : null;
     }
     this.render();
   }
@@ -327,7 +331,9 @@ export class SyncCenterModal extends Modal {
     }
     const actions = new Setting(this.contentEl)
       .addButton((button) =>
-        button.setButtonText("重试恢复").onClick(() => void this.refresh()),
+        button
+          .setButtonText(diagnostic ? "重试恢复" : "重试")
+          .onClick(() => void this.refresh()),
       )
       .addButton((button) =>
         button.setButtonText("关闭").onClick(() => this.close()),

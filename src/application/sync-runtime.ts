@@ -1090,10 +1090,15 @@ export class SyncRuntime {
   }
 
   async recover(): Promise<void> {
+    let recoveringPush = false;
     try {
-      await this.recoverInternal();
+      await this.recoverInternal((active) => {
+        recoveringPush = active;
+      });
     } catch (error) {
-      if (error instanceof RecoveryDiagnosticError) throw error;
+      // Pull/preview failures must never borrow an older retained push journal.
+      if (!recoveringPush || error instanceof RecoveryDiagnosticError)
+        throw error;
       let evidence: RecoveryEvidence = { spaceId: this.mapping.spaceId };
       // Only use existing validated repositories. Failed validation yields unknown state.
       try {
@@ -1176,7 +1181,9 @@ export class SyncRuntime {
     }
   }
 
-  private async recoverInternal(): Promise<void> {
+  private async recoverInternal(
+    setRecoveringPush: (active: boolean) => void,
+  ): Promise<void> {
     if (
       (await this.readJournalSchemaVersion(
         this.root + "/push/journal.json",
@@ -1184,7 +1191,9 @@ export class SyncRuntime {
     ) {
       if (!this.normalizedPush)
         throw new Error("NORMALIZED_PUSH_AUTHORITY_REQUIRED");
+      setRecoveringPush(true);
       await this.normalizedPush.coordinator.recover();
+      setRecoveringPush(false);
     }
     await this.discardOrphanPreviews();
     const pullVersion = await this.readJournalSchemaVersion(
@@ -1195,6 +1204,7 @@ export class SyncRuntime {
       await this.recoverTreePull();
     else if (pullVersion !== null) throw new Error("不支持的拉取日志版本");
 
+    setRecoveringPush(true);
     const pushVersion = await this.readJournalSchemaVersion(
       this.root + "/push/journal.json",
     );

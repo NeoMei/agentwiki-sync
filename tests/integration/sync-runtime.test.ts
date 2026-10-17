@@ -2997,3 +2997,34 @@ it("does not read raw evidence or clear a hash-invalid recovery journal", async 
   expect(JSON.stringify(diagnostic)).not.toMatch(/DO-NOT-TRUST|SECRET/);
   expect(await control.read(path)).toBe(raw);
 });
+
+it("does not attribute a later pull read failure to a completed push", async () => {
+  const { RecoveryDiagnosticError, recoveryDiagnostic } =
+    await import("../../src/core/sync-diagnostics");
+  const remote = new FakeTreeRemoteV3();
+  await remote.seedTree({ revision: "rev-empty" });
+  const vault = new MemoryVault({});
+  const control = new MemoryControlStore();
+  const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+  await runtime.applyPullV3(await runtime.previewPullV3());
+  vault.seedMarkdown("Wiki/pages/note.md", "body");
+  await runtime.applyPushV3(await runtime.previewPushV3());
+  const journalPath =
+    ".agentwiki/devices/d-local/spaces/s-space/push/journal.json";
+  const before = await control.read(journalPath);
+  control.onTextRead = (path) => {
+    if (path.endsWith("/pull/journal.json"))
+      throw new Error("pull storage unavailable");
+  };
+  const error: unknown = await runtime
+    .recover()
+    .catch((value: unknown) => value);
+  expect(error).toBeInstanceOf(Error);
+  expect(error).not.toBeInstanceOf(RecoveryDiagnosticError);
+  const diagnostic = recoveryDiagnostic(error, "space");
+  expect(diagnostic.transactionId).toBeUndefined();
+  expect(diagnostic.sessionId).toBeUndefined();
+  expect(diagnostic.publishedRevision).toBeUndefined();
+  expect(diagnostic.localPhase).toBe("unknown");
+  expect(await control.read(journalPath)).toBe(before);
+});

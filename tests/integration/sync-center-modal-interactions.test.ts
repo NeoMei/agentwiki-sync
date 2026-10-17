@@ -278,3 +278,30 @@ it("shows recovery context and retains it after diagnostic export fails", async 
   expect(content()).toContain("session-1");
   expect(content()).toContain("重试恢复");
 });
+
+it("keeps an ordinary network load failure separate from transaction recovery", async () => {
+  const modal = new SyncCenterModal({} as App, {
+    targets: [{ spaceId: "space", label: "Space" }],
+    initialSpaceId: "space",
+    loadDiff: async () => {
+      throw new Error("network unavailable");
+    },
+    runStrategy: async () => {},
+    exportDiagnostic: async () => {},
+  });
+  modal.open();
+  await vi.waitFor(() =>
+    expect((modal.contentEl as unknown as MockElement).textContent).toContain(
+      "网络连接失败",
+    ),
+  );
+  const content = (modal.contentEl as unknown as MockElement).textContent;
+  expect(content).not.toMatch(
+    /事务|备份|不要重新发起推送|未确认状态|重试恢复|导出诊断/,
+  );
+  expect(
+    findAll(modal.contentEl, (item) => item.tag === "button").map(
+      (item) => item.textContent,
+    ),
+  ).toEqual(["重试", "关闭"]);
+});
