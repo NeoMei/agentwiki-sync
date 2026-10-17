@@ -529,3 +529,99 @@ describe("BlobTransfer", () => {
     expect(remote.downloadAttempts.get("attachment-2")).toBe(2);
   });
 });
+
+describe("limit diagnostics", () => {
+  it.each([
+    [
+      { maxAttachmentBytes: 3 },
+      { sizeBytes: "4", width: 1, height: 1 },
+      "attachmentBytes",
+    ],
+    [
+      { maxBlobChunks: 1 },
+      { sizeBytes: "8", width: 1, height: 1 },
+      "chunkCount",
+    ],
+    [
+      { maxImageDimension: 2 },
+      { sizeBytes: "4", width: 3, height: 1 },
+      "imageDimension",
+    ],
+    [
+      { maxDecodedPixels: 2 },
+      { sizeBytes: "4", width: 2, height: 2 },
+      "decodedPixels",
+    ],
+  ])(
+    "carries the violated constraint before upload",
+    async (overrides, metadata, kind) => {
+      const remote = new FakeV3Remote();
+      const { subject } = transfer(remote, undefined, [], overrides);
+      const req = { ...(await requirement(new Uint8Array(4))), ...metadata };
+      await expect(
+        subject.uploadMissing({
+          sessionId: "s",
+          missingContentHashes: [req.contentHash],
+          requirements: [req],
+          readBlob: async () => new Uint8Array(4),
+          persistReceipt: async () => {},
+        }),
+      ).rejects.toMatchObject({
+        message: "BLOB_LIMIT_EXCEEDED",
+        detail: { kind },
+      });
+      expect(remote.uploaded).toEqual([]);
+    },
+  );
+  it("reports attachment count and total bytes separately", async () => {
+    const remote = new FakeV3Remote();
+    const requirements = [
+      await requirement(new Uint8Array([1, 2])),
+      await requirement(new Uint8Array([3, 4])),
+    ];
+    const input = {
+      sessionId: "s",
+      missingContentHashes: requirements.map((r) => r.contentHash),
+      requirements,
+      readBlob: async () => null,
+      persistReceipt: async () => {},
+    };
+    await expect(
+      transfer(remote, undefined, [], {
+        maxRevisionAttachments: 1,
+      }).subject.uploadMissing(input),
+    ).rejects.toMatchObject({
+      detail: { kind: "attachmentCount", actual: 2, limit: 1 },
+    });
+    await expect(
+      transfer(remote, undefined, [], {
+        maxTransferBlobBytes: 3,
+      }).subject.uploadMissing(input),
+    ).rejects.toMatchObject({
+      detail: { kind: "transferBytes", actual: 4, limit: 3 },
+    });
+  });
+});
+
+it("counts distinct attachment records even when download bytes are deduplicated", async () => {
+  const remote = new FakeV3Remote();
+  const req = await requirement(new Uint8Array([1]));
+  const attachments = ["a", "b"].map((attachmentId) => ({
+    ...req,
+    attachmentId,
+    path: `assets/${attachmentId}.png`,
+    updatedAt: "2026-09-05T00:00:00.000Z",
+  }));
+  await expect(
+    transfer(remote, undefined, [], {
+      maxRevisionAttachments: 1,
+    }).subject.downloadMissing({
+      transferId: "t",
+      expiresAt: futureExpiry,
+      revision: "r1",
+      attachments,
+    }),
+  ).rejects.toMatchObject({
+    detail: { kind: "attachmentCount", actual: 2, limit: 1 },
+  });
+});

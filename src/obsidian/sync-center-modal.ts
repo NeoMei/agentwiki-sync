@@ -1,3 +1,8 @@
+import {
+  recoveryDiagnostic,
+  recoveryStateLabel,
+  type SafeSyncDiagnostic,
+} from "../core/sync-diagnostics";
 import { Modal, Notice, Setting, type App } from "obsidian";
 import { userErrorMessage } from "../core/user-errors";
 import { SyncTargetSelection } from "../application/sync-coordinator";
@@ -77,6 +82,7 @@ export interface SyncCenterHandlers {
     spaceId: string,
     options: SyncOperationOptions,
   ) => Promise<SyncDiff>;
+  exportDiagnostic?: (value: SafeSyncDiagnostic) => Promise<void>;
   cancelPendingPush?: (spaceId: string) => Promise<void>;
   runStrategy: (
     spaceId: string,
@@ -129,6 +135,7 @@ export function syncSummary(diff: SyncDiff): string {
 export class SyncCenterModal extends Modal {
   private diff: SyncDiff | null = null;
   private loadError: string | null = null;
+  private diagnostic: SafeSyncDiagnostic | null = null;
   private running: boolean = false;
   private readonly targetSelection: SyncTargetSelection;
   private operation: AbortController | null = null;
@@ -160,6 +167,7 @@ export class SyncCenterModal extends Modal {
     const generation = ++this.refreshGeneration;
     this.diff = null;
     this.loadError = null;
+    this.diagnostic = null;
     this.running = false;
     this.progress = null;
     this.operation?.abort();
@@ -179,6 +187,7 @@ export class SyncCenterModal extends Modal {
     } catch (error) {
       if (generation !== this.refreshGeneration) return;
       this.loadError = userErrorMessage(error);
+      this.diagnostic = recoveryDiagnostic(error, this.targetSelection.current);
     }
     this.render();
   }
@@ -298,12 +307,43 @@ export class SyncCenterModal extends Modal {
     this.contentEl.createEl("p", {
       text: `加载差异失败：${this.loadError}`,
     });
-    new Setting(this.contentEl)
+    const diagnostic = this.diagnostic;
+    if (diagnostic) {
+      const target = this.handlers.targets.find(
+        (item) => item.spaceId === diagnostic.spaceId,
+      );
+      this.contentEl.createEl("p", {
+        text: `Space：${target?.label ?? diagnostic.spaceId}（${diagnostic.spaceId}）`,
+      });
+      this.contentEl.createEl("p", {
+        text: `事务：${diagnostic.transactionId ?? "未知"}；会话：${diagnostic.sessionId ?? "未知"}`,
+      });
+      this.contentEl.createEl("p", {
+        text: `服务器会话状态：${recoveryStateLabel(diagnostic.remoteStatus)}；${diagnostic.remoteCommit}；本地完成阶段：${recoveryStateLabel(diagnostic.localPhase)}${diagnostic.publishedRevision ? `；已发布版本：${diagnostic.publishedRevision}` : ""}`,
+      });
+      this.contentEl.createEl("p", {
+        text: "请先保留 Vault 和完整 .agentwiki 控制目录的备份，不要删除或移动事务记录。重试恢复仍失败时，将诊断文件交管理员核对会话和发布审计；备份由自己保管，不要直接发送。未确认状态前不要重新发起推送。",
+      });
+    }
+    const actions = new Setting(this.contentEl)
       .addButton((button) =>
-        button.setButtonText("重试").onClick(() => void this.refresh()),
+        button.setButtonText("重试恢复").onClick(() => void this.refresh()),
       )
       .addButton((button) =>
         button.setButtonText("关闭").onClick(() => this.close()),
+      );
+    if (diagnostic && this.handlers.exportDiagnostic)
+      actions.addButton((button) =>
+        button.setButtonText("导出诊断").onClick(async () => {
+          try {
+            await this.handlers.exportDiagnostic!(diagnostic);
+            new Notice("诊断已导出。文件不含正文、凭据或原始事务记录。");
+          } catch (error) {
+            new Notice(
+              `诊断导出失败：${userErrorMessage(error)}。原事务记录已保留。`,
+            );
+          }
+        }),
       );
   }
 

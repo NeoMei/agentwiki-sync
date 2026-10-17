@@ -291,11 +291,18 @@ export class TreePushService {
 
   async inspect(): Promise<Pick<
     TreePushJournal,
-    "remoteState" | "result" | "localCommitPhase" | "credentialIdAtCreation"
+    | "remoteState"
+    | "result"
+    | "localCommitPhase"
+    | "credentialIdAtCreation"
+    | "idempotencyKey"
+    | "sessionId"
   > | null> {
     const value = await this.journal.read();
     return value
       ? {
+          idempotencyKey: value.payload.idempotencyKey,
+          sessionId: value.payload.sessionId,
           remoteState: value.payload.remoteState,
           result: value.payload.result,
           localCommitPhase: value.payload.localCommitPhase,

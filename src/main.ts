@@ -1,3 +1,4 @@
+import { exportDiagnostic } from "./core/sync-diagnostics";
 import { Notice, Plugin } from "obsidian";
 import {
   MappingDetachRepository,
@@ -1135,6 +1136,15 @@ export default class AgentWikiSyncPlugin extends Plugin {
       })),
       initialSpaceId: initial.spaceId,
       loadDiff: (spaceId, options) => this.collectSyncDiff(spaceId, options),
+      exportDiagnostic: (value) =>
+        exportDiagnostic(value, async (json) => {
+          const folder = "AgentWiki诊断";
+          if (!this.app.vault.getAbstractFileByPath(folder))
+            await this.app.vault.createFolder(folder);
+          const path = `${folder}/sync-${Date.now()}-${crypto.randomUUID()}.json`;
+          await this.app.vault.create(path, json);
+          new Notice(`诊断文件：${path}`);
+        }),
       runStrategy: (spaceId, strategy, options) =>
         this.runSyncStrategy(spaceId, strategy, options),
       cancelPendingPush: (spaceId) => this.cancelPendingPush(spaceId),

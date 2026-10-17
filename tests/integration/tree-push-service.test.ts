@@ -1376,3 +1376,30 @@ describe("TreePushServiceV3", () => {
     );
   });
 });
+
+it("reports the actual Vault attachment path before writing an over-limit push journal", async () => {
+  store = new MemoryControlStore();
+  const remote = new StrictV3PushRemote();
+  const blob = new Uint8Array(50); // fixture capability allows only 10 chunks of 4 bytes
+  const { preview, currentHash } = await v3Prepared(blob);
+  const service = new TreePushServiceV3(
+    remote,
+    store,
+    ".agentwiki/tree/diagnostic-limit",
+    {
+      readBlob: async () => blob,
+      revalidateConfirmation: async () => currentHash.value,
+    },
+  );
+  await expect(service.publishPrepared(preview)).rejects.toMatchObject({
+    message: "BLOB_LIMIT_EXCEEDED",
+    detail: {
+      kind: "chunkCount",
+      actual: 13,
+      limit: 10,
+      path: "Wiki/assets/image.png",
+    },
+  });
+  expect(await service.inspect()).toBeNull();
+  expect(remote.createInputs).toEqual([]);
+});

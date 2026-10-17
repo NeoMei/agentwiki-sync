@@ -1,6 +1,13 @@
+import {
+  BlobLimitError,
+  blobLimitMessage,
+  RecoveryDiagnosticError,
+} from "./sync-diagnostics";
 import { AgentWikiHttpError } from "../agentwiki/client";
 
 const errorMessages: Record<string, string> = {
+  BLOB_LIMIT_EXCEEDED:
+    "附件超出同步限制，未提供具体对象或数值。请压缩图片、缩小尺寸或减少本次附件数量后重试。",
   INSTALLATION_CODE_INVALID: "连接码无效。请在 AgentWiki 网页重新生成。",
   INSTALLATION_CODE_EXPIRED: "连接码已过期。请在 AgentWiki 网页重新生成。",
   INSTALLATION_ALREADY_EXCHANGED:
@@ -122,6 +129,9 @@ const protocolValidationMessages: Array<[string, string]> = [
 
 /** Convert any error into a user-friendly Chinese message. */
 export function userErrorMessage(error: unknown): string {
+  if (error instanceof RecoveryDiagnosticError && error.original)
+    return userErrorMessage(error.original);
+  if (error instanceof BlobLimitError) return blobLimitMessage(error.detail);
   if (error instanceof AgentWikiHttpError) {
     const body = error.body as
       { error?: { code?: string; message?: string } } | undefined;

@@ -1,3 +1,4 @@
+import { assertBlobLimits, assertLimit } from "../core/sync-diagnostics";
 import {
   BlobChunkReceiptV3Schema,
   BlobRequirementV3Schema,
@@ -39,6 +40,7 @@ export interface BlobTransferOptions {
 
 export interface UploadMissingInput {
   sessionId: string;
+  pathFor?: (contentHash: string) => string | undefined;
   missingContentHashes: string[];
   requirements: BlobRequirementV3[];
   readBlob(requirement: BlobRequirementV3): Promise<Uint8Array | null>;
@@ -127,53 +129,24 @@ export class BlobTransfer {
 
   private requirementMap(
     requirements: BlobRequirementV3[],
+    pathFor?: (contentHash: string) => string | undefined,
   ): Map<string, BlobRequirementV3> {
     const result = new Map<string, BlobRequirementV3>();
     for (const raw of requirements) {
+      assertBlobLimits(raw, this.capabilities, pathFor?.(raw.contentHash));
       const value = BlobRequirementV3Schema.parse(raw);
       if (result.has(value.contentHash))
         throw new BlobTransferDeterministicError("BLOB_REQUIREMENT_REPEATED");
-      const size = Number(value.sizeBytes);
-      if (
-        !Number.isSafeInteger(size) ||
-        size < 1 ||
-        size >
-          Math.min(
-            this.capabilities.maxAttachmentBytes,
-            TREE_SYNC_V3_HARD_LIMITS.maxAttachmentBytes,
-          ) ||
-        Math.ceil(size / this.chunkBytes) >
-          Math.min(
-            this.capabilities.maxBlobChunks,
-            TREE_SYNC_V3_HARD_LIMITS.maxBlobChunks,
-          ) ||
-        value.width >
-          Math.min(
-            this.capabilities.maxImageDimension,
-            TREE_SYNC_V3_HARD_LIMITS.maxImageDimension,
-          ) ||
-        value.height >
-          Math.min(
-            this.capabilities.maxImageDimension,
-            TREE_SYNC_V3_HARD_LIMITS.maxImageDimension,
-          ) ||
-        value.width * value.height >
-          Math.min(
-            this.capabilities.maxDecodedPixels,
-            TREE_SYNC_V3_HARD_LIMITS.maxDecodedPixels,
-          )
-      )
-        throw new BlobTransferDeterministicError("BLOB_LIMIT_EXCEEDED");
       result.set(value.contentHash, value);
     }
-    if (
-      result.size >
+    assertLimit(
+      "attachmentCount",
+      result.size,
       Math.min(
         this.capabilities.maxRevisionAttachments,
         TREE_SYNC_V3_HARD_LIMITS.maxRevisionAttachments,
-      )
-    )
-      throw new BlobTransferDeterministicError("BLOB_LIMIT_EXCEEDED");
+      ),
+    );
     return result;
   }
 
@@ -181,16 +154,17 @@ export class BlobTransfer {
     let total = 0;
     for (const requirement of requirements) {
       total += Number(requirement.sizeBytes);
-      if (
-        !Number.isSafeInteger(total) ||
-        total >
-          Math.min(
-            this.capabilities.maxTransferBlobBytes,
-            TREE_SYNC_V3_HARD_LIMITS.maxTransferBlobBytes,
-          )
-      )
+      if (!Number.isSafeInteger(total))
         throw new BlobTransferDeterministicError("BLOB_LIMIT_EXCEEDED");
     }
+    assertLimit(
+      "transferBytes",
+      total,
+      Math.min(
+        this.capabilities.maxTransferBlobBytes,
+        TREE_SYNC_V3_HARD_LIMITS.maxTransferBlobBytes,
+      ),
+    );
   }
 
   private async workers<T>(
@@ -223,7 +197,7 @@ export class BlobTransfer {
   }
 
   async uploadMissing(input: UploadMissingInput): Promise<void> {
-    const requirements = this.requirementMap(input.requirements);
+    const requirements = this.requirementMap(input.requirements, input.pathFor);
     const missing = new Set<string>();
     for (const hash of input.missingContentHashes) {
       if (missing.has(hash))
@@ -295,8 +269,17 @@ export class BlobTransfer {
   async downloadMissing(input: DownloadMissingInput): Promise<void> {
     if (input.revision === "current")
       throw new BlobTransferDeterministicError("DOWNLOAD_REVISION_NOT_FIXED");
+    assertLimit(
+      "attachmentCount",
+      input.attachments.length,
+      Math.min(
+        this.capabilities.maxRevisionAttachments,
+        TREE_SYNC_V3_HARD_LIMITS.maxRevisionAttachments,
+      ),
+    );
     const byHash = new Map<string, SyncAttachmentV3>();
     for (const attachment of input.attachments) {
+      assertBlobLimits(attachment, this.capabilities, attachment.path);
       const expected = BlobRequirementV3Schema.parse({
         contentHash: attachment.contentHash,
         sizeBytes: attachment.sizeBytes,

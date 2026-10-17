@@ -1,4 +1,8 @@
 import {
+  RecoveryDiagnosticError,
+  type RecoveryEvidence,
+} from "../core/sync-diagnostics";
+import {
   FlatAttachmentPathSchema,
   validatePortableMarkdownPath,
   treeCapabilitiesHashV3,
@@ -1086,6 +1090,93 @@ export class SyncRuntime {
   }
 
   async recover(): Promise<void> {
+    try {
+      await this.recoverInternal();
+    } catch (error) {
+      if (error instanceof RecoveryDiagnosticError) throw error;
+      let evidence: RecoveryEvidence = { spaceId: this.mapping.spaceId };
+      // Only use existing validated repositories. Failed validation yields unknown state.
+      try {
+        // A failed identity/integrity check is not a trustworthy diagnostic source.
+        if (
+          error instanceof Error &&
+          /身份|哈希|hash|identity|ownership|binding|scope|mismatch/iu.test(
+            error.message,
+          )
+        )
+          throw error;
+        const version = await this.readJournalSchemaVersion(
+          this.root + "/push/journal.json",
+        );
+        if (version === 4 && this.normalizedPush) {
+          const journal = await this.inspectNormalizedPush();
+          if (journal)
+            evidence = {
+              ...evidence,
+              transactionId: journal.binding.operationId,
+              localPhase: journal.phase,
+              publishedRevision:
+                journal.mode === "remote_push"
+                  ? journal.verifiedTarget?.revision
+                  : undefined,
+            };
+        } else if (version === 3 && this.remoteV3) {
+          const journal = await this.v3PushService().inspect();
+          if (journal)
+            evidence = {
+              ...evidence,
+              transactionId: journal.idempotencyKey,
+              sessionId: journal.sessionId ?? undefined,
+              localPhase: journal.localCommitPhase,
+              ...(journal.remoteState === "published" && journal.result
+                ? { publishedRevision: journal.result.revision }
+                : {}),
+            };
+        } else if (version === 2) {
+          const journal = await new TreePushService(
+            this.legacyTreeRemote,
+            this.control,
+            this.root + "/push",
+          ).inspect();
+          if (journal)
+            evidence = {
+              ...evidence,
+              transactionId: journal.idempotencyKey,
+              sessionId: journal.sessionId ?? undefined,
+              localPhase: journal.localCommitPhase,
+              ...(journal.remoteState === "published" && journal.result
+                ? { publishedRevision: journal.result.revision }
+                : {}),
+            };
+        } else if (version === 1 && this.legacyRemote) {
+          const journal = await new PushService(
+            this.legacyRemote,
+            this.control,
+            this.root + "/push",
+          ).inspect();
+          if (journal)
+            evidence = {
+              ...evidence,
+              transactionId: journal.idempotencyKey,
+              sessionId: journal.sessionId ?? undefined,
+              localPhase: journal.localCommitPhase,
+              ...(journal.remoteState === "published" && journal.result
+                ? { publishedRevision: journal.result.revision }
+                : {}),
+            };
+        }
+      } catch {
+        /* Identity, hash or storage failures must not expose raw journals. */
+      }
+      throw new RecoveryDiagnosticError(
+        error instanceof Error ? error.message : "同步恢复失败",
+        evidence,
+        error,
+      );
+    }
+  }
+
+  private async recoverInternal(): Promise<void> {
     if (
       (await this.readJournalSchemaVersion(
         this.root + "/push/journal.json",

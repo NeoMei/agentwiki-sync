@@ -1,3 +1,4 @@
+import { RecoveryDiagnosticError } from "../core/sync-diagnostics";
 import {
   batchHash,
   canonicalBytes,
@@ -114,11 +115,18 @@ export class PushService {
   }
   async inspect(): Promise<Pick<
     PushJournal,
-    "remoteState" | "result" | "localCommitPhase" | "credentialIdAtCreation"
+    | "remoteState"
+    | "result"
+    | "localCommitPhase"
+    | "credentialIdAtCreation"
+    | "idempotencyKey"
+    | "sessionId"
   > | null> {
     const value = await this.journal.read();
     return value
       ? {
+          idempotencyKey: value.payload.idempotencyKey,
+          sessionId: value.payload.sessionId,
           remoteState: value.payload.remoteState,
           result: value.payload.result,
           localCommitPhase: value.payload.localCommitPhase,
@@ -466,7 +474,13 @@ export class PushService {
       if (session.status === "published" && session.result)
         return this.commitResult(journal, session.result);
       if (session.status === "aborted" || session.status === "expired")
-        throw new Error("推送会话无法恢复");
+        throw new RecoveryDiagnosticError("推送会话无法恢复", {
+          spaceId: journal.spaceId,
+          transactionId: journal.idempotencyKey,
+          sessionId: journal.sessionId,
+          remoteStatus: session.status,
+          localPhase: journal.localCommitPhase,
+        });
       received = new Set(session.receivedBatchIndexes);
     }
     await this.uploadBatches(journal, capabilities, received);

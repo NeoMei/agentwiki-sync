@@ -1,4 +1,9 @@
 import {
+  assertBlobLimits,
+  assertLimit,
+  RecoveryDiagnosticError,
+} from "../core/sync-diagnostics";
+import {
   BlobChunkReceiptV3Schema,
   BlobRequirementV3Schema,
   CreateTreePushSessionRequestV3Schema,
@@ -411,7 +416,12 @@ export class TreePushServiceV3 {
 
   async inspect(): Promise<Pick<
     TreePushJournalV3,
-    "remoteState" | "result" | "localCommitPhase" | "credentialIdAtCreation"
+    | "remoteState"
+    | "result"
+    | "localCommitPhase"
+    | "credentialIdAtCreation"
+    | "idempotencyKey"
+    | "sessionId"
   > | null> {
     const value = await this.journal.read();
     if (
@@ -422,6 +432,8 @@ export class TreePushServiceV3 {
       throw new Error("UPGRADE_PUSH_OWNERSHIP_MISMATCH");
     return value
       ? {
+          idempotencyKey: value.payload.idempotencyKey,
+          sessionId: value.payload.sessionId,
           remoteState: value.payload.remoteState,
           result: value.payload.result,
           localCommitPhase: value.payload.localCommitPhase,
@@ -496,6 +508,14 @@ export class TreePushServiceV3 {
       capabilityDigest !== (await this.remote.capabilitiesHash)
     )
       throw new Error("CAPABILITIES_CHANGED");
+    for (const change of input.changes) {
+      if (change.operation === "upsert_attachment")
+        assertBlobLimits(
+          change.attachment,
+          input.capabilities,
+          change.vaultPath,
+        );
+    }
     const changes: PreparedTreePushChangeV3[] = [];
     let totalBodyBytes = 0;
     for (const change of input.changes) {
@@ -530,24 +550,27 @@ export class TreePushServiceV3 {
       });
     }
     const blob = this.requirements(changes);
+    assertLimit(
+      "attachmentCount",
+      blob.attachmentCount,
+      input.capabilities.maxRevisionAttachments,
+    );
+    assertLimit(
+      "transferBytes",
+      blob.transferBlobBytes,
+      input.capabilities.maxTransferBlobBytes,
+    );
     if (
       changes.length > input.capabilities.maxChangeCount ||
-      totalBodyBytes > input.capabilities.maxClientTotalBodyBytes ||
-      blob.attachmentCount > input.capabilities.maxRevisionAttachments ||
-      blob.transferBlobBytes > input.capabilities.maxTransferBlobBytes ||
+      totalBodyBytes > input.capabilities.maxClientTotalBodyBytes
+    )
+      throw new RangeError("BATCH_TOO_LARGE");
+    if (
       blob.requirements.some(
-        (item) =>
-          Number(item.sizeBytes) > input.capabilities.maxAttachmentBytes ||
-          Math.ceil(
-            Number(item.sizeBytes) / input.capabilities.blobChunkBytes,
-          ) > input.capabilities.maxBlobChunks ||
-          !input.capabilities.allowedMimeTypes.includes(item.mimeType) ||
-          item.width > input.capabilities.maxImageDimension ||
-          item.height > input.capabilities.maxImageDimension ||
-          item.width * item.height > input.capabilities.maxDecodedPixels,
+        (item) => !input.capabilities.allowedMimeTypes.includes(item.mimeType),
       )
     )
-      throw new RangeError("BLOB_LIMIT_EXCEEDED");
+      throw new RangeError("ATTACHMENT_CONTENT_INVALID");
     const journal: TreePushJournalV3 = {
       schemaVersion: 3,
       protocolVersion: "3",
@@ -708,6 +731,7 @@ export class TreePushServiceV3 {
         (hash) => !journal.requiredBlobs[hash]?.completed,
       ),
       requirements: journal.blobRequirements,
+      pathFor: (hash) => journal.requiredBlobs[hash]?.vaultPath,
       signal: options?.signal,
       readBlob: async (requirement) => {
         const entry = journal.requiredBlobs[requirement.contentHash];
@@ -1072,7 +1096,13 @@ export class TreePushServiceV3 {
       return null;
     }
     if (status.status === "aborted" || status.status === "expired")
-      throw new Error("推送会话无法恢复");
+      throw new RecoveryDiagnosticError("推送会话无法恢复", {
+        spaceId: journal.spaceId,
+        transactionId: journal.idempotencyKey,
+        sessionId: journal.sessionId,
+        remoteStatus: status.status,
+        localPhase: journal.localCommitPhase,
+      });
     if (this.ownership && journal.remoteState === "finalizing") return null;
     for (const hash of status.completedContentHashes) {
       const entry = journal.requiredBlobs[hash];

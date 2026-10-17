@@ -238,3 +238,43 @@ describe("rendered SyncCenterModal image details", () => {
     expect(runStrategy).not.toHaveBeenCalled();
   });
 });
+
+it("shows recovery context and retains it after diagnostic export fails", async () => {
+  const { RecoveryDiagnosticError } =
+    await import("../../src/core/sync-diagnostics");
+  const exported: unknown[] = [];
+  const modal = new SyncCenterModal({} as App, {
+    targets: [{ spaceId: "space-1", label: "测试空间" }],
+    initialSpaceId: "space-1",
+    loadDiff: async () => {
+      throw new RecoveryDiagnosticError("推送会话无法恢复", {
+        sessionId: "session-1",
+        transactionId: "operation-1",
+        remoteStatus: "expired",
+        localPhase: "not_started",
+      });
+    },
+    runStrategy: async () => {},
+    exportDiagnostic: async (value) => {
+      exported.push(value);
+      throw new Error("disk full");
+    },
+  });
+  modal.open();
+  await vi.waitFor(() =>
+    expect((modal.contentEl as unknown as MockElement).textContent).toContain(
+      "session-1",
+    ),
+  );
+  const content = () => (modal.contentEl as unknown as MockElement).textContent;
+  expect(content()).toContain("测试空间");
+  expect(content()).toContain("未确认");
+  expect(content()).toContain("不要删除");
+  const buttons = findAll(modal.contentEl, (item) => item.tag === "button");
+  const exportButton = buttons.find((item) => item.textContent === "导出诊断");
+  expect(exportButton).toBeDefined();
+  exportButton!.dispatchEvent({ type: "click" });
+  await vi.waitFor(() => expect(exported).toHaveLength(1));
+  expect(content()).toContain("session-1");
+  expect(content()).toContain("重试恢复");
+});

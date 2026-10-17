@@ -2911,3 +2911,89 @@ describe("parent restoration transactions", () => {
     });
   }
 });
+
+it("keeps an unrecovered journal and reports unknown remote commit after timeout", async () => {
+  const { RecoveryDiagnosticError, recoveryDiagnostic } =
+    await import("../../src/core/sync-diagnostics");
+  const remote = new FakeTreeRemoteV3();
+  await remote.seedTree({ revision: "rev-empty" });
+  const vault = new MemoryVault({});
+  const control = new MemoryControlStore();
+  const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+  await runtime.applyPullV3(await runtime.previewPullV3());
+  vault.seedMarkdown("Wiki/pages/note.md", "body");
+  remote.loseFinalizeResponseOnce = true;
+  await expect(
+    runtime.applyPushV3(await runtime.previewPushV3()),
+  ).rejects.toThrow("finalize response lost");
+  const path = ".agentwiki/devices/d-local/spaces/s-space/push/journal.json";
+  const before = await control.read(path);
+  remote.getSession = async () => {
+    throw new Error("timeout");
+  };
+  const error = await runtime.recover().catch((value: unknown) => value);
+  expect(error).toBeInstanceOf(RecoveryDiagnosticError);
+  const diagnostic = recoveryDiagnostic(error, "space");
+  expect(diagnostic.transactionId).toBeTruthy();
+  expect(diagnostic.sessionId).toBeTruthy();
+  expect(diagnostic.remoteCommit).toContain("未确认");
+  expect(await control.read(path)).toBe(before);
+  expect(remote.finalizeCalls).toBe(1);
+});
+
+it("reports verified publication when local baseline completion still fails", async () => {
+  const { recoveryDiagnostic } =
+    await import("../../src/core/sync-diagnostics");
+  const remote = new FakeTreeRemoteV3();
+  await remote.seedTree({ revision: "rev-empty" });
+  const vault = new MemoryVault({});
+  const control = new MemoryControlStore();
+  const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+  await runtime.applyPullV3(await runtime.previewPullV3());
+  vault.seedMarkdown("Wiki/pages/note.md", "body");
+  remote.loseFinalizeResponseOnce = true;
+  await expect(
+    runtime.applyPushV3(await runtime.previewPushV3()),
+  ).rejects.toThrow("finalize response lost");
+  control.failWhenTextPathIncludes = "/tree-v2/generations/";
+  const error = await runtime.recover().catch((value: unknown) => value);
+  expect(error).toBeInstanceOf(Error);
+  const diagnostic = recoveryDiagnostic(error, "space");
+  expect(diagnostic.remoteCommit).toBe("已确认远端发布");
+  expect(diagnostic.publishedRevision).toBeTruthy();
+  expect(diagnostic.localPhase).toBe("not_started");
+  expect(remote.finalizeCalls).toBe(1);
+  expect(
+    await control.read(
+      ".agentwiki/devices/d-local/spaces/s-space/push/journal.json",
+    ),
+  ).not.toBeNull();
+});
+
+it("does not read raw evidence or clear a hash-invalid recovery journal", async () => {
+  const { recoveryDiagnostic } =
+    await import("../../src/core/sync-diagnostics");
+  const remote = new FakeTreeRemote();
+  const control = new MemoryControlStore();
+  const runtime = new SyncRuntime(
+    new MemoryVault({}),
+    control,
+    remote,
+    mapping(),
+  );
+  const path = ".agentwiki/devices/d-local/spaces/s-space/push/journal.json";
+  const raw = JSON.stringify({
+    envelopeSchemaVersion: 1,
+    writeGeneration: 1,
+    payloadHash: "bad",
+    payload: { schemaVersion: 1, sessionId: "DO-NOT-TRUST", token: "SECRET" },
+  });
+  await control.write(path, raw);
+  const error = await runtime.recover().catch((value: unknown) => value);
+  expect(error).toBeInstanceOf(Error);
+  const diagnostic = recoveryDiagnostic(error, "space");
+  expect(diagnostic.sessionId).toBeUndefined();
+  expect(diagnostic.remoteCommit).toContain("未确认");
+  expect(JSON.stringify(diagnostic)).not.toMatch(/DO-NOT-TRUST|SECRET/);
+  expect(await control.read(path)).toBe(raw);
+});
