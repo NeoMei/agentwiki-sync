@@ -2971,7 +2971,7 @@ it("reports verified publication when local baseline completion still fails", as
 });
 
 it("does not read raw evidence or clear a hash-invalid recovery journal", async () => {
-  const { recoveryDiagnostic } =
+  const { RecoveryDiagnosticError, recoveryDiagnostic } =
     await import("../../src/core/sync-diagnostics");
   const remote = new FakeTreeRemote();
   const control = new MemoryControlStore();
@@ -2990,9 +2990,12 @@ it("does not read raw evidence or clear a hash-invalid recovery journal", async 
   });
   await control.write(path, raw);
   const error = await runtime.recover().catch((value: unknown) => value);
-  expect(error).toBeInstanceOf(Error);
+  expect(error).toBeInstanceOf(RecoveryDiagnosticError);
   const diagnostic = recoveryDiagnostic(error, "space");
   expect(diagnostic.sessionId).toBeUndefined();
+  expect(diagnostic.transactionId).toBeUndefined();
+  expect(diagnostic.publishedRevision).toBeUndefined();
+  expect(diagnostic.localPhase).toBe("unknown");
   expect(diagnostic.remoteCommit).toContain("未确认");
   expect(JSON.stringify(diagnostic)).not.toMatch(/DO-NOT-TRUST|SECRET/);
   expect(await control.read(path)).toBe(raw);
@@ -3027,4 +3030,42 @@ it("does not attribute a later pull read failure to a completed push", async () 
   expect(diagnostic.publishedRevision).toBeUndefined();
   expect(diagnostic.localPhase).toBe("unknown");
   expect(await control.read(journalPath)).toBe(before);
+});
+
+it("wraps initial push hash validation failure with unknown recovery evidence", async () => {
+  const { RecoveryDiagnosticError, recoveryDiagnostic } =
+    await import("../../src/core/sync-diagnostics");
+  const remote = new FakeTreeRemoteV3();
+  await remote.seedTree({ revision: "rev-empty" });
+  const vault = new MemoryVault({});
+  const control = new MemoryControlStore();
+  const runtime = SyncRuntime.v3(vault, control, remote, mapping());
+  await runtime.applyPullV3(await runtime.previewPullV3());
+  vault.seedMarkdown("Wiki/pages/note.md", "body");
+  await runtime.applyPushV3(await runtime.previewPushV3());
+  const path = ".agentwiki/devices/d-local/spaces/s-space/push/journal.json";
+  // Keep a real, schema-valid journal payload and corrupt only envelope hashes.
+  const retained = new Map<string, string>();
+  for (const candidate of [path, path + ".prev", path + ".next"]) {
+    const raw = await control.read(candidate);
+    if (!raw) continue;
+    const envelope = JSON.parse(raw) as Record<string, unknown>;
+    envelope.payloadHash = "0".repeat(64);
+    const corrupt = JSON.stringify(envelope);
+    await control.write(candidate, corrupt);
+    retained.set(candidate, corrupt);
+  }
+  expect(retained.size).toBeGreaterThan(0);
+  const error: unknown = await runtime
+    .recover()
+    .catch((value: unknown) => value);
+  expect(error).toBeInstanceOf(RecoveryDiagnosticError);
+  const diagnostic = recoveryDiagnostic(error, "space");
+  expect(diagnostic.transactionId).toBeUndefined();
+  expect(diagnostic.sessionId).toBeUndefined();
+  expect(diagnostic.publishedRevision).toBeUndefined();
+  expect(diagnostic.localPhase).toBe("unknown");
+  expect(diagnostic.remoteCommit).toContain("未确认");
+  for (const [candidate, corrupt] of retained)
+    expect(await control.read(candidate)).toBe(corrupt);
 });

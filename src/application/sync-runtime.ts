@@ -1184,6 +1184,7 @@ export class SyncRuntime {
   private async recoverInternal(
     setRecoveringPush: (active: boolean) => void,
   ): Promise<void> {
+    setRecoveringPush(true);
     if (
       (await this.readJournalSchemaVersion(
         this.root + "/push/journal.json",
@@ -1191,10 +1192,9 @@ export class SyncRuntime {
     ) {
       if (!this.normalizedPush)
         throw new Error("NORMALIZED_PUSH_AUTHORITY_REQUIRED");
-      setRecoveringPush(true);
       await this.normalizedPush.coordinator.recover();
-      setRecoveringPush(false);
     }
+    setRecoveringPush(false);
     await this.discardOrphanPreviews();
     const pullVersion = await this.readJournalSchemaVersion(
       this.root + "/pull/journal.json",
