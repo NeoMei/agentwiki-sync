@@ -344,20 +344,20 @@ describe("bounded v2 tree", () => {
     ).rejects.toThrow(/快照对象数量超过限制/);
   });
 
-  it("rejects a snapshot that exceeds maxDocumentTreeBytes", async () => {
+  it("rejects a snapshot that exceeds the negotiated manifest byte limit", async () => {
     const http = new FakeHttp();
     http.responses.push({
       status: 200,
       json: v2SnapshotPage({
         revisionManifestByteLength: String(
-          TREE_SYNC_V2_LIMITS.maxDocumentTreeBytes + 1,
+          v2Capabilities.maxClientManifestBytes + 1,
         ),
         revisionBodyBytes: "0",
       }),
     });
     await expect(
       v2Remote(http).snapshotPages()[Symbol.asyncIterator]().next(),
-    ).rejects.toThrow(/快照字节数超过限制/);
+    ).rejects.toThrow("SPACE_TOO_LARGE");
   });
 
   it("rejects a delta that exceeds maxDeltaItems", async () => {

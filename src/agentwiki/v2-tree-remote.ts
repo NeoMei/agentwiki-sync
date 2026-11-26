@@ -80,21 +80,26 @@ function toTreeLimits(capabilities: TreeSyncCapabilitiesV2): TreeSyncLimits {
   };
 }
 
-function assertSnapshotLimits(page: {
-  folderCount: string;
-  pageCount: string;
-  revisionManifestByteLength: string;
-  revisionBodyBytes: string;
-}): void {
+function assertSnapshotLimits(
+  page: {
+    folderCount: string;
+    pageCount: string;
+    revisionManifestByteLength: string;
+    revisionBodyBytes: string;
+  },
+  limits: TreeSyncCapabilitiesV2,
+): void {
   const objectCount =
     parseDecimalCount(page.folderCount) + parseDecimalCount(page.pageCount);
-  if (objectCount > BigInt(TREE_SYNC_V2_LIMITS.maxSnapshotObjects))
+  if (objectCount > BigInt(limits.maxSnapshotObjects))
     throw new Error("快照对象数量超过限制");
-  const bytes =
-    parseDecimalCount(page.revisionManifestByteLength) +
-    parseDecimalCount(page.revisionBodyBytes);
-  if (bytes > BigInt(TREE_SYNC_V2_LIMITS.maxDocumentTreeBytes))
-    throw new Error("快照字节数超过限制");
+  if (
+    parseDecimalCount(page.revisionBodyBytes) >
+      BigInt(limits.maxClientTotalBodyBytes) ||
+    parseDecimalCount(page.revisionManifestByteLength) >
+      BigInt(limits.maxClientManifestBytes)
+  )
+    throw new Error("SPACE_TOO_LARGE");
 }
 
 export class V2TreeRemote implements TreeRemotePort {
@@ -113,11 +118,32 @@ export class V2TreeRemote implements TreeRemotePort {
     return toTreeLimits(this.selection.capabilities);
   }
 
+  private async json(
+    method: string,
+    path: string,
+    body?: unknown,
+    canonical = false,
+  ): Promise<unknown> {
+    return (
+      await this.client.boundedJson(
+        method,
+        path,
+        this.selection.capabilities.maxResponseBytes,
+        body,
+        canonical,
+      )
+    ).json;
+  }
+
   async refreshCapabilities(): Promise<TreeSyncLimits> {
     const parsed = TreeCapabilitiesResponseV2Schema.parse(
       (
         await retryRead(async () =>
-          this.client.raw("GET", "/api/sync/v2/capabilities"),
+          this.client.boundedJson(
+            "GET",
+            "/api/sync/v2/capabilities",
+            TREE_SYNC_V2_LIMITS.capabilitiesDiscoveryBytes,
+          ),
         )
       ).json,
     );
@@ -131,7 +157,7 @@ export class V2TreeRemote implements TreeRemotePort {
   async spaces(): Promise<TreeSpaceSummary[]> {
     try {
       const parsed = TreeSpaceListResponseV2Schema.parse(
-        await this.client.treeSpaces(),
+        await retryRead(() => this.json("GET", "/api/sync/v2/spaces")),
       );
       return parsed.spaces.map((space) => ({ ...space }));
     } catch (error) {
@@ -145,12 +171,10 @@ export class V2TreeRemote implements TreeRemotePort {
   async head(): Promise<TreeHead> {
     const page = await retryRead(async () =>
       TreeRevisionHeadResponseV2Schema.parse(
-        (
-          await this.client.raw(
-            "GET",
-            `/api/sync/v2/spaces/${encodeURIComponent(this.spaceId)}/head`,
-          )
-        ).json,
+        await this.json(
+          "GET",
+          `/api/sync/v2/spaces/${encodeURIComponent(this.spaceId)}/head`,
+        ),
       ),
     );
     return {
@@ -179,12 +203,10 @@ export class V2TreeRemote implements TreeRemotePort {
       if (cursor) query.set("cursor", cursor);
       const page = await retryRead(async () =>
         TreeSnapshotPageV2Schema.parse(
-          (
-            await this.client.raw(
-              "GET",
-              `/api/sync/v2/spaces/${encodeURIComponent(this.spaceId)}/snapshot?${query}`,
-            )
-          ).json,
+          await this.json(
+            "GET",
+            `/api/sync/v2/spaces/${encodeURIComponent(this.spaceId)}/snapshot?${query}`,
+          ),
         ),
       );
       const signature = JSON.stringify([
@@ -202,7 +224,7 @@ export class V2TreeRemote implements TreeRemotePort {
         throw new Error("分页元数据已变更");
       fixed = signature;
       requestRevision = page.revision;
-      assertSnapshotLimits(page);
+      assertSnapshotLimits(page, this.selection.capabilities);
       yield {
         protocolVersion: "2",
         spaceId: page.spaceId,
@@ -236,12 +258,10 @@ export class V2TreeRemote implements TreeRemotePort {
       if (cursor) query.set("cursor", cursor);
       const page = await retryRead(async () =>
         TreeDeltaPageV2Schema.parse(
-          (
-            await this.client.raw(
-              "GET",
-              `/api/sync/v2/spaces/${encodeURIComponent(this.spaceId)}/delta?${query}`,
-            )
-          ).json,
+          await this.json(
+            "GET",
+            `/api/sync/v2/spaces/${encodeURIComponent(this.spaceId)}/delta?${query}`,
+          ),
         ),
       );
       const signature = JSON.stringify([
@@ -261,7 +281,7 @@ export class V2TreeRemote implements TreeRemotePort {
       fixed = signature;
       toRevision = page.toRevision;
       items.push(...page.items);
-      if (items.length > TREE_SYNC_V2_LIMITS.maxDeltaItems)
+      if (items.length > this.selection.capabilities.maxDeltaItems)
         throw new Error("增量条目数量超过限制");
       const next = page.nextCursor;
       if (next !== null) {
@@ -281,15 +301,12 @@ export class V2TreeRemote implements TreeRemotePort {
       ...input,
     });
     const value = CreateTreePushSessionResponseV2Schema.parse(
-      (
-        await this.client.raw(
-          "POST",
-          `/api/sync/v2/spaces/${encodeURIComponent(this.spaceId)}/push-sessions`,
-          body,
-          true,
-          true,
-        )
-      ).json,
+      await this.json(
+        "POST",
+        `/api/sync/v2/spaces/${encodeURIComponent(this.spaceId)}/push-sessions`,
+        body,
+        true,
+      ),
     );
     return {
       sessionId: value.sessionId,
@@ -305,15 +322,12 @@ export class V2TreeRemote implements TreeRemotePort {
   ): Promise<{ receipt: string }> {
     const body = TreePushBatchV2Schema.parse(batch);
     const value = TreePushBatchReceiptV2Schema.parse(
-      (
-        await this.client.raw(
-          "PUT",
-          `/api/sync/v2/spaces/${encodeURIComponent(this.spaceId)}/push-sessions/${encodeURIComponent(sessionId)}/batches/${batch.batchIndex}`,
-          body,
-          true,
-          true,
-        )
-      ).json,
+      await this.json(
+        "PUT",
+        `/api/sync/v2/spaces/${encodeURIComponent(this.spaceId)}/push-sessions/${encodeURIComponent(sessionId)}/batches/${batch.batchIndex}`,
+        body,
+        true,
+      ),
     );
     return { receipt: value.receipt };
   }
@@ -328,24 +342,20 @@ export class V2TreeRemote implements TreeRemotePort {
       userConfirmed: true,
     });
     const value = TreeFinalizePushResponseV2Schema.parse(
-      (
-        await this.client.raw(
-          "POST",
-          `/api/sync/v2/spaces/${encodeURIComponent(this.spaceId)}/push-sessions/${encodeURIComponent(sessionId)}/finalize`,
-          body,
-        )
-      ).json,
+      await this.json(
+        "POST",
+        `/api/sync/v2/spaces/${encodeURIComponent(this.spaceId)}/push-sessions/${encodeURIComponent(sessionId)}/finalize`,
+        body,
+      ),
     );
     return toFinalizeResult(value);
   }
 
   async getSession(sessionId: string): Promise<TreePushSessionStatus> {
-    const raw = (
-      await this.client.raw(
-        "GET",
-        `/api/sync/v2/spaces/${encodeURIComponent(this.spaceId)}/push-sessions/${encodeURIComponent(sessionId)}`,
-      )
-    ).json;
+    const raw = await this.json(
+      "GET",
+      `/api/sync/v2/spaces/${encodeURIComponent(this.spaceId)}/push-sessions/${encodeURIComponent(sessionId)}`,
+    );
     // The published v2 package predates the server's recoverable
     // `finalizing` state. Validate the stable response shape with the
     // published schema while temporarily substituting its closest state.
@@ -372,9 +382,10 @@ export class V2TreeRemote implements TreeRemotePort {
   }
 
   async abort(sessionId: string): Promise<void> {
-    await this.client.raw(
+    await this.client.noContent(
       "DELETE",
       `/api/sync/v2/spaces/${encodeURIComponent(this.spaceId)}/push-sessions/${encodeURIComponent(sessionId)}`,
+      this.selection.capabilities.maxResponseBytes,
     );
   }
 }

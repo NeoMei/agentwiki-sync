@@ -13,6 +13,7 @@ import type {
   TreePage,
   TreeSnapshot,
 } from "../../src/core/tree-model";
+import { HttpResponseTooLargeError } from "../../src/ports/http";
 import type { TreeRemotePort } from "../../src/ports/tree-remote";
 import { FakeAgentWiki } from "../fakes/fake-agentwiki";
 import { FakeHttp } from "../fakes/fake-http";
@@ -346,6 +347,69 @@ describe("V2TreeRemote", () => {
       folderId: "f1",
       path: "pages/Guide/A.md",
     });
+  });
+
+  it("reads a 10 MiB UTF-8 page with a separate manifest budget", async () => {
+    const http = new FakeHttp();
+    const body = "中".repeat(3_495_253) + "a";
+    http.responses.push({
+      status: 200,
+      json: v2SnapshotPage({
+        revisionBodyBytes: "10485760",
+        revisionManifestByteLength: "10486272",
+        pages: [{ ...pageV2("p1", null, "pages/A.md"), body }],
+      }),
+    });
+    const selection = v2Selection();
+    const remote = new V2TreeRemote(client(http), "space", {
+      ...selection,
+      capabilities: {
+        ...selection.capabilities,
+        maxPageBytes: 10_485_760,
+        maxClientTotalBodyBytes: 10_485_760,
+        maxClientManifestBytes: 67_108_864,
+        maxResponseBytes: 67_108_864,
+      },
+    });
+
+    const snapshot = await collectSnapshot(remote);
+
+    expect(snapshot.pages[0]?.body).toBe(body);
+    expect(http.calls[0]?.maxResponseBytes).toBe(67_108_864);
+  });
+
+  it("rejects a v2 delta that exceeds the negotiated JSON response limit", async () => {
+    const http = new FakeHttp();
+    const selection = v2Selection();
+    const json = {
+      protocolVersion: "2",
+      spaceId: "space",
+      fromRevision: "r0",
+      toRevision: "r1",
+      toSequence: 1,
+      toRevisionContentHash: "e".repeat(64),
+      toFolderCount: "0",
+      toPageCount: "1",
+      toRevisionManifestByteLength: "10",
+      toRevisionBodyBytes: "4",
+      items: [
+        { operation: "upsert_page", page: pageV2("p1", null, "pages/A.md") },
+      ],
+      nextCursor: null,
+    };
+    http.responses.push({ status: 200, json });
+    const remote = new V2TreeRemote(client(http), "space", {
+      ...selection,
+      capabilities: {
+        ...selection.capabilities,
+        maxResponseBytes:
+          new TextEncoder().encode(JSON.stringify(json)).byteLength - 1,
+      },
+    });
+
+    await expect(remote.delta("r0")).rejects.toBeInstanceOf(
+      HttpResponseTooLargeError,
+    );
   });
 
   it("parses the v2 space list with a strict local schema", async () => {

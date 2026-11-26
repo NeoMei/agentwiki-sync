@@ -1,10 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { canonicalBytes, sha256Hex } from "../../src/agentwiki/protocol";
 import {
   AgentWikiClient,
   normalizeServerUrl,
 } from "../../src/agentwiki/client";
 import { ConnectionService } from "../../src/application/connection-service";
+import type { HttpPort } from "../../src/ports/http";
 import { ProtocolSelectionRepository } from "../../src/storage/protocol-selection";
 import { MemorySecrets } from "../fakes/memory-secrets";
 import { FakeHttp } from "../fakes/fake-http";
@@ -20,6 +21,29 @@ describe("AgentWiki connection", () => {
     );
     expect(() => normalizeServerUrl("http://example.com", true)).toThrow();
     expect(() => normalizeServerUrl("https://u:p@example.com?q=1")).toThrow();
+  });
+
+  it("offers the larger page limit on raw and checked requests", async () => {
+    const request = vi.fn<HttpPort["request"]>().mockResolvedValue({
+      status: 200,
+      json: {},
+    });
+    const client = new AgentWikiClient(
+      "https://wiki.example.com",
+      { request },
+      () => "secret",
+    );
+
+    await client.raw("GET", "/api/integrations/obsidian/session");
+    await client.boundedJson("GET", "/api/sync/v3/capabilities", 65_536);
+
+    for (const [call] of request.mock.calls) {
+      expect(call.headers).toMatchObject({
+        Authorization: "Bearer secret",
+        "X-AgentWiki-Sync-Max-Page-Bytes": "10485760",
+      });
+    }
+    expect(request).toHaveBeenCalledTimes(2);
   });
 
   it("rejects redirects and validates a fixed paginated revision", async () => {
@@ -67,7 +91,13 @@ describe("AgentWiki connection", () => {
     ).rejects.toThrow(/元数据已变更/);
   });
 
-  it("stores a credential before exchange and activates only after verification", async () => {
+  it("verifies large-page capabilities before activating a credential", async () => {
+    const capabilities = {
+      ...FakeHttp.capabilities,
+      maxPageBytes: 10_485_760,
+      maxBatchBytes: 67_108_864,
+      maxResponseBytes: 67_108_864,
+    };
     const http = new FakeHttp();
     http.route("POST", "/api/integrations/obsidian/exchange", {
       status: 201,
@@ -78,7 +108,7 @@ describe("AgentWiki connection", () => {
         credentialStatus: "provisional",
         provisionalExpiresAt: "2026-08-14T01:00:00.000Z",
         user: { id: "u", displayName: "U" },
-        capabilities: FakeHttp.capabilities,
+        capabilities,
       },
     });
     const session = {
@@ -93,7 +123,7 @@ describe("AgentWiki connection", () => {
       credentialStatus: "provisional",
       provisionalExpiresAt: "2026-08-14T01:00:00.000Z",
       user: { id: "u", displayName: "U" },
-      capabilities: FakeHttp.capabilities,
+      capabilities,
     };
     http.responses.push(
       {
@@ -105,7 +135,7 @@ describe("AgentWiki connection", () => {
           credentialStatus: "provisional",
           provisionalExpiresAt: "2026-08-14T01:00:00.000Z",
           user: { id: "u", displayName: "U" },
-          capabilities: FakeHttp.capabilities,
+          capabilities,
         },
       },
       { status: 200, json: session },
