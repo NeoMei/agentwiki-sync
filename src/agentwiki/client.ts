@@ -11,6 +11,7 @@ import {
 } from "./protocol";
 import type { HttpPort, HttpResponse } from "../ports/http";
 import { retryRead } from "./retry";
+import { LARGE_SYNC_PAGE_BYTES } from "./protocol/limits";
 
 export function normalizeServerUrl(input: string, development = false): string {
   const url = new URL(input);
@@ -54,6 +55,19 @@ export class AgentWikiClient {
     private readonly credential: () => string | null,
   ) {}
 
+  private requestHeaders(
+    authenticated: boolean,
+    contentType = "application/json; charset=utf-8",
+  ): Record<string, string> {
+    const headers: Record<string, string> = {
+      "Content-Type": contentType,
+      "X-AgentWiki-Sync-Max-Page-Bytes": String(LARGE_SYNC_PAGE_BYTES),
+    };
+    const secret = authenticated ? this.credential() : null;
+    if (secret) headers.Authorization = `Bearer ${secret}`;
+    return headers;
+  }
+
   async raw(
     method: string,
     path: string,
@@ -61,11 +75,6 @@ export class AgentWikiClient {
     authenticated = true,
     canonical = false,
   ): Promise<HttpResponse> {
-    const secret = authenticated ? this.credential() : null;
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json; charset=utf-8",
-    };
-    if (secret) headers.Authorization = `Bearer ${secret}`;
     const response = await this.http.request({
       method,
       url: `${this.serverUrl}${path}`,
@@ -74,7 +83,7 @@ export class AgentWikiClient {
         canonical && body !== undefined
           ? (await import("./protocol")).canonicalBytes(body)
           : undefined,
-      headers,
+      headers: this.requestHeaders(authenticated),
     });
     if (response.status >= 300 && response.status < 400)
       throw new AgentWikiHttpError(
@@ -104,18 +113,13 @@ export class AgentWikiClient {
       maxResponseBytes: number;
     },
   ): Promise<HttpResponse> {
-    const headers: Record<string, string> = {
-      "Content-Type": options.contentType ?? "application/json; charset=utf-8",
-    };
-    const secret = this.credential();
-    if (secret) headers.Authorization = `Bearer ${secret}`;
     const response = await this.http.request({
       method,
       url: `${this.serverUrl}${path}`,
       body: options.body,
       canonicalBody: options.canonicalBody,
       binaryBody: options.binaryBody,
-      headers,
+      headers: this.requestHeaders(true, options.contentType),
       responseType: options.responseType,
       maxResponseBytes: options.maxResponseBytes,
     });
@@ -208,12 +212,6 @@ export class AgentWikiClient {
   async spaces(): Promise<SyncSpaceListResponse> {
     return SyncSpaceListResponseSchema.parse(
       (await this.raw("GET", "/api/sync/v1/spaces")).json,
-    );
-  }
-
-  async treeSpaces(): Promise<unknown> {
-    return retryRead(
-      async () => (await this.raw("GET", "/api/sync/v2/spaces")).json,
     );
   }
 

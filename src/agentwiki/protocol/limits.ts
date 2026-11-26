@@ -1,3 +1,5 @@
+export const LARGE_SYNC_PAGE_BYTES = 10 * 1024 * 1024;
+
 const MAX_SIGNED_BIGINT = 9223372036854775807n;
 
 export function parseDecimalCount(value: string): bigint {

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { validatePortablePath } from "../../core/portable-path";
+import { LARGE_SYNC_PAGE_BYTES } from "./limits";
 
 const PublicIdSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/);
 const HashSchema = z.string().regex(/^[0-9a-f]{64}$/);
@@ -36,14 +37,16 @@ export const SyncCapabilitiesSchema = z
 
 export function parseCapabilities(value: unknown) {
   const parsed = SyncCapabilitiesSchema.parse(value);
+  const largePages = parsed.maxPageBytes === LARGE_SYNC_PAGE_BYTES;
+  const maxJsonBytes = largePages ? 64 * 1024 * 1024 : 4_194_304;
   if (
-    parsed.maxPageBytes !== 1_048_576 ||
+    (!largePages && parsed.maxPageBytes !== 1_048_576) ||
     parsed.maxBatchItems < 1 ||
     parsed.maxBatchItems > 100 ||
     parsed.maxBatchBytes < 1_048_576 ||
-    parsed.maxBatchBytes > 4_194_304 ||
+    parsed.maxBatchBytes > maxJsonBytes ||
     parsed.maxResponseBytes < 1_048_576 ||
-    parsed.maxResponseBytes > 4_194_304 ||
+    parsed.maxResponseBytes > maxJsonBytes ||
     parsed.maxPageItems < 1 ||
     parsed.maxPageItems > 200 ||
     parsed.maxChangeCount !== 5_000 ||

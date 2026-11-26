@@ -23,8 +23,8 @@ const errorMessages: Record<string, string> = {
   SPACE_FORBIDDEN:
     "当前凭据没有此空间的访问权限。重新授权后请移除旧映射，再选择当前可访问的空间。",
   SPACE_READ_ONLY: "此空间只读，无法推送。请联系管理员获取编辑权限。",
-  SPACE_TOO_LARGE: "空间超出同步限制（5000 页 / 100MB）。",
-  PAGE_TOO_LARGE: "单页超出大小限制（1MB）。",
+  SPACE_TOO_LARGE: "空间超出当前同步容量限制。",
+  PAGE_TOO_LARGE: "单页正文超出当前同步大小限制。",
   BATCH_TOO_LARGE: "批次超出限制。请分批推送。",
   PUSH_SESSION_EXPIRED: "上传会话已过期。请重新预览并推送。",
   PUSH_SESSION_NOT_FOUND: "上传会话不存在。请重新预览并推送。",
